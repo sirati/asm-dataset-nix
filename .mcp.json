@@ -1,0 +1,122 @@
+{
+    "mcpServers": {
+        "language-nil": {
+            "command": "systemd-run",
+            "args": [
+                "--scope",
+                "--user",
+                "-p",
+                "MemoryMax=1G",
+                "-p",
+                "MemorySwapMax=2G",
+                "mcp-language-server",
+                "--workspace",
+                "./",
+                "--lsp",
+                "nil",
+                "--",
+                "--stdio"
+            ]
+        },
+        "language-nixd": {
+            "command": "systemd-run",
+            "args": [
+                "--scope",
+                "--user",
+                "-p",
+                "MemoryMax=1G",
+                "-p",
+                "MemorySwapMax=2G",
+                "mcp-language-server",
+                "--workspace",
+                "./",
+                "--lsp",
+                "nixd"
+            ]
+        },
+        "language-ruff": {
+            "command": "systemd-run",
+            "args": [
+                "--scope",
+                "--user",
+                "-p",
+                "MemoryMax=1G",
+                "-p",
+                "MemorySwapMax=2G",
+                "mcp-language-server",
+                "--workspace",
+                "./",
+                "--lsp",
+                "ruff",
+                "--",
+                "server"
+            ]
+        },
+        "language-json": {
+            "command": "systemd-run",
+            "args": [
+                "--scope",
+                "--user",
+                "-p",
+                "MemoryMax=1G",
+                "-p",
+                "MemorySwapMax=2G",
+                "mcp-language-server",
+                "--workspace",
+                "./",
+                "--lsp",
+                "vscode-json-languageserver",
+                "--",
+                "--stdio"
+            ]
+        },
+        "language-bash": {
+            "command": "systemd-run",
+            "args": [
+                "--scope",
+                "--user",
+                "-p",
+                "MemoryMax=1G",
+                "-p",
+                "MemorySwapMax=2G",
+                "mcp-language-server",
+                "--workspace",
+                "./",
+                "--lsp",
+                "bash-language-server",
+                "--",
+                "start"
+            ]
+        },
+        "language-python": {
+            "command": "systemd-run",
+            "args": [
+                "--scope",
+                "--user",
+                "-p",
+                "MemoryMax=1G",
+                "-p",
+                "MemorySwapMax=2G",
+                "mcp-language-server",
+                "--workspace",
+                "./",
+                "--lsp",
+                "basedpyright-langserver",
+                "--",
+                "--stdio"
+            ]
+        },
+        "nix-online": {
+            "command": "systemd-run",
+            "args": [
+                "--scope",
+                "--user",
+                "-p",
+                "MemoryMax=1G",
+                "-p",
+                "MemorySwapMax=2G",
+                "mcp-nixos"
+            ]
+        }
+    }
+}
