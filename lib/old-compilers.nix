@@ -4,6 +4,13 @@
 # Takes a list of { oldPkgs, gccSpecs, clangSpecs } records describing which
 # compiler versions to extract from each old nixpkgs input.
 #
+# For cross-compilation, GCC versions that would fail due to the stage-final
+# compiler being too new (e.g. gcc11 building gcc9's runtime) are fixed by
+# overriding depsBuildBuild on the unwrapped cross GCC to use the native GCC
+# of the same version. This ensures GCC N's source is compiled by GCC N itself
+# (fixed-point bootstrap), avoiding source-level incompatibilities in libgcc
+# and libstdc++.
+#
 # Uses tryEval for safety — gracefully skips compilers that fail evaluation.
 # Uses explicit spec lists rather than auto-discovery (old nixpkgs attr names vary).
 #
@@ -103,6 +110,11 @@ let
   # Build a compiler entry for an old GCC version.
   # Uses the old nixpkgs' GCC but injects it into the current nixpkgs' stdenv,
   # so we get old compiler + current libc/binutils.
+  #
+  # For cross-compilation, overrides depsBuildBuild on the unwrapped cross GCC
+  # to use the native GCC of the same version. This makes GCC N compile its own
+  # source code (fixed-point), avoiding incompatibilities where the default
+  # stage-final compiler (e.g. gcc11) is too new for GCC N's runtime sources.
   mkOldGccEntry =
     oldPkgs:
     { attr, label }:
@@ -121,8 +133,20 @@ let
           targetPkgs: target:
           let
             oldTargetPkgs = archLib.getPkgsForTarget oldPkgs target;
+            oldCrossGcc = oldTargetPkgs.buildPackages.${attr};
           in
-          targetPkgs.overrideCC targetPkgs.stdenv oldTargetPkgs.${attr};
+          if target.crossAttr != null && (oldTargetPkgs ? buildPackages) then
+            # Cross-compilation: override the unwrapped cross GCC's depsBuildBuild
+            # to use the native GCC of the same version, so GCC N compiles itself.
+            let
+              bootstrappedCC = oldCrossGcc.cc.overrideAttrs (old: {
+                depsBuildBuild = [ oldPkgs.${attr} ];
+              });
+              rewrapped = oldCrossGcc.override { cc = bootstrappedCC; };
+            in
+            targetPkgs.overrideCC targetPkgs.stdenv rewrapped
+          else
+            targetPkgs.overrideCC targetPkgs.stdenv oldTargetPkgs.${attr};
       };
 
   # Build a compiler entry for an old Clang/LLVM version.
