@@ -4,3 +4,8 @@ result-*
 
 # Ignore automatically generated direnv output
 .direnv
+
+# Test artifacts
+.cross-results/
+test_results.jsonl
+report_hello_cross.md

@@ -7,10 +7,37 @@
 # Metadata (labels, compiler info) is computed without creating derivations,
 # so _meta can be evaluated instantly even for the full 75K matrix.
 
-{ pkgs, lib }:
+{
+  pkgs,
+  lib,
+  extraCompilers ? {
+    gcc = [ ];
+    clang = [ ];
+    all = [ ];
+  },
+}:
 
 let
-  compilers = import ./compilers.nix { inherit pkgs; };
+  currentCompilers = import ./compilers.nix { inherit pkgs; };
+
+  # Merge current and extra (old) compilers, deduplicating by label.
+  # Current compilers take priority over extra ones.
+  dedupByLabel =
+    comps:
+    builtins.attrValues (
+      builtins.listToAttrs (
+        map (c: {
+          name = c.label;
+          value = c;
+        }) comps
+      )
+    );
+
+  compilers = {
+    gcc = dedupByLabel (extraCompilers.gcc ++ currentCompilers.gcc);
+    clang = dedupByLabel (extraCompilers.clang ++ currentCompilers.clang);
+    all = dedupByLabel (extraCompilers.all ++ currentCompilers.all);
+  };
   archDefs = import ./architectures.nix { };
   flagDefs = import ./flags.nix { };
   pkgDefs = import ./packages.nix { };

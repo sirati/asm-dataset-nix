@@ -43,7 +43,7 @@ let
       label = "gcc${vnum}";
       # Use default stdenv when this IS the default GCC (cache-friendly)
       mkStdenv =
-        targetPkgs:
+        targetPkgs: _target:
         if isDefault then targetPkgs.stdenv else targetPkgs.overrideCC targetPkgs.stdenv targetPkgs.${name};
     };
 
@@ -70,7 +70,7 @@ let
       inherit name version;
       family = "clang";
       label = "clang${vnum}";
-      mkStdenv = targetPkgs: targetPkgs.${name}.stdenv;
+      mkStdenv = targetPkgs: _target: targetPkgs.${name}.stdenv;
     };
 
 in

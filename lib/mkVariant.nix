@@ -20,7 +20,7 @@ let
   targetPkgs = archLib.getPkgsForTarget pkgs target;
 
   # Build the custom stdenv using the compiler's mkStdenv
-  customStdenv = compiler.mkStdenv targetPkgs;
+  customStdenv = compiler.mkStdenv targetPkgs target;
 
   # Resolve compiler-specific flags (e.g., novec differs between gcc and clang)
   resolvedCflags =
