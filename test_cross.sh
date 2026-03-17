@@ -40,11 +40,11 @@ trap 'echo "Interrupted, killing all children..."; kill 0; exit 130' INT TERM
 # Compilers that passed the native hello test, newest first
 COMPILERS=(
   gcc15 gcc14 gcc13 gcc12 gcc11 gcc10
-  gcc9 gcc8 gcc7 gcc6 gcc5 gcc4_9 gcc4_8 gcc4_5
+  gcc9 gcc8 gcc7 gcc6 gcc5 gcc4_9 gcc4_8 gcc4_6 gcc4_5 gcc4_4
   clang22 clang21 clang20 clang19 clang18
   clang17 clang16 clang15 clang14 clang13 clang12 clang11 clang10
   clang9 clang8 clang7 clang6 clang5
-  clang4 clang3_9 clang3_8 clang3_7
+  clang4 clang3_9 clang3_8 clang3_7 clang3_5 clang3_4
 )
 
 ARCHS=(i686 aarch64 armv7l mipsel mips64el)

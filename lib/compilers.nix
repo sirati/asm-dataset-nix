@@ -41,10 +41,18 @@ let
       inherit name version;
       family = "gcc";
       label = "gcc${vnum}";
-      # Use default stdenv when this IS the default GCC (cache-friendly)
+      # Use default stdenv when this IS the default GCC (cache-friendly).
+      # For cross targets, use buildPackages.gccN (the cross-compiler that
+      # runs on the build platform), not targetPkgs.gccN (which would be a
+      # target-platform binary that can't run on the builder).
       mkStdenv =
-        targetPkgs: _target:
-        if isDefault then targetPkgs.stdenv else targetPkgs.overrideCC targetPkgs.stdenv targetPkgs.${name};
+        targetPkgs: target:
+        if isDefault then
+          targetPkgs.stdenv
+        else if target.crossAttr != null then
+          targetPkgs.overrideCC targetPkgs.stdenv targetPkgs.buildPackages.${name}
+        else
+          targetPkgs.overrideCC targetPkgs.stdenv targetPkgs.${name};
     };
 
   # ── Clang/LLVM discovery ─────────────────────────────────────────────────
@@ -70,7 +78,15 @@ let
       inherit name version;
       family = "clang";
       label = "clang${vnum}";
-      mkStdenv = targetPkgs: _target: targetPkgs.${name}.stdenv;
+      # For cross targets, use buildPackages.llvmPackages_N.clang (the cross-compiler
+      # that runs on the build platform), not targetPkgs.llvmPackages_N.clang
+      # (which would be a target-platform binary that can't run on the builder).
+      mkStdenv =
+        targetPkgs: target:
+        if target.crossAttr != null then
+          targetPkgs.overrideCC targetPkgs.stdenv targetPkgs.buildPackages.${name}.clang
+        else
+          targetPkgs.${name}.stdenv;
     };
 
 in

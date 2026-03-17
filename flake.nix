@@ -33,6 +33,46 @@
       systems = [ "x86_64-linux" ];
       developModule = import ./develop.nix;
 
+      # Overlay to fix compiler-rt on 32-bit MIPS (O32 ABI).
+      # The O32 ABI struct stat is 144 bytes, but compiler-rt (through
+      # LLVM 22) hardcodes 160 (the N32 value). This was reported as
+      # LLVM D129749 and partially fixed in LLVM 15, then regressed.
+      # We fix it universally via postPatch sed on the .h file.
+      compilerRtMipsOverlay =
+        final: prev:
+        let
+          patchCompilerRt =
+            rt:
+            rt.overrideAttrs (old: {
+              postPatch = (old.postPatch or "") + ''
+                for f in lib/sanitizer_common/sanitizer_platform_limits_posix.h \
+                         lib/sanitizer_common/sanitizer_platform_limits_posix.cc; do
+                  [ -f "$f" ] || continue
+                  # LLVM 5-14, 20-22: FIRST_32_SECOND_64(160, 216) in __mips__ #else branch
+                  sed -i 's/FIRST_32_SECOND_64(160, 216)/FIRST_32_SECOND_64(144, 216)/g' "$f"
+                  # LLVM 16-19: inline ternary (_MIPS_SIM == _ABIN32) ? 176 : 160
+                  sed -i 's/(_MIPS_SIM == _ABIN32) ? 176 : 160/(_MIPS_SIM == _ABIN32) ? 176 : 144/g' "$f"
+                done
+              '';
+            });
+          patchLlvmSet =
+            llvmPkgs:
+            llvmPkgs
+            // {
+              compiler-rt = patchCompilerRt llvmPkgs.compiler-rt;
+            };
+          llvmAttrNames = builtins.filter (n: builtins.match "llvmPackages_[0-9]+" n != null) (
+            builtins.attrNames prev
+          );
+          llvmOverrides = builtins.listToAttrs (
+            map (name: {
+              inherit name;
+              value = patchLlvmSet prev.${name};
+            }) llvmAttrNames
+          );
+        in
+        llvmOverrides // { llvmPackages = patchLlvmSet prev.llvmPackages; };
+
       forAllSystems =
         f:
         nixpkgs.lib.genAttrs systems (
@@ -42,6 +82,7 @@
             pkgs = import nixpkgs {
               inherit system;
               config.allowUnfree = true;
+              overlays = [ compilerRtMipsOverlay ];
             };
           }
         );
@@ -63,14 +104,17 @@
           oldPkgs_22_11 = import nixpkgs-22_11 {
             inherit system;
             config.allowUnfree = true;
+            overlays = [ compilerRtMipsOverlay ];
           };
           oldPkgs_23_11 = import nixpkgs-23_11 {
             inherit system;
             config.allowUnfree = true;
+            overlays = [ compilerRtMipsOverlay ];
           };
           oldPkgs_24_05 = import nixpkgs-24_05 {
             inherit system;
             config.allowUnfree = true;
+            overlays = [ compilerRtMipsOverlay ];
           };
 
           oldCompilers = import ./lib/old-compilers.nix {
@@ -78,6 +122,8 @@
             oldNixpkgsSets = [
               {
                 oldPkgs = oldPkgs_15_09;
+                nixpkgsSrc = nixpkgs-15_09;
+                inherit system;
                 gccSpecs = [
                   {
                     attr = "gcc44";
@@ -97,6 +143,8 @@
               }
               {
                 oldPkgs = oldPkgs_18_03;
+                nixpkgsSrc = nixpkgs-18_03;
+                inherit system;
                 gccSpecs = [
                   {
                     attr = "gcc45";
