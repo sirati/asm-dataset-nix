@@ -42,6 +42,24 @@
       crossConfig = "mips64el-unknown-linux-gnuabin32";
       system = "mips64el-linux";
     };
+    ppc32 = {
+      label = "ppc32";
+      crossAttr = "ppc32";
+      crossConfig = "powerpc-unknown-linux-gnu";
+      system = "powerpc-linux";
+    };
+    ppc64 = {
+      label = "ppc64";
+      crossAttr = "ppc64";
+      crossConfig = "powerpc64-unknown-linux-gnuabielfv2";
+      system = "powerpc64-linux";
+    };
+    riscv64 = {
+      label = "riscv64";
+      crossAttr = "riscv64";
+      crossConfig = "riscv64-unknown-linux-gnu";
+      system = "riscv64-linux";
+    };
   };
 
   # Helper: given native pkgs and a target, return the appropriate pkgs set.

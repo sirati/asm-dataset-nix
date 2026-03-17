@@ -33,45 +33,8 @@
       systems = [ "x86_64-linux" ];
       developModule = import ./develop.nix;
 
-      # Overlay to fix compiler-rt on 32-bit MIPS (O32 ABI).
-      # The O32 ABI struct stat is 144 bytes, but compiler-rt (through
-      # LLVM 22) hardcodes 160 (the N32 value). This was reported as
-      # LLVM D129749 and partially fixed in LLVM 15, then regressed.
-      # We fix it universally via postPatch sed on the .h file.
-      compilerRtMipsOverlay =
-        final: prev:
-        let
-          patchCompilerRt =
-            rt:
-            rt.overrideAttrs (old: {
-              postPatch = (old.postPatch or "") + ''
-                for f in lib/sanitizer_common/sanitizer_platform_limits_posix.h \
-                         lib/sanitizer_common/sanitizer_platform_limits_posix.cc; do
-                  [ -f "$f" ] || continue
-                  # LLVM 5-14, 20-22: FIRST_32_SECOND_64(160, 216) in __mips__ #else branch
-                  sed -i 's/FIRST_32_SECOND_64(160, 216)/FIRST_32_SECOND_64(144, 216)/g' "$f"
-                  # LLVM 16-19: inline ternary (_MIPS_SIM == _ABIN32) ? 176 : 160
-                  sed -i 's/(_MIPS_SIM == _ABIN32) ? 176 : 160/(_MIPS_SIM == _ABIN32) ? 176 : 144/g' "$f"
-                done
-              '';
-            });
-          patchLlvmSet =
-            llvmPkgs:
-            llvmPkgs
-            // {
-              compiler-rt = patchCompilerRt llvmPkgs.compiler-rt;
-            };
-          llvmAttrNames = builtins.filter (n: builtins.match "llvmPackages_[0-9]+" n != null) (
-            builtins.attrNames prev
-          );
-          llvmOverrides = builtins.listToAttrs (
-            map (name: {
-              inherit name;
-              value = patchLlvmSet prev.${name};
-            }) llvmAttrNames
-          );
-        in
-        llvmOverrides // { llvmPackages = patchLlvmSet prev.llvmPackages; };
+      # MIPS compiler-rt cross-compilation fixes (see lib/mips-clang-overlay.nix)
+      compilerRtMipsOverlay = import ./lib/mips-clang-overlay.nix;
 
       forAllSystems =
         f:
@@ -79,6 +42,12 @@
           system:
           f {
             inherit system;
+            # Clean pkgs — no overlays, hits binary cache. Use for devShells.
+            cleanPkgs = import nixpkgs {
+              inherit system;
+              config.allowUnfree = true;
+            };
+            # Overlayed pkgs — dataset-specific patches. Use for builds.
             pkgs = import nixpkgs {
               inherit system;
               config.allowUnfree = true;
@@ -88,215 +57,35 @@
         );
 
       perSystem = forAllSystems (
-        { system, pkgs }:
+        { system, pkgs, cleanPkgs }:
         let
           lib = pkgs.lib;
 
           # ── Old nixpkgs sets for legacy compilers ────────────────────────
-          oldPkgs_15_09 = import nixpkgs-15_09 {
+          oldNixpkgsSets = import ./lib/old-nixpkgs.nix {
             inherit system;
-            config.allowUnfree = true;
-          };
-          oldPkgs_18_03 = import nixpkgs-18_03 {
-            inherit system;
-            config.allowUnfree = true;
-          };
-          oldPkgs_22_11 = import nixpkgs-22_11 {
-            inherit system;
-            config.allowUnfree = true;
-            overlays = [ compilerRtMipsOverlay ];
-          };
-          oldPkgs_23_11 = import nixpkgs-23_11 {
-            inherit system;
-            config.allowUnfree = true;
-            overlays = [ compilerRtMipsOverlay ];
-          };
-          oldPkgs_24_05 = import nixpkgs-24_05 {
-            inherit system;
-            config.allowUnfree = true;
-            overlays = [ compilerRtMipsOverlay ];
+            nixpkgsInputs = {
+              inherit
+                nixpkgs-15_09
+                nixpkgs-18_03
+                nixpkgs-22_11
+                nixpkgs-23_11
+                nixpkgs-24_05
+                ;
+            };
+            mipsClangOverlay = compilerRtMipsOverlay;
           };
 
           oldCompilers = import ./lib/old-compilers.nix {
             inherit pkgs lib;
-            oldNixpkgsSets = [
-              {
-                oldPkgs = oldPkgs_15_09;
-                nixpkgsSrc = nixpkgs-15_09;
-                inherit system;
-                gccSpecs = [
-                  {
-                    attr = "gcc44";
-                    label = "4_4";
-                  }
-                  {
-                    attr = "gcc46";
-                    label = "4_6";
-                  }
-                ];
-                clangSpecs = [
-                  {
-                    attr = "llvmPackages_36";
-                    label = "3_6";
-                  }
-                ];
-              }
-              {
-                oldPkgs = oldPkgs_18_03;
-                nixpkgsSrc = nixpkgs-18_03;
-                inherit system;
-                gccSpecs = [
-                  {
-                    attr = "gcc45";
-                    label = "4_5";
-                  }
-                  {
-                    attr = "gcc5";
-                    label = "5";
-                  }
-                ];
-                clangSpecs = [
-                  {
-                    attr = "llvmPackages_34";
-                    label = "3_4";
-                  }
-                  {
-                    attr = "llvmPackages_35";
-                    label = "3_5";
-                  }
-                  {
-                    attr = "llvmPackages_37";
-                    label = "3_7";
-                  }
-                  {
-                    attr = "llvmPackages_38";
-                    label = "3_8";
-                  }
-                  {
-                    attr = "llvmPackages_39";
-                    label = "3_9";
-                  }
-                  {
-                    attr = "llvmPackages_4";
-                    label = "4";
-                  }
-                ];
-              }
-              {
-                oldPkgs = oldPkgs_22_11;
-                gccSpecs = [
-                  {
-                    attr = "gcc48";
-                    label = "4_8";
-                  }
-                  {
-                    attr = "gcc49";
-                    label = "4_9";
-                  }
-                  {
-                    attr = "gcc6";
-                    label = "6";
-                  }
-                  {
-                    attr = "gcc7";
-                    label = "7";
-                  }
-                  {
-                    attr = "gcc8";
-                    label = "8";
-                  }
-                  {
-                    attr = "gcc9";
-                    label = "9";
-                  }
-                  {
-                    attr = "gcc10";
-                    label = "10";
-                  }
-                  {
-                    attr = "gcc11";
-                    label = "11";
-                  }
-                  {
-                    attr = "gcc12";
-                    label = "12";
-                  }
-                ];
-                clangSpecs = [
-                  {
-                    attr = "llvmPackages_5";
-                    label = "5";
-                  }
-                  {
-                    attr = "llvmPackages_6";
-                    label = "6";
-                  }
-                  {
-                    attr = "llvmPackages_7";
-                    label = "7";
-                  }
-                  {
-                    attr = "llvmPackages_8";
-                    label = "8";
-                  }
-                  {
-                    attr = "llvmPackages_9";
-                    label = "9";
-                  }
-                  {
-                    attr = "llvmPackages_10";
-                    label = "10";
-                  }
-                  {
-                    attr = "llvmPackages_11";
-                    label = "11";
-                  }
-                  {
-                    attr = "llvmPackages_12";
-                    label = "12";
-                  }
-                  {
-                    attr = "llvmPackages_13";
-                    label = "13";
-                  }
-                  {
-                    attr = "llvmPackages_14";
-                    label = "14";
-                  }
-                ];
-              }
-              {
-                oldPkgs = oldPkgs_23_11;
-                clangSpecs = [
-                  {
-                    attr = "llvmPackages_15";
-                    label = "15";
-                  }
-                  {
-                    attr = "llvmPackages_16";
-                    label = "16";
-                  }
-                ];
-                gccSpecs = [ ];
-              }
-              {
-                oldPkgs = oldPkgs_24_05;
-                clangSpecs = [
-                  {
-                    attr = "llvmPackages_17";
-                    label = "17";
-                  }
-                ];
-                gccSpecs = [ ];
-              }
-            ];
+            inherit oldNixpkgsSets;
           };
 
           matrix = import ./lib/matrix.nix {
             inherit pkgs lib;
             extraCompilers = oldCompilers;
           };
-          develop = developModule { inherit pkgs; };
+          develop = developModule { pkgs = cleanPkgs; };
 
           # ── Nested dataset output ──────────────────────────────────────────
           # Access: .#dataset.<system>.<pkg>.<arch>.<compiler-opt-flags-hardening>
@@ -308,11 +97,6 @@
           ) matrix.nestedMatrix;
 
           # ── Manifest generation app ────────────────────────────────────────
-          # Usage:
-          #   nix run .#generate-manifest                          # full meta (fast)
-          #   nix run .#generate-manifest -- hello                 # one pkg meta
-          #   nix run .#generate-manifest -- hello x86_64          # one pkg+arch meta
-          #   nix run .#generate-manifest -- hello x86_64 drv      # with drvPaths (slow)
           generateManifestScript = pkgs.writeShellScript "generate-manifest" ''
             set -euo pipefail
             PKG="''${1:-}"
