@@ -17,10 +17,31 @@ let
   archLib = import ./architectures.nix { };
 
   # Get the pkgs set for this target (native or cross)
-  targetPkgs = archLib.getPkgsForTarget pkgs target;
+  targetPkgs =
+    let p = archLib.getPkgsForTarget pkgs target;
+    in if p == null then builtins.throw "cross target ${target.label} not available" else p;
 
   # Build the custom stdenv using the compiler's mkStdenv
-  customStdenv = compiler.mkStdenv targetPkgs target;
+  baseStdenv = compiler.mkStdenv targetPkgs target;
+
+  # Fix clang ppc64 linker: clang normalizes powerpc64-unknown-linux-gnuabielfv2
+  # to powerpc64-unknown-linux-gnu internally, then can't find the cross linker.
+  # Inject -fuse-ld= via overrideAttrs to append to the wrapper's build script
+  # (override { extraBuildCommands } would replace the resource-root setup).
+  customStdenv =
+    if compiler.family == "clang" && target.label == "ppc64" then
+      let
+        cc = baseStdenv.cc;
+        fixedCC = cc.overrideAttrs (old: {
+          postFixup = (old.postFixup or "") + ''
+            echo "-fuse-ld=${cc.bintools}/bin/${cc.bintools.targetPrefix}ld" \
+              >> $out/nix-support/cc-cflags
+          '';
+        });
+      in
+      targetPkgs.overrideCC baseStdenv fixedCC
+    else
+      baseStdenv;
 
   # Resolve compiler-specific flags (e.g., novec differs between gcc and clang)
   resolvedCflags =
