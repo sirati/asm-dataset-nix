@@ -179,7 +179,7 @@ let
     }:
     target:
     if oldPkgs ? pkgsCross then
-      # Modern nixpkgs: use pkgsCross directly
+      # Modern nixpkgs: use pkgsCross directly (returns null if cross attr missing)
       archLib.getPkgsForTarget oldPkgs target
     else if nixpkgsSrc != null && system != null then
       # Pre-pkgsCross nixpkgs: re-import with crossSystem
@@ -226,13 +226,21 @@ let
             # pkgsCross available (22.11+): use buildPackages with depsBuildBuild bootstrap
             let
               oldCrossPkgs = getOldCrossPkgs nixpkgsInfo target;
-              oldCrossGcc = oldCrossPkgs.buildPackages.${attr};
-              bootstrappedCC = oldCrossGcc.cc.overrideAttrs (old: {
-                depsBuildBuild = [ oldPkgs.${attr} ];
-              });
-              rewrapped = oldCrossGcc.override { cc = bootstrappedCC; };
             in
-            targetPkgs.overrideCC targetPkgs.stdenv rewrapped
+            if oldCrossPkgs == null then
+              builtins.throw "${attr}: cross target ${target.label} not available in this nixpkgs"
+            else
+              let
+                oldCrossGcc = oldCrossPkgs.buildPackages.${attr};
+                bootstrappedCC = oldCrossGcc.cc.overrideAttrs (old: {
+                  depsBuildBuild = [ oldPkgs.${attr} ];
+                  # Disable libsanitizer for old cross GCC — its struct stat
+                  # definitions can mismatch the cross glibc headers (e.g. gcc12/mips64el).
+                  configureFlags = (old.configureFlags or [ ]) ++ [ "--disable-libsanitizer" ];
+                });
+                rewrapped = oldCrossGcc.override { cc = bootstrappedCC; };
+              in
+              targetPkgs.overrideCC targetPkgs.stdenv rewrapped
           else if nixpkgsInfo.nixpkgsSrc != null && nixpkgsInfo.system != null then
             # Pre-pkgsCross (18.03, 15.09): re-import with crossSystem.
             # tryEval guards against old nixpkgs not understanding the
@@ -246,10 +254,10 @@ let
                 config.allowUnfree = true;
               };
               crossAvailable = builtins.tryEval (
-                oldCrossPkgs ? buildPackages && oldCrossPkgs.buildPackages.${attr}.name
+                (oldCrossPkgs ? buildPackages) && oldCrossPkgs.buildPackages.${attr}.name != ""
               );
               crossCC =
-                if crossAvailable.success then
+                if crossAvailable.success && crossAvailable.value then
                   oldCrossPkgs.buildPackages.${attr}
                 else
                   builtins.throw "${attr}: cross-compiler not available in this nixpkgs for ${target.label}";
@@ -303,7 +311,10 @@ let
             let
               oldCrossPkgs = getOldCrossPkgs nixpkgsInfo target;
             in
-            targetPkgs.overrideCC targetPkgs.stdenv oldCrossPkgs.buildPackages.${attr}.clang
+            if oldCrossPkgs == null then
+              builtins.throw "${attr}: cross target ${target.label} not available in this nixpkgs"
+            else
+              targetPkgs.overrideCC targetPkgs.stdenv oldCrossPkgs.buildPackages.${attr}.clang
           else
             # Pre-pkgsCross (18.03, 15.09): hybrid wrapper approach.
             # The old nixpkgs' cross infrastructure has broken C++ stdlib

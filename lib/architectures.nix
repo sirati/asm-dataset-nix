@@ -66,5 +66,11 @@
   # For native (x86_64), returns pkgs unchanged.
   # For cross targets, returns pkgs.pkgsCross.<crossAttr>.
   getPkgsForTarget =
-    pkgs: target: if target.crossAttr == null then pkgs else pkgs.pkgsCross.${target.crossAttr};
+    pkgs: target:
+    if target.crossAttr == null then
+      pkgs
+    else if !(pkgs ? pkgsCross) || !(pkgs.pkgsCross ? ${target.crossAttr}) then
+      null
+    else
+      pkgs.pkgsCross.${target.crossAttr};
 }
