@@ -15,26 +15,31 @@
     i686 = {
       label = "i686";
       crossAttr = "gnu32";
+      crossConfig = "i686-unknown-linux-gnu";
       system = "i686-linux";
     };
     aarch64 = {
       label = "aarch64";
       crossAttr = "aarch64-multiplatform";
+      crossConfig = "aarch64-unknown-linux-gnu";
       system = "aarch64-linux";
     };
     armv7l = {
       label = "armv7l";
       crossAttr = "armv7l-hf-multiplatform";
+      crossConfig = "armv7l-unknown-linux-gnueabihf";
       system = "armv7l-linux";
     };
     mipsel = {
       label = "mipsel";
       crossAttr = "mipsel-linux-gnu";
+      crossConfig = "mipsel-unknown-linux-gnu";
       system = "mipsel-linux";
     };
     mips64el = {
       label = "mips64el";
       crossAttr = "mips64el-linux-gnuabin32";
+      crossConfig = "mips64el-unknown-linux-gnuabin32";
       system = "mips64el-linux";
     };
   };

@@ -1,15 +1,20 @@
 # Old compiler discovery from legacy nixpkgs inputs.
 # Produces compiler entries in the same shape as compilers.nix.
 #
-# Takes a list of { oldPkgs, gccSpecs, clangSpecs } records describing which
-# compiler versions to extract from each old nixpkgs input.
+# Takes a list of { oldPkgs, gccSpecs, clangSpecs, nixpkgsSrc?, system? }
+# records describing which compiler versions to extract from each old nixpkgs.
 #
-# For cross-compilation, GCC versions that would fail due to the stage-final
-# compiler being too new (e.g. gcc11 building gcc9's runtime) are fixed by
-# overriding depsBuildBuild on the unwrapped cross GCC to use the native GCC
-# of the same version. This ensures GCC N's source is compiled by GCC N itself
-# (fixed-point bootstrap), avoiding source-level incompatibilities in libgcc
-# and libstdc++.
+# Cross-compilation strategies (in order of preference):
+#
+# 1. pkgsCross available (nixpkgs 22.11+): use buildPackages.<compiler>
+#    directly. For GCC, override depsBuildBuild for version-matched bootstrap.
+#
+# 2. No pkgsCross but nixpkgsSrc provided (nixpkgs 18.03): re-import the
+#    nixpkgs source with crossSystem to get buildPackages.<compiler> from the
+#    old nixpkgs' own cross infrastructure.
+#
+# 3. Neither pkgsCross nor nixpkgsSrc (nixpkgs 15.09): cross-compilation
+#    not possible, throw a clear error.
 #
 # Uses tryEval for safety — gracefully skips compilers that fail evaluation.
 # Uses explicit spec lists rather than auto-discovery (old nixpkgs attr names vary).
@@ -107,18 +112,101 @@ let
     else
       null;
 
+  # Extract the unwrapped clang binary from an old LLVM package.
+  # Modern (3.7+): .clang.cc is the unwrapped clang (e.g. "clang-3.7.1")
+  # Very old (3.4-3.5): .clang IS the raw binary (no .cc, or .cc is gcc)
+  extractUnwrappedClang =
+    llvmPkg:
+    let
+      clang = llvmPkg.clang;
+      hasCC = clang ? cc;
+      ccName = if hasCC then (builtins.tryEval clang.cc.name).value or "" else "";
+      ccIsClang = builtins.match "clang-.*" ccName != null;
+    in
+    if hasCC && ccIsClang then
+      clang.cc # 3.7, 3.8, 3.9, 4.0: .cc is the unwrapped clang
+    else
+      clang; # 3.4, 3.5: .clang itself is the raw binary
+
+  # Determine which hardening flags an old clang doesn't support.
+  # These flags are injected by the modern cc-wrapper but old clangs reject them.
+  getClangUnsupportedHardeningFlags =
+    version:
+    let
+      parts = builtins.match "([0-9]+)\\.([0-9]+).*" version;
+      major = if parts != null then lib.toInt (builtins.elemAt parts 0) else 0;
+      minor = if parts != null then lib.toInt (builtins.elemAt parts 1) else 0;
+    in
+    # -fstack-protector-strong: added in clang 3.5
+    lib.optional (major < 3 || (major == 3 && minor < 5)) "stackprotector"
+    # -fstack-clash-protection: added in clang 11
+    ++ lib.optional (major < 11) "stackclashprotection"
+    # -fzero-call-used-regs: added in clang 16
+    ++ lib.optional (major < 16) "zerocallusedregs";
+
+  # Whether an old clang needs -fmacro-prefix-map stripped from the wrapper.
+  # -fmacro-prefix-map was added in clang 10.
+  clangNeedsMacroPrefixMapStripped =
+    version:
+    let
+      parts = builtins.match "([0-9]+)\\..*" version;
+      major = if parts != null then lib.toInt (builtins.head parts) else 0;
+    in
+    major < 10;
+
+  # Build commands to strip -fmacro-prefix-map flags from nix-support files.
+  # Old clangs (<10) don't support this flag.
+  stripMacroPrefixMapCommands = ''
+    for f in $out/nix-support/cc-cflags $out/nix-support/libc-cflags $out/nix-support/libcxx-cxxflags; do
+      if [ -f "$f" ]; then
+        sed -i "s/ -fmacro-prefix-map=[^ ]*//g" "$f"
+      fi
+    done
+    sed -i '/-fmacro-prefix-map/d' $out/nix-support/setup-hook
+  '';
+
+  # Get cross-compiler from old nixpkgs for a given target.
+  # For pre-pkgsCross nixpkgs, re-imports with crossSystem to get
+  # buildPackages which contain the cross-compilers.
+  #
+  # Returns the cross-imported pkgs set with buildPackages, or null
+  # if cross-compilation is not possible.
+  getOldCrossPkgs =
+    {
+      oldPkgs,
+      nixpkgsSrc ? null,
+      system ? null,
+    }:
+    target:
+    if oldPkgs ? pkgsCross then
+      # Modern nixpkgs: use pkgsCross directly
+      archLib.getPkgsForTarget oldPkgs target
+    else if nixpkgsSrc != null && system != null then
+      # Pre-pkgsCross nixpkgs: re-import with crossSystem
+      import nixpkgsSrc {
+        inherit system;
+        crossSystem = {
+          config = target.crossConfig;
+        };
+        config.allowUnfree = true;
+      }
+    else
+      null;
+
   # Build a compiler entry for an old GCC version.
   # Uses the old nixpkgs' GCC but injects it into the current nixpkgs' stdenv,
   # so we get old compiler + current libc/binutils.
   #
-  # For cross-compilation, overrides depsBuildBuild on the unwrapped cross GCC
-  # to use the native GCC of the same version. This makes GCC N compile its own
-  # source code (fixed-point), avoiding incompatibilities where the default
-  # stage-final compiler (e.g. gcc11) is too new for GCC N's runtime sources.
+  # For cross-compilation with pkgsCross (22.11+): overrides depsBuildBuild
+  # on the unwrapped cross GCC to use the native GCC of the same version.
+  #
+  # For cross-compilation without pkgsCross (18.03): re-imports the old
+  # nixpkgs with crossSystem and gets the cross-compiler from buildPackages.
   mkOldGccEntry =
-    oldPkgs:
+    nixpkgsInfo: # { oldPkgs, nixpkgsSrc?, system? }
     { attr, label }:
     let
+      oldPkgs = nixpkgsInfo.oldPkgs;
       tried = builtins.tryEval (oldPkgs.${attr}.cc.version or oldPkgs.${attr}.version);
     in
     if !tried.success then
@@ -131,22 +219,44 @@ let
         version = tried.value;
         mkStdenv =
           targetPkgs: target:
-          let
-            oldTargetPkgs = archLib.getPkgsForTarget oldPkgs target;
-            oldCrossGcc = oldTargetPkgs.buildPackages.${attr};
-          in
-          if target.crossAttr != null && (oldTargetPkgs ? buildPackages) then
-            # Cross-compilation: override the unwrapped cross GCC's depsBuildBuild
-            # to use the native GCC of the same version, so GCC N compiles itself.
+          if target.crossAttr == null then
+            # Native: just use the old compiler directly
+            targetPkgs.overrideCC targetPkgs.stdenv oldPkgs.${attr}
+          else if oldPkgs ? pkgsCross then
+            # pkgsCross available (22.11+): use buildPackages with depsBuildBuild bootstrap
             let
+              oldCrossPkgs = getOldCrossPkgs nixpkgsInfo target;
+              oldCrossGcc = oldCrossPkgs.buildPackages.${attr};
               bootstrappedCC = oldCrossGcc.cc.overrideAttrs (old: {
                 depsBuildBuild = [ oldPkgs.${attr} ];
               });
               rewrapped = oldCrossGcc.override { cc = bootstrappedCC; };
             in
             targetPkgs.overrideCC targetPkgs.stdenv rewrapped
+          else if nixpkgsInfo.nixpkgsSrc != null && nixpkgsInfo.system != null then
+            # Pre-pkgsCross (18.03, 15.09): re-import with crossSystem.
+            # tryEval guards against old nixpkgs not understanding the
+            # target's ABI (e.g. gnuabin32 unknown in nixpkgs 18.03).
+            let
+              oldCrossPkgs = import nixpkgsInfo.nixpkgsSrc {
+                system = nixpkgsInfo.system;
+                crossSystem = {
+                  config = target.crossConfig;
+                };
+                config.allowUnfree = true;
+              };
+              crossAvailable = builtins.tryEval (
+                oldCrossPkgs ? buildPackages && oldCrossPkgs.buildPackages.${attr}.name
+              );
+              crossCC =
+                if crossAvailable.success then
+                  oldCrossPkgs.buildPackages.${attr}
+                else
+                  builtins.throw "${attr}: cross-compiler not available in this nixpkgs for ${target.label}";
+            in
+            targetPkgs.overrideCC targetPkgs.stdenv crossCC
           else
-            targetPkgs.overrideCC targetPkgs.stdenv oldTargetPkgs.${attr};
+            builtins.throw "${attr}: cross-compilation not supported (no pkgsCross and no nixpkgsSrc)";
       };
 
   # Build a compiler entry for an old Clang/LLVM version.
@@ -154,10 +264,17 @@ let
   # - Modern (5+): .clang.version and .stdenv.cc
   # - Old (3.6-4): .stdenv.cc exists, version from .clang.cc.name
   # - Very old (3.4-3.5): only .clang, version from .clang.name
+  #
+  # Cross-compilation strategies:
+  # 1. pkgsCross available (22.11+): use buildPackages.<llvmPkg>.clang
+  # 2. Pre-pkgsCross (18.03): hybrid wrapper — modern cross cc-wrapper with
+  #    the old unwrapped clang binary swapped in. The old nixpkgs' own cross
+  #    infrastructure has broken C++ stdlib hooks, so we bypass it entirely.
   mkOldClangEntry =
-    oldPkgs:
+    nixpkgsInfo: # { oldPkgs, nixpkgsSrc?, system? }
     { attr, label }:
     let
+      oldPkgs = nixpkgsInfo.oldPkgs;
       llvmPkg = oldPkgs.${attr};
       tried = builtins.tryEval llvmPkg;
       version = if tried.success then extractClangVersion llvmPkg else null;
@@ -172,12 +289,44 @@ let
         inherit version;
         mkStdenv =
           targetPkgs: target:
-          let
-            oldTargetPkgs = archLib.getPkgsForTarget oldPkgs target;
-            oldLlvmPkg = oldTargetPkgs.${attr};
-            cc = extractClangCC oldLlvmPkg;
-          in
-          targetPkgs.overrideCC targetPkgs.stdenv cc;
+          if target.crossAttr == null then
+            # Native: use extractClangCC on the native LLVM package
+            let
+              cc = extractClangCC oldPkgs.${attr};
+            in
+            targetPkgs.overrideCC targetPkgs.stdenv cc
+          else if oldPkgs ? pkgsCross then
+            # pkgsCross available (22.11+): get cross-clang from buildPackages.
+            # Use .clang directly (not extractClangCC) because
+            # buildPackages.llvmPkg.stdenv.cc is the native compiler,
+            # while .clang is the actual cross-compiler wrapper.
+            let
+              oldCrossPkgs = getOldCrossPkgs nixpkgsInfo target;
+            in
+            targetPkgs.overrideCC targetPkgs.stdenv oldCrossPkgs.buildPackages.${attr}.clang
+          else
+            # Pre-pkgsCross (18.03, 15.09): hybrid wrapper approach.
+            # The old nixpkgs' cross infrastructure has broken C++ stdlib
+            # hooks that reference cross-compiled GCC binaries. Instead,
+            # take the modern cross clang wrapper and swap in the old
+            # unwrapped clang binary. This gives us correct cross bintools
+            # and sysroot from modern nixpkgs + old clang codegen.
+            let
+              unwrappedClang = extractUnwrappedClang oldPkgs.${attr};
+              unsupportedFlags = getClangUnsupportedHardeningFlags version;
+              needsStripMacroMap = clangNeedsMacroPrefixMapStripped version;
+
+              # Use the modern cross clang wrapper as a template
+              modernCrossClang = targetPkgs.buildPackages.llvmPackages.clang;
+              hybridClang = modernCrossClang.override {
+                cc = unwrappedClang // {
+                  hardeningUnsupportedFlags = unsupportedFlags;
+                };
+                propagateDoc = false;
+                extraBuildCommands = if needsStripMacroMap then stripMacroPrefixMapCommands else "";
+              };
+            in
+            targetPkgs.overrideCC targetPkgs.stdenv hybridClang;
       };
 
   # Process one old nixpkgs set into compiler entries.
@@ -186,10 +335,13 @@ let
       oldPkgs,
       gccSpecs,
       clangSpecs,
+      nixpkgsSrc ? null,
+      system ? null,
     }:
     let
-      gccEntries = builtins.filter (x: x != null) (map (mkOldGccEntry oldPkgs) gccSpecs);
-      clangEntries = builtins.filter (x: x != null) (map (mkOldClangEntry oldPkgs) clangSpecs);
+      nixpkgsInfo = { inherit oldPkgs nixpkgsSrc system; };
+      gccEntries = builtins.filter (x: x != null) (map (mkOldGccEntry nixpkgsInfo) gccSpecs);
+      clangEntries = builtins.filter (x: x != null) (map (mkOldClangEntry nixpkgsInfo) clangSpecs);
     in
     {
       gcc = gccEntries;

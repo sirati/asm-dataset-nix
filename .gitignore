@@ -8,3 +8,5 @@ result-*
 # Test artifacts
 test_results.jsonl
 
+.cross-results/
+nix-upstream/

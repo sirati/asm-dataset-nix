@@ -5,7 +5,7 @@ Constraints: systemd cgroup, 60GB RAM + 60GB swap, 12 parallel compilers
 Each compiler tries archs in order (i686, aarch64, armv7l, mipsel, mips64el), stops on first failure.
 
 ## Summary
-
+summery outdatd!
 - **Passed**: 68 (4 via depsBuildBuild bootstrap)
 - **Failed**: 31
 - **Skipped** (after first failure): 81
@@ -15,19 +15,21 @@ Each compiler tries archs in order (i686, aarch64, armv7l, mipsel, mips64el), st
 | Compiler   | i686      | aarch64   | armv7l    | mipsel    | mips64el  |
 |------------|-----------|-----------|-----------|-----------|-----------|
 | gcc15      | OK        | OK        | OK        | OK        | OK        |
-| gcc14      | OK        | FAIL      | SKIP      | SKIP      | SKIP      |
-| gcc13      | OK        | FAIL      | SKIP      | SKIP      | SKIP      |
-| gcc12      | OK (boot) | SKIP      | SKIP      | SKIP      | SKIP      |
-| gcc11      | OK        | FAIL      | SKIP      | SKIP      | SKIP      |
-| gcc10      | OK (boot) | SKIP      | SKIP      | SKIP      | SKIP      |
-| gcc9       | OK (boot) | SKIP      | SKIP      | SKIP      | SKIP      |
-| gcc8       | OK (boot) | SKIP      | SKIP      | SKIP      | SKIP      |
-| gcc7       | OK        | FAIL      | SKIP      | SKIP      | SKIP      |
-| gcc6       | FAIL      | SKIP      | SKIP      | SKIP      | SKIP      |
-| gcc5       | FAIL      | SKIP      | SKIP      | SKIP      | SKIP      |
-| gcc4_9     | FAIL      | SKIP      | SKIP      | SKIP      | SKIP      |
-| gcc4_8     | FAIL      | SKIP      | SKIP      | SKIP      | SKIP      |
+| gcc14      | OK        | OK        | OK        | OK        | OK        |
+| gcc13      | OK        | OK        | OK        | OK        | OK        |
+| gcc12      | OK        | OK        | OK        | OK        | FAIL      |
+| gcc11      | OK        | OK        | OK        | OK        | OK        |
+| gcc10      | OK        | OK        | OK        | OK        | OK        |
+| gcc9       | OK        | OK        | OK        | OK        | OK        |
+| gcc8       | OK        | OK        | OK        | OK        | OK        |
+| gcc7       | OK        | OK        | OK        | OK        | OK        |
+| gcc6       | OK        | OK        | OK        | OK        | OK        |
+| gcc5       | OK        | OK        | OK        | OK        | FAIL      |
+| gcc4_9     | OK        | OK        | OK        | OK        | OK        |
+| gcc4_8     | OK        | OK        | OK        | OK        | OK        |
+| gcc4_6     | FAIL      | SKIP      | SKIP      | SKIP      | SKIP      |
 | gcc4_5     | FAIL      | SKIP      | SKIP      | SKIP      | SKIP      |
+| gcc4_4     | FAIL      | SKIP      | SKIP      | SKIP      | SKIP      |
 | clang22    | OK        | OK        | OK        | FAIL      | SKIP      |
 | clang21    | OK        | OK        | OK        | FAIL      | SKIP      |
 | clang20    | OK        | OK        | OK        | FAIL      | SKIP      |
@@ -46,10 +48,12 @@ Each compiler tries archs in order (i686, aarch64, armv7l, mipsel, mips64el), st
 | clang7     | OK        | OK        | OK        | FAIL      | SKIP      |
 | clang6     | OK        | OK        | OK        | FAIL      | SKIP      |
 | clang5     | OK        | OK        | OK        | FAIL      | SKIP      |
-| clang4     | FAIL      | SKIP      | SKIP      | SKIP      | SKIP      |
-| clang3_9   | FAIL      | SKIP      | SKIP      | SKIP      | SKIP      |
-| clang3_8   | FAIL      | SKIP      | SKIP      | SKIP      | SKIP      |
-| clang3_7   | FAIL      | SKIP      | SKIP      | SKIP      | SKIP      |
+| clang4     | OK        | OK        | OK        | FAIL      | SKIP      |
+| clang3_9   | OK        | OK        | OK        | FAIL      | SKIP      |
+| clang3_8   | OK        | OK        | OK        | FAIL      | SKIP      |
+| clang3_7   | OK        | OK        | OK        | FAIL      | SKIP      |
+| clang3_5   | OK        | FAIL      | SKIP      | SKIP      | SKIP      |
+| clang3_4   | OK        | OK        | OK        | FAIL      | SKIP      |
 
 ## Failure Modes
 
