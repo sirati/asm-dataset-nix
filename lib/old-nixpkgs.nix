@@ -48,11 +48,22 @@ in
     nixpkgsSrc = nixpkgsInputs.nixpkgs-15_09;
     inherit system;
     gccSpecs = [
-      { attr = "gcc44"; label = "4_4"; }
-      { attr = "gcc46"; label = "4_6"; }
+      {
+        attr = "gcc44";
+        label = "4_4";
+        gccSubdir = "4.4";
+      }
+      {
+        attr = "gcc46";
+        label = "4_6";
+        gccSubdir = "4.6";
+      }
     ];
     clangSpecs = [
-      { attr = "llvmPackages_36"; label = "3_6"; }
+      {
+        attr = "llvmPackages_36";
+        label = "3_6";
+      }
     ];
   }
 
@@ -62,16 +73,40 @@ in
     nixpkgsSrc = nixpkgsInputs.nixpkgs-18_03;
     inherit system;
     gccSpecs = [
-      { attr = "gcc45"; label = "4_5"; }
-      { attr = "gcc5"; label = "5"; }
+      {
+        attr = "gcc45";
+        label = "4_5";
+      }
+      {
+        attr = "gcc5";
+        label = "5";
+      }
     ];
     clangSpecs = [
-      { attr = "llvmPackages_34"; label = "3_4"; }
-      { attr = "llvmPackages_35"; label = "3_5"; }
-      { attr = "llvmPackages_37"; label = "3_7"; }
-      { attr = "llvmPackages_38"; label = "3_8"; }
-      { attr = "llvmPackages_39"; label = "3_9"; }
-      { attr = "llvmPackages_4"; label = "4"; }
+      {
+        attr = "llvmPackages_34";
+        label = "3_4";
+      }
+      {
+        attr = "llvmPackages_35";
+        label = "3_5";
+      }
+      {
+        attr = "llvmPackages_37";
+        label = "3_7";
+      }
+      {
+        attr = "llvmPackages_38";
+        label = "3_8";
+      }
+      {
+        attr = "llvmPackages_39";
+        label = "3_9";
+      }
+      {
+        attr = "llvmPackages_4";
+        label = "4";
+      }
     ];
   }
 
@@ -79,27 +114,84 @@ in
   {
     oldPkgs = oldPkgs_22_11;
     gccSpecs = [
-      { attr = "gcc48"; label = "4_8"; }
-      { attr = "gcc49"; label = "4_9"; }
-      { attr = "gcc6"; label = "6"; }
-      { attr = "gcc7"; label = "7"; }
-      { attr = "gcc8"; label = "8"; }
-      { attr = "gcc9"; label = "9"; }
-      { attr = "gcc10"; label = "10"; }
-      { attr = "gcc11"; label = "11"; }
-      { attr = "gcc12"; label = "12"; }
+      {
+        attr = "gcc48";
+        label = "4_8";
+      }
+      {
+        attr = "gcc49";
+        label = "4_9";
+      }
+      {
+        attr = "gcc6";
+        label = "6";
+      }
+      {
+        attr = "gcc7";
+        label = "7";
+      }
+      {
+        attr = "gcc8";
+        label = "8";
+      }
+      {
+        attr = "gcc9";
+        label = "9";
+      }
+      {
+        attr = "gcc10";
+        label = "10";
+      }
+      {
+        attr = "gcc11";
+        label = "11";
+      }
+      {
+        attr = "gcc12";
+        label = "12";
+      }
     ];
     clangSpecs = [
-      { attr = "llvmPackages_5"; label = "5"; }
-      { attr = "llvmPackages_6"; label = "6"; }
-      { attr = "llvmPackages_7"; label = "7"; }
-      { attr = "llvmPackages_8"; label = "8"; }
-      { attr = "llvmPackages_9"; label = "9"; }
-      { attr = "llvmPackages_10"; label = "10"; }
-      { attr = "llvmPackages_11"; label = "11"; }
-      { attr = "llvmPackages_12"; label = "12"; }
-      { attr = "llvmPackages_13"; label = "13"; }
-      { attr = "llvmPackages_14"; label = "14"; }
+      {
+        attr = "llvmPackages_5";
+        label = "5";
+      }
+      {
+        attr = "llvmPackages_6";
+        label = "6";
+      }
+      {
+        attr = "llvmPackages_7";
+        label = "7";
+      }
+      {
+        attr = "llvmPackages_8";
+        label = "8";
+      }
+      {
+        attr = "llvmPackages_9";
+        label = "9";
+      }
+      {
+        attr = "llvmPackages_10";
+        label = "10";
+      }
+      {
+        attr = "llvmPackages_11";
+        label = "11";
+      }
+      {
+        attr = "llvmPackages_12";
+        label = "12";
+      }
+      {
+        attr = "llvmPackages_13";
+        label = "13";
+      }
+      {
+        attr = "llvmPackages_14";
+        label = "14";
+      }
     ];
   }
 
@@ -107,8 +199,14 @@ in
   {
     oldPkgs = oldPkgs_23_11;
     clangSpecs = [
-      { attr = "llvmPackages_15"; label = "15"; }
-      { attr = "llvmPackages_16"; label = "16"; }
+      {
+        attr = "llvmPackages_15";
+        label = "15";
+      }
+      {
+        attr = "llvmPackages_16";
+        label = "16";
+      }
     ];
     gccSpecs = [ ];
   }
@@ -117,7 +215,10 @@ in
   {
     oldPkgs = oldPkgs_24_05;
     clangSpecs = [
-      { attr = "llvmPackages_17"; label = "17"; }
+      {
+        attr = "llvmPackages_17";
+        label = "17";
+      }
     ];
     gccSpecs = [ ];
   }

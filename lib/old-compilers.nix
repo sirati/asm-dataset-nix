@@ -9,12 +9,13 @@
 # 1. pkgsCross available (nixpkgs 22.11+): use buildPackages.<compiler>
 #    directly. For GCC, override depsBuildBuild for version-matched bootstrap.
 #
-# 2. No pkgsCross but nixpkgsSrc provided (nixpkgs 18.03): re-import the
-#    nixpkgs source with crossSystem to get buildPackages.<compiler> from the
-#    old nixpkgs' own cross infrastructure.
+# 2. No pkgsCross but nixpkgsSrc + buildPackages available (nixpkgs 18.03):
+#    re-import with crossSystem, extract unwrapped .cc from the old cross-gcc,
+#    wrap with modern cc-wrapper (hybrid approach — avoids broken old wrappers).
 #
-# 3. Neither pkgsCross nor nixpkgsSrc (nixpkgs 15.09): cross-compilation
-#    not possible, throw a clear error.
+# 3. No pkgsCross, no buildPackages but nixpkgsSrc + gccSubdir (nixpkgs 15.09):
+#    call the old gcc expression directly with cross params, build using native
+#    gccN as the build compiler. Wrap result with modern cc-wrapper.
 #
 # Uses tryEval for safety — gracefully skips compilers that fail evaluation.
 # Uses explicit spec lists rather than auto-discovery (old nixpkgs attr names vary).
@@ -29,6 +30,7 @@
 
 let
   archLib = import ./architectures.nix { };
+  oldGccCross = import ./old-gcc-cross.nix { inherit pkgs lib; };
 
   # Extract version string from a Clang package across different nixpkgs eras.
   # Modern: .clang.version exists
@@ -200,11 +202,18 @@ let
   # For cross-compilation with pkgsCross (22.11+): overrides depsBuildBuild
   # on the unwrapped cross GCC to use the native GCC of the same version.
   #
-  # For cross-compilation without pkgsCross (18.03): re-imports the old
-  # nixpkgs with crossSystem and gets the cross-compiler from buildPackages.
+  # For cross-compilation with nixpkgsSrc + buildPackages (18.03): re-import
+  # with crossSystem, extract unwrapped .cc, wrap with modern cc-wrapper.
+  #
+  # For cross-compilation with nixpkgsSrc + gccSubdir (15.09): call old gcc
+  # expression directly with cross params, wrap with modern cc-wrapper.
   mkOldGccEntry =
     nixpkgsInfo: # { oldPkgs, nixpkgsSrc?, system? }
-    { attr, label }:
+    {
+      attr,
+      label,
+      gccSubdir ? null,
+    }:
     let
       oldPkgs = nixpkgsInfo.oldPkgs;
       tried = builtins.tryEval (oldPkgs.${attr}.cc.version or oldPkgs.${attr}.version);
@@ -241,28 +250,21 @@ let
                 rewrapped = oldCrossGcc.override { cc = bootstrappedCC; };
               in
               targetPkgs.overrideCC targetPkgs.stdenv rewrapped
+          else if nixpkgsInfo.nixpkgsSrc != null && nixpkgsInfo.system != null && gccSubdir != null then
+            # Pre-buildPackages (15.09): call old gcc expression directly with
+            # cross params, build using native gccN, wrap with modern cc-wrapper.
+            oldGccCross.mkCrossGccFromOldExpr {
+              nixpkgsSrc = nixpkgsInfo.nixpkgsSrc;
+              inherit gccSubdir oldPkgs attr;
+            } targetPkgs target
           else if nixpkgsInfo.nixpkgsSrc != null && nixpkgsInfo.system != null then
-            # Pre-pkgsCross (18.03, 15.09): re-import with crossSystem.
-            # tryEval guards against old nixpkgs not understanding the
-            # target's ABI (e.g. gnuabin32 unknown in nixpkgs 18.03).
-            let
-              oldCrossPkgs = import nixpkgsInfo.nixpkgsSrc {
-                system = nixpkgsInfo.system;
-                crossSystem = {
-                  config = target.crossConfig;
-                };
-                config.allowUnfree = true;
-              };
-              crossAvailable = builtins.tryEval (
-                (oldCrossPkgs ? buildPackages) && oldCrossPkgs.buildPackages.${attr}.name != ""
-              );
-              crossCC =
-                if crossAvailable.success && crossAvailable.value then
-                  oldCrossPkgs.buildPackages.${attr}
-                else
-                  builtins.throw "${attr}: cross-compiler not available in this nixpkgs for ${target.label}";
-            in
-            targetPkgs.overrideCC targetPkgs.stdenv crossCC
+            # Pre-pkgsCross but has buildPackages (18.03): re-import with
+            # crossSystem, extract unwrapped .cc, wrap with modern cc-wrapper.
+            oldGccCross.mkCrossGccFrom1803 {
+              nixpkgsSrc = nixpkgsInfo.nixpkgsSrc;
+              system = nixpkgsInfo.system;
+              inherit oldPkgs attr;
+            } targetPkgs target
           else
             builtins.throw "${attr}: cross-compilation not supported (no pkgsCross and no nixpkgsSrc)";
       };
