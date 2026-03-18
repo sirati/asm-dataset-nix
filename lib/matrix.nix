@@ -47,6 +47,34 @@ let
   # Skip -Oz for GCC (clang-only flag)
   isValidCombo = compiler: optLevel: !(optLevel.clangOnly && compiler.family == "gcc");
 
+  # Skip compiler/target combos below the minimum supported version (from support_matrix.md).
+  parseVersion =
+    version:
+    let
+      parts = builtins.match "([0-9]+)\\.([0-9]+).*" version;
+    in
+    if parts != null then
+      {
+        major = lib.toInt (builtins.elemAt parts 0);
+        minor = lib.toInt (builtins.elemAt parts 1);
+      }
+    else
+      {
+        major = 0;
+        minor = 0;
+      };
+
+  meetsMinVersion =
+    cv: mv: mv.major == 0 || cv.major > mv.major || (cv.major == mv.major && cv.minor >= mv.minor);
+
+  isValidArchCombo =
+    compiler: target:
+    let
+      cv = parseVersion compiler.version;
+      mv = if compiler.family == "gcc" then target.minGccVersion else target.minClangVersion;
+    in
+    meetsMinVersion cv mv;
+
   # All valid (compiler, optLevel) pairs
   compilerOptPairs = lib.concatMap (
     compiler:
@@ -153,6 +181,10 @@ let
       };
     };
 
+  # Filter flag combos to only include compilers that meet the target's minimum version.
+  combosForTarget =
+    target: builtins.filter (combo: isValidArchCombo combo.compiler target) allFlagCombos;
+
   # ── Nested attrset: dataset.<pkg>.<arch>.<suffix> ────────────────────────
   nestedMatrix = lib.genAttrs (map (p: p.label) pkgDefs.all) (
     pkgLabel:
@@ -164,7 +196,7 @@ let
       let
         target = archDefs.targets.${archName};
       in
-      builtins.listToAttrs (map (mkEntry pkgDef target) allFlagCombos)
+      builtins.listToAttrs (map (mkEntry pkgDef target) (combosForTarget target))
     )
   );
 
@@ -183,7 +215,7 @@ let
         map (combo: {
           name = mkSuffix combo;
           value = mkMeta pkgDef target combo;
-        }) allFlagCombos
+        }) (combosForTarget target)
       )
     )
   );

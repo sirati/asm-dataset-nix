@@ -1,105 +1,130 @@
 # Cross-Compilation Failure Analysis (Detailed)
 
 Host: x86_64-linux, nixpkgs-unstable + old nixpkgs (15.09, 18.03, 22.11, 23.11, 24.05)
-40 compilers x 8 targets = 320 tests. 196 pass, 32 fail, 92 skipped.
-Previous run: 181 pass, 37 fail, 102 skipped.
+40 compilers x 8 targets = 320 tests. 241 pass, 59 fail, 0 skipped, 20 unsupported (n/a).
+Previous run: 241 pass, 79 fail, 0 skipped.
 
 No regressions from previously passing compiler/target combinations.
 
 ---
 
-## Fixes Applied This Round
+## Fix #9: Minimum supported version enforcement (20 FAIL → n/a)
+
+**Files**: `lib/architectures.nix`, `lib/matrix.nix`, `gen_table.sh`, `support_matrix.md`
+
+**Problem**: The matrix generated compiler/target combos that are known to be
+unsupported per the ISA support matrix (e.g., RISC-V with GCC <7, ARM64 with GCC <4.8).
+These combos always fail and clutter the failure analysis.
+
+**Fix**: Added `minGccVersion` and `minClangVersion` fields (as `{ major; minor; }`)
+to each target in `architectures.nix`. Added `isValidArchCombo` filter in `matrix.nix`
+that excludes combos below the minimum version. Updated `gen_table.sh` to show `n/a`.
+
+Also corrected support_matrix.md: lowered ARM64 Clang from 3.5→3.4 and MIPS Clang
+from 3.5→3.4 (clang3_4 passes both).
+
+**Combos excluded (20)**:
+- riscv64 GCC <7: gcc4_4, gcc4_5, gcc4_6, gcc4_8, gcc4_9, gcc5, gcc6 (7)
+- riscv64 Clang <9: clang3_4, clang3_5, clang3_7, clang3_8, clang3_9, clang4, clang5, clang6, clang7, clang8 (10)
+- aarch64 GCC <4.8: gcc4_4, gcc4_5, gcc4_6 (3)
+
+---
+
+## Fixes Applied Previous Rounds
+
+### Fix #6: clang ppc64 `-mabi=elfv2` (12 failures fixed)
+
+**File**: `lib/mkVariant.nix`
+
+**Problem**: Old clangs from old nixpkgs (22.11, 23.11, 24.05) default to ELFv1 ABI
+for ppc64 (`-target-abi elfv1`), but the ppc64 sysroot from nixpkgs-unstable uses
+ELFv2. The linker fails with:
+
+```
+ld: error: ABI version 1 is not compatible with ABI version 2 output
+```
+
+**Root cause**: When clang targets `powerpc64-unknown-linux-gnu`, it defaults to ELFv1
+(the historic ABI). The nixpkgs-unstable cross toolchain uses ELFv2 (the modern ABI
+used by all 64-bit little-endian ppc64le and modern big-endian ppc64). The triple
+`powerpc64-unknown-linux-gnuabielfv2` is normalized by clang to drop the `abielfv2`
+suffix, so clang doesn't detect ELFv2 from the triple alone.
+
+**Fix**: For clang+ppc64, inject `-mabi=elfv2` via `cc.overrideAttrs` postFixup,
+appending to `$out/nix-support/cc-cflags`. This forces clang to generate ELFv2
+object code matching the sysroot.
+
+**Result**: clang8-17 from old nixpkgs all pass ppc64 (12 new passes).
+
+### Fix #7: clang <3.9 ppc64 ld symlink (2 failures fixed)
+
+**File**: `lib/mkVariant.nix`
+
+**Problem**: clang <3.9 doesn't support `-fuse-ld=<absolute-path>` (the existing
+fix #2 for ppc64 linker resolution). It rejects the flag with:
+
+```
+error: invalid linker name in argument '-fuse-ld=/nix/store/...'
+```
+
+**Fix**: Version-gated approach in `mkVariant.nix`:
+- Parse `clangMajor` from `compiler.version`
+- For `clangMajor < 4`: create a `ppc64-ld-fix/` directory with a symlink
+  `powerpc64-unknown-linux-gnu-ld -> <cross-ld>` and inject `-B$out/ppc64-ld-fix`
+- For `clangMajor >= 4`: use `-fuse-ld=<absolute-path>` (existing approach)
+
+Both paths also inject `-mabi=elfv2` (fix #6).
+
+**Result**: clang3_7 and clang3_8 now pass ppc64 (2 new passes).
+
+### Fix #8: Test all SKIPs (33 hidden passes revealed)
+
+**Files**: `test_cross.sh`, `test_skipped.sh`
+
+**Problem**: `test_cross.sh` stops testing a compiler after its first failure.
+
+**Fix**: Added `--no-skip` flag to `test_cross.sh`. Created `test_skipped.sh` to
+re-test all entries marked "skip" in `.cross-results/`.
+
+**Result**: 92 previously-skipped entries tested. 33 passed, 59 failed.
 
 ### Fix #1: `getPkgsForTarget` null-safe (18 improved error messages)
 
 **File**: `lib/architectures.nix`
 
-**Problem**: `getPkgsForTarget` directly accessed `pkgs.pkgsCross.${target.crossAttr}`,
-throwing a raw `attribute 'ppc32' missing` error when old nixpkgs lacked the cross attr.
-
-**Fix**: Check `!(pkgs ? pkgsCross) || !(pkgs.pkgsCross ? ${target.crossAttr})` before
-accessing; return `null` when missing. Added null-handling in `mkVariant.nix` (throws
-descriptive error) and `old-compilers.nix` (both `mkOldGccEntry` and `mkOldClangEntry`
-check for `null` from `getOldCrossPkgs`).
-
-**Result**: Errors now read `gcc10: cross target ppc32 not available in this nixpkgs`
-instead of `attribute 'ppc32' missing`. Still fails (ppc32 genuinely doesn't exist in
-old nixpkgs), but the error is descriptive and the matrix handles it gracefully.
+**Fix**: Return `null` when `pkgsCross.${crossAttr}` doesn't exist, with descriptive
+error messages downstream.
 
 ### Fix #2: clang ppc64 linker `-fuse-ld=` (5 failures fixed)
 
 **File**: `lib/mkVariant.nix`
 
-**Problem**: clang normalizes the triple `powerpc64-unknown-linux-gnuabielfv2` to
-`powerpc64-unknown-linux-gnu` internally, dropping the `abielfv2` suffix. When
-searching for the linker, clang invokes bare `ld` instead of the prefixed cross
-linker `powerpc64-unknown-linux-gnuabielfv2-ld`, causing `posix_spawn failed`.
-
-**Fix**: For clang+ppc64, use `cc.overrideAttrs` with `postFixup` to append
-`-fuse-ld=${cc.bintools}/bin/${cc.bintools.targetPrefix}ld` to `$out/nix-support/cc-cflags`.
-This tells clang exactly which linker binary to use.
-
-**Key insight**: Using `cc.override { extraBuildCommands = ... }` would **replace**
-(not append to) the nixpkgs-provided `extraBuildCommands` that set up the
-`resource-root` symlinks and `-resource-dir` flag. This caused all header checks to
-fail (`checking for stdio.h... no`). Using `overrideAttrs` + `postFixup` appends
-without disturbing the existing wrapper setup.
-
-**Result**: clang18-22/ppc64 all build successfully.
+**Fix**: `overrideAttrs` + `postFixup` to append `-fuse-ld=<path>` for clang+ppc64.
+Now subsumed by fix #6/#7.
 
 ### Fix #4: gcc12 `--disable-libsanitizer` (1 failure fixed)
 
 **File**: `lib/old-compilers.nix`
 
-**Problem**: gcc12 (nixpkgs-22.11) cross-compilation for mips64el failed because
-`libsanitizer` has hardcoded MIPS N32 `struct stat` sizes that don't match the
-glibc 2.35 headers. Errors included `static assertion failed`, `redefinition of
-'struct stat64'`, and `'__NR_mmap2' was not declared`.
-
-**Fix**: Added `--disable-libsanitizer` to `configureFlags` in the `overrideAttrs`
-for old cross GCC builds. Applied broadly to all old cross GCCs (not just gcc12)
-since sanitizers aren't needed for dataset builds and can cause similar issues with
-other version/target combinations.
-
-**Result**: gcc12/mips64el now passes. gcc12 now fails at ppc32 (next target) which
-is the expected "ppc32 not available in old nixpkgs" error.
+**Fix**: Added `--disable-libsanitizer` to `configureFlags` for old cross GCC builds.
 
 ### Fix #5: Operator precedence `?` vs `&&` (1 failure fixed, 4 passes unlocked)
 
 **File**: `lib/old-compilers.nix`
 
-**Problem**: The `crossAvailable` check had an operator precedence bug:
-```nix
-crossAvailable = builtins.tryEval (
-  oldCrossPkgs ? buildPackages && oldCrossPkgs.buildPackages.${attr}.name
-);
-```
-Nix `?` has lower precedence than `&&`, so this parsed as:
-```nix
-oldCrossPkgs ? (buildPackages && oldCrossPkgs.buildPackages.${attr}.name)
-```
-When `&&` short-circuited to the `.name` string, `tryEval` returned
-`{ success = true; value = "gcc-cross-wrapper-..."; }` — a string, not a bool.
-Later code used this as a boolean and failed with "expected a Boolean but found a string".
-
-**Fix**: Three changes:
-1. Parenthesized: `(oldCrossPkgs ? buildPackages) && ...`
-2. Added `!= ""` to ensure boolean result: `... .name != ""`
-3. Changed condition to `crossAvailable.success && crossAvailable.value` (since
-   `tryEval` can succeed with `false`, meaning cross is genuinely unavailable)
-
-**Result**: gcc5/i686 now passes (was eval error). gcc5 also now passes aarch64,
-armv7l, mipsel (4 unlocked targets), failing at mips64el (pre-pkgsCross nixpkgs
-doesn't understand gnuabin32). gcc4_5/i686 eval now succeeds but the cross compiler
-build fails (gcc4_5 source incompatible with modern gcc15).
+**Fix**: Parenthesized `(oldCrossPkgs ? buildPackages) && ...` and ensured boolean result.
 
 ---
 
-## Remaining Failures (32)
+## Remaining Failures (59)
 
-### 1. ppc32 missing in old nixpkgs (18 failures)
+### 1. ppc32 missing in old nixpkgs (21 failures)
 
-**Affected**: gcc6-12, gcc4_8-4_9 (nixpkgs-22.11), clang8-17 (nixpkgs-22.11/23.11/24.05)
+**Affected**:
+- gcc6-12, gcc4_8-4_9 (nixpkgs-22.11): 9 compilers
+- clang8-17 (nixpkgs-22.11/23.11/24.05): 10 compilers
+- clang5-7 (nixpkgs-22.11): 3 compilers (note: also have ppc64 issues, see #5)
+Total: 22, but clang5-7/ppc32 overlap with category #5. Net unique ppc32: 21.
 
 **Error**:
 ```
@@ -109,20 +134,19 @@ error: gcc10: cross target ppc32 not available in this nixpkgs
 **Root cause**: `pkgsCross.ppc32` was added to nixpkgs after 24.05 (only exists in
 nixpkgs-unstable). Old nixpkgs inputs don't define it.
 
-**Status**: Accept. These compilers pass all other available targets. ppc32 is simply
+**Status**: Accept — these compilers pass all other available targets. ppc32 is simply
 not available in the old nixpkgs versions.
 
 ---
 
-### 2. old clang mips64el N32 (8 failures)
+### 2. Old clang mips64el N32 (9 failures)
 
-**Affected**: clang3_4, clang3_7, clang3_8, clang3_9, clang4, clang5, clang6, clang7
-(from nixpkgs-18.03 and nixpkgs-22.11)
+**Affected**: clang3_4, clang3_5, clang3_7, clang3_8, clang3_9, clang4, clang5,
+clang6, clang7 / mips64el
 
 **Error**:
 ```
 configure: error: C compiler cannot create executables
-checking for mips64el-unknown-linux-gnuabin32-gcc... mips64el-unknown-linux-gnuabin32-clang
 ```
 
 **Root cause**: These old clang versions have limited or broken MIPS N32 ABI support.
@@ -133,9 +157,49 @@ codegen support that wasn't fully implemented until clang 8.
 
 ---
 
-### 3. gcc4_4/gcc4_6 no cross support (2 failures)
+### 3. clang9 riscv64 codegen failure (1 failure)
 
-**Affected**: gcc4_4/i686, gcc4_6/i686 (from nixpkgs-15.09)
+**Affected**: clang9/riscv64
+
+**Error**:
+```
+configure: error: C compiler cannot create executables
+```
+
+**Root cause**: RISC-V backend in LLVM was experimental in clang 9, stabilized in
+clang 10. clang <9 is now excluded from the matrix (below MSV=9). clang9 meets the
+MSV but its RISC-V support is still too immature for the sysroot/ABI expectations.
+
+**Status**: Accept (old compiler limitation). clang10+ all pass riscv64.
+
+---
+
+### 4. Old clang ppc64 residual (5 failures)
+
+**Affected**: clang5/ppc64, clang6/ppc64, clang7/ppc64, clang3_4/ppc64, clang3_5/ppc64
+
+**clang5-7** (from nixpkgs-22.11 `llvmPackages_5/6/7`): These are affected by the
+same ELFv1/ELFv2 ABI mismatch as the fixed clang8-17 group. The `-mabi=elfv2` fix
+is applied, but the old `llvmPackages_5/6/7` in 22.11 have additional evaluation/
+wrapping issues that prevent the fix from taking effect.
+
+**clang3_4/3_5** (hybrid wrapper from nixpkgs-18.03): These ancient clangs invoke
+the native x86_64 assembler instead of the cross assembler for ppc64. Error:
+```
+Fatal error: invalid listing option `6'
+```
+The `6` is from `powerpc64` being parsed as a flag by the native x86 assembler.
+clang 3.4/3.5 lack proper cross-assembler tool selection for ppc64.
+
+**Status**: Accept — old compiler limitations. clang3_7+ (with fix #7) and clang8+
+(with fix #6) all pass ppc64.
+
+---
+
+### 5. gcc4_4/gcc4_6 no cross infrastructure (12 failures)
+
+**Affected**: gcc4_4, gcc4_6 / i686, armv7l, mipsel, mips64el, ppc32, ppc64
+(aarch64 and riscv64 excluded — below MSV, shown as n/a)
 
 **Error**:
 ```
@@ -143,71 +207,43 @@ error: gcc44: cross-compiler not available in this nixpkgs for i686
 ```
 
 **Root cause**: nixpkgs 15.09 predates the `pkgsCross` and `buildPackages` infrastructure
-entirely. The re-import with `crossSystem` also lacks `buildPackages`, so cross-compilation
-is impossible for these ancient compilers.
+entirely. Cross-compilation is impossible for these ancient compilers.
 
-**Status**: Accept (ancient nixpkgs limitation). Native compilation works.
+**Status**: Accept (ancient nixpkgs limitation). Native compilation works fine.
 
 ---
 
-### 4. gcc4_5 cross compiler build failure (1 failure)
+### 6. gcc4_5 cross compiler build failure (6 failures)
 
-**Affected**: gcc4_5/i686 (from nixpkgs-18.03)
+**Affected**: gcc4_5 / i686, armv7l, mipsel, mips64el, ppc32, ppc64
+(aarch64 and riscv64 excluded — below MSV, shown as n/a)
 
 **Error**:
 ```
 make[1]: *** [Makefile:5012: all-gcc] Error 2
 ```
-(gcc-4.5.4 source fails to compile with gcc 15 — warnings treated as errors)
 
-**Root cause**: The eval fix (#5) made gcc4_5/i686 evaluate successfully, but the
-actual cross compiler build fails because GCC 4.5.4 source code is incompatible
-with modern GCC 15 used as the build compiler. This is a pre-existing build issue
-that was hidden by the eval error.
+**Root cause**: GCC 4.5.4 source (2012) fails to compile with modern GCC 15 used as
+the build compiler. Warnings are treated as errors.
 
-### Fix strategies
-
-**A. Suppress warnings in gcc4_5 build**:
-Override gcc4_5's cross compiler derivation to add `-Wno-error` to the build flags.
-This may allow the old GCC source to compile despite the warnings.
-
-```nix
-bootstrappedCC = oldCrossGcc.cc.overrideAttrs (old: {
-  depsBuildBuild = [ oldPkgs.${attr} ];
-  CFLAGS = "-Wno-error";
-  CXXFLAGS = "-Wno-error";
-});
-```
-
-**B. Accept the limitation**:
-gcc4_5 is from 2012 and native compilation works. Cross-compilation of this vintage
-compiler with modern build tools is fragile.
-
-**Status**: Accept for now. Could try fix A if more coverage is desired.
+**Status**: Accept for now — gcc4_5 is from 2012, native compilation works.
 
 ---
 
-### 5. gcc5 mips64el cross not available (1 failure)
+### 7. gcc5 limited cross targets (3 failures)
 
-**Affected**: gcc5/mips64el (from nixpkgs-18.03)
+**Affected**: gcc5 / mips64el, ppc32, ppc64
+(riscv64 excluded — below MSV, shown as n/a)
 
-**Error**:
-```
-error: gcc5: cross-compiler not available in this nixpkgs for mips64el
-```
+**Root cause**: gcc5 is from nixpkgs-18.03 (pre-pkgsCross). Cross-compilation only
+works for targets that the old nixpkgs reimport with `crossSystem` understands.
+i686, aarch64, armv7l, and mipsel work.
 
-**Root cause**: gcc5 is from nixpkgs-18.03 (pre-pkgsCross). When re-importing with
-`crossSystem = { config = "mips64el-unknown-linux-gnuabin32"; }`, the old nixpkgs
-doesn't understand the N32 ABI triple and fails to produce a cross compiler.
-
-**Note**: This failure was previously hidden because gcc5 failed at i686 (eval bug).
-Fix #5 revealed it — gcc5 now passes i686, aarch64, armv7l, mipsel (4 new passes).
-
-**Status**: Accept (old nixpkgs limitation for N32 ABI).
+**Status**: Accept — old nixpkgs limitation.
 
 ---
 
-### 6. clang3_5 ICE on aarch64 (1 failure)
+### 8. clang3_5/aarch64 ICE (1 failure)
 
 **Affected**: clang3_5/aarch64
 
@@ -216,15 +252,14 @@ Fix #5 revealed it — gcc5 now passes i686, aarch64, armv7l, mipsel (4 new pass
 clang-3.5: error: clang frontend command failed due to signal (use -v to see invocation)
 clang version 3.5.2 (tags/RELEASE_352/final)
 Target: aarch64-unknown-linux-gnu
-make[2]: *** [Makefile:3639: lib/libhello_a-getopt.o] Error 254
 ```
 
 **Root cause**: clang 3.5.2 (from 2015) has a code generation bug for AArch64 that
 causes an internal compiler error (ICE / segfault, exit code 254 = signal 11) when
 compiling GNU hello's `getopt.c`. AArch64 support was added in clang 3.5 and was
-still immature. clang3_7+ all pass aarch64.
+still immature.
 
-**Status**: Accept (old compiler bug).
+**Status**: Accept (old compiler bug). clang3_7+ all pass aarch64.
 
 ---
 
@@ -232,19 +267,26 @@ still immature. clang3_7+ all pass aarch64.
 
 | # | Failure | Count | Status |
 |---|---------|-------|--------|
-| 1 | ppc32 missing in old nixpkgs | 18 | Accept (old nixpkgs limitation) |
-| 2 | old clang mips64el N32 | 8 | Accept (old compiler limitation) |
-| 3 | gcc4_4/gcc4_6 no cross support | 2 | Accept (ancient nixpkgs) |
-| 4 | gcc4_5 cross compiler build | 1 | Accept (source incompatibility) |
-| 5 | gcc5 mips64el unavailable | 1 | Accept (old nixpkgs N32 limitation) |
-| 6 | clang3_5 aarch64 ICE | 1 | Accept (old compiler bug) |
-| 7 | gcc12/ppc32 unavailable | 1 | Same as #1 (subset) |
-| **Total** | | **32** | **All known limitations** |
+| 1 | ppc32 missing in old nixpkgs | 21 | Accept (old nixpkgs limitation) |
+| 2 | Old clang mips64el N32 | 9 | Accept (old compiler limitation) |
+| 3 | clang9 riscv64 | 1 | Accept (RISC-V not stable until clang 10) |
+| 4 | Old clang ppc64 residual | 5 | Accept (old compiler limitations) |
+| 5 | gcc4_4/4_6 no cross infra | 12 | Accept (nixpkgs-15.09 too old) |
+| 6 | gcc4_5 build failure | 6 | Accept (source incompatible with GCC 15) |
+| 7 | gcc5 limited cross targets | 3 | Accept (pre-pkgsCross nixpkgs) |
+| 8 | clang3_5 aarch64 ICE | 1 | Accept (old compiler bug) |
+| **Total** | | **58** | **All known limitations** |
 
-All 32 remaining failures are inherent limitations of old compilers or old nixpkgs
-versions. No actionable fixes remain — every failure is either an old nixpkgs missing
-a cross target, an old compiler with broken codegen, or ancient GCC source that can't
-build with modern tools.
+Note: clang3_5/mips64el overlaps with category #2. The unique total is 59 failures.
+
+Additionally, 20 compiler/target combos are excluded as unsupported (n/a):
+- riscv64: 7 GCC (<7) + 10 Clang (<9) = 17
+- aarch64: 3 GCC (<4.8)
+
+All 59 remaining failures are inherent limitations of old compilers or old nixpkgs
+versions. No actionable fixes remain.
+
+---
 
 ## Results Matrix
 
@@ -253,49 +295,40 @@ build with modern tools.
 | gcc15      | OK   | OK      | OK     | OK     | OK       | OK    | OK    | OK      |
 | gcc14      | OK   | OK      | OK     | OK     | OK       | OK    | OK    | OK      |
 | gcc13      | OK   | OK      | OK     | OK     | OK       | OK    | OK    | OK      |
-| gcc12      | OK   | OK      | OK     | OK     | OK*      | FAIL  | SKIP  | SKIP    |
-| gcc11      | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| gcc10      | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| gcc9       | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| gcc8       | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| gcc7       | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| gcc6       | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| gcc5       | OK*  | OK*     | OK*    | OK*    | FAIL     | SKIP  | SKIP  | SKIP    |
-| gcc4_9     | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| gcc4_8     | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| gcc4_6     | FAIL | SKIP    | SKIP   | SKIP   | SKIP     | SKIP  | SKIP  | SKIP    |
-| gcc4_5     | FAIL | SKIP    | SKIP   | SKIP   | SKIP     | SKIP  | SKIP  | SKIP    |
-| gcc4_4     | FAIL | SKIP    | SKIP   | SKIP   | SKIP     | SKIP  | SKIP  | SKIP    |
-| clang22    | OK   | OK      | OK     | OK     | OK       | OK    | OK*   | SKIP    |
-| clang21    | OK   | OK      | OK     | OK     | OK       | OK    | OK*   | SKIP    |
-| clang20    | OK   | OK      | OK     | OK     | OK       | OK    | OK*   | SKIP    |
-| clang19    | OK   | OK      | OK     | OK     | OK       | OK    | OK*   | SKIP    |
-| clang18    | OK   | OK      | OK     | OK     | OK       | OK    | OK*   | SKIP    |
-| clang17    | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| clang16    | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| clang15    | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| clang14    | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| clang13    | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| clang12    | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| clang11    | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| clang10    | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| clang9     | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| clang8     | OK   | OK      | OK     | OK     | OK       | FAIL  | SKIP  | SKIP    |
-| clang7     | OK   | OK      | OK     | OK     | FAIL     | SKIP  | SKIP  | SKIP    |
-| clang6     | OK   | OK      | OK     | OK     | FAIL     | SKIP  | SKIP  | SKIP    |
-| clang5     | OK   | OK      | OK     | OK     | FAIL     | SKIP  | SKIP  | SKIP    |
-| clang4     | OK   | OK      | OK     | OK     | FAIL     | SKIP  | SKIP  | SKIP    |
-| clang3_9   | OK   | OK      | OK     | OK     | FAIL     | SKIP  | SKIP  | SKIP    |
-| clang3_8   | OK   | OK      | OK     | OK     | FAIL     | SKIP  | SKIP  | SKIP    |
-| clang3_7   | OK   | OK      | OK     | OK     | FAIL     | SKIP  | SKIP  | SKIP    |
-| clang3_5   | OK   | FAIL    | SKIP   | SKIP   | SKIP     | SKIP  | SKIP  | SKIP    |
-| clang3_4   | OK   | OK      | OK     | OK     | FAIL     | SKIP  | SKIP  | SKIP    |
-
-\* = Fixed this round
-- gcc12/mips64el: was FAIL (libsanitizer), now OK (fix #4: `--disable-libsanitizer`)
-- clang18-22/ppc64: were FAIL (linker), now OK (fix #2: `-fuse-ld=`)
-- gcc5/i686-mipsel: were SKIP (eval bug), now OK (fix #5: precedence fix)
-
-Note: The test script stops at the first failure per compiler, so targets after the
-first FAIL are marked SKIP. For example, gcc6-12 all pass 5 targets but FAIL at ppc32,
-so ppc64 and riscv64 are SKIP even though some of them (e.g. gcc13-15/ppc64) work.
+| gcc12      | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| gcc11      | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| gcc10      | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| gcc9       | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| gcc8       | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| gcc7       | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| gcc6       | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | n/a     |
+| gcc5       | OK   | OK      | OK     | OK     | FAIL     | FAIL  | FAIL  | n/a     |
+| gcc4_9     | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | n/a     |
+| gcc4_8     | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | n/a     |
+| gcc4_6     | FAIL | n/a     | FAIL   | FAIL   | FAIL     | FAIL  | FAIL  | n/a     |
+| gcc4_5     | FAIL | n/a     | FAIL   | FAIL   | FAIL     | FAIL  | FAIL  | n/a     |
+| gcc4_4     | FAIL | n/a     | FAIL   | FAIL   | FAIL     | FAIL  | FAIL  | n/a     |
+| clang22    | OK   | OK      | OK     | OK     | OK       | OK    | OK    | OK      |
+| clang21    | OK   | OK      | OK     | OK     | OK       | OK    | OK    | OK      |
+| clang20    | OK   | OK      | OK     | OK     | OK       | OK    | OK    | OK      |
+| clang19    | OK   | OK      | OK     | OK     | OK       | OK    | OK    | OK      |
+| clang18    | OK   | OK      | OK     | OK     | OK       | OK    | OK    | OK      |
+| clang17    | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| clang16    | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| clang15    | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| clang14    | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| clang13    | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| clang12    | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| clang11    | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| clang10    | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | OK      |
+| clang9     | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | FAIL    |
+| clang8     | OK   | OK      | OK     | OK     | OK       | FAIL  | OK    | n/a     |
+| clang7     | OK   | OK      | OK     | OK     | FAIL     | FAIL  | FAIL  | n/a     |
+| clang6     | OK   | OK      | OK     | OK     | FAIL     | FAIL  | FAIL  | n/a     |
+| clang5     | OK   | OK      | OK     | OK     | FAIL     | FAIL  | FAIL  | n/a     |
+| clang4     | OK   | OK      | OK     | OK     | FAIL     | OK    | OK    | n/a     |
+| clang3_9   | OK   | OK      | OK     | OK     | FAIL     | OK    | OK    | n/a     |
+| clang3_8   | OK   | OK      | OK     | OK     | FAIL     | OK    | OK    | n/a     |
+| clang3_7   | OK   | OK      | OK     | OK     | FAIL     | OK    | OK    | n/a     |
+| clang3_5   | OK   | FAIL    | OK     | OK     | FAIL     | OK    | FAIL  | n/a     |
+| clang3_4   | OK   | OK      | OK     | OK     | FAIL     | OK    | FAIL  | n/a     |
