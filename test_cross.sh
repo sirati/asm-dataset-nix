@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Test cross-compilation of hello for each working compiler across all 5 cross targets.
-# Each compiler tries archs sequentially, stopping at first failure.
+# Test cross-compilation of hello for each working compiler across all cross targets.
 # Up to 12 compilers run in parallel. Newest compilers first.
 #
-# Usage: ./test_cross.sh
+# Usage: ./test_cross.sh [--no-skip]
+#   default:    stop at first failure per compiler, mark remaining archs as SKIP
+#   --no-skip:  test every arch independently, never skip
+#
 # The script re-execs itself inside a screen session under a systemd cgroup.
 
 set -euo pipefail
@@ -13,6 +15,13 @@ REPORT="$SCRIPT_DIR/report_hello_cross.md"
 RESULTS_DIR="$SCRIPT_DIR/.cross-results"
 SCREEN_NAME="test-cross"
 MAX_JOBS=12
+SKIP_ON_FAIL=1
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-skip) SKIP_ON_FAIL=0 ;;
+  esac
+done
 
 # ── Step 1: Re-exec inside screen if not already ──────────────────────────
 if [ -z "${IN_SCREEN:-}" ]; then
@@ -60,7 +69,11 @@ STATUS_LOG="$RESULTS_DIR/.status.log"
 : > "$STATUS_LOG"
 LOCK_FILE="$RESULTS_DIR/.status.lock"
 
-echo "Testing $TOTAL_COMPILERS compilers x $TOTAL_ARCHS archs (stop-on-fail per compiler), $MAX_JOBS parallel"
+if [ "$SKIP_ON_FAIL" = "1" ]; then
+  echo "Testing $TOTAL_COMPILERS compilers x $TOTAL_ARCHS archs (stop-on-fail per compiler), $MAX_JOBS parallel"
+else
+  echo "Testing $TOTAL_COMPILERS compilers x $TOTAL_ARCHS archs (no-skip mode), $MAX_JOBS parallel"
+fi
 echo ""
 
 # ── Status printer (tail -f the status log) ──────────────────────────────
@@ -72,8 +85,8 @@ log_status() {
   flock "$LOCK_FILE" echo "$1" >> "$STATUS_LOG"
 }
 
-# ── Worker: test one compiler across all archs, stop on first failure ─────
-export RESULTS_DIR STATUS_LOG LOCK_FILE
+# ── Worker: test one compiler across all archs ───────────────────────────
+export RESULTS_DIR STATUS_LOG LOCK_FILE SKIP_ON_FAIL
 worker() {
   log_status() {
     flock "$LOCK_FILE" echo "$1" >> "$STATUS_LOG"
@@ -96,16 +109,18 @@ worker() {
       echo "$output" > "${outfile}.buildlog"
       echo "$output" | tail -10 > "${outfile}.log"
       log_status "failed: ${label}"
-      # Mark remaining archs as skipped
-      local skip=0
-      for a2 in i686 aarch64 armv7l mipsel mips64el ppc32 ppc64 riscv64; do
-        if [ "$skip" = "1" ]; then
-          echo "skip" > "$RESULTS_DIR/${compiler}__${a2}"
-          log_status "skipped: ${compiler} hello with target arch ${a2}"
-        fi
-        [ "$a2" = "$arch" ] && skip=1
-      done
-      return
+      if [ "$SKIP_ON_FAIL" = "1" ]; then
+        # Mark remaining archs as skipped
+        local skip=0
+        for a2 in i686 aarch64 armv7l mipsel mips64el ppc32 ppc64 riscv64; do
+          if [ "$skip" = "1" ]; then
+            echo "skip" > "$RESULTS_DIR/${compiler}__${a2}"
+            log_status "skipped: ${compiler} hello with target arch ${a2}"
+          fi
+          [ "$a2" = "$arch" ] && skip=1
+        done
+        return
+      fi
     fi
   done
 }
