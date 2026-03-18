@@ -48,7 +48,10 @@ in
       crossAttr = "armv7l-hf-multiplatform";
       crossConfig = "armv7l-unknown-linux-gnueabihf";
       system = "armv7l-linux";
-      minGccVersion = noMin;
+      minGccVersion = {
+        major = 4;
+        minor = 7;
+      }; # gnueabihf target triple added in GCC 4.7
       minClangVersion = noMin;
     };
     mipsel = {
@@ -80,7 +83,10 @@ in
       crossAttr = "ppc64";
       crossConfig = "powerpc64-unknown-linux-gnuabielfv2";
       system = "powerpc64-linux";
-      minGccVersion = noMin;
+      minGccVersion = {
+        major = 4;
+        minor = 9;
+      }; # ELFv2 ABI (gnuabielfv2) added in GCC 4.9
       minClangVersion = noMin;
     };
     riscv64 = {

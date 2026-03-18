@@ -18,9 +18,9 @@
 | gcc5       | OK        | OK        | OK        | OK        | FAIL      | FAIL      | FAIL      | n/a       |
 | gcc4_9     | OK        | OK        | OK        | OK        | OK        | FAIL      | OK        | n/a       |
 | gcc4_8     | OK        | OK        | OK        | OK        | OK        | FAIL      | OK        | n/a       |
-| gcc4_6     | FAIL      | n/a       | FAIL      | FAIL      | FAIL      | FAIL      | FAIL      | n/a       |
-| gcc4_5     | FAIL      | n/a       | FAIL      | FAIL      | FAIL      | FAIL      | FAIL      | n/a       |
-| gcc4_4     | FAIL      | n/a       | FAIL      | FAIL      | FAIL      | FAIL      | FAIL      | n/a       |
+| gcc4.6     | OK        | OK        | OK        | OK        | N/A       | N/A       | N/A       | N/A       |
+| gcc4.5     | OK        | FAIL      | FAIL      | FAIL      | N/A       | N/A       | N/A       | N/A       |
+| gcc4.4     | OK        | OK        | OK        | OK        | N/A       | N/A       | N/A       | N/A       |
 | clang22    | OK        | OK        | OK        | OK        | OK        | OK        | OK        | OK        |
 | clang21    | OK        | OK        | OK        | OK        | OK        | OK        | OK        | OK        |
 | clang20    | OK        | OK        | OK        | OK        | OK        | OK        | OK        | OK        |
