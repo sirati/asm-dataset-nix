@@ -228,7 +228,7 @@ let
         version = tried.value;
         mkStdenv =
           targetPkgs: target:
-          if target.crossAttr == null then
+          if target.crossAttr == null && !(target ? crossSystem) then
             # Native: just use the old compiler directly
             targetPkgs.overrideCC targetPkgs.stdenv oldPkgs.${attr}
           else if oldPkgs ? pkgsCross then
@@ -299,7 +299,7 @@ let
         inherit version;
         mkStdenv =
           targetPkgs: target:
-          if target.crossAttr == null then
+          if target.crossAttr == null && !(target ? crossSystem) then
             # Native: use extractClangCC on the native LLVM package
             let
               cc = extractClangCC oldPkgs.${attr};

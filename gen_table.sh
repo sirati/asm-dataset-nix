@@ -14,13 +14,20 @@ COMPILERS=(
   clang4 clang3_9 clang3_8 clang3_7 clang3_5 clang3_4
 )
 
-ARCHS=(i686 aarch64 armv7l mipsel mips64el ppc32 ppc64 riscv64)
+ARCHS=(i686 aarch64 armv7l-hf armv7l-sf mipsel mips64el ppc32 ppc64 riscv64)
 
-# Minimum supported compiler versions per target (from support_matrix.md).
-# Format: min_gcc_major.minor and min_clang_major.minor (0.0 = no restriction).
-declare -A MIN_GCC MIN_CLANG
-for arch in "${ARCHS[@]}"; do MIN_GCC[$arch]="0.0"; MIN_CLANG[$arch]="0.0"; done
+# Minimum/maximum supported compiler versions per target.
+# Format: major.minor (0.0 = no restriction).
+declare -A MIN_GCC MIN_CLANG MAX_GCC MAX_CLANG
+for arch in "${ARCHS[@]}"; do
+  MIN_GCC[$arch]="0.0"; MIN_CLANG[$arch]="0.0"
+  MAX_GCC[$arch]="0.0"; MAX_CLANG[$arch]="0.0"
+done
 MIN_GCC[aarch64]="4.8"
+MIN_GCC[armv7l-hf]="4.7"
+MAX_GCC[armv7l-sf]="4.6"
+MIN_CLANG[armv7l-sf]="999.0"  # exclude all clang from armv7l-sf
+MIN_GCC[ppc64]="4.8"
 MIN_GCC[riscv64]="7.0"
 MIN_CLANG[riscv64]="9.0"
 
@@ -42,21 +49,29 @@ parse_compiler() {
   fi
 }
 
-# Check if compiler meets minimum version for target. Returns 0 (true) or 1 (false).
+# Check if compiler meets min/max version for target. Returns 0 (true) or 1 (false).
 is_supported() {
   local compiler="$1" arch="$2"
   parse_compiler "$compiler"
-  local min
+  local min max
   if [[ "$_family" == "gcc" ]]; then
-    min="${MIN_GCC[$arch]}"
+    min="${MIN_GCC[$arch]}"; max="${MAX_GCC[$arch]}"
   else
-    min="${MIN_CLANG[$arch]}"
+    min="${MIN_CLANG[$arch]}"; max="${MAX_CLANG[$arch]}"
   fi
   local min_major="${min%%.*}" min_minor="${min#*.}"
-  (( min_major == 0 )) && return 0
-  (( _major > min_major )) && return 0
-  (( _major == min_major && _minor >= min_minor )) && return 0
-  return 1
+  local max_major="${max%%.*}" max_minor="${max#*.}"
+  # Check minimum
+  if (( min_major != 0 )); then
+    (( _major < min_major )) && return 1
+    (( _major == min_major && _minor < min_minor )) && return 1
+  fi
+  # Check maximum
+  if (( max_major != 0 )); then
+    (( _major > max_major )) && return 1
+    (( _major == max_major && _minor > max_minor )) && return 1
+  fi
+  return 0
 }
 
 # Count results (excluding n/a combos below minimum supported version)

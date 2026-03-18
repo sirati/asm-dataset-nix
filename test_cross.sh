@@ -56,7 +56,7 @@ COMPILERS=(
   clang4 clang3_9 clang3_8 clang3_7 clang3_5 clang3_4
 )
 
-ARCHS=(i686 aarch64 armv7l mipsel mips64el ppc32 ppc64 riscv64)
+ARCHS=(i686 aarch64 armv7l-hf armv7l-sf mipsel mips64el ppc32 ppc64 riscv64)
 
 rm -rf "$RESULTS_DIR"
 mkdir -p "$RESULTS_DIR"
@@ -94,7 +94,7 @@ worker() {
 
   local compiler="$1"
 
-  for arch in i686 aarch64 armv7l mipsel mips64el ppc32 ppc64 riscv64; do
+  for arch in i686 aarch64 armv7l-hf armv7l-sf mipsel mips64el ppc32 ppc64 riscv64; do
     local attr=".#dataset.x86_64-linux.hello.${arch}.${compiler}-O2-baseline-unhardened"
     local outfile="$RESULTS_DIR/${compiler}__${arch}"
     local label="${compiler} hello with target arch ${arch}"
@@ -112,7 +112,7 @@ worker() {
       if [ "$SKIP_ON_FAIL" = "1" ]; then
         # Mark remaining archs as skipped
         local skip=0
-        for a2 in i686 aarch64 armv7l mipsel mips64el ppc32 ppc64 riscv64; do
+        for a2 in i686 aarch64 armv7l-hf armv7l-sf mipsel mips64el ppc32 ppc64 riscv64; do
           if [ "$skip" = "1" ]; then
             echo "skip" > "$RESULTS_DIR/${compiler}__${a2}"
             log_status "skipped: ${compiler} hello with target arch ${a2}"

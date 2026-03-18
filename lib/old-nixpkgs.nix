@@ -54,6 +54,11 @@ in
         gccSubdir = "4.4";
       }
       {
+        attr = "gcc45";
+        label = "4_5";
+        gccSubdir = "4.5";
+      }
+      {
         attr = "gcc46";
         label = "4_6";
         gccSubdir = "4.6";
@@ -73,10 +78,6 @@ in
     nixpkgsSrc = nixpkgsInputs.nixpkgs-18_03;
     inherit system;
     gccSpecs = [
-      {
-        attr = "gcc45";
-        label = "4_5";
-      }
       {
         attr = "gcc5";
         label = "5";

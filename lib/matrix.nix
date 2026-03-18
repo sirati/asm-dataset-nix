@@ -67,13 +67,28 @@ let
   meetsMinVersion =
     cv: mv: mv.major == 0 || cv.major > mv.major || (cv.major == mv.major && cv.minor >= mv.minor);
 
+  # maxVersion: { major = 0; minor = 0; } means no maximum (all versions pass).
+  meetsMaxVersion =
+    cv: mv: mv.major == 0 || cv.major < mv.major || (cv.major == mv.major && cv.minor <= mv.minor);
+
   isValidArchCombo =
     compiler: target:
     let
       cv = parseVersion compiler.version;
-      mv = if compiler.family == "gcc" then target.minGccVersion else target.minClangVersion;
+      minV = if compiler.family == "gcc" then target.minGccVersion else target.minClangVersion;
+      maxV =
+        if compiler.family == "gcc" then
+          target.maxGccVersion or {
+            major = 0;
+            minor = 0;
+          }
+        else
+          target.maxClangVersion or {
+            major = 0;
+            minor = 0;
+          };
     in
-    meetsMinVersion cv mv;
+    meetsMinVersion cv minV && meetsMaxVersion cv maxV;
 
   # All valid (compiler, optLevel) pairs
   compilerOptPairs = lib.concatMap (
