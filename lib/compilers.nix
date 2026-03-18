@@ -49,7 +49,7 @@ let
         targetPkgs: target:
         if isDefault then
           targetPkgs.stdenv
-        else if target.crossAttr != null then
+        else if target.crossAttr != null || target ? crossSystem then
           targetPkgs.overrideCC targetPkgs.stdenv targetPkgs.buildPackages.${name}
         else
           targetPkgs.overrideCC targetPkgs.stdenv targetPkgs.${name};
@@ -83,7 +83,7 @@ let
       # (which would be a target-platform binary that can't run on the builder).
       mkStdenv =
         targetPkgs: target:
-        if target.crossAttr != null then
+        if target.crossAttr != null || target ? crossSystem then
           targetPkgs.overrideCC targetPkgs.stdenv targetPkgs.buildPackages.${name}.clang
         else
           targetPkgs.${name}.stdenv;

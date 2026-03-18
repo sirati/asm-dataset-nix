@@ -8,7 +8,7 @@ GCC 4.4, 4.5, and 4.6 come from nixpkgs that predate the modern
 | Compiler | Source nixpkgs | Cross infra available |
 |----------|---------------|-----------------------|
 | gcc4.4   | 15.09         | None (no pkgsCross, no buildPackages) |
-| gcc4.5   | 18.03         | buildPackages exists, but wrappers broken with modern Nix |
+| gcc4.5   | 15.09         | None (no pkgsCross, no buildPackages) |
 | gcc4.6   | 15.09         | None (no pkgsCross, no buildPackages) |
 
 The compilers themselves DO support cross-compilation — they just need to be
@@ -24,7 +24,7 @@ The compilers themselves DO support cross-compilation — they just need to be
 - `lib/old-gcc-cross.nix` (NEW) — cross-GCC builder for 15.09/18.03-era compilers
   - `getGccUnsupportedHardeningFlags` — version-based hardening flag detection
   - `mkCrossGccFromOldExpr` — builds cross-gcc from 15.09 source (gcc4.4, gcc4.6)
-  - `mkCrossGccFrom1803` — builds cross-gcc from 18.03 re-import (gcc4.5)
+  - `mkCrossGccFrom1803` — builds cross-gcc from 18.03 re-import (gcc5)
 - `lib/old-compilers.nix` (MODIFIED) — `mkOldGccEntry` routes to new builders
 - `lib/old-nixpkgs.nix` (MODIFIED) — added `gccSubdir` to 15.09 gcc specs
 - `lib/architectures.nix` (MODIFIED) — updated `minGccVersion` for armv7l and ppc64
@@ -56,12 +56,15 @@ hybridGcc = modernCrossGcc.override {
 targetPkgs.overrideCC targetPkgs.stdenv hybridGcc
 ```
 
-### Strategy 2: nixpkgs-18.03 (gcc4.5) — `mkCrossGccFrom1803`
+### Strategy 2 (gcc4.5): Now also uses Strategy 1
 
-Re-import 18.03 with `crossSystem` to get `buildPackages.gcc45`. Override
-the unwrapped `.cc` with `depsBuildBuild = [ oldPkgs.gcc45 ]` (same-version
-bootstrap) to avoid build failures from the 18.03 default gcc7.3 compiler.
-Extract the fixed unwrapped `.cc` and wrap with modern cc-wrapper.
+gcc4.5 was originally sourced from nixpkgs-18.03, but its gcc expression
+uses the modern `buildPlatform`/`hostPlatform`/`targetPlatform` interface
+and 18.03's default gcc7.3 couldn't compile gcc4.5 source (`cfns.gperf`
+`gnu_inline` attribute error). Since nixpkgs-15.09 also contains gcc4.5
+with the old-style `cross`/`binutilsCross` interface, gcc4.5 was moved
+to the 15.09 group and now uses `mkCrossGccFromOldExpr` — identical to
+gcc4.4 and gcc4.6. This gives gcc4.5 full cross-target support.
 
 ## Issues Encountered and Fixes
 
@@ -148,17 +151,6 @@ postInstall without checking if it exists. Modern nixpkgs doesn't have paxctl.
 **Fix**: Provide a no-op `paxmark` script via
 `pkgs.writeShellScriptBin "paxmark" "exit 0"` in `nativeBuildInputs`.
 
-### Strategy 2 issues (gcc4.5 via 18.03 path)
-
-#### 12. `gnu_inline` attribute inconsistency in cfns.gperf
-
-18.03's default build compiler (gcc 7.3) rejects gcc4.5 source due to
-inconsistent `gnu_inline` attribute on `libc_name_p` in `cfns.gperf`.
-
-**Fix**: Override `depsBuildBuild = [ oldPkgs.gcc45 ]` on the unwrapped
-cross-gcc derivation so gcc4.5 compiles itself (same-version bootstrap).
-This avoids the gcc7 incompatibility entirely.
-
 ### Target triple incompatibilities
 
 #### 13. armv7l `gnueabihf` unknown to gcc < 4.7
@@ -169,36 +161,28 @@ was added to GCC's config.sub in GCC 4.7. GCC 4.4/4.5/4.6 don't recognize it.
 **Fix**: Updated `architectures.nix` to set `minGccVersion = { major = 4; minor = 7; }`
 for armv7l, excluding gcc4.4/4.5/4.6 from this target.
 
-#### 14. ppc64 `gnuabielfv2` unknown to gcc < 4.9
+#### 14. ppc64 `gnuabielfv2` unknown to gcc <= 4.6 (old-expression path)
 
 The ELFv2 ABI suffix (`gnuabielfv2`) in `powerpc64-unknown-linux-gnuabielfv2`
-was added in GCC 4.9. GCC 4.4/4.5/4.6/4.8 don't recognize it.
+is not recognized by the old GCC expressions from nixpkgs-15.09 (gcc4.4/4.5/4.6).
+GCC 4.8+ from nixpkgs-22.11 works fine via `pkgsCross` (the cross infrastructure
+handles the triple without the GCC source needing to parse it directly).
 
-**Fix**: Updated `architectures.nix` to set `minGccVersion = { major = 4; minor = 9; }`
-for ppc64, excluding gcc4.4-4.8 from this target.
-
-#### 15. gcc4.5 limited cross targets in 18.03
-
-The 18.03 re-import path only has cross support for a subset of targets:
-- mips64el: `buildPackages.gcc45` not available (18.03 lacks cross attrs)
-- ppc32: `kernelArch` attribute missing (18.03 cross infra incomplete)
-- mipsel: glibc ABI mismatch (`skipping incompatible libc.so`)
-
-**Result**: gcc4.5 cross only works for i686.
+**Fix**: Updated `architectures.nix` to set `minGccVersion = { major = 4; minor = 8; }`
+for ppc64, excluding gcc4.4-4.6 from this target while keeping gcc4.8+ working.
 
 ## Final Status
 
-| Compiler | i686 | armv7l | mipsel | mips64el | ppc32 | ppc64 | aarch64 | riscv64 |
-|----------|------|--------|--------|----------|-------|-------|---------|---------|
-| gcc4.4   | OK   | N/A^1  | OK     | OK       | OK    | N/A^2 | N/A^3   | N/A^4   |
-| gcc4.5   | OK   | N/A^1  | FAIL^5 | FAIL^6   | FAIL^7| N/A^2 | N/A^3   | N/A^4   |
-| gcc4.6   | OK   | N/A^1  | OK     | OK       | OK    | N/A^2 | N/A^3   | N/A^4   |
+All three compilers have identical cross-target support:
 
-Notes:
-1. armv7l excluded: `gnueabihf` target triple requires GCC >= 4.7
-2. ppc64 excluded: `gnuabielfv2` target triple requires GCC >= 4.9
-3. aarch64 excluded: ARM64 backend added in GCC 4.8
-4. riscv64 excluded: RISC-V backend added in GCC 7
-5. mipsel gcc4.5: glibc ABI mismatch in 18.03 cross re-import
-6. mips64el gcc4.5: cross-compiler not available in 18.03
-7. ppc32 gcc4.5: `kernelArch` missing in 18.03 cross infrastructure
+| Compiler | i686 | mipsel | mips64el | ppc32 |
+|----------|------|--------|----------|-------|
+| gcc4.4   | OK   | OK     | OK       | OK    |
+| gcc4.5   | OK   | OK     | OK       | OK    |
+| gcc4.6   | OK   | OK     | OK       | OK    |
+
+Excluded targets (via `minGccVersion` in `architectures.nix`):
+- **armv7l**: `gnueabihf` target triple requires GCC >= 4.7
+- **ppc64**: `gnuabielfv2` triple unknown to old-expression path (GCC <= 4.6); minGccVersion = 4.8
+- **aarch64**: ARM64 backend added in GCC 4.8
+- **riscv64**: RISC-V backend added in GCC 7
