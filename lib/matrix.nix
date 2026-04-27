@@ -241,9 +241,73 @@ let
   numPkgs = builtins.length pkgDefs.all;
   matrixSize = combosPerArch * numArchs * numPkgs;
 
+  # ── Cross-toolchain pre-build ──────────────────────────────────────────
+  # For each valid (target, compiler) pair, expose the cross-compiler (cc)
+  # derivation. Building these before the package phase populates the Nix
+  # store / binary cache so that subsequent variant builds skip toolchain
+  # construction. Combos that fail evaluation (e.g. old-nixpkgs missing an
+  # attribute for a target) are silently dropped via tryEval.
+  crossToolchainMap = lib.mapAttrs (
+    archName: target:
+    let
+      targetPkgs' = archDefs.getPkgsForTarget pkgs target;
+      validCompilers = builtins.filter (comp: isValidArchCombo comp target) compilers.all;
+    in
+    if targetPkgs' == null then
+      { }
+    else
+      builtins.listToAttrs (
+        lib.concatMap (
+          comp:
+          let
+            tried = builtins.tryEval (comp.mkStdenv targetPkgs' target).cc;
+          in
+          if tried.success then
+            [
+              {
+                name = comp.label;
+                value = tried.value;
+              }
+            ]
+          else
+            [ ]
+        ) validCompilers
+      )
+  ) archDefs.targets;
+
+  # Per-arch linkFarms for batch building: one derivation that depends on
+  # every valid cross-compiler for the architecture.
+  crossToolchains = lib.mapAttrs (
+    archName: compilerMap:
+    pkgs.linkFarm "cross-toolchains-${archName}" (
+      lib.mapAttrsToList (label: cc: {
+        name = label;
+        path = cc;
+      }) compilerMap
+    )
+  ) crossToolchainMap;
+
+  # Pure metadata: which (arch, compiler) pairs the matrix considers valid.
+  # Instant to evaluate — does not force any derivations.
+  crossToolchainsMeta = lib.mapAttrs (
+    archName: target:
+    map (comp: {
+      compiler = comp.label;
+      family = comp.family;
+      version = comp.version;
+    }) (builtins.filter (comp: isValidArchCombo comp target) compilers.all)
+  ) archDefs.targets;
+
 in
 {
-  inherit nestedMatrix metaMatrix matrixSize;
+  inherit
+    nestedMatrix
+    metaMatrix
+    matrixSize
+    crossToolchainMap
+    crossToolchains
+    crossToolchainsMeta
+    ;
 
   # Targeted access (fast — only evaluates the requested slice)
   getPackage = pkgLabel: nestedMatrix.${pkgLabel};

@@ -176,6 +176,22 @@
             targets = builtins.attrNames (import ./lib/architectures.nix { }).targets;
             matrixSize = matrix.matrixSize;
           };
+
+          # ── Cross-toolchains (pre-build for cache population) ─────────────
+          # Build before the package phase so SLURM workers can pull cross
+          # compilers from a shared cache instead of rebuilding them.
+          #   nix build .#crossToolchains.<sys>.<arch>            — all compilers for one arch
+          #   nix build .#_crossToolchainMap.<sys>.<arch>.<comp>  — single toolchain
+          # Some (arch, compiler) combos fail evaluation due to gaps in old
+          # nixpkgs cross infrastructure (e.g. gcc5 + ppc32: nixpkgs-18.03
+          # lacks platform.kernelArch for the triple). Those errors raise
+          # from derivationStrict and cannot be caught by tryEval, so an
+          # aggregate "all" output would propagate them and is intentionally
+          # omitted. The job-feeder is expected to iterate
+          # _crossToolchainsMeta and tolerate per-combo failures.
+          crossToolchains = matrix.crossToolchains;
+          _crossToolchainMap = matrix.crossToolchainMap;
+          _crossToolchainsMeta = matrix.crossToolchainsMeta;
         }
       );
 
@@ -189,5 +205,9 @@
       _meta = nixpkgs.lib.mapAttrs (_: s: s._meta) perSystem;
       _drvPaths = nixpkgs.lib.mapAttrs (_: s: s._drvPaths) perSystem;
       _debug = nixpkgs.lib.mapAttrs (_: s: s._debug) perSystem;
+
+      crossToolchains = nixpkgs.lib.mapAttrs (_: s: s.crossToolchains) perSystem;
+      _crossToolchainMap = nixpkgs.lib.mapAttrs (_: s: s._crossToolchainMap) perSystem;
+      _crossToolchainsMeta = nixpkgs.lib.mapAttrs (_: s: s._crossToolchainsMeta) perSystem;
     };
 }
