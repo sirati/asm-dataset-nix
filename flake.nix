@@ -97,6 +97,20 @@
           ) matrix.nestedMatrix;
 
           # ── Manifest generation app ────────────────────────────────────────
+          # ── Docker image (compiler_suit_runner) ───────────────────────────
+          # Layered podman image used by the SLURM runner (see
+          # plans/splendid-snacking-cascade.md §B2.5). Lazily evaluated;
+          # depends on harmonia which is available in the pinned nixpkgs
+          # but the call is wrapped to fail at attribute access time only,
+          # not at flake-eval time, so other outputs are unaffected by any
+          # future packaging gap.
+          dockerImage = import ./nix/docker-image.nix {
+            inherit pkgs lib;
+            semantic-layering = import ./nix/semantic-layering.nix;
+            runnerSrc = ./python;
+            harmonia = pkgs.harmonia or null;
+          };
+
           generateManifestScript = pkgs.writeShellScript "generate-manifest" ''
             set -euo pipefail
             PKG="''${1:-}"
@@ -132,7 +146,14 @@
 
         in
         {
-          packages = { };
+          packages = {
+            inherit dockerImage;
+          };
+
+          # Expose dockerImage at top-level too so `.#dockerImage` works
+          # without `.packages.x86_64-linux.dockerImage`. Mirrors the
+          # asm-tokenizer convention.
+          inherit dockerImage;
 
           apps = {
             generate-manifest = {
@@ -209,5 +230,10 @@
       crossToolchains = nixpkgs.lib.mapAttrs (_: s: s.crossToolchains) perSystem;
       _crossToolchainMap = nixpkgs.lib.mapAttrs (_: s: s._crossToolchainMap) perSystem;
       _crossToolchainsMeta = nixpkgs.lib.mapAttrs (_: s: s._crossToolchainsMeta) perSystem;
+
+      # Layered podman image for the compiler_suit_runner. Lives both
+      # under packages.<sys>.dockerImage (so `nix build .#dockerImage`
+      # works on the default system) and as a per-system attribute.
+      dockerImage = nixpkgs.lib.mapAttrs (_: s: s.dockerImage) perSystem;
     };
 }
