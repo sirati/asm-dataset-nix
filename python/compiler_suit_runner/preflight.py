@@ -1,0 +1,352 @@
+"""Local pre-flight: enumerate the variant matrix via ``nix eval``.
+
+The runner needs the full superset of (pkg, arch, variant_suffix) tuples
+*before* it submits anything, because the dynamic_batch framework's
+queue is fixed at coord.run() time (see plan §"How to inject Phase 2 +
+Phase 3 items into the queue", option A). This module implements the
+local pre-flight: it shells out to ``nix eval`` against this repo's
+flake to read
+
+* ``.#_meta.<sys>``  — instant; pure metadata only.
+* ``.#_drvPaths.<sys>`` — slow; forces drv instantiation.
+* ``.#_crossToolchainsMeta.<sys>`` — instant.
+
+and assembles a :class:`PreflightResult` that downstream code (CLI,
+manifest_gen) can feed to ``emit_all_manifests``.
+
+Subprocess invocation is dependency-injected via ``run_subprocess`` so
+unit tests stay hermetic — the real flake never has to be evaluated.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import pathlib
+import subprocess
+from collections.abc import Callable, Iterable
+from typing import Optional
+
+from compiler_suit_runner.partition import VariantSpec
+
+
+# ---------------------------------------------------------------------------
+# Public dataclass
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class PreflightResult:
+    """The outputs of one pre-flight pass.
+
+    ``variants`` is the full superset that ``emit_all_manifests`` will
+    materialise into phase-3 manifests (filtered by the user's
+    ``--packages`` / ``--archs`` flags upstream).
+
+    ``toolchain_specs`` enumerates every ``(arch, compiler_label)`` pair
+    the matrix considers a valid cross-toolchain target — these become
+    phase-2 toolchain manifests.
+
+    ``common_dep_drvs`` is left empty by this module: the populating
+    logic lives in phase 1b's merge worker (see
+    :mod:`compiler_suit_runner.workers.merge_worker`). It exists as a
+    field here so callers can pass a complete :class:`PreflightResult`
+    around regardless of whether the merge has run yet.
+
+    ``toolchain_drvs`` is the canonical set of nix drv paths for every
+    matrix variant's drv. The phase-1b classifier intersects this with
+    its frequency map to identify "this is a toolchain build, hoist it
+    to phase 2" vs "this is a common host dep we should pre-build".
+    For now we expose it as a frozenset so the merge worker can consume
+    it without reconstructing the set itself.
+    """
+
+    sys_name: str
+    variants: tuple[VariantSpec, ...]
+    toolchain_specs: tuple[tuple[str, str], ...]
+    common_dep_drvs: tuple[tuple[str, str], ...]
+    toolchain_drvs: frozenset[str]
+
+
+# ---------------------------------------------------------------------------
+# Subprocess injection
+# ---------------------------------------------------------------------------
+
+
+# ``run_subprocess`` accepts argv (list[str]) and returns a tuple of
+# (stdout_bytes, stderr_bytes, returncode).
+RunSubprocess = Callable[[list[str]], tuple[bytes, bytes, int]]
+
+
+def _default_run_subprocess(argv: list[str]) -> tuple[bytes, bytes, int]:
+    """Real ``subprocess.run`` invocation; never goes through a shell."""
+    proc = subprocess.run(  # noqa: S603 - argv is constructed in-module
+        argv,
+        check=False,
+        capture_output=True,
+        shell=False,
+    )
+    return proc.stdout, proc.stderr, proc.returncode
+
+
+# ---------------------------------------------------------------------------
+# nix eval helper
+# ---------------------------------------------------------------------------
+
+
+def run_nix_eval(
+    flake_ref: str,
+    attr: str,
+    *,
+    raw: bool = False,
+    run_subprocess: Optional[RunSubprocess] = None,
+):
+    """Invoke ``nix eval`` on a single attribute.
+
+    By default returns the parsed JSON result. With ``raw=True`` the
+    function returns the stdout as a :class:`str` (useful for
+    ``--raw`` outputs like single drv paths).
+
+    Raises :class:`RuntimeError` on non-zero exit; the stderr is
+    embedded in the exception message so callers can surface it.
+    """
+    runner = run_subprocess or _default_run_subprocess
+
+    argv: list[str] = [
+        "nix",
+        "eval",
+        "--extra-experimental-features",
+        "nix-command flakes",
+    ]
+    if raw:
+        argv.append("--raw")
+    else:
+        argv.append("--json")
+    argv.append(f"{flake_ref}#{attr}")
+
+    stdout, stderr, rc = runner(argv)
+    if rc != 0:
+        decoded_err = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"nix eval {flake_ref}#{attr} failed (rc={rc}): {decoded_err}"
+        )
+
+    if raw:
+        return stdout.decode("utf-8", errors="replace")
+
+    text = stdout.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"nix eval {flake_ref}#{attr} returned invalid JSON: {exc}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Variant enumeration
+# ---------------------------------------------------------------------------
+
+
+def _tier_from_pkg(pkg: str) -> int:
+    """Best-effort tier lookup that doesn't import memory_budget here.
+
+    We deliberately avoid the import to keep this module's dependency
+    surface minimal — preflight is also imported by the CLI and we want
+    that startup to stay fast. The tier numbers track
+    ``memory_budget.tier_of`` (1/2/3); divergence would only affect
+    memory budgeting, not correctness.
+    """
+    if pkg in ("hello", "busybox"):
+        return 1
+    if pkg in ("coreutils", "gawk"):
+        return 3
+    return 2
+
+
+def _build_variant_spec(
+    *,
+    pkg: str,
+    arch: str,
+    suffix: str,
+    meta_entry: dict,
+    drv_path: str,
+) -> VariantSpec:
+    """Assemble one :class:`VariantSpec` from the meta + drvPaths slices."""
+    label = meta_entry.get("variantLabel", suffix)
+    compiler_id = meta_entry.get("compiler", "")
+    return {
+        "label": label,
+        "drv": drv_path,
+        "tarball_name": f"{label}.tar.zst",
+        "compiler_id": compiler_id,
+        "tier": _tier_from_pkg(pkg),
+        "pkg": pkg,
+        "arch": arch,
+    }
+
+
+def enumerate_variants(
+    flake_ref: str,
+    sys_name: str,
+    *,
+    packages: Optional[list[str]] = None,
+    archs: Optional[list[str]] = None,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> tuple[tuple[VariantSpec, ...], frozenset[str]]:
+    """Enumerate every ``(pkg, arch, suffix)`` variant the matrix exposes.
+
+    Filters by ``packages`` and ``archs`` if provided (each is an inclusion
+    list — None means "all").
+
+    Returns ``(variants, toolchain_drvs)`` where ``toolchain_drvs`` is the
+    set of nix drv paths corresponding to the variants. (The plan calls
+    this the canonical set; phase 1b uses it to filter "toolchain" from
+    "common host dep" classification.)
+    """
+    meta = run_nix_eval(
+        flake_ref,
+        f"_meta.{sys_name}",
+        run_subprocess=run_subprocess,
+    )
+    drvs = run_nix_eval(
+        flake_ref,
+        f"_drvPaths.{sys_name}",
+        run_subprocess=run_subprocess,
+    )
+
+    if not isinstance(meta, dict):
+        raise RuntimeError(
+            f"_meta.{sys_name} is not a JSON object (got {type(meta).__name__})"
+        )
+    if not isinstance(drvs, dict):
+        raise RuntimeError(
+            f"_drvPaths.{sys_name} is not a JSON object (got {type(drvs).__name__})"
+        )
+
+    pkg_filter = set(packages) if packages else None
+    arch_filter = set(archs) if archs else None
+
+    variants: list[VariantSpec] = []
+    drv_set: set[str] = set()
+
+    for pkg, arch_attrs in sorted(meta.items()):
+        if pkg_filter is not None and pkg not in pkg_filter:
+            continue
+        if not isinstance(arch_attrs, dict):
+            continue
+        drvs_pkg = drvs.get(pkg)
+        if not isinstance(drvs_pkg, dict):
+            continue
+        for arch, suffix_attrs in sorted(arch_attrs.items()):
+            if arch_filter is not None and arch not in arch_filter:
+                continue
+            if not isinstance(suffix_attrs, dict):
+                continue
+            drvs_arch = drvs_pkg.get(arch)
+            if not isinstance(drvs_arch, dict):
+                continue
+            for suffix, meta_entry in sorted(suffix_attrs.items()):
+                if not isinstance(meta_entry, dict):
+                    continue
+                drv = drvs_arch.get(suffix)
+                if not isinstance(drv, str) or not drv:
+                    continue
+                variant = _build_variant_spec(
+                    pkg=pkg,
+                    arch=arch,
+                    suffix=suffix,
+                    meta_entry=meta_entry,
+                    drv_path=drv,
+                )
+                variants.append(variant)
+                drv_set.add(drv)
+
+    return tuple(variants), frozenset(drv_set)
+
+
+# ---------------------------------------------------------------------------
+# Toolchain enumeration
+# ---------------------------------------------------------------------------
+
+
+def enumerate_toolchains(
+    flake_ref: str,
+    sys_name: str,
+    archs: Optional[list[str]] = None,
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> tuple[tuple[str, str], ...]:
+    """Read ``.#_crossToolchainsMeta.<sys>`` and return the (arch, compiler)
+    pair list.
+
+    Filters by ``archs`` if provided. The returned list is sorted by
+    ``(arch, compiler_label)`` for reproducible manifest ordering.
+    """
+    meta = run_nix_eval(
+        flake_ref,
+        f"_crossToolchainsMeta.{sys_name}",
+        run_subprocess=run_subprocess,
+    )
+    if not isinstance(meta, dict):
+        raise RuntimeError(
+            f"_crossToolchainsMeta.{sys_name} is not a JSON object"
+            f" (got {type(meta).__name__})"
+        )
+
+    arch_filter = set(archs) if archs else None
+    pairs: list[tuple[str, str]] = []
+    for arch, comps in sorted(meta.items()):
+        if arch_filter is not None and arch not in arch_filter:
+            continue
+        if not isinstance(comps, list):
+            continue
+        for entry in comps:
+            if not isinstance(entry, dict):
+                continue
+            label = entry.get("compiler")
+            if isinstance(label, str) and label:
+                pairs.append((arch, label))
+    pairs.sort()
+    return tuple(pairs)
+
+
+# ---------------------------------------------------------------------------
+# Composite
+# ---------------------------------------------------------------------------
+
+
+def preflight(
+    flake_ref: str,
+    sys_name: str,
+    *,
+    packages: Optional[list[str]] = None,
+    archs: Optional[list[str]] = None,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> PreflightResult:
+    """Composite call: variants + toolchains.
+
+    ``common_dep_drvs`` is left empty here — phase 1b's merge worker
+    populates it on the cluster. The phase-2 manifests therefore only
+    cover toolchains until the merge runs.
+    """
+    variants, toolchain_drvs = enumerate_variants(
+        flake_ref,
+        sys_name,
+        packages=packages,
+        archs=archs,
+        run_subprocess=run_subprocess,
+    )
+    toolchain_specs = enumerate_toolchains(
+        flake_ref,
+        sys_name,
+        archs=archs,
+        run_subprocess=run_subprocess,
+    )
+    return PreflightResult(
+        sys_name=sys_name,
+        variants=variants,
+        toolchain_specs=toolchain_specs,
+        common_dep_drvs=(),
+        toolchain_drvs=toolchain_drvs,
+    )
