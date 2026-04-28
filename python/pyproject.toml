@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compiler-suit-runner"
+version = "0.1.0"
+description = "Cluster-side runner that drives the asm-dataset-nix matrix on SLURM via the dynamic_batch framework."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [
+    { name = "sirati", email = "git@sirati.me" },
+]
+keywords = [
+    "nix",
+    "slurm",
+    "cross-compilation",
+    "dataset",
+    "compiler",
+    "asm",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Distributed Computing",
+]
+# Runtime is intentionally stdlib-only. Optional integrations live in
+# [project.optional-dependencies] below.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+slurm = ["dynamic_batch @ git+https://github.com/sirati/asm-tokenizer"]
+# Cachix federation uses the `cachix` CLI via subprocess; no Python
+# package dependency required. This entry is kept as a documentation
+# extra so users see the option.
+cachix = []
+
+[project.scripts]
+compiler-suit-runner = "compiler_suit_runner.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/sirati/asm-dataset-nix"
+Repository = "https://github.com/sirati/asm-dataset-nix"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["compiler_suit_runner*"]
+exclude = ["compiler_suit_runner.tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["compiler_suit_runner/tests"]
+addopts = "-q --tb=short"
+filterwarnings = [
+    # tarfile.extractall(filter=...) was added in 3.12; older test
+    # fixtures call it without the kwarg and trigger a DeprecationWarning
+    # under 3.14+. We silence it here so test output stays readable.
+    "ignore::DeprecationWarning:tarfile",
+    "ignore:.*tarfile.*extraction.*:DeprecationWarning",
+]
