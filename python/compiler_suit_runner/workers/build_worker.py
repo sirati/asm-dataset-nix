@@ -30,8 +30,6 @@ import time
 from collections.abc import Callable
 from typing import Optional
 
-from compiler_suit_runner.peer_cache import PeerListWatcher
-
 __all__ = [
     "BuildWorkerResult",
     "BuildWorkerEnv",
@@ -91,7 +89,11 @@ class BuildWorkerEnv:
 
     flake_ref: str
     dataset_output_dir: pathlib.Path
-    peer_watcher: Optional[PeerListWatcher] = None
+    # Path to a peer-substituter file written by ``PeerListWatcher``.
+    # Each invocation reads it once and splices the contents into
+    # ``nix build`` argv. ``None`` (or a missing file) disables peer
+    # substitution.
+    substituters_file: Optional[pathlib.Path] = None
     # Subprocess injection point. Default uses real subprocess.run().
     # Signature: argv -> (stdout_bytes, stderr_bytes, returncode).
     run_subprocess: Optional[Callable[[list[str]], tuple[bytes, bytes, int]]] = None
@@ -182,6 +184,27 @@ def _default_run_subprocess(argv: list[str]) -> tuple[bytes, bytes, int]:
     return proc.stdout, proc.stderr, proc.returncode
 
 
+def _read_substituters_file(path: pathlib.Path) -> list[str]:
+    """Return the ``nix build`` argv fragment encoded in ``path``.
+
+    The file is written atomically by :class:`PeerListWatcher` whenever
+    the peer set changes; each line is a literal nix-build argument
+    (``--extra-substituters URL``, ``--extra-trusted-public-keys KEY``,
+    ``--substitute-on-destination``...). Missing or unreadable files
+    return an empty list — peer substitution is best-effort.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, FileNotFoundError):
+        return []
+    out: list[str] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped:
+            out.append(stripped)
+    return out
+
+
 def build_attr(
     attr: str,
     env: BuildWorkerEnv,
@@ -193,11 +216,11 @@ def build_attr(
     Constructs ``nix build --no-link --print-out-paths <flake_ref>#<attr>``
     plus:
 
-    * peer substituter args from ``env.peer_watcher.extra_args`` (when
-      a watcher is wired up — usually ``None`` in tests).
+    * peer substituter args read fresh from
+      ``env.substituters_file`` on each invocation (when set).
     * caller-supplied ``extra_args`` (e.g. ``--skip-existing`` for
-      common-deps so the build short-circuits when the output is already
-      in the local store).
+      common-deps so the build short-circuits when the output is
+      already in the local store).
 
     Returns ``(success, stdout, stderr)`` where ``success`` is True iff
     the subprocess returned 0. The subprocess inherits the parent
@@ -211,9 +234,8 @@ def build_attr(
         "--no-link",
         "--print-out-paths",
     ]
-    if env.peer_watcher is not None:
-        peer_args = list(env.peer_watcher.extra_args)
-        argv.extend(peer_args)
+    if env.substituters_file is not None:
+        argv.extend(_read_substituters_file(env.substituters_file))
     if extra_args:
         argv.extend(extra_args)
     argv.append(f"{env.flake_ref}#{attr}")
@@ -479,3 +501,79 @@ def build_worker(
         duration_seconds=max(0.0, clock() - start),
         output_path=output_path,
     )
+
+
+# ---------------------------------------------------------------------------
+# Subprocess entry point
+#
+# Spawned by the dynamic_runner framework as
+# ``python -m compiler_suit_runner.workers.build_worker``. Reads one
+# manifest path per line from stdin and dispatches each through
+# :func:`build_worker`. Phase-2 toolchains, phase-2 common deps, and
+# phase-3 variants all share this entry point — the per-manifest
+# ``item_class`` field decides the routing inside :func:`build_worker`.
+#
+# TODO(phase 8 follow-up): wire to ``dynamic_runner.comm`` once the
+# comm shape for TaskInfo dispatch is stabilised.
+
+
+def main() -> int:
+    """Subprocess entry point for the build worker."""
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        prog="compiler_suit_runner.workers.build_worker",
+    )
+    parser.add_argument("--dynamic_queue", type=int, default=None)
+    parser.add_argument("--socket-path", type=str, default=None)
+    parser.add_argument("--source", type=str, default=None)
+    parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--log-file", type=str, default=None)
+    parser.add_argument(
+        "--flake-ref",
+        type=str,
+        required=True,
+    )
+    parser.add_argument(
+        "--dataset-output-dir",
+        type=str,
+        required=True,
+    )
+    parser.add_argument(
+        "--substituters-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a peer-substituter file maintained by"
+            " PeerListWatcher; read fresh on every nix build."
+        ),
+    )
+    parser.add_argument("--skip-existing", action="store_true")
+    args, _ = parser.parse_known_args()
+
+    env = BuildWorkerEnv(
+        flake_ref=args.flake_ref,
+        dataset_output_dir=pathlib.Path(args.dataset_output_dir),
+        substituters_file=(
+            pathlib.Path(args.substituters_file)
+            if args.substituters_file
+            else None
+        ),
+    )
+
+    rc = 0
+    for line in sys.stdin:
+        manifest_path = pathlib.Path(line.strip())
+        if not str(manifest_path):
+            continue
+        result = build_worker(manifest_path, env)
+        if not result.success:
+            rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())
