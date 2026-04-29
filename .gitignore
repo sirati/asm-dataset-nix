@@ -10,3 +10,7 @@ test_results.jsonl
 
 .cross-results/
 nix-upstream/
+
+# Python bytecode
+__pycache__/
+*.pyc

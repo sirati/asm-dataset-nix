@@ -41,6 +41,7 @@ from typing import Optional
 __all__ = [
     "PeerInfo",
     "SigningKey",
+    "SUBSTITUTERS_FILENAME",
     "generate_signing_key",
     "announce_self",
     "withdraw_self",
@@ -418,15 +419,47 @@ def prune_stale(
 # ---------------------------------------------------------------------------
 
 
+SUBSTITUTERS_FILENAME = "_substituters.txt"
+
+
+def _write_substituters_file(
+    target: pathlib.Path, args: list[str]
+) -> None:
+    """Atomically write ``args`` (one per line) to ``target``.
+
+    Uses a sibling ``.tmp`` + ``os.replace`` so concurrent readers
+    never observe a partially-written file. Empty ``args`` produces
+    an empty (but present) file, which workers treat as "no peers".
+    """
+    target = pathlib.Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    payload = "\n".join(args)
+    if payload:
+        payload += "\n"
+    fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, payload.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, target)
+
+
 class PeerListWatcher(threading.Thread):
-    """Background thread that polls the peers/ dir and rebuilds args.
+    """Background thread that polls the peers/ dir and republishes args.
+
+    On every successful refresh the watcher writes the current
+    nix-build extra args into ``peers/_substituters.txt`` (atomically),
+    one argument per line. Workers re-read the file on every nix-build
+    invocation, so they never need to share an in-process reference to
+    the watcher.
 
     Provides:
 
     * ``self.peers`` — current snapshot ``list[PeerInfo]`` (read under
       the internal lock; the property returns a fresh copy).
-    * ``self.extra_args`` — current nix-build extra args
-      (``list[str]``); same locking discipline.
+    * ``self.substituters_path`` — the published file's absolute path.
     * ``self.stop()`` — request the thread to exit.
 
     The watcher is a daemon thread so it does not prevent process
@@ -448,9 +481,12 @@ class PeerListWatcher(threading.Thread):
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._peers: list[PeerInfo] = []
-        self._extra_args: list[str] = []
-        # Prime the snapshot once synchronously so callers that read
-        # immediately after .start() see a meaningful initial state.
+        self._substituters_path = (
+            _peers_dir(self._shared_fs) / SUBSTITUTERS_FILENAME
+        )
+        # Prime the snapshot + published file once synchronously so
+        # callers that read immediately after .start() see a meaningful
+        # initial state.
         self._refresh()
 
     # --- public read-side API -------------------------------------------------
@@ -461,9 +497,8 @@ class PeerListWatcher(threading.Thread):
             return list(self._peers)
 
     @property
-    def extra_args(self) -> list[str]:
-        with self._lock:
-            return list(self._extra_args)
+    def substituters_path(self) -> pathlib.Path:
+        return self._substituters_path
 
     # --- lifecycle ------------------------------------------------------------
 
@@ -490,7 +525,15 @@ class PeerListWatcher(threading.Thread):
         )
         with self._lock:
             self._peers = new_peers
-            self._extra_args = new_args
+        try:
+            _write_substituters_file(self._substituters_path, new_args)
+        except OSError:
+            # Republish failure must never crash the watcher; workers
+            # gracefully fall back to "no peers" until the next tick.
+            logger.exception(
+                "PeerListWatcher: failed to publish %s",
+                self._substituters_path,
+            )
 
 
 # ---------------------------------------------------------------------------

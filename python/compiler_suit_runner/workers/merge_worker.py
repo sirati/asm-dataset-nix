@@ -267,3 +267,124 @@ def merge_worker(
             # attributes; ignore and re-raise unchanged.
             pass
         raise
+
+
+# ---------------------------------------------------------------------------
+# Subprocess entry point
+#
+# Spawned by the dynamic_runner framework as
+# ``python -m compiler_suit_runner.workers.merge_worker``. Reads one
+# manifest path per line from stdin and dispatches each through
+# :func:`merge_worker`.
+#
+# TODO(phase 8 follow-up): wire to ``dynamic_runner.comm`` once the
+# comm shape for TaskInfo dispatch is stabilised.
+
+
+def _load_variants_from_path(path: pathlib.Path) -> tuple[VariantSpec, ...]:
+    """Load a JSON file containing the variant superset for the run.
+
+    The primary writes this file once at run start (alongside the
+    manifests) so each merge invocation can rehydrate the variants
+    list without re-running pre-flight.
+    """
+    if not path.exists():
+        return ()
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError(f"variants JSON {path} top-level must be a list")
+    out: list[VariantSpec] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        out.append(entry)  # type: ignore[arg-type]
+    return tuple(out)
+
+
+def _load_toolchain_drvs_from_path(path: pathlib.Path) -> frozenset[str]:
+    """Load a JSON list of drv paths into a frozenset."""
+    if not path.exists():
+        return frozenset()
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError(f"toolchain drvs JSON {path} top-level must be a list")
+    return frozenset(str(x) for x in raw if isinstance(x, str))
+
+
+def main() -> int:
+    """Subprocess entry point for the phase-1b merge worker."""
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        prog="compiler_suit_runner.workers.merge_worker",
+    )
+    parser.add_argument("--dynamic_queue", type=int, default=None)
+    parser.add_argument("--socket-path", type=str, default=None)
+    parser.add_argument("--source", type=str, default=None)
+    parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--log-file", type=str, default=None)
+    parser.add_argument(
+        "--raw-partition-dir",
+        type=str,
+        required=True,
+    )
+    parser.add_argument(
+        "--partition-dir",
+        type=str,
+        required=True,
+    )
+    parser.add_argument("--input-hash", type=str, default="")
+    parser.add_argument(
+        "--variants-file",
+        type=str,
+        default=None,
+        help="Path to JSON list of VariantSpec dicts.",
+    )
+    parser.add_argument(
+        "--toolchain-drvs-file",
+        type=str,
+        default=None,
+        help="Path to JSON list of toolchain drv paths.",
+    )
+    parser.add_argument("--common-threshold", type=int, default=10)
+    parser.add_argument("--skip-existing", action="store_true")
+    args, _ = parser.parse_known_args()
+
+    variants: tuple[VariantSpec, ...] = ()
+    if args.variants_file:
+        variants = _load_variants_from_path(pathlib.Path(args.variants_file))
+
+    toolchain_drvs: frozenset[str] = frozenset()
+    if args.toolchain_drvs_file:
+        toolchain_drvs = _load_toolchain_drvs_from_path(
+            pathlib.Path(args.toolchain_drvs_file)
+        )
+
+    env = MergeWorkerEnv(
+        raw_partition_dir=pathlib.Path(args.raw_partition_dir),
+        partition_dir=pathlib.Path(args.partition_dir),
+        input_hash=args.input_hash,
+        variants=variants,
+        toolchain_drvs=toolchain_drvs,
+        common_threshold=args.common_threshold,
+    )
+
+    rc = 0
+    for line in sys.stdin:
+        manifest_path = pathlib.Path(line.strip())
+        if not str(manifest_path):
+            continue
+        try:
+            result = merge_worker(manifest_path, env)
+            if result.error is not None:
+                rc = 1
+        except Exception:  # noqa: BLE001
+            rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())
