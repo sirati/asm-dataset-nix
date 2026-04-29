@@ -58,6 +58,7 @@ from compiler_suit_runner.manifest_gen import (
 )
 from compiler_suit_runner.memory_budget import MEMORY_FLOOR_BYTES
 from compiler_suit_runner.peer_cache import (
+    SUBSTITUTERS_FILENAME,
     HarmoniaProcess,
     PeerInfo,
     PeerListWatcher,
@@ -230,18 +231,14 @@ class SuitTask:
         return build_worker
 
     def _substituters_file_path(self) -> Optional[pathlib.Path]:
-        """Return the substituters-file path for the build worker.
+        """Return the substituters-file path :class:`PeerListWatcher` writes.
 
-        Set by 8.5 once :class:`PeerListWatcher` publishes it; returns
-        ``None`` when the watcher has not yet written one (best-effort
-        peer substitution).
+        Returns ``None`` when ``peers_dir`` is unset; the build worker
+        treats that as "no peer substitution".
         """
-        candidate = (
-            self.config.peers_dir / "_substituters.txt"
-            if self.config.peers_dir is not None
-            else None
-        )
-        return candidate
+        if self.config.peers_dir is None:
+            return None
+        return self.config.peers_dir / SUBSTITUTERS_FILENAME
 
     # ==================================================================
     # Custom dispatch surface (used by the runner orchestrator)
