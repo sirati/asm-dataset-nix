@@ -54,13 +54,9 @@ from compiler_suit_runner.cachix_uploader import (
 from compiler_suit_runner.manifest_gen import (
     ItemClass,
     ManifestHeader,
-    ManifestSet,
     read_manifest,
 )
-from compiler_suit_runner.memory_budget import (
-    MEMORY_FLOOR_BYTES,
-    decode_size,
-)
+from compiler_suit_runner.memory_budget import MEMORY_FLOOR_BYTES
 from compiler_suit_runner.peer_cache import (
     HarmoniaProcess,
     PeerInfo,
@@ -86,7 +82,6 @@ from compiler_suit_runner.workers.partition_worker import (
 
 __all__ = [
     "SuitTaskConfig",
-    "PhaseCounter",
     "SuitTask",
 ]
 
@@ -96,31 +91,11 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-# Map every barrier-bound item_class to (rank, optional flag_name).
-# ``flag_name`` is ``None`` for non-barrier items: those classes still
-# get a counter but never trigger a flag write.
-#
-# The mapping is keyed by the *rank* (high bits of the encoded size) so the
-# bookkeeping side stays consistent with how the scheduler actually
-# dispatches items: counters are indexed by rank, not by item_class, so
-# that toolchain + common-dep items (both phase-2 builds) share a single
-# phase-2 counter.
-
+# Item classes that map onto the build worker. Both phase-2 toolchains
+# and phase-2 common deps use the same nix-build entry point.
 _PHASE2_BUILD_CLASSES: frozenset[str] = frozenset(
     {"phase2_toolchain", "phase2_common_dep"}
 )
-
-# Map each item_class to (rank, flag_to_write_when_complete).
-# Phase ordering is now framework-owned via PhaseSpec.depends_on; the
-# rank table is residual bookkeeping until PhaseCounter is removed in
-# 8.3 and discover_items takes over in 8.6.
-_ITEM_CLASS_RANK: dict[str, tuple[int, Optional[str]]] = {
-    "phase1a_partition": (6, None),
-    "phase1b_merge": (4, None),
-    "phase2_toolchain": (2, None),
-    "phase2_common_dep": (2, None),
-    "phase3_variant": (0, None),
-}
 
 
 def _make_binary_info(path: pathlib.Path, size: int):
@@ -195,35 +170,6 @@ class SuitTaskConfig:
     variants: tuple = ()
 
 
-@dataclasses.dataclass
-class PhaseCounter:
-    """Counter that triggers a barrier flag when ``expected`` is reached.
-
-    ``expected`` is set when :meth:`SuitTask.initialize_counters` walks
-    the manifest directory; ``completed`` increments on every dispatch of
-    an item belonging to that rank, regardless of success or failure.
-    Failure must still count: a single shard's nix crash should not park
-    every secondary forever on the phase-1a barrier.
-
-    Thread-safety: callers must hold the counter's :attr:`lock` for the
-    duration of the increment + flag-write decision.
-    """
-
-    expected: int
-    completed: int = 0
-    flag_name: Optional[str] = None
-    flags_dir: Optional[pathlib.Path] = None
-    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
-    flag_written: bool = False
-
-    @property
-    def is_complete(self) -> bool:
-        """Return True iff every expected item has been observed."""
-        # No lock here: a stale read returns False, which only delays the
-        # flag write, never produces a false positive.
-        return self.expected > 0 and self.completed >= self.expected
-
-
 # ---------------------------------------------------------------------------
 # SuitTask
 # ---------------------------------------------------------------------------
@@ -256,11 +202,6 @@ class SuitTask:
     ) -> None:
         self.config = config
         self._logger = logger or logging.getLogger(__name__)
-
-        # Counter table: rank -> PhaseCounter. Indexed by rank so phase-2
-        # toolchain + common-dep items share one counter.
-        self._counters: dict[int, PhaseCounter] = {}
-        self._counters_lock = threading.Lock()
 
         # Peer-cache state: lazily populated by setup_peer_cache.
         self._signing_key: Optional[SigningKey] = None
@@ -330,18 +271,18 @@ class SuitTask:
             binaries.append(_make_binary_info(entry, size))
         return binaries
 
-    def estimate_memory(self, binary_size: int) -> int:
-        """Return per-item memory budget — low 48 bits, floored.
+    def estimate_memory(self, item) -> int:
+        """Return per-item memory budget in bytes, floored.
 
-        The framework feeds this to the Rust scheduler for memory-aware
-        packing. ``binary_size`` is the encoded
-        ``(rank << 48) | mem`` integer.
+        Per-type estimators (8.6) override this; the fallback shape
+        accepts either a :class:`TaskInfo` or a raw integer for
+        backward compatibility with the legacy in-process surface.
         """
+        size = getattr(item, "size", item)
         try:
-            _, mem = decode_size(binary_size)
-        except ValueError:
+            return max(int(size), MEMORY_FLOOR_BYTES)
+        except (TypeError, ValueError):
             return MEMORY_FLOOR_BYTES
-        return max(mem, MEMORY_FLOOR_BYTES)
 
     def dispatch_binary(
         self,
@@ -349,65 +290,34 @@ class SuitTask:
         output_dir: Optional[pathlib.Path] = None,
         **kwargs: Any,
     ) -> None:
-        """Read ``binary_info.path``, route to the right worker, count.
+        """Read ``binary_info.path`` and route to the right worker.
 
-        Steps:
-
-        1. Read & parse the manifest (sentinel-routing recovers from
-           a parse failure by counting the item against its rank — see
-           below).
-        2. Look up the (rank, optional flag_name) for ``item_class``.
-        3. Invoke the matching worker, swallowing any exception so the
-           secondary's process stays alive.
-        4. Increment the rank's :class:`PhaseCounter` and, if the
-           counter has reached its expected total, atomically write
-           the flag file that unblocks the next phase's barrier
-           sentinels.
-
-        The counter advances on **both** success and failure. A single
-        crashing nix invocation must not deadlock the whole run; any
-        partial-progress accounting is the merge worker's concern.
+        Phase drain detection is now framework-owned (via
+        :class:`PhaseSpec.depends_on`); this method just reads the
+        manifest and dispatches one item, swallowing any worker
+        exception so the secondary's process stays alive.
 
         ``output_dir`` and ``kwargs`` are accepted for forward
         compatibility with framework hooks that pass extra context; we
         pull what we need from ``self.config``.
         """
         path = pathlib.Path(getattr(binary_info, "path"))
-        # Default item_class for failure-routing. We try to read the
-        # manifest first; on read failure we fall back to a synthesized
-        # item_class derived from the encoded rank so the failure still
-        # lands in the right counter.
-        header: Optional[ManifestHeader] = None
         try:
             header = read_manifest(path)
         except Exception as exc:  # noqa: BLE001 — log + degrade
             self._logger.exception(
                 "dispatch_binary: failed to read manifest %s: %s", path, exc
             )
-
-        if header is None:
-            # Decode the rank from the on-disk size. We can't recover
-            # item_class without the JSON, but the rank is enough to find
-            # the right counter.
-            size = getattr(binary_info, "size", 0)
-            try:
-                rank, _ = decode_size(int(size))
-            except (TypeError, ValueError):
-                rank = -1
-            self._increment_rank(rank)
             return
 
-        item_class = header.item_class
         try:
-            self._dispatch_item(item_class, path, header)
+            self._dispatch_item(header.item_class, path, header)
         except Exception:  # noqa: BLE001 — never raise out
             self._logger.exception(
                 "dispatch_binary: worker raised for %s (%s)",
                 path,
-                item_class,
+                header.item_class,
             )
-        finally:
-            self._increment_for_item_class(item_class)
 
     # --- Internal dispatch helpers --------------------------------------
 
@@ -450,102 +360,6 @@ class SuitTask:
         raise ValueError(
             f"unknown item_class {item_class!r} in manifest {path}"
         )
-
-    # --- Counter advancement -------------------------------------------
-
-    def _increment_for_item_class(self, item_class: str) -> None:
-        """Increment the counter for the item_class's rank."""
-        spec = _ITEM_CLASS_RANK.get(item_class)
-        if spec is None:
-            self._logger.warning(
-                "dispatch_binary: no counter rank for item_class %r",
-                item_class,
-            )
-            return
-        rank, _flag = spec
-        self._increment_rank(rank)
-
-    def _increment_rank(self, rank: int) -> None:
-        """Advance the rank's counter (no-op if uninitialised).
-
-        Phase drain detection is now owned by the framework via
-        PhaseSpec.depends_on; the residual counter is preserved here
-        only until 8.3 deletes PhaseCounter entirely.
-        """
-        with self._counters_lock:
-            counter = self._counters.get(rank)
-        if counter is None:
-            return
-        with counter.lock:
-            counter.completed += 1
-
-    # ==================================================================
-    # Counter setup
-    # ==================================================================
-
-    def initialize_counters(
-        self,
-        manifest_set_or_dir: "pathlib.Path | ManifestSet",
-    ) -> None:
-        """Populate :attr:`_counters` from a ManifestSet or directory.
-
-        For a :class:`ManifestSet` the headers tuple is consulted
-        directly. For a directory, every ``*.json`` file is read via
-        :func:`manifest_gen.read_manifest`; unreadable files are
-        skipped with a warning so a corrupt manifest never blocks
-        startup.
-        """
-        headers: list[ManifestHeader] = []
-        if isinstance(manifest_set_or_dir, ManifestSet):
-            headers = list(manifest_set_or_dir.headers)
-        else:
-            target = pathlib.Path(manifest_set_or_dir)
-            try:
-                entries = sorted(target.iterdir())
-            except (FileNotFoundError, NotADirectoryError):
-                entries = []
-            for entry in entries:
-                if not entry.is_file() or entry.suffix != ".json":
-                    continue
-                if entry.name.startswith(".") or entry.name.startswith("_"):
-                    continue
-                try:
-                    headers.append(read_manifest(entry))
-                except Exception as exc:  # noqa: BLE001 — corrupt manifest
-                    self._logger.warning(
-                        "initialize_counters: skipping unreadable"
-                        " manifest %s: %s",
-                        entry,
-                        exc,
-                    )
-
-        # Group by rank, accumulating a flag_name when *any* item at
-        # this rank requires one.
-        per_rank_count: dict[int, int] = {}
-        per_rank_flag: dict[int, Optional[str]] = {}
-        for header in headers:
-            spec = _ITEM_CLASS_RANK.get(header.item_class)
-            if spec is None:
-                continue
-            rank, flag_name = spec
-            per_rank_count[rank] = per_rank_count.get(rank, 0) + 1
-            if flag_name is not None and per_rank_flag.get(rank) is None:
-                per_rank_flag[rank] = flag_name
-
-        with self._counters_lock:
-            self._counters = {
-                rank: PhaseCounter(
-                    expected=count,
-                    completed=0,
-                    flag_name=per_rank_flag.get(rank),
-                    flags_dir=(
-                        self.config.flags_dir
-                        if per_rank_flag.get(rank) is not None
-                        else None
-                    ),
-                )
-                for rank, count in per_rank_count.items()
-            }
 
     # ==================================================================
     # Setup / teardown
@@ -779,6 +593,5 @@ class SuitTask:
         return ""
 
     def format_binary_size(self, size: int) -> str:  # pragma: no cover - default
-        rank, mem = decode_size(size) if size >= 0 else (-1, 0)
-        gib = mem / (1024**3)
-        return f"rank={rank} mem={gib:.2f}GiB"
+        gib = max(0, size) / (1024**3)
+        return f"mem={gib:.2f}GiB"
