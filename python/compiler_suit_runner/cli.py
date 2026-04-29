@@ -85,7 +85,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         "--shared-fs",
         type=pathlib.Path,
         help="Shared filesystem root used by the run for peers/, "
-        "manifests/, partition/, flags/, dataset/.",
+        "manifests/, partition/, dataset/.",
     )
     parser.add_argument(
         "--run-id",
@@ -156,13 +156,6 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         "--no-cache",
         action="store_true",
         help="Skip the incremental cache (always pre-flight).",
-    )
-    parser.add_argument(
-        "--barrier-timeout",
-        type=float,
-        default=24 * 60 * 60,
-        dest="barrier_timeout_seconds",
-        help="Per-barrier timeout in seconds (default: 24h).",
     )
     parser.add_argument(
         "--cache-root",
@@ -268,8 +261,8 @@ def _config_from_args(
 ) -> SuitTaskConfig:
     """Translate the parsed argparse namespace into a SuitTaskConfig.
 
-    The shared FS subdirectories (manifests/, partition/, flags/,
-    dataset/, peers/) are derived from ``--shared-fs``.
+    The shared FS subdirectories (manifests/, partition/, dataset/,
+    peers/) are derived from ``--shared-fs``.
     """
     shared = pathlib.Path(args.shared_fs)
     return SuitTaskConfig(
@@ -279,7 +272,6 @@ def _config_from_args(
         manifest_dir=shared / "manifests",
         raw_partition_dir=shared / "partition" / "raw",
         partition_dir=shared / "partition",
-        flags_dir=shared / "flags",
         dataset_dir=shared / "dataset",
         peers_dir=shared / "peers",
         run_id=run_id,
@@ -287,7 +279,6 @@ def _config_from_args(
         hostname=socket.gethostname(),
         cachix_cache=args.cachix_cache,
         cachix_token_file=args.cachix_auth_token_file,
-        barrier_timeout_seconds=args.barrier_timeout_seconds,
         input_hash=input_hash,
         toolchain_drvs=toolchain_drvs,
         variants=variants,
