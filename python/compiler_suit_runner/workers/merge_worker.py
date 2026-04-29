@@ -7,7 +7,7 @@ and writes a single ``partition.json`` plus a sidecar ``skip_list.json``.
 The phase-1a barrier flag is written by the runner's bookkeeping thread,
 *not* by this worker. This worker assumes phase-1a is already complete:
 its only synchronization is the implicit barrier item that the
-dynamic_batch scheduler will have completed before this item runs.
+dynamic_runner scheduler will have completed before this item runs.
 
 Stdlib only; no threading.
 """

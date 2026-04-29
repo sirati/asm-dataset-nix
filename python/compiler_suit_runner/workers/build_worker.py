@@ -61,7 +61,7 @@ VALID_ITEM_CLASSES: frozenset[str] = frozenset(
 )
 
 # Truncation limit for log excerpts captured into result.nix_log_excerpt.
-# The result is sent through dynamic_batch's error-response transport
+# The result is sent through dynamic_runner's error-response transport
 # which has a finite payload budget; ~8 KiB is plenty to diagnose a
 # failure without blowing it up.
 _LOG_EXCERPT_BYTE_LIMIT = 8 * 1024
@@ -368,7 +368,7 @@ def build_worker(
        :func:`copy_tarball` to ``env.dataset_output_dir``.
     6. Build the result; capture the log excerpt on failure.
 
-    Never raises out of this function — the caller (a dynamic_batch
+    Never raises out of this function — the caller (a dynamic_runner
     worker process) needs the result to round-trip through its IPC
     transport, and an unhandled exception would tear the secondary down.
     """

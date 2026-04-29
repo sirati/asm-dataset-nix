@@ -1,9 +1,9 @@
-# dynamic_batch_rs worker-pinning requirements
+# dynamic_runner worker-pinning requirements
 
 | Field    | Value                                                  |
 |----------|--------------------------------------------------------|
 | Status   | Proposed                                               |
-| Audience | `asm-tokenizer` / `dynamic_batch_rs` maintainers       |
+| Audience | `dynamic-runner` maintainers       |
 | Source   | `asm-dataset-nix` dataset team                         |
 | Date     | 2026-04-29                                             |
 
@@ -18,7 +18,7 @@ its files are the dominant working set: the same `cc1`, `as`, `ld`,
 `libgcc`, headers, etc. are read for every package compiled against
 that toolchain.
 
-The current `dynamic_batch_rs` scheduler re-sorts the pending item list
+The current `dynamic_runner._native` scheduler re-sorts the pending item list
 by `size` descending and dispatches items to workers from a single
 shared queue. Locality across consecutive items handed to a single
 worker is therefore incidental: two items dispatched in sequence to the
@@ -112,7 +112,7 @@ This change is strictly additive:
   loop runs against the `__free__` bucket.
 - No on-the-wire protocol changes between primary and secondaries —
   pinning is an internal scheduler concern, opaque to workers.
-- The CLI / Python entry points (`dynamic_batch.run.run`,
+- The CLI / Python entry points (`dynamic_runner.run`,
   `RustPrimaryCoordinator.run`) need no signature changes.
 
 ## Rebalancing

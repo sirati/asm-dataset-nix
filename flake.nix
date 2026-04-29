@@ -17,6 +17,13 @@
     nixpkgs-22_11.url = "github:NixOS/nixpkgs/4d2b37a84fad1091b9de401eb450aae66f1a741e";
     nixpkgs-23_11.url = "github:NixOS/nixpkgs/057f9aecfb71c4437d2b27d3323df7f93c010b7e";
     nixpkgs-24_05.url = "github:NixOS/nixpkgs/63dacb46bf939521bdc93981b4cbb7ecb58427a0";
+
+    # External runner: provides `python3Packages.dynamic-runner` via its
+    # overlay (replaces the previous in-tree `dynamic-batch-rs` path-flake).
+    dynamic-runner.url = "github:sirati/dynamic-runner/v0.1.1";
+    # Generic semantic-layering helpers + extract-layer-assignment tool
+    # (replaces the in-tree `nix/semantic-layering.nix` import).
+    nix-docker-layered-image.url = "github:sirati/nix-docker-layered-image/v0.1.0";
   };
 
   outputs =
@@ -28,6 +35,8 @@
       nixpkgs-22_11,
       nixpkgs-23_11,
       nixpkgs-24_05,
+      dynamic-runner,
+      nix-docker-layered-image,
     }:
     let
       systems = [ "x86_64-linux" ];
@@ -47,11 +56,18 @@
               inherit system;
               config.allowUnfree = true;
             };
-            # Overlayed pkgs — dataset-specific patches. Use for builds.
+            # Overlayed pkgs — dataset-specific patches plus the external
+            # `dynamic-runner` (Python pkg) and `nix-docker-layered-image`
+            # (semantic-layering helpers + extract-layer-assignment tool).
+            # Use for builds.
             pkgs = import nixpkgs {
               inherit system;
               config.allowUnfree = true;
-              overlays = [ compilerRtMipsOverlay ];
+              overlays = [
+                compilerRtMipsOverlay
+                dynamic-runner.overlays.default
+                nix-docker-layered-image.overlays.default
+              ];
             };
           }
         );
@@ -106,7 +122,6 @@
           # future packaging gap.
           dockerImage = import ./nix/docker-image.nix {
             inherit pkgs lib;
-            semantic-layering = import ./nix/semantic-layering.nix;
             runnerSrc = ./python;
             harmonia = pkgs.harmonia or null;
           };

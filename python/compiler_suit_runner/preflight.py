@@ -1,7 +1,7 @@
 """Local pre-flight: enumerate the variant matrix via ``nix eval``.
 
 The runner needs the full superset of (pkg, arch, variant_suffix) tuples
-*before* it submits anything, because the dynamic_batch framework's
+*before* it submits anything, because the dynamic_runner framework's
 queue is fixed at coord.run() time (see plan §"How to inject Phase 2 +
 Phase 3 items into the queue", option A). This module implements the
 local pre-flight: it shells out to ``nix eval`` against this repo's

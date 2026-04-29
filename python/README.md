@@ -1,14 +1,14 @@
 # compiler_suit_runner
 
 Cluster-side runner that drives the [asm-dataset-nix][repo] matrix on SLURM
-via the [`dynamic_batch`][dynbatch] framework from `asm-tokenizer`. A single
+via the [`dynamic-runner`][dynrunner] framework. A single
 SLURM submission orchestrates ~300K Nix derivations across three phases —
 partition, toolchains, variants — with peer-to-peer Nix store sharing and
 optional Cachix federation, so a fresh cluster cold-boot converges to a full
 dataset without per-worker rebuilds.
 
 [repo]: https://github.com/sirati/asm-dataset-nix
-[dynbatch]: https://github.com/sirati/asm-tokenizer
+[dynrunner]: https://github.com/sirati/dynamic-runner
 
 ## Status
 
@@ -19,14 +19,14 @@ heterogeneous-cluster networking and Cachix throttling.
 ## Architecture
 
 Three phases per submission, all coordinated by one `SuitTask`
-`TaskDefinition` and a single `dynamic_batch.run(...)` call:
+`TaskDefinition` and a single `dynamic_runner.run(...)` call:
 
 ```
                           one SLURM submission
    ┌─────────────────────── primary host ────────────────────────┐
    │  compiler-suit-runner submit                                 │
    │   1. preflight: emit phase-1a manifests, hash inputs         │
-   │   2. dynamic_batch.run(SuitTask())                           │
+   │   2. dynamic_runner.run(SuitTask())                           │
    │      └─ builds image, sbatch, primary loop                   │
    └──────────────────────────────────────────────────────────────┘
                                   │
@@ -65,7 +65,7 @@ Editable install, runtime only (single-process / local smoke):
 pip install -e python/
 ```
 
-With the SLURM bridge (pulls `dynamic_batch` from `asm-tokenizer`):
+With the SLURM bridge (pulls `dynamic-runner` from its own flake):
 
 ```
 pip install -e 'python/[slurm]'
@@ -164,7 +164,7 @@ All paths relative to `python/compiler_suit_runner/`.
 |------------------------------|----------------|
 | `cli.py`                     | argparse front-end; `compiler-suit-runner` entry point. |
 | `__main__.py`                | `python -m compiler_suit_runner` for secondaries inside the container. |
-| `preflight.py`               | input hashing + cache lookup before `dynamic_batch.run`. |
+| `preflight.py`               | input hashing + cache lookup before `dynamic_runner.run`. |
 | `suit_task.py`               | the single `TaskDefinition` orchestrator (rank-aware). |
 | `manifest_gen.py`            | emits queue-item manifest files with rank-encoded sizes. |
 | `partition.py`               | phase 1a/1b utilities used by partition/merge workers. |
@@ -179,10 +179,10 @@ All paths relative to `python/compiler_suit_runner/`.
 
 ## Limitations
 
-* **Worker pinning.** The current `dynamic_batch_rs` scheduler does not
+* **Worker pinning.** The current `dynamic_runner._native` scheduler does not
   support hard worker-to-task-class pinning. Phase 2 and phase 3 share
   one worker pool; we approximate pinning via the rank-in-size encoding
-  (see [`docs/dynamic_batch_rs_pinning_requirements.md`][pinning]) but a
+  (see [`docs/dynamic_runner._native_pinning_requirements.md`][pinning]) but a
   proper scheduler-side feature is still pending.
 * **OOM long tail.** A small fraction of variants get OOM-killed under
   aggressive concurrency. Re-run with `--retry-oom` to retry just the
@@ -195,7 +195,7 @@ All paths relative to `python/compiler_suit_runner/`.
 * **Single-cluster tested only.** The `--gateway` / multi-cluster
   federation path exists in code but is not yet exercised end-to-end.
 
-[pinning]: ../docs/dynamic_batch_rs_pinning_requirements.md
+[pinning]: ../docs/dynamic_runner._native_pinning_requirements.md
 
 ## Testing
 

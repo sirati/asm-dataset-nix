@@ -1,6 +1,6 @@
 """Pre-flight manifest generation for the compiler-suit runner.
 
-The dynamic_batch framework discovers queue items by scanning a target
+The dynamic_runner framework discovers queue items by scanning a target
 directory for manifest files. Two pieces of metadata travel with each
 item:
 
