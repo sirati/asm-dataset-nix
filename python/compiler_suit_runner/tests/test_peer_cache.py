@@ -240,6 +240,16 @@ def _wait_until(predicate, timeout: float = 2.0, poll: float = 0.02) -> bool:
     return bool(predicate())
 
 
+def _read_substituters_file(path: pathlib.Path) -> list[str]:
+    """Helper: load the watcher-published substituters file."""
+    if not path.exists():
+        return []
+    return [
+        line for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
 def test_peerlist_watcher_picks_up_writes_and_deletions(
     shared_fs: pathlib.Path,
 ) -> None:
@@ -248,7 +258,7 @@ def test_peerlist_watcher_picks_up_writes_and_deletions(
     )
     # Initial state: no peers.
     assert watcher.peers == []
-    assert watcher.extra_args == []
+    assert _read_substituters_file(watcher.substituters_path) == []
     watcher.start()
     try:
         announce_self(shared_fs, _mk_peer(1))
@@ -263,10 +273,16 @@ def test_peerlist_watcher_picks_up_writes_and_deletions(
 
         announce_self(shared_fs, _mk_peer(2))
         assert _wait_until(lambda: len(watcher.peers) == 2, timeout=2.0)
-        # extra_args should now reflect both peers.
-        args = watcher.extra_args
+        # The published substituters file should now reflect both peers.
+        assert _wait_until(
+            lambda: any(
+                "host2.example:5002" in line
+                for line in _read_substituters_file(watcher.substituters_path)
+            ),
+            timeout=2.0,
+        )
+        args = _read_substituters_file(watcher.substituters_path)
         assert "--extra-substituters" in args
-        assert "http://host2.example:5002" in " ".join(args)
 
         # Self-announcement is filtered out via exclude_id.
         announce_self(
@@ -293,12 +309,13 @@ def test_peerlist_watcher_picks_up_writes_and_deletions(
         assert not watcher.is_alive()
 
 
-def test_peerlist_watcher_empty_extra_args_when_no_peers(
+def test_peerlist_watcher_publishes_empty_file_when_no_peers(
     shared_fs: pathlib.Path,
 ) -> None:
     watcher = PeerListWatcher(shared_fs, tick_seconds=0.05)
-    assert watcher.extra_args == []
-    # Don't even start the thread; the prime-on-init refresh suffices.
+    # The prime-on-init refresh writes (or overwrites) an empty file.
+    assert watcher.substituters_path.exists()
+    assert _read_substituters_file(watcher.substituters_path) == []
 
 
 # ---------------------------------------------------------------------------
