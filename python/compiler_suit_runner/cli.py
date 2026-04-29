@@ -7,7 +7,7 @@ front-end. Subcommands:
 
 * ``submit`` — primary host's flow: pre-flight (or incremental cache
   hit), emit manifests, dispatch the run via either the in-process
-  single-process loop or the dynamic_batch SLURM bridge.
+  single-process loop or the dynamic_runner SLURM bridge.
 * ``secondary`` — secondary container entry: bring up peer-cache state
   and live until told to stop. SLURM dispatch handles per-item work.
 * ``preflight`` — pre-flight only; print the manifest count by class.
@@ -16,7 +16,7 @@ front-end. Subcommands:
 
 Single-process execution is implemented inline via
 :func:`run_single_process` because it is small enough to keep with the
-CLI; SLURM execution defers to dynamic_batch's pipeline.
+CLI; SLURM execution defers to dynamic_runner's pipeline.
 """
 
 from __future__ import annotations
@@ -571,20 +571,20 @@ def cmd_submit(args: argparse.Namespace) -> int:
     if args.multi_computer == "single-process":
         rc = run_single_process(config, logger=log)
     elif args.multi_computer == "slurm":
-        # Defer to dynamic_batch's SLURM pipeline. Imported lazily so
-        # the test environment does not require dynamic_batch_rs.
+        # Defer to dynamic_runner's SLURM pipeline. Imported lazily so
+        # the test environment does not require the native extension.
         try:
-            from dynamic_batch.run import run as dynamic_batch_run  # type: ignore
+            from dynamic_runner import run as dynamic_runner_run  # type: ignore
         except Exception as exc:  # noqa: BLE001
             log.error(
-                "SLURM dispatch requires the dynamic_batch package: %s",
+                "SLURM dispatch requires the dynamic-runner package: %s",
                 exc,
             )
             return 1
         try:
             task = SuitTask(config)
             task.initialize_counters(manifest_dir)
-            dynamic_batch_run(task)
+            dynamic_runner_run(task)
         except Exception:  # noqa: BLE001
             log.exception("SLURM dispatch failed")
             return 1
@@ -666,7 +666,7 @@ def cmd_secondary(args: argparse.Namespace) -> int:
         # Iterate manifests once. The framework normally drives this via
         # its own dispatch loop; we only support single-process testing
         # here. SLURM's framework integration is handled by the parent
-        # via dynamic_batch.run; this entrypoint exists so containers can
+        # via dynamic_runner.run; this entrypoint exists so containers can
         # `python -m compiler_suit_runner secondary --secondary-id X`.
         task.initialize_counters(config.manifest_dir)
         for binary in task.find_binaries():

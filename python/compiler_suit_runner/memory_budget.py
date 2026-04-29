@@ -1,6 +1,6 @@
 """Size-encoding and memory-budget helpers for the compiler-suit runner.
 
-The dynamic_batch framework re-sorts pending items by their integer ``size``
+The dynamic_runner framework re-sorts pending items by their integer ``size``
 field in descending order before dispatch, and exposes only that single
 integer to ``TaskDefinition.estimate_memory``. We therefore pack two pieces
 of scheduling metadata into one ``size`` value:

@@ -23,8 +23,7 @@ slices without forcing the whole tree.
 flake.nix                     entry point; wires everything below
 lib/                          modular Nix library (~387K-derivation matrix)
 nix/
-├── docker-image.nix          layered podman image for the runner
-└── semantic-layering.nix     vendored layer-assignment helper
+└── docker-image.nix          layered podman image for the runner
 docs/                         design notes; cross-compilation caveats
 python/
 ├── pyproject.toml            compiler_suit_runner package metadata
@@ -70,12 +69,11 @@ supported:
 
 For driving the full matrix on a cluster, this repository ships a
 Python package — `compiler_suit_runner` — under `python/`. It plugs
-the matrix into the [`dynamic_batch`][dynbatch] framework from
-`asm-tokenizer`, runs a three-phase pipeline (partition → toolchain
-build → variant build) inside a single SLURM submission, and uses
-[`harmonia`][harmonia] to share Nix store paths between secondaries
-on the cluster. Optional Cachix federation pushes toolchain closures
-out to a public cache.
+the matrix into the [`dynamic-runner`][dynrunner] framework, runs a
+three-phase pipeline (partition → toolchain build → variant build)
+inside a single SLURM submission, and uses [`harmonia`][harmonia] to
+share Nix store paths between secondaries on the cluster. Optional
+Cachix federation pushes toolchain closures out to a public cache.
 
 Quick local smoke test (no cluster):
 
@@ -92,13 +90,13 @@ Full SLURM usage, output layout, the incremental cache, and the
 runner's module map are documented in
 [`python/README.md`](python/README.md).
 
-[dynbatch]: https://github.com/sirati/asm-tokenizer
+[dynrunner]: https://github.com/sirati/dynamic-runner
 [harmonia]: https://github.com/nix-community/harmonia
 
 ## Documentation
 
 * [`python/README.md`](python/README.md) — runner usage, phases, CLI.
-* [`docs/dynamic_batch_rs_pinning_requirements.md`](docs/dynamic_batch_rs_pinning_requirements.md)
+* [`docs/dynamic_runner_pinning_requirements.md`](docs/dynamic_runner_pinning_requirements.md)
   — scheduler-side worker-pinning request to the upstream framework.
 * [`docs/old-gcc-cross-compilation.md`](docs/old-gcc-cross-compilation.md)
   and [`docs/old-gcc-44-45-46-cross.md`](docs/old-gcc-44-45-46-cross.md)

@@ -1,6 +1,6 @@
 """The single ``TaskDefinition`` that orchestrates the compiler-suit run.
 
-The dynamic_batch framework dispatches one shared queue of items to a pool
+The dynamic_runner framework dispatches one shared queue of items to a pool
 of workers. We pack three logical phases (1a partition, 1b merge, 2 build,
 3 variant build, plus barrier sentinels) into that one queue by encoding a
 *phase rank* into the high bits of each item's ``size`` field. The Rust
@@ -27,7 +27,7 @@ bookkeeping that the framework does not provide:
   :meth:`teardown` (the inverse, idempotent).
 
 The framework's structural :class:`Protocol` (see
-``dynamic_batch/task_protocol.py``) is also implemented with sensible
+``dynamic_runner/task_protocol.py``) is also implemented with sensible
 defaults — many of those methods (``get_stages``, ``add_task_arguments``,
 ``build_worker_command_args``, ...) are framework wiring that this single
 in-process task never actually exercises, but the methods exist so a
@@ -135,19 +135,22 @@ _ITEM_CLASS_RANK: dict[str, tuple[int, Optional[str]]] = {
 def _make_binary_info(path: pathlib.Path, size: int):
     """Return a framework-compatible BinaryInfo, falling back to a stub.
 
-    The dynamic_batch framework defines :class:`shared.BinaryInfo` as the
-    canonical scheduling-item shape. When the framework is on
-    ``sys.path`` (i.e. the secondary container's environment) we use the
-    real class so the Rust scheduler treats the result identically to
-    other tasks. Otherwise (unit tests, local development without the
-    framework checked out) we synthesise an attribute-compatible stub
-    via :class:`types.SimpleNamespace`; only the ``path`` and ``size``
+    The dynamic_runner framework defines
+    :class:`dynamic_runner._shared.BinaryInfo` as the canonical
+    scheduling-item shape. When the framework is on ``sys.path`` (i.e.
+    the secondary container's environment) we use the real class so the
+    Rust scheduler treats the result identically to other tasks.
+    Otherwise (unit tests, local development without the framework
+    installed) we synthesise an attribute-compatible stub via
+    :class:`types.SimpleNamespace`; only the ``path`` and ``size``
     attributes are actually consulted by our dispatch surface, so the
     stub is sufficient.
     """
     try:
-        from shared import BinaryInfo  # type: ignore[import-not-found]
-        from shared.binary_info import BinaryIdentifier  # type: ignore[import-not-found]
+        from dynamic_runner._shared import (  # type: ignore[import-not-found]
+            BinaryIdentifier,
+            BinaryInfo,
+        )
     except Exception:  # noqa: BLE001 — framework absent
         return SimpleNamespace(path=path, size=size)
 
@@ -236,7 +239,7 @@ class PhaseCounter:
 
 
 class SuitTask:
-    """The single dynamic_batch :class:`TaskDefinition` for the run.
+    """The single dynamic_runner :class:`TaskDefinition` for the run.
 
     Lifecycle (orchestrated by the CLI):
 
@@ -312,7 +315,7 @@ class SuitTask:
         Sub-directories and dotfiles are ignored.
 
         Missing or non-existent ``input_dir`` returns an empty list rather
-        than raising — this matches what other dynamic_batch tasks do
+        than raising — this matches what other dynamic_runner tasks do
         when their input tree was never produced.
         """
         target = (
@@ -767,7 +770,7 @@ class SuitTask:
     # ==================================================================
     # Framework Protocol surface (sensible defaults).
     #
-    # The dynamic_batch task_protocol expects a handful of methods our
+    # The dynamic_runner task_protocol expects a handful of methods our
     # custom dispatch loop never actually calls; we still implement them
     # so a SuitTask satisfies the runtime_checkable Protocol's
     # ``isinstance(t, TaskDefinition)`` check unchanged.

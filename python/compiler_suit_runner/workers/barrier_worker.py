@@ -1,6 +1,6 @@
 """Barrier worker — sentinel item dispatch surface.
 
-The dynamic_batch framework has no item-level dependency support, so
+The dynamic_runner framework has no item-level dependency support, so
 phase ordering (1a -> 1b -> 2 -> 3) is enforced by sentinel items whose
 worker simply polls a flag file on the shared filesystem until it
 exists. This module is the load-bearing mechanic for that ordering;

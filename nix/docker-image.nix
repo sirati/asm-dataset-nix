@@ -4,13 +4,14 @@
   Implements B2.5 of the splendid-snacking-cascade plan.
 
   This image is built once per submission and shipped to SLURM nodes
-  via dynamic_batch's layered_transfer pipeline (per-blob upload
-  dedup, see asm-tokenizer/dynamic_batch/packaging/layered_transfer.py).
+  via dynamic_runner's layered_transfer pipeline (per-blob upload
+  dedup, see dynamic-runner/python/dynamic_runner/packaging/layered_transfer.py).
   Inside each container the runner orchestrates harmonia (peer
   binary cache), an optional cachix uploader, and per-variant
   `nix build` invocations.
 
-  Layers are assigned via `nix/semantic-layering.nix` so a small
+  Layers are assigned via the external `nix-docker-layered-image`
+  flake (overlay-injected as `pkgs.lib.semanticLayering`) so a small
   change to a single unit (e.g. project source) only invalidates
   that unit's layer instead of reshuffling popularity-contest
   buckets across the whole image.
@@ -27,7 +28,6 @@
 {
   pkgs,
   lib,
-  semantic-layering,
   name ? "asm-dataset-nix-runner",
   tag ? "latest",
   runnerSrc,
@@ -38,13 +38,14 @@
 }:
 
 let
-  semanticLayering = semantic-layering { inherit lib; };
+  # Provided by `nix-docker-layered-image`'s overlay applied in flake.nix.
+  semanticLayering = pkgs.lib.semanticLayering;
 
-  # Python with pytest + caller-supplied extras. The runner itself
-  # is pure-stdlib at present (B2.x), but cluster smoke-tests run
-  # `pytest` inside the container so we always include it.
+  # Python env: pytest for in-container smoke tests, dynamic-runner for the
+  # SLURM bridge (provided by the dynamic-runner flake's overlay), plus any
+  # caller-supplied extras.
   pythonEnv = pkgs.python313.withPackages (
-    py: [ py.pytest ] ++ (pythonPackages py)
+    py: [ py.pytest py.dynamic-runner ] ++ (pythonPackages py)
   );
 
   # Project source materialised under /app/python/compiler_suit_runner

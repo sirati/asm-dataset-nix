@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "compiler-suit-runner"
 version = "0.1.0"
-description = "Cluster-side runner that drives the asm-dataset-nix matrix on SLURM via the dynamic_batch framework."
+description = "Cluster-side runner that drives the asm-dataset-nix matrix on SLURM via the dynamic-runner framework."
 readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "MIT" }
@@ -36,7 +36,7 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest"]
-slurm = ["dynamic_batch @ git+https://github.com/sirati/asm-tokenizer"]
+slurm = ["dynamic-runner @ git+https://github.com/sirati/dynamic-runner@v0.1.1"]
 # Cachix federation uses the `cachix` CLI via subprocess; no Python
 # package dependency required. This entry is kept as a documentation
 # extra so users see the option.
