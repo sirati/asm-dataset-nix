@@ -44,15 +44,11 @@ class FakeClock:
         return v
 
 
-class StubPeerWatcher:
-    """Mimics PeerListWatcher.extra_args without spinning a thread."""
-
-    def __init__(self, extra_args: list[str]) -> None:
-        self._extra_args = list(extra_args)
-
-    @property
-    def extra_args(self) -> list[str]:
-        return list(self._extra_args)
+def _write_substituters_file(tmp_path, lines: list[str]):
+    """Helper: write a substituters file the build worker can read."""
+    target = tmp_path / "_substituters.txt"
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return target
 
 
 class RecordingRunner:
@@ -181,12 +177,12 @@ def test_build_attr_includes_peer_args(tmp_path):
         "k1 k2",
         "--substitute-on-destination",
     ]
-    watcher = StubPeerWatcher(peer_args)
+    substituters = _write_substituters_file(tmp_path, peer_args)
     runner = RecordingRunner()
     env = BuildWorkerEnv(
         flake_ref=".",
         dataset_output_dir=tmp_path,
-        peer_watcher=watcher,
+        substituters_file=substituters,
         run_subprocess=runner,
     )
     build_attr("foo", env)
@@ -422,7 +418,7 @@ def test_build_worker_phase3_variant_uses_last_stdout_line(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_build_worker_with_peer_watcher_includes_peer_args(tmp_path):
+def test_build_worker_with_substituters_file_includes_peer_args(tmp_path):
     peer_args = [
         "--extra-substituters",
         "http://h:5000",
@@ -430,7 +426,7 @@ def test_build_worker_with_peer_watcher_includes_peer_args(tmp_path):
         "k",
         "--substitute-on-destination",
     ]
-    watcher = StubPeerWatcher(peer_args)
+    substituters = _write_substituters_file(tmp_path, peer_args)
     manifest = _write_manifest(
         tmp_path / "m.json",
         item_class=ITEM_CLASS_PHASE2_TOOLCHAIN,
@@ -441,7 +437,7 @@ def test_build_worker_with_peer_watcher_includes_peer_args(tmp_path):
     env = BuildWorkerEnv(
         flake_ref=".",
         dataset_output_dir=tmp_path / "dataset",
-        peer_watcher=watcher,
+        substituters_file=substituters,
         run_subprocess=runner,
     )
     build_worker(manifest, env)

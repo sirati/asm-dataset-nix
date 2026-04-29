@@ -229,6 +229,20 @@ class SuitTask:
     def _build_worker(self):
         return build_worker
 
+    def _substituters_file_path(self) -> Optional[pathlib.Path]:
+        """Return the substituters-file path for the build worker.
+
+        Set by 8.5 once :class:`PeerListWatcher` publishes it; returns
+        ``None`` when the watcher has not yet written one (best-effort
+        peer substitution).
+        """
+        candidate = (
+            self.config.peers_dir / "_substituters.txt"
+            if self.config.peers_dir is not None
+            else None
+        )
+        return candidate
+
     # ==================================================================
     # Custom dispatch surface (used by the runner orchestrator)
     # ==================================================================
@@ -352,7 +366,7 @@ class SuitTask:
             env = BuildWorkerEnv(
                 flake_ref=self.config.flake_ref,
                 dataset_output_dir=self.config.dataset_dir,
-                peer_watcher=self._peer_watcher,
+                substituters_file=self._substituters_file_path(),
             )
             self._build_worker(path, env)
             return
