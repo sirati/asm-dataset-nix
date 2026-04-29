@@ -397,3 +397,75 @@ def partition_worker(
         nix_calls=nix_calls,
         error=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Subprocess entry point
+#
+# The dynamic_runner framework spawns this module as
+# ``python -m compiler_suit_runner.workers.partition_worker`` with its
+# standard worker-protocol argv (``--dynamic_queue`` / ``--socket-path``,
+# plus shared-fs / output paths). The framework's per-task IPC is owned
+# by ``dynamic_runner.comm``; in this best-effort shim the per-manifest
+# loop reads one manifest path per line from stdin so the entry point
+# can be exercised both by the framework's worker protocol (driven via
+# its dispatcher's stdin pipe) and by unit tests.
+#
+# TODO(phase 8 follow-up): wire this up to ``dynamic_runner.comm``
+# (ReadyResponse / ProcessTask / DoneResponse) once the comm shape for
+# TaskInfo dispatch is stabilised. For now the manifest-per-line stdin
+# protocol is enough to satisfy the per-worker entry-point contract.
+
+
+def _build_env_from_args(args) -> "WorkerEnv":
+    """Construct a :class:`WorkerEnv` from parsed argv."""
+    return WorkerEnv(
+        raw_partition_dir=pathlib.Path(args.raw_partition_dir),
+        flake_ref=args.flake_ref,
+    )
+
+
+def main() -> int:
+    """Subprocess entry point for the phase-1a partition worker."""
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        prog="compiler_suit_runner.workers.partition_worker",
+    )
+    parser.add_argument("--dynamic_queue", type=int, default=None)
+    parser.add_argument("--socket-path", type=str, default=None)
+    parser.add_argument("--source", type=str, default=None)
+    parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--log-file", type=str, default=None)
+    parser.add_argument(
+        "--raw-partition-dir",
+        type=str,
+        required=True,
+        help="Shared-FS directory for per-shard partition outputs.",
+    )
+    parser.add_argument(
+        "--flake-ref",
+        type=str,
+        required=True,
+        help="Flake reference passed through to ``nix derivation show``.",
+    )
+    parser.add_argument("--skip-existing", action="store_true")
+    args, _ = parser.parse_known_args()
+
+    env = _build_env_from_args(args)
+    rc = 0
+    for line in sys.stdin:
+        manifest_path = pathlib.Path(line.strip())
+        if not str(manifest_path):
+            continue
+        result = partition_worker(manifest_path, env)
+        if result.error is not None:
+            rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())
