@@ -443,14 +443,11 @@ def run_single_process(
     task = SuitTask(config)
     try:
         task.setup_peer_cache()
-        # Initialize counters from the manifest dir (handles every
-        # rank correctly).
-        task.initialize_counters(config.manifest_dir)
 
         binaries = task.find_binaries()
-        # Phase order: size DESC. The Rust scheduler does this; we mirror
-        # it here so the bookkeeping in dispatch_binary fires the next
-        # barrier flag at the right moment.
+        # Sort by size DESC so larger items dispatch first. The
+        # framework now owns inter-phase ordering via PhaseSpec; this
+        # in-process loop is kept only for tests.
         binaries.sort(
             key=lambda b: getattr(b, "size", 0),
             reverse=True,
@@ -583,7 +580,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
             return 1
         try:
             task = SuitTask(config)
-            task.initialize_counters(manifest_dir)
             dynamic_runner_run(task)
         except Exception:  # noqa: BLE001
             log.exception("SLURM dispatch failed")
@@ -663,12 +659,12 @@ def cmd_secondary(args: argparse.Namespace) -> int:
         return 1
 
     try:
-        # Iterate manifests once. The framework normally drives this via
-        # its own dispatch loop; we only support single-process testing
-        # here. SLURM's framework integration is handled by the parent
-        # via dynamic_runner.run; this entrypoint exists so containers can
-        # `python -m compiler_suit_runner secondary --secondary-id X`.
-        task.initialize_counters(config.manifest_dir)
+        # Iterate manifests once. The framework normally drives this
+        # via its own dispatch loop; we only support single-process
+        # testing here. SLURM's framework integration is handled by
+        # the parent via dynamic_runner.run; this entrypoint exists so
+        # containers can `python -m compiler_suit_runner secondary
+        # --secondary-id X`.
         for binary in task.find_binaries():
             task.dispatch_binary(binary)
     except Exception:  # noqa: BLE001
