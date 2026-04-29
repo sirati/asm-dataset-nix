@@ -417,50 +417,75 @@ def run_single_process(
     *,
     logger: Optional[logging.Logger] = None,
 ) -> int:
-    """Drive the entire pipeline in this process — no SLURM, no podman.
+    """Drive the pipeline in this process via the framework's runner.
 
-    1. Construct :class:`SuitTask`.
-    2. ``setup_peer_cache``.
-    3. ``find_binaries``; sort by encoded size DESC (matching the Rust
-       scheduler's behaviour).
-    4. ``initialize_counters`` so the bookkeeping fires when each phase
-       hits its expected count, writing the next phase's barrier flag.
-    5. Dispatch each item via ``dispatch_binary``.
-    6. ``teardown``.
+    Constructs a :class:`SuitTask`, hands it to ``dynamic_runner.run``,
+    and lets the framework own setup / teardown via the
+    ``on_run_start`` / ``on_run_end`` lifecycle hooks. Falls back to
+    the legacy in-process dispatch loop when ``dynamic_runner`` is
+    not importable (the consumer's hermetic test environment).
 
-    Returns 0 on success, 1 on any exception during item iteration.
+    Returns 0 on success, 1 on any unhandled exception.
     """
     log = logger or logging.getLogger(__name__)
     task = SuitTask(config)
+
     try:
-        task.setup_peer_cache()
-
-        binaries = task.find_binaries()
-        # Sort by size DESC so larger items dispatch first. The
-        # framework now owns inter-phase ordering via PhaseSpec; this
-        # in-process loop is kept only for tests.
-        binaries.sort(
-            key=lambda b: getattr(b, "size", 0),
-            reverse=True,
+        from dynamic_runner.run import run as dynamic_runner_run  # type: ignore[import-not-found]
+    except Exception as exc:  # noqa: BLE001 — framework absent
+        log.warning(
+            "dynamic_runner.run unavailable (%s);"
+            " falling back to legacy in-process dispatch loop",
+            exc,
         )
+        return _legacy_run_single_process(task, config, log)
 
-        log.info(
-            "single-process run: dispatching %d items", len(binaries)
-        )
-        for binary in binaries:
-            task.dispatch_binary(binary)
-
-        # Make sure dataset_dir exists even on an empty matrix.
+    try:
+        # The framework's ``run`` consumes argparse via sys.argv; we
+        # let it do so and rely on lifecycle hooks for setup.
+        dynamic_runner_run(task)
         config.dataset_dir.mkdir(parents=True, exist_ok=True)
+    except SystemExit as exc:
+        return int(exc.code) if exc.code is not None else 0
     except Exception:  # noqa: BLE001 — never raise out
         log.exception("single-process run failed")
         return 1
+    return 0
+
+
+def _legacy_run_single_process(
+    task: SuitTask,
+    config: SuitTaskConfig,
+    log: logging.Logger,
+) -> int:
+    """Fallback in-process dispatch loop (kept for hermetic tests).
+
+    Used only when ``dynamic_runner.run`` cannot be imported. Sets up
+    peer-cache state via the lifecycle hooks, dispatches each
+    discovered item via :meth:`SuitTask.dispatch_binary`, then tears
+    state back down.
+    """
+    try:
+        task.on_run_start()
+        binaries = task.find_binaries()
+        binaries.sort(key=lambda b: getattr(b, "size", 0), reverse=True)
+        log.info(
+            "legacy single-process run: dispatching %d items",
+            len(binaries),
+        )
+        for binary in binaries:
+            task.dispatch_binary(binary)
+        config.dataset_dir.mkdir(parents=True, exist_ok=True)
+        success = True
+    except Exception:  # noqa: BLE001 — never raise out
+        log.exception("legacy single-process run failed")
+        success = False
     finally:
         try:
-            task.teardown()
+            task.on_run_end(success)
         except Exception:  # noqa: BLE001
-            log.exception("teardown failed")
-    return 0
+            log.exception("on_run_end failed")
+    return 0 if success else 1
 
 
 # ---------------------------------------------------------------------------
@@ -620,10 +645,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
 def cmd_secondary(args: argparse.Namespace) -> int:
     """Secondary container entry.
 
-    For SLURM: framework's worker pool drives item dispatch via
-    ``SuitTask.dispatch_binary``. We just need to bring up peer-cache
-    state and live until the primary signals stop. For single-process
-    submission this command is unused.
+    Hands the SuitTask off to ``dynamic_runner.run`` so the
+    framework's secondary coordinator drives item dispatch; lifecycle
+    hooks own peer-cache setup / teardown.
     """
     log = _setup_logging(args.debug)
 
@@ -644,28 +668,20 @@ def cmd_secondary(args: argparse.Namespace) -> int:
 
     task = SuitTask(config)
     try:
-        task.setup_peer_cache()
-    except Exception:  # noqa: BLE001
-        log.exception("secondary setup failed")
+        from dynamic_runner.run import run as dynamic_runner_run  # type: ignore[import-not-found]
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "secondary mode requires dynamic_runner: %s", exc
+        )
         return 1
 
     try:
-        # Iterate manifests once. The framework normally drives this
-        # via its own dispatch loop; we only support single-process
-        # testing here. SLURM's framework integration is handled by
-        # the parent via dynamic_runner.run; this entrypoint exists so
-        # containers can `python -m compiler_suit_runner secondary
-        # --secondary-id X`.
-        for binary in task.find_binaries():
-            task.dispatch_binary(binary)
+        dynamic_runner_run(task)
+    except SystemExit as exc:
+        return int(exc.code) if exc.code is not None else 0
     except Exception:  # noqa: BLE001
-        log.exception("secondary dispatch loop failed")
+        log.exception("secondary dispatch failed")
         return 1
-    finally:
-        try:
-            task.teardown()
-        except Exception:  # noqa: BLE001
-            log.exception("teardown failed")
     return 0
 
 
