@@ -6,12 +6,7 @@ import pytest
 
 from compiler_suit_runner.memory_budget import (
     MEMORY_FLOOR_BYTES,
-    MEMORY_MASK,
-    PHASE_1A_PARTITION,
-    PHASE_2_BUILD,
-    PHASE_3_VARIANT,
     common_dep_memory_bytes,
-    encode_size,
     merge_memory_bytes,
     partition_shard_memory_bytes,
     tier_of,
@@ -109,59 +104,3 @@ def test_all_budgets_are_at_or_above_floor() -> None:
         assert budget_fn() >= MEMORY_FLOOR_BYTES, budget_fn.__name__
     for pkg in ("hello", "sqlite", "coreutils", "unknown-pkg"):
         assert variant_memory_bytes(pkg) >= MEMORY_FLOOR_BYTES, pkg
-
-
-def test_all_budgets_fit_in_48_bits() -> None:
-    """The size-encoding scheme reserves 48 bits for memory; budgets must fit."""
-    for budget_fn in (
-        toolchain_memory_bytes,
-        common_dep_memory_bytes,
-        partition_shard_memory_bytes,
-        merge_memory_bytes,
-    ):
-        assert budget_fn() <= MEMORY_MASK, budget_fn.__name__
-    for pkg in ("hello", "sqlite", "coreutils"):
-        assert variant_memory_bytes(pkg) <= MEMORY_MASK, pkg
-
-
-# --- ordering invariant tying budgets back to ranks --------------------------
-
-
-@pytest.mark.parametrize(
-    "in_range_memory",
-    [
-        MEMORY_FLOOR_BYTES,
-        1 * _GIB,
-        2 * _GIB,
-        4 * _GIB,
-        6 * _GIB,
-        MEMORY_MASK,
-    ],
-)
-def test_phase_1a_partition_dominates_phase_2_build(in_range_memory: int) -> None:
-    """The integration property the plan calls out explicitly:
-    encode_size(PHASE_1A_PARTITION, X) > encode_size(PHASE_2_BUILD, X) for any
-    in-range X. This ensures the partition phase always dispatches before the
-    toolchain build phase regardless of memory budgets."""
-    assert encode_size(PHASE_1A_PARTITION, in_range_memory) > encode_size(
-        PHASE_2_BUILD, in_range_memory
-    )
-
-
-def test_phase_2_build_dominates_phase_3_variant() -> None:
-    for memory in (MEMORY_FLOOR_BYTES, 2 * _GIB, MEMORY_MASK):
-        assert encode_size(PHASE_2_BUILD, memory) > encode_size(
-            PHASE_3_VARIANT, memory
-        )
-
-
-def test_real_budgets_still_respect_phase_order() -> None:
-    """Use the actual budget values (not synthetic) and confirm that phase
-    ranks dominate. This catches accidental tier inflation that breaks the
-    48-bit reservation."""
-    assert encode_size(
-        PHASE_1A_PARTITION, partition_shard_memory_bytes()
-    ) > encode_size(PHASE_2_BUILD, toolchain_memory_bytes())
-    assert encode_size(PHASE_2_BUILD, toolchain_memory_bytes()) > encode_size(
-        PHASE_3_VARIANT, variant_memory_bytes("coreutils")
-    )

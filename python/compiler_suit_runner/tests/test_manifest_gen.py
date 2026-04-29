@@ -1,13 +1,9 @@
 """Unit tests for ``compiler_suit_runner.manifest_gen``.
 
-Sparse-file note: manifest files have apparent sizes up to ~1.5 PB
-(``(6 << 48) | mem`` for the phase-1a partition rank). ext4 caps single
-files at 16 TiB, which is below the smallest non-zero rank's encoding.
-Production deployments target Lustre/GPFS (8 EiB max) or XFS (8 EiB).
-These tests therefore allocate ``tmp_path`` on a tmpfs (``/dev/shm`` or
-``$XDG_RUNTIME_DIR``) where sparse-file size limits are bound by RAM
-rather than the on-disk inode format. We override pytest's
-``tmp_path_factory`` basetemp via a session fixture below.
+Sparse-file note: manifest files have apparent sizes equal to their
+per-type memory budget (1-6 GiB). All common filesystems handle this
+fine, but we still re-root tmp on tmpfs to keep tests fast and avoid
+filling small disk-backed tmp dirs.
 """
 
 from __future__ import annotations
@@ -36,15 +32,7 @@ from compiler_suit_runner.manifest_gen import (
 )
 from compiler_suit_runner.memory_budget import (
     MEMORY_FLOOR_BYTES,
-    PHASE_1A_BARRIER,
-    PHASE_1A_PARTITION,
-    PHASE_1B_BARRIER,
-    PHASE_1B_MERGE,
-    PHASE_2_BARRIER,
-    PHASE_2_BUILD,
-    PHASE_3_VARIANT,
     common_dep_memory_bytes,
-    decode_size,
     merge_memory_bytes,
     partition_shard_memory_bytes,
     toolchain_memory_bytes,
@@ -158,9 +146,7 @@ def test_partition_shard_header_encodes_phase_and_memory():
 
     assert header.item_class == "phase1a_partition"
     assert header.name == "hello__x86_64"
-    rank, mem = decode_size(header.size)
-    assert rank == PHASE_1A_PARTITION
-    assert mem == partition_shard_memory_bytes()
+    assert header.size == partition_shard_memory_bytes()
     assert header.payload["pkg"] == "hello"
     assert header.payload["arch"] == "x86_64"
     assert len(header.payload["variants"]) == 3
@@ -180,9 +166,7 @@ def test_partition_barrier_header():
         "index": 2,
         "count": 5,
     }
-    rank, mem = decode_size(h.size)
-    assert rank == PHASE_1A_BARRIER
-    assert mem == MEMORY_FLOOR_BYTES
+    assert h.size == MEMORY_FLOOR_BYTES
 
 
 def test_partition_barrier_invalid_args():
@@ -199,9 +183,7 @@ def test_merge_header():
     assert h.item_class == "phase1b_merge"
     assert h.name == "phase1b_merge"
     assert h.payload == {}
-    rank, mem = decode_size(h.size)
-    assert rank == PHASE_1B_MERGE
-    assert mem == merge_memory_bytes()
+    assert h.size == merge_memory_bytes()
 
 
 def test_merge_barrier_header():
@@ -213,9 +195,7 @@ def test_merge_barrier_header():
         "index": 0,
         "count": 3,
     }
-    rank, mem = decode_size(h.size)
-    assert rank == PHASE_1B_BARRIER
-    assert mem == MEMORY_FLOOR_BYTES
+    assert h.size == MEMORY_FLOOR_BYTES
 
 
 def test_phase2_barrier_header():
@@ -227,9 +207,7 @@ def test_phase2_barrier_header():
         "index": 1,
         "count": 4,
     }
-    rank, mem = decode_size(h.size)
-    assert rank == PHASE_2_BARRIER
-    assert mem == MEMORY_FLOOR_BYTES
+    assert h.size == MEMORY_FLOOR_BYTES
 
 
 def test_toolchain_header_without_drv():
@@ -245,9 +223,7 @@ def test_toolchain_header_without_drv():
         "attr": "_crossToolchainMap.x86_64-linux.aarch64.gcc14",
     }
     assert "drv" not in h.payload
-    rank, mem = decode_size(h.size)
-    assert rank == PHASE_2_BUILD
-    assert mem == toolchain_memory_bytes()
+    assert h.size == toolchain_memory_bytes()
 
 
 def test_toolchain_header_with_drv():
@@ -269,9 +245,7 @@ def test_common_dep_header():
         "label": "glibc",
         "attr": "/nix/store/glibc-x.drv",
     }
-    rank, mem = decode_size(h.size)
-    assert rank == PHASE_2_BUILD
-    assert mem == common_dep_memory_bytes()
+    assert h.size == common_dep_memory_bytes()
 
 
 def test_variant_header_tier1():
@@ -279,10 +253,8 @@ def test_variant_header_tier1():
     h = make_variant_header(v, "x86_64-linux")
     assert h.item_class == "phase3_variant"
     assert h.name == v["label"]
-    rank, mem = decode_size(h.size)
-    assert rank == PHASE_3_VARIANT
-    assert mem == variant_memory_bytes("hello")
-    assert mem == 1 * 1024 * 1024 * 1024
+    assert h.size == variant_memory_bytes("hello")
+    assert h.size == 1 * 1024 * 1024 * 1024
     assert h.payload["sys"] == "x86_64-linux"
     assert h.payload["pkg"] == "hello"
     assert h.payload["arch"] == "x86_64"
@@ -299,9 +271,8 @@ def test_variant_header_tier1():
 def test_variant_header_tier2():
     v = _variant("sqlite", "aarch64", "O3", tier=2)
     h = make_variant_header(v, "aarch64-linux")
-    _, mem = decode_size(h.size)
-    assert mem == variant_memory_bytes("sqlite")
-    assert mem == 2 * 1024 * 1024 * 1024
+    assert h.size == variant_memory_bytes("sqlite")
+    assert h.size == 2 * 1024 * 1024 * 1024
     assert h.payload["attr"] == (
         f"dataset.aarch64-linux.sqlite.aarch64.{v['label']}"
     )
@@ -310,9 +281,8 @@ def test_variant_header_tier2():
 def test_variant_header_tier3():
     v = _variant("coreutils", "x86_64", "O2", tier=3)
     h = make_variant_header(v, "x86_64-linux")
-    _, mem = decode_size(h.size)
-    assert mem == variant_memory_bytes("coreutils")
-    assert mem == 4 * 1024 * 1024 * 1024
+    assert h.size == variant_memory_bytes("coreutils")
+    assert h.size == 4 * 1024 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------

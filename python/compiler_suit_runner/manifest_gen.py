@@ -1,25 +1,22 @@
 """Pre-flight manifest generation for the compiler-suit runner.
 
 The dynamic_runner framework discovers queue items by scanning a target
-directory for manifest files. Two pieces of metadata travel with each
-item:
+directory for manifest files. Each manifest carries:
 
-* The JSON contents of the file describe the item's class (which worker
-  should pick it up) and class-specific payload (pkg/arch/drv/...).
-* The file's *apparent* on-disk size encodes the scheduling integer
-  ``size = (phase_rank << 48) | (memory_bytes & ((1 << 48) - 1))``
-  (see :mod:`compiler_suit_runner.memory_budget`). The framework reads
-  this via ``os.stat().st_size`` to decide both phase ordering and
-  per-item memory budget.
+* JSON contents describing the item's class (which worker should pick
+  it up) and class-specific payload (pkg/arch/drv/...).
+* An apparent on-disk size equal to the per-type memory budget in
+  bytes. ``estimate_memory`` on the :class:`SuitTask` reads
+  :class:`TaskInfo.size` to drive memory-aware packing; phase / type
+  ordering is owned by :class:`PhaseSpec` declared on the task.
 
-We therefore write the JSON header to the file, then ``os.ftruncate`` the
-file to the encoded size. Because the JSON content is at most a few
-hundred bytes and the encoded size is on the order of gigabytes, the
-file is *sparse* — no actual disk usage is incurred for the trailing
-zero-fill.
+We write the JSON header to the file, then ``os.ftruncate`` the file
+to that memory-bytes value. Because the JSON content is sub-kilobyte
+and the budget is on the order of gigabytes, the file is *sparse* —
+no actual disk usage is incurred for the trailing zero-fill.
 
 This module produces manifests for all four item classes in the plan's
-"Updated rank table (final)":
+phase sequence:
 
 * ``phase1a_partition`` — one per (pkg, arch) shard
 * ``phase1a_barrier``   — ``num_workers`` sentinels for the phase-1a barrier
@@ -31,8 +28,7 @@ This module produces manifests for all four item classes in the plan's
 * ``phase3_variant``    — one per matrix variant
 
 Iteration order in the returned :class:`ManifestSet` follows the phase
-sequence; the Rust scheduler re-sorts by ``size`` DESC anyway, but the
-pre-sort order keeps debug logging readable.
+sequence.
 """
 
 from __future__ import annotations
@@ -46,15 +42,7 @@ from typing import Final, Literal
 
 from compiler_suit_runner.memory_budget import (
     MEMORY_FLOOR_BYTES,
-    PHASE_1A_BARRIER,
-    PHASE_1A_PARTITION,
-    PHASE_1B_BARRIER,
-    PHASE_1B_MERGE,
-    PHASE_2_BARRIER,
-    PHASE_2_BUILD,
-    PHASE_3_VARIANT,
     common_dep_memory_bytes,
-    encode_size,
     merge_memory_bytes,
     partition_shard_memory_bytes,
     toolchain_memory_bytes,
@@ -97,10 +85,10 @@ _ALL_ITEM_CLASSES: tuple[ItemClass, ...] = (
 class ManifestHeader:
     """JSON-serialisable description of one queue item.
 
-    ``size`` is the packed scheduling integer (see :mod:`memory_budget`).
-    It must equal the on-disk apparent size of the manifest file —
-    :func:`write_manifest` enforces this via ``os.ftruncate``, and
-    :func:`read_manifest` verifies it on load.
+    ``size`` is the per-type memory budget in bytes (see
+    :mod:`memory_budget`). It must equal the on-disk apparent size of
+    the manifest file — :func:`write_manifest` enforces this via
+    ``os.ftruncate``, and :func:`read_manifest` verifies it on load.
     """
 
     item_class: ItemClass
@@ -129,7 +117,7 @@ def make_partition_shard_header(shard: Shard) -> ManifestHeader:
     return ManifestHeader(
         item_class="phase1a_partition",
         name=shard.name,
-        size=encode_size(PHASE_1A_PARTITION, partition_shard_memory_bytes()),
+        size=partition_shard_memory_bytes(),
         payload=payload,
     )
 
@@ -152,7 +140,7 @@ def make_partition_barrier_header(index: int, count: int) -> ManifestHeader:
     return ManifestHeader(
         item_class="phase1a_barrier",
         name=name,
-        size=encode_size(PHASE_1A_BARRIER, MEMORY_FLOOR_BYTES),
+        size=MEMORY_FLOOR_BYTES,
         payload={
             "flag_name": "phase1a_done",
             "index": index,
@@ -166,7 +154,7 @@ def make_merge_header() -> ManifestHeader:
     return ManifestHeader(
         item_class="phase1b_merge",
         name="phase1b_merge",
-        size=encode_size(PHASE_1B_MERGE, merge_memory_bytes()),
+        size=merge_memory_bytes(),
         payload={},
     )
 
@@ -183,7 +171,7 @@ def make_merge_barrier_header(index: int, count: int) -> ManifestHeader:
     return ManifestHeader(
         item_class="phase1b_barrier",
         name=name,
-        size=encode_size(PHASE_1B_BARRIER, MEMORY_FLOOR_BYTES),
+        size=MEMORY_FLOOR_BYTES,
         payload={
             "flag_name": "phase1b_done",
             "index": index,
@@ -216,7 +204,7 @@ def make_toolchain_header(
     return ManifestHeader(
         item_class="phase2_toolchain",
         name=f"toolchain__{arch}__{compiler_label}",
-        size=encode_size(PHASE_2_BUILD, toolchain_memory_bytes()),
+        size=toolchain_memory_bytes(),
         payload=payload,
     )
 
@@ -230,7 +218,7 @@ def make_common_dep_header(drv: str, label: str) -> ManifestHeader:
     return ManifestHeader(
         item_class="phase2_common_dep",
         name=f"common_dep__{label}",
-        size=encode_size(PHASE_2_BUILD, common_dep_memory_bytes()),
+        size=common_dep_memory_bytes(),
         payload={
             "drv": drv,
             "label": label,
@@ -251,7 +239,7 @@ def make_phase2_barrier_header(index: int, count: int) -> ManifestHeader:
     return ManifestHeader(
         item_class="phase2_barrier",
         name=name,
-        size=encode_size(PHASE_2_BARRIER, MEMORY_FLOOR_BYTES),
+        size=MEMORY_FLOOR_BYTES,
         payload={
             "flag_name": "phase2_done",
             "index": index,
@@ -297,7 +285,7 @@ def make_variant_header(
     return ManifestHeader(
         item_class="phase3_variant",
         name=label,
-        size=encode_size(PHASE_3_VARIANT, variant_memory_bytes(pkg)),
+        size=variant_memory_bytes(pkg),
         payload=payload,
     )
 
@@ -322,10 +310,11 @@ def write_manifest(
 
     The JSON content (a few hundred bytes) is written first, then the
     file is extended with ``os.ftruncate`` so its apparent size matches
-    ``header.size``. The trailing region is sparse — no real disk usage.
+    ``header.size`` (the per-type memory budget). The trailing region
+    is sparse — no real disk usage.
 
     The write is atomic against concurrent readers: contents are placed
-    in a sibling ``.tmp`` file (truncated to the encoded size before
+    in a sibling ``.tmp`` file (truncated to the budget size before
     rename) and ``os.replace``\\ d into the final location.
     """
     target_dir = pathlib.Path(target_dir)
@@ -364,10 +353,10 @@ _HEADER_READ_LIMIT_BYTES: Final[int] = 64 * 1024
 def read_manifest(path: pathlib.Path) -> ManifestHeader:
     """Inverse of :func:`write_manifest`.
 
-    Verifies that the file's apparent size matches the header's encoded
-    size — a mismatch indicates corruption (e.g. a writer crashed before
-    the ``ftruncate``, or an external tool rewrote the file without
-    preserving its sparse extent).
+    Verifies that the file's apparent size matches the header's
+    declared ``size`` — a mismatch indicates corruption (e.g. a writer
+    crashed before the ``ftruncate``, or an external tool rewrote the
+    file without preserving its sparse extent).
 
     Only the leading ``_HEADER_READ_LIMIT_BYTES`` are read from disk; the
     trailing sparse zero-fill is never loaded into memory. The leading
@@ -403,7 +392,7 @@ def read_manifest(path: pathlib.Path) -> ManifestHeader:
     if stat.st_size != parsed["size"]:
         raise ValueError(
             f"{path}: apparent size {stat.st_size} does not match"
-            f" encoded size {parsed['size']}; manifest is corrupt"
+            f" declared size {parsed['size']}; manifest is corrupt"
         )
 
     return ManifestHeader(
@@ -455,8 +444,7 @@ def emit_all_manifests(
     Ordering of the returned ``headers`` tuple is deterministic and
     follows the phase sequence: phase1a, phase1a_barrier, phase1b_merge,
     phase1b_barrier, phase2 (toolchains then common_deps), phase2_barrier,
-    phase3 variants. The Rust scheduler re-sorts by ``size`` DESC at
-    dispatch, so this in-memory order is purely for debug clarity.
+    phase3 variants.
 
     ``num_workers`` controls how many barrier sentinels are emitted at
     each barrier rank — one per worker, so all workers eventually pull a
