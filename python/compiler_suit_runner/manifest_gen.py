@@ -15,16 +15,15 @@ to that memory-bytes value. Because the JSON content is sub-kilobyte
 and the budget is on the order of gigabytes, the file is *sparse* —
 no actual disk usage is incurred for the trailing zero-fill.
 
-This module produces manifests for all four item classes in the plan's
-phase sequence:
+This module produces manifests for all five item classes in the plan's
+phase sequence (the dynamic_runner framework now owns phase ordering
+and drain detection via :class:`PhaseSpec.depends_on`, so explicit
+barrier sentinels are no longer needed):
 
 * ``phase1a_partition`` — one per (pkg, arch) shard
-* ``phase1a_barrier``   — ``num_workers`` sentinels for the phase-1a barrier
 * ``phase1b_merge``     — exactly one merge item
-* ``phase1b_barrier``   — ``num_workers`` sentinels
 * ``phase2_toolchain``  — one per (arch, compiler_label) cross-toolchain
 * ``phase2_common_dep`` — one per common host dep drv
-* ``phase2_barrier``    — ``num_workers`` sentinels
 * ``phase3_variant``    — one per matrix variant
 
 Iteration order in the returned :class:`ManifestSet` follows the phase
@@ -56,12 +55,9 @@ from compiler_suit_runner.partition import Shard, VariantSpec, split_into_shards
 
 ItemClass = Literal[
     "phase1a_partition",
-    "phase1a_barrier",
     "phase1b_merge",
-    "phase1b_barrier",
     "phase2_toolchain",
     "phase2_common_dep",
-    "phase2_barrier",
     "phase3_variant",
 ]
 
@@ -71,12 +67,9 @@ ItemClass = Literal[
 # rather than raising ``KeyError``.
 _ALL_ITEM_CLASSES: tuple[ItemClass, ...] = (
     "phase1a_partition",
-    "phase1a_barrier",
     "phase1b_merge",
-    "phase1b_barrier",
     "phase2_toolchain",
     "phase2_common_dep",
-    "phase2_barrier",
     "phase3_variant",
 )
 
@@ -122,33 +115,6 @@ def make_partition_shard_header(shard: Shard) -> ManifestHeader:
     )
 
 
-def make_partition_barrier_header(index: int, count: int) -> ManifestHeader:
-    """Build the ``index``-th phase-1a barrier sentinel.
-
-    ``count`` sentinels are emitted (one per worker) so every worker
-    eventually pulls one and parks on the flag-file poll. The framework
-    re-sorts by ``size`` DESC so all barriers of one rank get dispatched
-    together; we still tag each sentinel with its index for log clarity.
-    """
-    if count <= 0:
-        raise ValueError(f"barrier count must be positive, got {count}")
-    if not 0 <= index < count:
-        raise ValueError(
-            f"barrier index {index} out of range for count {count}"
-        )
-    name = f"phase1a_barrier_{index:04d}_of_{count:04d}"
-    return ManifestHeader(
-        item_class="phase1a_barrier",
-        name=name,
-        size=MEMORY_FLOOR_BYTES,
-        payload={
-            "flag_name": "phase1a_done",
-            "index": index,
-            "count": count,
-        },
-    )
-
-
 def make_merge_header() -> ManifestHeader:
     """Build the singleton phase-1b merge manifest."""
     return ManifestHeader(
@@ -156,27 +122,6 @@ def make_merge_header() -> ManifestHeader:
         name="phase1b_merge",
         size=merge_memory_bytes(),
         payload={},
-    )
-
-
-def make_merge_barrier_header(index: int, count: int) -> ManifestHeader:
-    """Build the ``index``-th phase-1b barrier sentinel."""
-    if count <= 0:
-        raise ValueError(f"barrier count must be positive, got {count}")
-    if not 0 <= index < count:
-        raise ValueError(
-            f"barrier index {index} out of range for count {count}"
-        )
-    name = f"phase1b_barrier_{index:04d}_of_{count:04d}"
-    return ManifestHeader(
-        item_class="phase1b_barrier",
-        name=name,
-        size=MEMORY_FLOOR_BYTES,
-        payload={
-            "flag_name": "phase1b_done",
-            "index": index,
-            "count": count,
-        },
     )
 
 
@@ -223,27 +168,6 @@ def make_common_dep_header(drv: str, label: str) -> ManifestHeader:
             "drv": drv,
             "label": label,
             "attr": drv,
-        },
-    )
-
-
-def make_phase2_barrier_header(index: int, count: int) -> ManifestHeader:
-    """Build the ``index``-th phase-2 barrier sentinel."""
-    if count <= 0:
-        raise ValueError(f"barrier count must be positive, got {count}")
-    if not 0 <= index < count:
-        raise ValueError(
-            f"barrier index {index} out of range for count {count}"
-        )
-    name = f"phase2_barrier_{index:04d}_of_{count:04d}"
-    return ManifestHeader(
-        item_class="phase2_barrier",
-        name=name,
-        size=MEMORY_FLOOR_BYTES,
-        payload={
-            "flag_name": "phase2_done",
-            "index": index,
-            "count": count,
         },
     )
 
@@ -437,23 +361,21 @@ def emit_all_manifests(
     variants: Iterable[VariantSpec],
     toolchain_specs: Iterable[tuple[str, str]],
     common_deps: Iterable[tuple[str, str]],
-    num_workers: int,
+    num_workers: int = 1,
 ) -> ManifestSet:
     """Produce one ManifestHeader per queue item; write each to disk.
 
     Ordering of the returned ``headers`` tuple is deterministic and
-    follows the phase sequence: phase1a, phase1a_barrier, phase1b_merge,
-    phase1b_barrier, phase2 (toolchains then common_deps), phase2_barrier,
-    phase3 variants.
+    follows the phase sequence: phase1a, phase1b_merge, phase2
+    (toolchains then common_deps), phase3 variants. Phase ordering is
+    enforced by the framework's :class:`PhaseSpec.depends_on` graph;
+    no explicit barrier sentinels are emitted.
 
-    ``num_workers`` controls how many barrier sentinels are emitted at
-    each barrier rank — one per worker, so all workers eventually pull a
-    barrier item and synchronise on the flag file.
+    ``num_workers`` is accepted for API compatibility with older
+    callers; it is no longer used (the framework sizes its worker pool
+    independently).
     """
-    if num_workers < 1:
-        raise ValueError(
-            f"num_workers must be >= 1, got {num_workers}"
-        )
+    del num_workers  # accepted for compatibility; no longer used
 
     target_dir = pathlib.Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -467,16 +389,8 @@ def emit_all_manifests(
     for shard in shards:
         headers.append(make_partition_shard_header(shard))
 
-    # Phase 1a barrier — one sentinel per worker.
-    for index in range(num_workers):
-        headers.append(make_partition_barrier_header(index, num_workers))
-
     # Phase 1b — singleton merge.
     headers.append(make_merge_header())
-
-    # Phase 1b barrier.
-    for index in range(num_workers):
-        headers.append(make_merge_barrier_header(index, num_workers))
 
     # Phase 2 — toolchains, then common deps.
     for arch, compiler_label in toolchain_specs:
@@ -485,10 +399,6 @@ def emit_all_manifests(
         )
     for drv, label in common_deps:
         headers.append(make_common_dep_header(drv, label))
-
-    # Phase 2 barrier.
-    for index in range(num_workers):
-        headers.append(make_phase2_barrier_header(index, num_workers))
 
     # Phase 3 — variants.
     for variant in variants_tuple:

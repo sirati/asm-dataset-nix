@@ -20,11 +20,8 @@ from compiler_suit_runner.manifest_gen import (
     ManifestSet,
     emit_all_manifests,
     make_common_dep_header,
-    make_merge_barrier_header,
     make_merge_header,
-    make_partition_barrier_header,
     make_partition_shard_header,
-    make_phase2_barrier_header,
     make_toolchain_header,
     make_variant_header,
     read_manifest,
@@ -157,57 +154,12 @@ def test_partition_shard_header_encodes_phase_and_memory():
         assert v["arch"] == "x86_64"
 
 
-def test_partition_barrier_header():
-    h = make_partition_barrier_header(2, 5)
-    assert h.item_class == "phase1a_barrier"
-    assert h.name == "phase1a_barrier_0002_of_0005"
-    assert h.payload == {
-        "flag_name": "phase1a_done",
-        "index": 2,
-        "count": 5,
-    }
-    assert h.size == MEMORY_FLOOR_BYTES
-
-
-def test_partition_barrier_invalid_args():
-    with pytest.raises(ValueError):
-        make_partition_barrier_header(0, 0)
-    with pytest.raises(ValueError):
-        make_partition_barrier_header(5, 5)  # index out of range
-    with pytest.raises(ValueError):
-        make_partition_barrier_header(-1, 3)
-
-
 def test_merge_header():
     h = make_merge_header()
     assert h.item_class == "phase1b_merge"
     assert h.name == "phase1b_merge"
     assert h.payload == {}
     assert h.size == merge_memory_bytes()
-
-
-def test_merge_barrier_header():
-    h = make_merge_barrier_header(0, 3)
-    assert h.item_class == "phase1b_barrier"
-    assert h.name == "phase1b_barrier_0000_of_0003"
-    assert h.payload == {
-        "flag_name": "phase1b_done",
-        "index": 0,
-        "count": 3,
-    }
-    assert h.size == MEMORY_FLOOR_BYTES
-
-
-def test_phase2_barrier_header():
-    h = make_phase2_barrier_header(1, 4)
-    assert h.item_class == "phase2_barrier"
-    assert h.name == "phase2_barrier_0001_of_0004"
-    assert h.payload == {
-        "flag_name": "phase2_done",
-        "index": 1,
-        "count": 4,
-    }
-    assert h.size == MEMORY_FLOOR_BYTES
 
 
 def test_toolchain_header_without_drv():
@@ -404,7 +356,6 @@ def _build_full_input():
 
 def test_emit_all_manifests_full_shape(tmp_path: pathlib.Path):
     variants, toolchain_specs, common_deps = _build_full_input()
-    num_workers = 4
 
     result = emit_all_manifests(
         target_dir=tmp_path,
@@ -412,19 +363,15 @@ def test_emit_all_manifests_full_shape(tmp_path: pathlib.Path):
         variants=variants,
         toolchain_specs=toolchain_specs,
         common_deps=common_deps,
-        num_workers=num_workers,
     )
     assert isinstance(result, ManifestSet)
     assert result.target_dir == tmp_path
 
     grouped = result.by_class
     assert len(grouped["phase1a_partition"]) == 4
-    assert len(grouped["phase1a_barrier"]) == num_workers
     assert len(grouped["phase1b_merge"]) == 1
-    assert len(grouped["phase1b_barrier"]) == num_workers
     assert len(grouped["phase2_toolchain"]) == 4
     assert len(grouped["phase2_common_dep"]) == 2
-    assert len(grouped["phase2_barrier"]) == num_workers
     assert len(grouped["phase3_variant"]) == 12
 
     # Every header has a corresponding file with the right apparent size.
@@ -445,18 +392,14 @@ def test_emit_all_manifests_iteration_order(tmp_path: pathlib.Path):
         variants=variants,
         toolchain_specs=toolchain_specs,
         common_deps=common_deps,
-        num_workers=2,
     )
     classes = [h.item_class for h in result.headers]
     # Verify the canonical phase order in the in-memory listing.
     expected_order = [
         "phase1a_partition",
-        "phase1a_barrier",
         "phase1b_merge",
-        "phase1b_barrier",
         "phase2_toolchain",
         "phase2_common_dep",
-        "phase2_barrier",
         "phase3_variant",
     ]
     seen_order: list[str] = []
@@ -466,37 +409,11 @@ def test_emit_all_manifests_iteration_order(tmp_path: pathlib.Path):
     assert seen_order == expected_order
 
 
-def test_emit_all_manifests_zero_workers_raises(tmp_path: pathlib.Path):
-    with pytest.raises(ValueError):
-        emit_all_manifests(
-            target_dir=tmp_path,
-            sys_name="x86_64-linux",
-            variants=[],
-            toolchain_specs=[],
-            common_deps=[],
-            num_workers=0,
-        )
-
-
-def test_emit_all_manifests_negative_workers_raises(
-    tmp_path: pathlib.Path,
-):
-    with pytest.raises(ValueError):
-        emit_all_manifests(
-            target_dir=tmp_path,
-            sys_name="x86_64-linux",
-            variants=[],
-            toolchain_specs=[],
-            common_deps=[],
-            num_workers=-1,
-        )
-
-
 def test_emit_all_manifests_empty_inputs(tmp_path: pathlib.Path):
     """A degenerate case: no variants, no toolchains, no deps.
 
-    The barriers + merge are still emitted (they're the framework's
-    synchronisation primitives, not data-driven items).
+    The merge manifest is still emitted (the framework owns phase
+    drain detection now, so no barrier sentinels are produced).
     """
     result = emit_all_manifests(
         target_dir=tmp_path,
@@ -504,17 +421,13 @@ def test_emit_all_manifests_empty_inputs(tmp_path: pathlib.Path):
         variants=[],
         toolchain_specs=[],
         common_deps=[],
-        num_workers=1,
     )
     grouped = result.by_class
     assert grouped["phase1a_partition"] == ()
     assert grouped["phase2_toolchain"] == ()
     assert grouped["phase2_common_dep"] == ()
     assert grouped["phase3_variant"] == ()
-    assert len(grouped["phase1a_barrier"]) == 1
     assert len(grouped["phase1b_merge"]) == 1
-    assert len(grouped["phase1b_barrier"]) == 1
-    assert len(grouped["phase2_barrier"]) == 1
 
 
 def test_manifest_set_by_class_includes_all_known_classes(
@@ -528,17 +441,13 @@ def test_manifest_set_by_class_includes_all_known_classes(
         variants=[],
         toolchain_specs=[],
         common_deps=[],
-        num_workers=1,
     )
     grouped = result.by_class
     expected_keys = {
         "phase1a_partition",
-        "phase1a_barrier",
         "phase1b_merge",
-        "phase1b_barrier",
         "phase2_toolchain",
         "phase2_common_dep",
-        "phase2_barrier",
         "phase3_variant",
     }
     assert set(grouped.keys()) == expected_keys
@@ -555,6 +464,5 @@ def test_emit_all_manifests_target_dir_created(tmp_path: pathlib.Path):
         variants=[],
         toolchain_specs=[],
         common_deps=[],
-        num_workers=1,
     )
     assert target.is_dir()

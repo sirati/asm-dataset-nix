@@ -70,13 +70,6 @@ from compiler_suit_runner.peer_cache import (
     generate_signing_key,
     withdraw_self,
 )
-from compiler_suit_runner.workers.barrier_worker import (
-    PHASE_1A_DONE_FLAG,
-    PHASE_1B_DONE_FLAG,
-    PHASE_2_DONE_FLAG,
-    barrier_worker,
-    write_flag,
-)
 from compiler_suit_runner.workers.build_worker import (
     BuildWorkerEnv,
     build_worker,
@@ -118,16 +111,14 @@ _PHASE2_BUILD_CLASSES: frozenset[str] = frozenset(
 )
 
 # Map each item_class to (rank, flag_to_write_when_complete).
-# Sentinel ranks (the barrier classes) write nothing — their *count*
-# is the trigger for the previous phase's flag.
+# Phase ordering is now framework-owned via PhaseSpec.depends_on; the
+# rank table is residual bookkeeping until PhaseCounter is removed in
+# 8.3 and discover_items takes over in 8.6.
 _ITEM_CLASS_RANK: dict[str, tuple[int, Optional[str]]] = {
-    "phase1a_partition": (6, PHASE_1A_DONE_FLAG),
-    "phase1a_barrier": (5, None),
-    "phase1b_merge": (4, PHASE_1B_DONE_FLAG),
-    "phase1b_barrier": (3, None),
-    "phase2_toolchain": (2, PHASE_2_DONE_FLAG),
-    "phase2_common_dep": (2, PHASE_2_DONE_FLAG),
-    "phase2_barrier": (1, None),
+    "phase1a_partition": (6, None),
+    "phase1b_merge": (4, None),
+    "phase2_toolchain": (2, None),
+    "phase2_common_dep": (2, None),
     "phase3_variant": (0, None),
 }
 
@@ -297,10 +288,6 @@ class SuitTask:
     def _build_worker(self):
         return build_worker
 
-    @property
-    def _barrier_worker(self):
-        return barrier_worker
-
     # ==================================================================
     # Custom dispatch surface (used by the runner orchestrator)
     # ==================================================================
@@ -439,15 +426,6 @@ class SuitTask:
             self._partition_worker(path, env)
             return
 
-        if item_class == "phase1a_barrier":
-            self._barrier_worker(
-                PHASE_1A_DONE_FLAG,
-                self.config.flags_dir,
-                poll_interval_seconds=self.config.poll_interval_seconds,
-                timeout_seconds=self.config.barrier_timeout_seconds,
-            )
-            return
-
         if item_class == "phase1b_merge":
             env = MergeWorkerEnv(
                 raw_partition_dir=self.config.raw_partition_dir,
@@ -458,24 +436,6 @@ class SuitTask:
                 common_threshold=self.config.common_threshold,
             )
             self._merge_worker(path, env)
-            return
-
-        if item_class == "phase1b_barrier":
-            self._barrier_worker(
-                PHASE_1B_DONE_FLAG,
-                self.config.flags_dir,
-                poll_interval_seconds=self.config.poll_interval_seconds,
-                timeout_seconds=self.config.barrier_timeout_seconds,
-            )
-            return
-
-        if item_class == "phase2_barrier":
-            self._barrier_worker(
-                PHASE_2_DONE_FLAG,
-                self.config.flags_dir,
-                poll_interval_seconds=self.config.poll_interval_seconds,
-                timeout_seconds=self.config.barrier_timeout_seconds,
-            )
             return
 
         if item_class in _PHASE2_BUILD_CLASSES or item_class == "phase3_variant":
@@ -506,33 +466,18 @@ class SuitTask:
         self._increment_rank(rank)
 
     def _increment_rank(self, rank: int) -> None:
-        """Advance the rank's counter; write its flag if complete."""
+        """Advance the rank's counter (no-op if uninitialised).
+
+        Phase drain detection is now owned by the framework via
+        PhaseSpec.depends_on; the residual counter is preserved here
+        only until 8.3 deletes PhaseCounter entirely.
+        """
         with self._counters_lock:
             counter = self._counters.get(rank)
         if counter is None:
-            # initialize_counters wasn't called (or this rank had zero
-            # expected items); nothing to do.
             return
         with counter.lock:
             counter.completed += 1
-            should_write = (
-                counter.flag_name is not None
-                and counter.flags_dir is not None
-                and not counter.flag_written
-                and counter.is_complete
-            )
-            if should_write:
-                counter.flag_written = True
-        if should_write:
-            try:
-                write_flag(counter.flags_dir, counter.flag_name)  # type: ignore[arg-type]
-            except Exception:  # noqa: BLE001 — flag write is best-effort
-                self._logger.exception(
-                    "failed to write barrier flag %r", counter.flag_name
-                )
-                with counter.lock:
-                    # Allow a future increment to retry the flag write.
-                    counter.flag_written = False
 
     # ==================================================================
     # Counter setup
