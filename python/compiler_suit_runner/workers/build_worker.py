@@ -518,9 +518,22 @@ def build_worker(
 
 
 def main() -> int:
-    """Subprocess entry point for the build worker."""
+    """Subprocess entry point for the build worker.
+
+    Drives the framework's worker protocol via the comm fd
+    (``--dynamic_queue`` / ``--socket-path``), routing each manager-
+    supplied relative path through :func:`build_worker`. See
+    :mod:`compiler_suit_runner.workers._runner_protocol` for the
+    line-based protocol details.
+    """
     import argparse
-    import sys
+    import logging
+
+    from ._runner_protocol import (
+        DispatchResult,
+        connect_comm,
+        run_protocol_loop,
+    )
 
     parser = argparse.ArgumentParser(
         prog="compiler_suit_runner.workers.build_worker",
@@ -552,6 +565,8 @@ def main() -> int:
     parser.add_argument("--skip-existing", action="store_true")
     args, _ = parser.parse_known_args()
 
+    log = logging.getLogger("compiler_suit_runner.workers.build_worker")
+
     env = BuildWorkerEnv(
         flake_ref=args.flake_ref,
         dataset_output_dir=pathlib.Path(args.dataset_output_dir),
@@ -562,15 +577,27 @@ def main() -> int:
         ),
     )
 
-    rc = 0
-    for line in sys.stdin:
-        manifest_path = pathlib.Path(line.strip())
-        if not str(manifest_path):
-            continue
+    sock = connect_comm(
+        dynamic_queue=args.dynamic_queue,
+        socket_path=args.socket_path,
+        log=log,
+    )
+    if sock is None:
+        log.warning("no comm channel supplied; worker exiting (test mode)")
+        return 0
+
+    def dispatch(manifest_path: pathlib.Path) -> DispatchResult:
         result = build_worker(manifest_path, env)
-        if not result.success:
-            rc = 1
-    return rc
+        if result.success:
+            return DispatchResult.ok()
+        return DispatchResult.error(result.error or "build failed")
+
+    return run_protocol_loop(
+        sock=sock,
+        source=args.source,
+        dispatch=dispatch,
+        log=log,
+    )
 
 
 if __name__ == "__main__":

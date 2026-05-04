@@ -426,9 +426,21 @@ def _build_env_from_args(args) -> "WorkerEnv":
 
 
 def main() -> int:
-    """Subprocess entry point for the phase-1a partition worker."""
+    """Subprocess entry point for the phase-1a partition worker.
+
+    Drives the framework's worker protocol via the comm fd
+    (``--dynamic_queue`` / ``--socket-path``). See
+    :mod:`compiler_suit_runner.workers._runner_protocol` for the
+    line-based protocol details.
+    """
     import argparse
-    import sys
+    import logging
+
+    from ._runner_protocol import (
+        DispatchResult,
+        connect_comm,
+        run_protocol_loop,
+    )
 
     parser = argparse.ArgumentParser(
         prog="compiler_suit_runner.workers.partition_worker",
@@ -453,16 +465,30 @@ def main() -> int:
     parser.add_argument("--skip-existing", action="store_true")
     args, _ = parser.parse_known_args()
 
+    log = logging.getLogger("compiler_suit_runner.workers.partition_worker")
     env = _build_env_from_args(args)
-    rc = 0
-    for line in sys.stdin:
-        manifest_path = pathlib.Path(line.strip())
-        if not str(manifest_path):
-            continue
+
+    sock = connect_comm(
+        dynamic_queue=args.dynamic_queue,
+        socket_path=args.socket_path,
+        log=log,
+    )
+    if sock is None:
+        log.warning("no comm channel supplied; worker exiting (test mode)")
+        return 0
+
+    def dispatch(manifest_path: pathlib.Path) -> DispatchResult:
         result = partition_worker(manifest_path, env)
-        if result.error is not None:
-            rc = 1
-    return rc
+        if result.error is None:
+            return DispatchResult.ok()
+        return DispatchResult.error(result.error)
+
+    return run_protocol_loop(
+        sock=sock,
+        source=args.source,
+        dispatch=dispatch,
+        log=log,
+    )
 
 
 if __name__ == "__main__":
