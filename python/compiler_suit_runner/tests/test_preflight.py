@@ -502,6 +502,8 @@ def _make_variant(label: str) -> dict:
         "optimization": "O2",
         "flag_set": "baseline",
         "hardening": "default",
+        "sanitizer": "san-off",
+        "march": "march-default",
         "tier": 1,
         "pkg": "hello",
         "arch": "x86_64",

@@ -39,6 +39,8 @@ class VariantSpec(TypedDict):
     optimization: str
     flag_set: str
     hardening: str
+    sanitizer: str
+    march: str
     tier: int
     pkg: str
     arch: str

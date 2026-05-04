@@ -191,6 +191,8 @@ def make_variant_header(
         "optimization": variant.get("optimization", ""),
         "flag_set": variant.get("flag_set", ""),
         "hardening": variant.get("hardening", ""),
+        "sanitizer": variant.get("sanitizer", ""),
+        "march": variant.get("march", ""),
         "tier": variant["tier"],
         "attr": f"dataset.{sys_name}.{pkg}.{arch}.{suffix}",
     }

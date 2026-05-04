@@ -1,4 +1,5 @@
-# Build one variant: (package, compiler, architecture, opt-level, flag-set, hardening).
+# Build one variant: (package, compiler, architecture, opt-level,
+# flag-set, hardening, sanitizer, march).
 #
 # Returns: { variantLabel, variantPkg, meta }
 
@@ -10,7 +11,16 @@
   target, # { label, crossAttr, system } from architectures.nix
   optLevel, # { flag, label, clangOnly } from flags.nix
   flagSet, # { label, cflags, cxxflags, ... } from flags.nix
-  hardening, # { label, hardeningDisable } from flags.nix
+  hardening, # { label, hardeningEnable, hardeningDisable, extraCflags? } from flags.nix
+  sanitizer ? {
+    label = "san-off";
+    cflags = "";
+    ldflags = "";
+  }, # { label, cflags, ldflags } from flags.nix
+  march ? {
+    label = "march-default";
+    cflags = "";
+  }, # { label, cflags } from flags.nix
 }:
 
 let
@@ -84,17 +94,37 @@ let
     else
       flagSet.cxxflags;
 
-  # Extra linker flags from the flag set (e.g., -Wl,--gc-sections, -no-pie)
-  extraLdflags = flagSet.ldflags or "";
+  # Extra linker flags — flag set + sanitizer; sanitizers need
+  # -fsanitize=X on both compile and link.
+  sanitizerCflags = sanitizer.cflags or "";
+  sanitizerLdflags = sanitizer.ldflags or "";
+  marchCflags = march.cflags or "";
+
+  flagSetLdflags = flagSet.ldflags or "";
+  extraLdflags = lib.concatStringsSep " " (
+    builtins.filter (s: s != "") [
+      flagSetLdflags
+      sanitizerLdflags
+    ]
+  );
 
   # Extra hardening flags to disable for this flag set (e.g., pie for nopic)
   extraHardeningDisable = flagSet.extraHardeningDisable or [ ];
 
-  # Combine optimization level + extra flags
+  # Hardening profile may inject ad-hoc cflags (e.g. -fcf-protection=full
+  # for the cet profile, -mbranch-protection=standard for btipac).
+  hardeningExtraCflags = hardening.extraCflags or "";
+
+  # Combine optimization level + extra flags + sanitizer + march +
+  # hardening-extra. Empty strings are filtered out so we don't emit
+  # leading/trailing whitespace.
   allCflags = lib.concatStringsSep " " (
     builtins.filter (s: s != "") [
       optLevel.flag
       resolvedCflags
+      sanitizerCflags
+      marchCflags
+      hardeningExtraCflags
     ]
   );
 
@@ -102,6 +132,9 @@ let
     builtins.filter (s: s != "") [
       optLevel.flag
       resolvedCxxflags
+      sanitizerCflags
+      marchCflags
+      hardeningExtraCflags
     ]
   );
 
@@ -113,6 +146,8 @@ let
     optLevel.label
     flagSet.label
     hardening.label
+    sanitizer.label
+    march.label
   ];
 
   # Override the package with our custom stdenv and flags
@@ -124,6 +159,7 @@ let
       [ "all" ]
     else
       hardening.hardeningDisable ++ extraHardeningDisable;
+  allHardeningEnable = hardening.hardeningEnable or [ ];
 
   variantPkg = basePkg.overrideAttrs (
     old:
@@ -169,6 +205,7 @@ let
     // {
       pname = "${old.pname or pkg.attr}-variant";
       hardeningDisable = allHardeningDisable;
+      hardeningEnable = allHardeningEnable;
 
       # Skip tests — we only care about the compiled binaries
       doCheck = false;
@@ -186,6 +223,8 @@ let
           optimization = optLevel.label;
           flags = flagSet.label;
           hardening = hardening.label;
+          sanitizer = sanitizer.label;
+          march = march.label;
         };
       };
     }

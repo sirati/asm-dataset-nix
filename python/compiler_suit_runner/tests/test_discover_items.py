@@ -118,6 +118,8 @@ def _variant(
         "optimization": suffix,
         "flag_set": "baseline",
         "hardening": "default",
+        "sanitizer": "san-off",
+        "march": "march-default",
         "tier": tier,
         "pkg": pkg,
         "arch": arch,
