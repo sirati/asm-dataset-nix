@@ -154,21 +154,31 @@ let
         major = 9;
         minor = 0;
       };
-      # Prevent the linker from re-adding -pie via cc-wrapper:
-      # static-pie must not be combined with -pie (only one of the
-      # two link modes can win, and -pie loses).
+      # Disable cc-wrapper's PIE/PIC hardening so the linker doesn't
+      # re-add -pie (which would conflict with -static-pie). The
+      # legacy "pie" name is gone in modern nixpkgs (unified into
+      # "pic"); we only list "pic" because nixpkgs 24+ rejects
+      # unknown names.
       extraHardeningDisable = [
         "pic"
-        "pie"
       ];
     }
   ];
 
   # Hardening — refactored from {hardened, unhardened} to individual
-  # profiles. Each entry enables exactly one hardening flavour atop
-  # an otherwise-disabled baseline so the asm impact is cleanly
-  # isolated, except "default" (nixpkgs cc-wrapper's full set) and
-  # "none" (everything off).
+  # profiles. We inject hardening flags directly via ``extraCflags`` /
+  # ``extraLdflags`` rather than relying on cc-wrapper's
+  # ``hardeningEnable`` hook, because the set of supported names in
+  # ``stdenv.cc.defaultHardeningFlags`` varies across nixpkgs versions
+  # (modern: bindnow/format/fortify/.../pic/relro; old-22.11:
+  # shadowstack/pacret/.../stackprotector). Direct injection is the
+  # only set that works uniformly across the legacy compiler infra.
+  #
+  # ``hardeningDisable = ["all"]`` silences cc-wrapper's automatic
+  # hardening so the only flags visible to the compiler are the ones
+  # this profile explicitly injects, giving clean asm-level isolation.
+  # The "default" entry leaves cc-wrapper's defaults active (whatever
+  # the per-nixpkgs version considers stock-hardened).
   hardeningModes = [
     {
       label = "none";
@@ -181,31 +191,31 @@ let
       hardeningDisable = [ ];
     }
     {
-      # nixpkgs hardeningEnable=stackprotector → -fstack-protector-strong
       label = "ssp";
-      hardeningEnable = [ "stackprotector" ];
+      hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
+      extraCflags = "-fstack-protector-strong --param=ssp-buffer-size=4";
     }
     {
-      # All-functions stack-protector — every function gets a canary.
-      # Not a nixpkgs flag, requires explicit cflags injection.
       label = "ssp-all";
       hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
       extraCflags = "-fstack-protector-all";
     }
     {
-      # _FORTIFY_SOURCE=2 (default fortify level in nixpkgs).
       label = "fortify";
-      hardeningEnable = [ "fortify" ];
+      hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
+      # Needs ≥-O1 to actually inject the runtime checks; below that
+      # gcc/clang silently no-op the macro. We inject it regardless;
+      # at -O0 this profile collapses to baseline.
+      extraCflags = "-D_FORTIFY_SOURCE=2";
     }
     {
-      # _FORTIFY_SOURCE=3 — extra runtime checks for object-size
-      # detection. GCC 12+, Clang 14+.
       label = "fortify3";
-      hardeningEnable = [ "fortify3" ];
+      hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
+      extraCflags = "-D_FORTIFY_SOURCE=3";
       minGccVersion = {
         major = 12;
         minor = 0;
@@ -216,41 +226,48 @@ let
       };
     }
     {
+      # PIE — produces a position-independent executable. Affects
+      # call/jump instruction encoding and main entry-point shape.
       label = "pie";
-      hardeningEnable = [ "pie" ];
+      hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
+      extraCflags = "-fPIE";
+      extraLdflags = "-pie";
     }
     {
       label = "relro";
-      hardeningEnable = [ "relro" ];
+      hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
+      extraLdflags = "-Wl,-z,relro";
     }
     {
       label = "bindnow";
-      hardeningEnable = [ "bindnow" ];
+      hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
+      extraLdflags = "-Wl,-z,now";
     }
     {
       label = "relro-bindnow";
-      hardeningEnable = [
-        "relro"
-        "bindnow"
-      ];
+      hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
+      extraLdflags = "-Wl,-z,relro -Wl,-z,now";
     }
     {
       label = "format";
-      hardeningEnable = [ "format" ];
+      hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
+      extraCflags = "-Wformat -Wformat-security -Werror=format-security";
     }
     {
       label = "strictoverflow";
-      hardeningEnable = [ "strictoverflow" ];
+      hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
+      extraCflags = "-fno-strict-overflow";
     }
     {
       # Intel CET (shadow stack + endbr64 at indirect-call targets).
-      # x86 only; GCC 8+, Clang 7+.
+      # x86 only; GCC 8+, Clang 7+. Visible at asm: every function
+      # entry gets endbr64; indirect branches gain validation.
       label = "cet";
       hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
@@ -269,8 +286,9 @@ let
       };
     }
     {
-      # ARM Branch Target Identification + Pointer Authentication.
-      # aarch64 only; GCC 9+, Clang 7+.
+      # aarch64 Branch Target Identification + Pointer Authentication.
+      # Visible at asm: bti j/c/jc instructions at indirect targets;
+      # pacia/autia in prologue/epilogue.
       label = "btipac";
       hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
@@ -282,6 +300,39 @@ let
       };
       minClangVersion = {
         major = 7;
+        minor = 0;
+      };
+    }
+    {
+      # -fstack-clash-protection — emits explicit stack-probing
+      # instructions in function prologues that allocate large stack
+      # frames. GCC 8+, Clang 11+.
+      label = "stackclash";
+      hardeningEnable = [ ];
+      hardeningDisable = [ "all" ];
+      extraCflags = "-fstack-clash-protection";
+      minGccVersion = {
+        major = 8;
+        minor = 0;
+      };
+      minClangVersion = {
+        major = 11;
+        minor = 0;
+      };
+    }
+    {
+      # -fzero-call-used-regs=used-gpr — zeros caller-saved GPRs at
+      # function return to limit ROP gadgets. GCC 11+, Clang 16+.
+      label = "zerocallregs";
+      hardeningEnable = [ ];
+      hardeningDisable = [ "all" ];
+      extraCflags = "-fzero-call-used-regs=used-gpr";
+      minGccVersion = {
+        major = 11;
+        minor = 0;
+      };
+      minClangVersion = {
+        major = 16;
         minor = 0;
       };
     }

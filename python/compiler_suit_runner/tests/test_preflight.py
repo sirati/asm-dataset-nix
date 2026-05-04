@@ -412,6 +412,8 @@ def _wide_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
     for pkg, arch_map in drvs.items():
         for arch, suffix_map in arch_map.items():
             responses[f"_drvPaths.{sys_name}.{pkg}.{arch}"] = suffix_map
+            for suffix, drv in suffix_map.items():
+                responses[f"_drvPaths.{sys_name}.{pkg}.{arch}.{suffix}"] = drv
     return responses
 
 

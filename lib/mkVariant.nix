@@ -94,25 +94,30 @@ let
     else
       flagSet.cxxflags;
 
-  # Extra linker flags — flag set + sanitizer; sanitizers need
-  # -fsanitize=X on both compile and link.
+  # Extra linker flags — flag set + sanitizer + hardening. Sanitizers
+  # need -fsanitize=X on both compile and link; hardening profiles may
+  # inject ldflags (relro, bindnow, pie's -pie) directly.
   sanitizerCflags = sanitizer.cflags or "";
   sanitizerLdflags = sanitizer.ldflags or "";
   marchCflags = march.cflags or "";
 
   flagSetLdflags = flagSet.ldflags or "";
+  hardeningExtraLdflags = hardening.extraLdflags or "";
   extraLdflags = lib.concatStringsSep " " (
     builtins.filter (s: s != "") [
       flagSetLdflags
       sanitizerLdflags
+      hardeningExtraLdflags
     ]
   );
 
   # Extra hardening flags to disable for this flag set (e.g., pie for nopic)
   extraHardeningDisable = flagSet.extraHardeningDisable or [ ];
 
-  # Hardening profile may inject ad-hoc cflags (e.g. -fcf-protection=full
-  # for the cet profile, -mbranch-protection=standard for btipac).
+  # Hardening profile injects flags directly (cflags/ldflags) rather
+  # than relying on cc-wrapper's hardeningEnable hook, since the set
+  # of supported names varies across nixpkgs versions used by old vs
+  # current compilers.
   hardeningExtraCflags = hardening.extraCflags or "";
 
   # Combine optimization level + extra flags + sanitizer + march +
