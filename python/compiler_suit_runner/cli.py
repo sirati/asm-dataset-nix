@@ -50,7 +50,6 @@ from compiler_suit_runner.partition_local import (
     PartitionResult,
     compute_partition_locally,
 )
-from compiler_suit_runner.prebuild import prebuild_drvs
 from compiler_suit_runner.preflight import (
     PreflightResult,
     filter_existing_variants,
@@ -788,30 +787,48 @@ def cmd_submit(args: argparse.Namespace) -> int:
         max_variants = getattr(args, "max_variants", None)
         if max_variants is not None and max_variants > 0:
             capped = pre.variants[:max_variants]
-            log.info(
-                "max-variants: capping %d -> %d variants",
-                len(pre.variants), len(capped),
+            # Narrow toolchain_specs too: only the (arch, compiler)
+            # pairs the kept variants actually depend on need a phase-2
+            # toolchain manifest. Otherwise --max-variants 1 still
+            # dispatches all 41 toolchains (stale from full preflight).
+            needed_pairs = {(v["arch"], v["compiler_id"]) for v in capped}
+            kept_tcs = tuple(
+                spec for spec in pre.toolchain_specs if spec in needed_pairs
             )
-            pre = dataclasses.replace(pre, variants=capped)
+            log.info(
+                "max-variants: capping %d -> %d variants; %d -> %d toolchains",
+                len(pre.variants), len(capped),
+                len(pre.toolchain_specs), len(kept_tcs),
+            )
+            pre = dataclasses.replace(
+                pre, variants=capped, toolchain_specs=kept_tcs,
+            )
 
         # Local partition: walk each variant's drv graph on the dev box
         # (where preflight already instantiated them) and refcount input
-        # drvs to identify shared host deps. Recorded into pre.common_dep_drvs
-        # so the prebuild step (workstream 2) can realise them locally;
-        # secondaries then substitute via the federated dev-box harmonia
-        # instead of rebuilding glibc / libc / ... once per variant.
+        # drvs to identify shared host deps. The result feeds phase-2
+        # ``common_dep`` task dispatch so secondaries build each shared
+        # dep ONCE (the first secondary to pick it up); other secondaries
+        # then substitute via the per-secondary harmonia federation
+        # (PeerListWatcher writes each peer's URL into nix.conf).
+        #
+        # ``compute_partition_locally`` returns ``(label, drv)`` tuples;
+        # ``emit_all_manifests`` iterates ``(drv, label)`` (matching
+        # ``make_common_dep_header``'s signature). Swap the pair on the
+        # boundary.
         try:
             partition = compute_partition_locally(
                 pre.variants,
                 toolchain_drvs=pre.toolchain_drvs,
             )
+            common_dep_drvs = tuple(
+                (drv, label) for label, drv in partition.common_dep_drvs
+            )
             log.info(
                 "partition: %d variants, %d common deps (refcount >= 10)",
-                len(pre.variants), len(partition.common_dep_drvs),
+                len(pre.variants), len(common_dep_drvs),
             )
-            pre = dataclasses.replace(
-                pre, common_dep_drvs=partition.common_dep_drvs,
-            )
+            pre = dataclasses.replace(pre, common_dep_drvs=common_dep_drvs)
         except Exception:  # noqa: BLE001 — partition is best-effort
             log.exception(
                 "partition computation failed; proceeding without"
@@ -819,48 +836,15 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 " its full closure)"
             )
 
-        # Pre-build shared closure on the dev box so dev-box harmonia
-        # serves it; every secondary then substitutes instead of
-        # rebuilding the same libc / common dep N times.
-        # Phase-2 dispatch stays cleared — pre-build is a more
-        # efficient replacement.
+        # toolchain_specs and common_dep_drvs are now real; emit phase-2
+        # toolchain + common_dep manifests. The framework's PhaseSpec
+        # dependency graph (``phase3.depends_on = ("phase2",)``) blocks
+        # phase-3 variant dispatch until phase-2 drains, so secondaries
+        # build the shared closure first; then they substitute from each
+        # other's harmonias when phase-3 starts.
         #
-        # NOTE: ``pre.toolchain_drvs`` is the misleadingly-named
-        # canonical *variant root* drv set (one drv per matrix variant);
-        # it's used by ``compute_partition_locally`` as the EXCLUSION
-        # set so variant roots never get reclassified as common deps.
-        # We must NOT pre-build it — that would mean building every
-        # sampled variant locally on the dev box, defeating the whole
-        # point of distribution.
-        prebuild_drv_set: list[str] = sorted(
-            {drv for _label, drv in pre.common_dep_drvs}
-        )
-        if prebuild_drv_set:
-            log.info(
-                "prebuilding %d shared drvs locally (toolchain + common deps)",
-                len(prebuild_drv_set),
-            )
-            try:
-                pb = prebuild_drvs(prebuild_drv_set, log=log)
-                log.info(
-                    "prebuild: %d succeeded, %d failed in %.1fs",
-                    len(pb.succeeded), len(pb.failed),
-                    pb.total_duration_seconds,
-                )
-                if pb.failed:
-                    log.warning(
-                        "prebuild had %d failures; secondaries may rebuild "
-                        "those drvs from scratch instead of substituting:",
-                        len(pb.failed),
-                    )
-                    for drv, excerpt in pb.failed[:3]:
-                        log.warning("  %s: %s", drv, excerpt[:200])
-            except Exception:  # noqa: BLE001 — prebuild is best-effort
-                log.exception(
-                    "prebuild step crashed; proceeding without "
-                    "pre-populated dev-box store"
-                )
-        pre = dataclasses.replace(pre, toolchain_specs=())
+        # No local pre-build — distribution is the entire point. Each
+        # secondary does its share of phase-2 in parallel.
 
         try:
             _emit_manifests_from_preflight(
