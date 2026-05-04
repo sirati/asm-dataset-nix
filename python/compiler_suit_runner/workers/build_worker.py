@@ -516,21 +516,25 @@ def build_worker(
         )
 
     if not success:
-        # Print the failure context to fd 2 (the secondary's stderr,
-        # which lands in slurm_<jobid>.err on the gateway). The
-        # framework only forwards ``error`` strings back to the
-        # primary; full nix log excerpts get dropped at the dispatch
-        # boundary, so without this print there's no way to diagnose
-        # a build failure from the dispatch.log.
+        # Write the failure context to a gateway-visible log file.
+        # Worker subprocesses have stdin/stdout/stderr silenced by the
+        # framework (subprocess_factory.rs:116), so writing to fd 2
+        # goes nowhere. ``/app/log-network`` is the secondary
+        # container's bind-mount of the gateway's per-run log dir,
+        # so files written there land in
+        # ``~/BIG/slurm/log/<run_id>/build-failures/`` and are
+        # visible from the dispatching machine via SSH.
         excerpt = _excerpt_log(stderr, env.log_excerpt_lines)
         try:
-            sys.stderr.write(
-                f"[build_worker] nix build failed for {name} ({item_class}); "
-                f"attr={attr!r}\n"
-                f"--- stderr excerpt ---\n{excerpt}\n--- end ---\n"
+            log_dir = pathlib.Path("/app/log-network/build-failures")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            (log_dir / f"{name}.log").write_text(
+                f"item_class: {item_class}\n"
+                f"attr: {attr}\n"
+                f"--- stderr excerpt ---\n{excerpt}\n--- end ---\n",
+                encoding="utf-8",
             )
-            sys.stderr.flush()
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 — best-effort
             pass
         return BuildWorkerResult(
             item_class=item_class,
