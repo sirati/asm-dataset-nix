@@ -283,6 +283,14 @@ class SuitTaskConfig:
 class SuitTask:
     """The single dynamic_runner :class:`TaskDefinition` for the run."""
 
+    # Items are JSON manifests on the shared FS — workers resolve
+    # ``TaskInfo.path`` themselves against ``config.manifest_dir`` and
+    # the framework should NOT stat / hash / stage them. The path
+    # propagates to the worker as an opaque identifier over the comm
+    # fd. Skips the primary-side ``queue_initial_staging`` content-hash
+    # pass entirely (was 30+ min on a full matrix dispatch).
+    uses_file_based_items: bool = False
+
     def __init__(
         self,
         config: SuitTaskConfig,
