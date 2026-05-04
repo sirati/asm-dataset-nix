@@ -171,7 +171,6 @@ All paths relative to `python/compiler_suit_runner/`.
 | `peer_cache.py`              | peer-list watcher, harmonia control, per-build env assembly. |
 | `cachix_uploader.py`         | optional cross-cluster cache federation. |
 | `incremental_cache.py`       | local pre-flight cache (`~/.cache/compiler_suit_runner/`). |
-| `memory_budget.py`           | `tier_of`, `encode_size`, `decode_size` for the rank-in-size scheme. |
 | `workers/partition_worker.py`| phase 1a per-shard partitioner. |
 | `workers/merge_worker.py`    | phase 1b single-machine global merge. |
 | `workers/barrier_worker.py`  | sentinel-file barriers between phases. |

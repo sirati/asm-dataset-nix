@@ -92,8 +92,9 @@ class SshDebugTask:
 
     # ── Per-type plumbing ──────────────────────────────────────────────
 
-    def estimate_memory(self, item: TaskInfo) -> int:
-        return 64 * 1024 * 1024  # 64 MiB — sshd is tiny
+    def estimate_memory(self, item: TaskInfo) -> int:  # noqa: ARG002
+        # Memory budgeting disabled — concurrency is bounded by --jobs N.
+        return 1
 
     def add_task_arguments(self, parser: ArgumentParser) -> None:
         # All knobs are baked into the image / framework CLI; nothing

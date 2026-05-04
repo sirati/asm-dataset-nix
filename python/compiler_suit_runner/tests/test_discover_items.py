@@ -192,8 +192,8 @@ def test_discover_items_yields_size_from_manifest(tmp_path: pathlib.Path) -> Non
     task = SuitTask(config)
     items = list(task.discover_items())
     assert len(items) == 1
-    # The merge header sets size = merge_memory_bytes() = 2 GiB.
-    assert items[0].size == 2 * 1024 * 1024 * 1024
+    # Memory budgeting is disabled — every header.size is 0.
+    assert items[0].size == 0
 
 
 def test_discover_items_skips_unreadable_manifests(

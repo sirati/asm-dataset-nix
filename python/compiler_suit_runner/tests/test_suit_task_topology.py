@@ -67,7 +67,6 @@ def test_phase1a_has_partition_type(tmp_path: pathlib.Path) -> None:
         types[0].worker_module
         == "compiler_suit_runner.workers.partition_worker"
     )
-    assert types[0].estimator_attr == "estimate_partition_memory"
 
 
 def test_phase1b_has_merge_type(tmp_path: pathlib.Path) -> None:
@@ -76,7 +75,6 @@ def test_phase1b_has_merge_type(tmp_path: pathlib.Path) -> None:
     types = phases["phase1b"].types
     assert len(types) == 1
     assert types[0].type_id == "merge"
-    assert types[0].estimator_attr == "estimate_merge_memory"
 
 
 def test_phase2_has_toolchain_and_common_dep_types(
@@ -86,9 +84,6 @@ def test_phase2_has_toolchain_and_common_dep_types(
     phases = _phases(task)
     type_ids = {t.type_id for t in phases["phase2"].types}
     assert type_ids == {"toolchain", "common_dep"}
-    by_id = {t.type_id: t for t in phases["phase2"].types}
-    assert by_id["toolchain"].estimator_attr == "estimate_toolchain_memory"
-    assert by_id["common_dep"].estimator_attr == "estimate_common_dep_memory"
     # Both share the same build worker module.
     for t in phases["phase2"].types:
         assert (
@@ -103,19 +98,16 @@ def test_phase3_has_variant_type(tmp_path: pathlib.Path) -> None:
     types = phases["phase3"].types
     assert len(types) == 1
     assert types[0].type_id == "variant"
-    assert types[0].estimator_attr == "estimate_variant_memory"
     assert (
         types[0].worker_module
         == "compiler_suit_runner.workers.build_worker"
     )
 
 
-def test_per_type_estimators_match_declared_attrs(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Every estimator_attr declared in get_phases must resolve on the task."""
+def test_estimate_memory_returns_constant(tmp_path: pathlib.Path) -> None:
+    """Memory budgeting is disabled: estimate_memory returns 1 byte
+    for any item, so the framework's resource scheduler is effectively
+    bypassed and concurrency is bounded only by ``--jobs N``."""
     task = SuitTask(_make_config(tmp_path))
-    phases = _phases(task)
-    for phase in phases.values():
-        for t in phase.types:
-            assert callable(getattr(task, t.estimator_attr)), t.estimator_attr
+    assert task.estimate_memory(None) == 1
+    assert task.estimate_memory(object()) == 1
