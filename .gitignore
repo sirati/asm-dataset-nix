@@ -14,3 +14,8 @@ nix-upstream/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Ephemeral ssh-debug keypair (private key) — see python/ssh_debug_runner/.
+# Pubkey is intentionally tracked so the Nix image build can read it.
+.ssh-debug/id_ed25519
+.ssh-debug/known_hosts

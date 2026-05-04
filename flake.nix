@@ -20,7 +20,8 @@
 
     # External runner: provides `python3Packages.dynamic-runner` via its
     # overlay (replaces the previous in-tree `dynamic-batch-rs` path-flake).
-    dynamic-runner.url = "github:sirati/dynamic-runner/v0.1.1";
+    # Tracks default branch; bump via `nix flake update dynamic-runner`.
+    dynamic-runner.url = "github:sirati/dynamic-runner";
     # Generic semantic-layering helpers + extract-layer-assignment tool
     # (replaces the in-tree `nix/semantic-layering.nix` import).
     nix-docker-layered-image.url = "github:sirati/nix-docker-layered-image/v0.1.0";
@@ -56,10 +57,26 @@
               inherit system;
               config.allowUnfree = true;
             };
-            # Overlayed pkgs — dataset-specific patches plus the external
-            # `dynamic-runner` (Python pkg) and `nix-docker-layered-image`
-            # (semantic-layering helpers + extract-layer-assignment tool).
-            # Use for builds.
+            # Image-build pkgs — only the overlays the runner / ssh-debug
+            # images actually need (`dynamic-runner` python pkg, semantic-
+            # layering helpers). Crucially does NOT include the mips-clang
+            # compiler-rt overlay: that overlay perturbs every llvmPackages_N
+            # set, which cascade-shifts the python313Packages fixed point
+            # through clang-using build deps, knocking scikit-image / bokeh
+            # / xarray etc. off the cache.nixos.org binary cache and forcing
+            # ~hours of source rebuilds. The mips fix only matters for
+            # MIPS cross-compile derivations, which the runner images don't
+            # produce — so we keep it out of this set.
+            runnerPkgs = import nixpkgs {
+              inherit system;
+              config.allowUnfree = true;
+              overlays = [
+                dynamic-runner.overlays.default
+                nix-docker-layered-image.overlays.default
+              ];
+            };
+            # Cross-compile pkgs — full overlay set including mips-clang
+            # compiler-rt patches. Used for the matrix / crossToolchains.
             pkgs = import nixpkgs {
               inherit system;
               config.allowUnfree = true;
@@ -73,7 +90,7 @@
         );
 
       perSystem = forAllSystems (
-        { system, pkgs, cleanPkgs }:
+        { system, pkgs, cleanPkgs, runnerPkgs }:
         let
           lib = pkgs.lib;
 
@@ -101,7 +118,20 @@
             inherit pkgs lib;
             extraCompilers = oldCompilers;
           };
-          develop = developModule { pkgs = cleanPkgs; };
+          # Dev shell stays fully on `cleanPkgs` so the binary cache
+          # serves mcp-nixos / language-server / transitive python
+          # packages unchanged. `dynamic-runner` is added to the dev
+          # Python env by `callPackage`-ing its `nix/wheel.nix`
+          # directly against `cleanPkgs.python313Packages`, bypassing
+          # the overlay's `pythonPackagesExtensions` hook (which would
+          # cascade-invalidate the entire python set's fixed point).
+          # We drive SuitTask off the framework directly during local
+          # development rather than `pip install -e .` against
+          # pyproject.toml.
+          develop = developModule {
+            pkgs = cleanPkgs;
+            dynamicRunnerSrc = dynamic-runner;
+          };
 
           # ── Nested dataset output ──────────────────────────────────────────
           # Access: .#dataset.<system>.<pkg>.<arch>.<compiler-opt-flags-hardening>
@@ -120,10 +150,31 @@
           # but the call is wrapped to fail at attribute access time only,
           # not at flake-eval time, so other outputs are unaffected by any
           # future packaging gap.
+          # Both runner images are built against `runnerPkgs` (no
+          # mips-clang-overlay) so their python313 closure stays on the
+          # binary cache; see the comment in `forAllSystems` above.
           dockerImage = import ./nix/docker-image.nix {
-            inherit pkgs lib;
+            pkgs = runnerPkgs;
+            lib = runnerPkgs.lib;
             runnerSrc = ./python;
-            harmonia = pkgs.harmonia or null;
+            harmonia = runnerPkgs.harmonia or null;
+            # Bake the same dev-debug pubkey we use for the
+            # ssh-debug task so `--enable-ssh-debug` on the runner
+            # accepts the same key. The corresponding private key
+            # lives at .ssh-debug/id_ed25519 (gitignored).
+            pubkeyFile = ./.ssh-debug/id_ed25519.pub;
+          };
+
+          # ── ssh-debug image (interactive debugging) ───────────────────────
+          # Parallel image used by the `ssh_debug_runner` task: spawns
+          # podman containers (via SLURM) running sshd on a high port so a
+          # developer can ssh in for live debugging through the gateway.
+          # See python/ssh_debug_runner/ for the dispatcher.
+          sshDebugImage = import ./nix/ssh-debug-image.nix {
+            pkgs = runnerPkgs;
+            lib = runnerPkgs.lib;
+            runnerSrc = ./python;
+            pubkeyFile = ./.ssh-debug/id_ed25519.pub;
           };
 
           generateManifestScript = pkgs.writeShellScript "generate-manifest" ''
@@ -162,13 +213,13 @@
         in
         {
           packages = {
-            inherit dockerImage;
+            inherit dockerImage sshDebugImage;
           };
 
           # Expose dockerImage at top-level too so `.#dockerImage` works
           # without `.packages.x86_64-linux.dockerImage`. Mirrors the
           # asm-tokenizer convention.
-          inherit dockerImage;
+          inherit dockerImage sshDebugImage;
 
           apps = {
             generate-manifest = {
@@ -250,5 +301,9 @@
       # under packages.<sys>.dockerImage (so `nix build .#dockerImage`
       # works on the default system) and as a per-system attribute.
       dockerImage = nixpkgs.lib.mapAttrs (_: s: s.dockerImage) perSystem;
+
+      # Layered podman image for the ssh_debug_runner — interactive
+      # SSH-able debug containers. Same exposure pattern as dockerImage.
+      sshDebugImage = nixpkgs.lib.mapAttrs (_: s: s.sshDebugImage) perSystem;
     };
 }

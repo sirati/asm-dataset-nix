@@ -35,6 +35,13 @@
   pythonPackages ? (_: [ ]),
   harmonia ? pkgs.harmonia or null,
   includeCachix ? true,
+  # Optional pubkey baked into /root/.ssh/authorized_keys so the
+  # opt-in `--enable-ssh-debug` flow can exec sshd with a usable
+  # auth file. If null, the SSH bits still get installed (openssh
+  # binary, host-key staging, sshd_config generation at boot) but
+  # no key is authorized — sshd would refuse all logins until the
+  # operator drops a key in via `podman exec`.
+  pubkeyFile ? null,
 }:
 
 let
@@ -44,6 +51,11 @@ let
   # Python env: pytest for in-container smoke tests, dynamic-runner for the
   # SLURM bridge (provided by the dynamic-runner flake's overlay), plus any
   # caller-supplied extras.
+  #
+  # No psutil dep — dynamic-runner aa8ab87+ dissolved that structurally
+  # (the Python side was reading two ints just to hand them to Rust;
+  # now Rust does std::thread::available_parallelism + /proc/meminfo
+  # directly, which is also cgroup-aware vs psutil's host-physical view).
   pythonEnv = pkgs.python313.withPackages (
     py: [ py.pytest py.dynamic-runner ] ++ (pythonPackages py)
   );
@@ -66,6 +78,102 @@ let
   cachixPkg =
     if includeCachix then (pkgs.cachix or null) else null;
 
+  # Bake sshd host keys at image-build time. Fingerprint reuse across
+  # ephemeral containers is acceptable for debugging (clients pass
+  # `-o StrictHostKeyChecking=no`). The runtime stages these into
+  # /tmp/ssh-debug/ with chmod 600, since nix-store mode is 0444 and
+  # sshd refuses to read 0444 host keys.
+  hostKeys = pkgs.runCommand "asm-dataset-nix-runner-host-keys" { } ''
+    mkdir -p $out/etc/ssh
+    ${pkgs.openssh}/bin/ssh-keygen -A -f $out
+    chmod 600 $out/etc/ssh/ssh_host_*_key
+    chmod 644 $out/etc/ssh/ssh_host_*_key.pub
+  '';
+
+  # Optional /root/.ssh/authorized_keys with the dev's pubkey. Wired
+  # in only when the caller passes `pubkeyFile`. The compiler_suit_runner's
+  # ssh_debug module fails open if no key is authorized — sshd binds
+  # the port but refuses every connection.
+  rootAuthorizedKeys =
+    if pubkeyFile != null then
+      pkgs.runCommand "asm-dataset-nix-runner-authorized-keys" { } ''
+        mkdir -p $out/root/.ssh
+        cp ${pubkeyFile} $out/root/.ssh/authorized_keys
+        chmod 700 $out/root/.ssh
+        chmod 600 $out/root/.ssh/authorized_keys
+      ''
+    else null;
+
+  # /etc/passwd, /etc/group, /etc/shadow, /etc/nsswitch.conf —
+  # required by harmonia-cache 3.x (which talks to nix-daemon as
+  # root) and by anything that does name lookups (sshd, sudo, ...).
+  # `dockerTools.buildLayeredImage` does NOT bake an NSS DB by
+  # default; without these podman/runtime fail with "no matching
+  # entries in passwd file" when User="root" or when sshd's
+  # locked-account check fires on `!` in shadow.
+  nssFiles = pkgs.runCommand "asm-dataset-nix-runner-nss" { } ''
+    mkdir -p $out/etc
+    cat > $out/etc/passwd <<EOF
+    root:x:0:0:root:/root:${pkgs.bash}/bin/bash
+    sshd:x:74:74:Privilege-separated SSH:/var/empty:/run/current-system/sw/bin/nologin
+    nobody:x:65534:65534:Nobody:/var/empty:/run/current-system/sw/bin/nologin
+    EOF
+    sed -i 's/^    //' $out/etc/passwd
+    cat > $out/etc/group <<EOF
+    root:x:0:
+    sshd:x:74:
+    nogroup:x:65534:
+    EOF
+    sed -i 's/^    //' $out/etc/group
+    # Empty password field for root: sshd's locked-account check
+    # treats `!` / `*` prefixes as locked and refuses login. Empty
+    # = "no password required"; password auth is blocked elsewhere.
+    cat > $out/etc/shadow <<EOF
+    root::1::::::
+    sshd:!:1::::::
+    nobody:!:1::::::
+    EOF
+    sed -i 's/^    //' $out/etc/shadow
+    chmod 644 $out/etc/passwd $out/etc/group
+    chmod 600 $out/etc/shadow
+    cat > $out/etc/nsswitch.conf <<EOF
+    passwd: files
+    group: files
+    shadow: files
+    hosts: files dns
+    networks: files dns
+    services: files
+    protocols: files
+    rpc: files
+    EOF
+    sed -i 's/^    //' $out/etc/nsswitch.conf
+    chmod 644 $out/etc/nsswitch.conf
+  '';
+
+  # Default /etc/nix/nix.conf. Single-user mode (build-users-group
+  # empty) because podman containers don't have nixbld* users;
+  # sandbox=false because the user namespace can't nest mount/cgroup
+  # ops sandboxed builds need. The `!include /etc/nix/peer.conf`
+  # is a SOFT include — silently skipped if the file's missing —
+  # populated at runtime by ``compiler_suit_runner.peer_cache``'s
+  # PeerNixConfWatcher with the live federation peer set.
+  nixConfFile = pkgs.writeText "nix.conf" ''
+    experimental-features = nix-command flakes
+    sandbox = false
+    build-users-group =
+    substituters = https://cache.nixos.org
+    trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+    extra-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+
+    !include /etc/nix/peer.conf
+  '';
+
+  nixConfDir = pkgs.runCommand "asm-dataset-nix-runner-nix-conf" { } ''
+    mkdir -p $out/etc/nix
+    cp ${nixConfFile} $out/etc/nix/nix.conf
+    chmod 644 $out/etc/nix/nix.conf
+  '';
+
   # Always-in-image foundation packages. Order does NOT determine
   # layer assignment (semantic-layering does); this is the
   # `contents` arg for buildLayeredImage.
@@ -75,6 +183,15 @@ let
     pkgs.cacert
     pkgs.coreutils
     pkgs.bash
+    pkgs.gnused
+    pkgs.gawk
+    pkgs.gnugrep
+    pkgs.findutils
+    # openssh: required by the opt-in `--enable-ssh-debug` flow.
+    # Always shipped (cost is small, ~5MB) so the operator can flip
+    # the feature on per-dispatch without rebuilding the image.
+    # See compiler_suit_runner.ssh_debug for the runtime side.
+    pkgs.openssh
   ];
 
   imageContents =
@@ -82,7 +199,11 @@ let
     ++ [
       pythonEnv
       projectFiles
+      nssFiles
+      nixConfDir
+      hostKeys
     ]
+    ++ lib.optional (rootAuthorizedKeys != null) rootAuthorizedKeys
     ++ lib.optional (harmonia != null) harmonia
     ++ lib.optional (cachixPkg != null) cachixPkg
     ++ contents;
@@ -139,6 +260,11 @@ let
         roots = [ projectFiles ];
         isolate = true;
       }
+      {
+        name = "nss-and-nix-conf";
+        roots = [ nssFiles nixConfDir ];
+        isolate = true;
+      }
     ];
 
   layeringPipeline = semanticLayering.buildPipeline {
@@ -161,15 +287,24 @@ pkgs.dockerTools.buildLayeredImage {
       "LANG=C.UTF-8"
       "PYTHONPATH=/app/python"
       "PATH=/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin"
+      # cacert is in basePkgs but its bundle path needs to be exposed
+      # explicitly for nix / curl / openssl to find it. Without these,
+      # `nix build` over HTTPS fails to verify substituter TLS certs.
+      "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+      "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+      "CURL_CA_BUNDLE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
     ];
 
-    # The runner __main__ entry point is added in B4.1. Until then
-    # `--help` is a smoke-default that doesn't require argparse to
-    # know about the full CLI; this lets the image build and be
-    # transferred independently of the CLI work.
-    Cmd = [
+    # Entrypoint is fixed `python -m`; Cmd is the default secondary
+    # module to invoke. The dynamic_runner SLURM wrapper invokes
+    # secondaries as `podman run image:tag {secondary_module} --secondary ...`,
+    # which APPENDS to Entrypoint and REPLACES Cmd, yielding
+    # `python -m compiler_suit_runner --secondary ...`.
+    Entrypoint = [
       "python"
       "-m"
+    ];
+    Cmd = [
       "compiler_suit_runner"
       "--help"
     ];

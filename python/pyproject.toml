@@ -36,7 +36,7 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest"]
-slurm = ["dynamic-runner @ git+https://github.com/sirati/dynamic-runner@v0.1.1"]
+slurm = ["dynamic-runner @ git+https://github.com/sirati/dynamic-runner"]
 # Cachix federation uses the `cachix` CLI via subprocess; no Python
 # package dependency required. This entry is kept as a documentation
 # extra so users see the option.
@@ -51,11 +51,19 @@ Repository = "https://github.com/sirati/asm-dataset-nix"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["compiler_suit_runner*"]
-exclude = ["compiler_suit_runner.tests*"]
+# ssh_debug_runner ships in the same nix-built docker image as
+# compiler_suit_runner (see nix/docker-image.nix:runnerSrc) and reuses
+# compiler_suit_runner.peer_cache + compiler_suit_runner.ssh_debug
+# as a vendored dependency, so we install both packages from the
+# same project tree.
+include = ["compiler_suit_runner*", "ssh_debug_runner*"]
+exclude = ["compiler_suit_runner.tests*", "ssh_debug_runner.tests*"]
 
 [tool.pytest.ini_options]
-testpaths = ["compiler_suit_runner/tests"]
+testpaths = [
+    "compiler_suit_runner/tests",
+    "ssh_debug_runner/tests",
+]
 addopts = "-q --tb=short"
 filterwarnings = [
     # tarfile.extractall(filter=...) was added in 3.12; older test
