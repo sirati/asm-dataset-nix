@@ -334,16 +334,16 @@ def emit_all_manifests(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     variants_tuple = tuple(variants)
-    shards = split_into_shards(variants_tuple)
 
     headers: list[ManifestHeader] = []
 
-    # Phase 1a — one per shard.
-    for shard in shards:
-        headers.append(make_partition_shard_header(shard))
-
-    # Phase 1b — singleton merge.
-    headers.append(make_merge_header())
+    # Phase 1a + Phase 1b are computed inline on the primary (job-list
+    # creation belongs there — secondaries have empty /nix/stores and
+    # can't walk drv graphs). The dispatch only ships phase 2 + 3
+    # build manifests; ``common_deps`` arrives pre-classified from the
+    # primary-side partition step (currently empty until that step is
+    # implemented; phase 3 builds substitute their host deps directly
+    # via the federated peer cache).
 
     # Phase 2 — toolchains, then common deps.
     for arch, compiler_label in toolchain_specs:

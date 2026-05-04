@@ -47,39 +47,30 @@ def _phases(task: SuitTask):
     return {p.phase_id: p for p in task.get_phases()}
 
 
-def test_get_phases_returns_four_phases(tmp_path: pathlib.Path) -> None:
+def test_get_phases_returns_two_build_phases(tmp_path: pathlib.Path) -> None:
+    """Phase 1a (partition) + 1b (merge) are job-list creation steps now
+    handled inline on the primary; only phase 2 (toolchain / common-dep)
+    + phase 3 (variant) builds dispatch to secondaries."""
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    assert set(phases.keys()) == {"phase1a", "phase1b", "phase2", "phase3"}
+    assert set(phases.keys()) == {"phase2", "phase3"}
 
 
 def test_phase_dependency_chain(tmp_path: pathlib.Path) -> None:
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    assert phases["phase1a"].depends_on == ()
-    assert phases["phase1b"].depends_on == ("phase1a",)
-    assert phases["phase2"].depends_on == ("phase1b",)
+    assert phases["phase2"].depends_on == ()
     assert phases["phase3"].depends_on == ("phase2",)
 
 
-def test_phase1a_has_partition_type(tmp_path: pathlib.Path) -> None:
+def test_phase1a_phase1b_no_longer_dispatched(tmp_path: pathlib.Path) -> None:
+    """Phase 1a (partition) + 1b (merge) used to dispatch to secondaries
+    but now run inline on the primary as part of job-list creation —
+    secondaries have empty /nix/stores and can't walk drv graphs."""
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    types = phases["phase1a"].types
-    assert len(types) == 1
-    assert types[0].type_id == "partition"
-    assert (
-        types[0].worker_module
-        == "compiler_suit_runner.workers.partition_worker"
-    )
-
-
-def test_phase1b_has_merge_type(tmp_path: pathlib.Path) -> None:
-    task = SuitTask(_make_config(tmp_path))
-    phases = _phases(task)
-    types = phases["phase1b"].types
-    assert len(types) == 1
-    assert types[0].type_id == "merge"
+    assert "phase1a" not in phases
+    assert "phase1b" not in phases
 
 
 def test_phase2_has_toolchain_and_common_dep_types(

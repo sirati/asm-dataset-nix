@@ -195,29 +195,17 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
     if build_max_concurrent is not None:
         build_kwargs["max_concurrent"] = build_max_concurrent
 
+    # Phase 1a (partition) and 1b (merge) are job-list-creation steps:
+    # walking the matrix's drv graph to classify "this drv is a
+    # toolchain", "this is a common host dep", "this is incidental".
+    # They belong on the primary (which has the drvs locally from
+    # preflight evaluation), not on secondaries (which have empty
+    # /nix/stores). When the primary has populated common_dep_drvs
+    # before dispatch, the framework only needs phase 2 + phase 3
+    # — both real builds, both substitutable from peer caches.
     return (
         PhaseSpec(
-            phase_id="phase1a",
-            types=(
-                TaskTypeSpec(
-                    type_id="partition",
-                    worker_module="compiler_suit_runner.workers.partition_worker",
-                ),
-            ),
-        ),
-        PhaseSpec(
-            phase_id="phase1b",
-            depends_on=("phase1a",),
-            types=(
-                TaskTypeSpec(
-                    type_id="merge",
-                    worker_module="compiler_suit_runner.workers.merge_worker",
-                ),
-            ),
-        ),
-        PhaseSpec(
             phase_id="phase2",
-            depends_on=("phase1b",),
             types=(
                 TaskTypeSpec(
                     type_id="toolchain",

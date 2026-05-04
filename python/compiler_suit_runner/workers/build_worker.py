@@ -238,7 +238,17 @@ def build_attr(
         argv.extend(_read_substituters_file(env.substituters_file))
     if extra_args:
         argv.extend(extra_args)
-    argv.append(f"{env.flake_ref}#{attr}")
+    # ``attr`` is interpreted in two modes:
+    #   - absolute drv path  (e.g. /nix/store/...drv) → build by drv,
+    #     no flake source needed on the secondary; the drv is fetched
+    #     from a peer harmonia via substituters.
+    #   - flake attribute    (e.g. _crossToolchainMap.x86_64-linux...) →
+    #     legacy single-process / dev-box path; needs flake_ref to
+    #     resolve to a checked-out tree.
+    if attr.startswith("/nix/store/") and attr.endswith(".drv"):
+        argv.append(f"{attr}^*")
+    else:
+        argv.append(f"{env.flake_ref}#{attr}")
 
     stdout, stderr, rc = runner(argv)
     return rc == 0, stdout, stderr
@@ -440,14 +450,20 @@ def build_worker(
             duration_seconds=max(0.0, clock() - start),
             error="manifest missing 'payload' object",
         )
-    attr = payload.get("attr")
+    # Prefer the absolute drv path when the manifest carries it: lets
+    # the secondary build via ``nix build /nix/store/...drv^*`` so the
+    # drv (and its closure) substitutes from peer harmonias without
+    # needing the flake source on the secondary's filesystem. Fall
+    # back to the flake attribute for legacy / single-process flows.
+    drv = payload.get("drv")
+    attr = drv if isinstance(drv, str) and drv.endswith(".drv") else payload.get("attr")
     if not isinstance(attr, str) or not attr:
         return BuildWorkerResult(
             item_class=item_class,
             name=name,
             success=False,
             duration_seconds=max(0.0, clock() - start),
-            error="manifest 'payload.attr' missing or empty",
+            error="manifest payload missing both 'drv' and 'attr'",
         )
 
     extra_args: list[str] = []
