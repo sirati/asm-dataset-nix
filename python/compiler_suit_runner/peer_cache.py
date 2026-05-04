@@ -347,31 +347,33 @@ def assemble_substituter_env(peers: list[PeerInfo]) -> dict[str, str]:
 
 
 def build_nix_extra_args(
-    peers: list[PeerInfo], substitute_on_destination: bool = True
+    peers: list[PeerInfo],
+    substitute_on_destination: bool = False,  # noqa: ARG001 — kept for API stability
 ) -> list[str]:
     """Build ``nix build`` arguments for peer substitution.
 
     Returns a list of args ready to splat into ``nix build`` after the
     attribute. Empty list -> empty list (no flags at all).
 
-    ``--substitute-on-destination`` is the key mechanic that turns
-    "first to build wins" into a passive announcement: harmonia pushes
-    the freshly built path to peers as part of the build graph rather
-    than waiting for them to poll.
+    ``--substitute-on-destination`` is a ``nix copy`` flag, not a
+    ``nix build`` flag. Earlier versions of this function injected it
+    unconditionally and ``nix build`` aborted with
+    ``error: unrecognised flag '--substitute-on-destination'``. The
+    parameter is preserved to keep callers' signatures stable but is
+    now ignored — the flag has no place in a build invocation. Peer
+    substitution still works via ``--extra-substituters`` +
+    ``--extra-trusted-public-keys``.
     """
     if not peers:
         return []
     urls = " ".join(p.substituter_url() for p in peers)
     keys = " ".join(p.public_key for p in peers)
-    args = [
+    return [
         "--extra-substituters",
         urls,
         "--extra-trusted-public-keys",
         keys,
     ]
-    if substitute_on_destination:
-        args.append("--substitute-on-destination")
-    return args
 
 
 # ---------------------------------------------------------------------------

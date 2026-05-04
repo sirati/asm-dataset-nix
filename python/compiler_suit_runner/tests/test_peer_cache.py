@@ -167,14 +167,21 @@ def test_build_nix_extra_args_empty() -> None:
     assert build_nix_extra_args([]) == []
 
 
-def test_build_nix_extra_args_with_destination() -> None:
+def test_build_nix_extra_args_substitute_on_destination_arg_is_ignored() -> None:
+    """``--substitute-on-destination`` is a ``nix copy`` flag, not a
+    ``nix build`` flag — earlier versions of this function injected it
+    unconditionally and ``nix build`` aborted with
+    ``error: unrecognised flag '--substitute-on-destination'``. The
+    parameter is preserved on the function signature for API stability
+    but the flag is no longer emitted regardless of the value.
+    """
     peers = [_mk_peer(1)]
     args = build_nix_extra_args(peers, substitute_on_destination=True)
     assert "--extra-substituters" in args
     assert "http://host1.example:5001" in args
     assert "--extra-trusted-public-keys" in args
     assert peers[0].public_key in args
-    assert args[-1] == "--substitute-on-destination"
+    assert "--substitute-on-destination" not in args
 
 
 def test_build_nix_extra_args_without_destination() -> None:
