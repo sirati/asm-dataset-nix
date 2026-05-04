@@ -19,3 +19,9 @@ __pycache__/
 # Pubkey is intentionally tracked so the Nix image build can read it.
 .ssh-debug/id_ed25519
 .ssh-debug/known_hosts
+
+# Claude Code per-session scratch (worktrees, transcripts).
+.claude/
+
+# Local work-in-progress notes; not part of the dataset.
+transformer_spec.md

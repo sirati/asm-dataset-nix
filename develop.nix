@@ -20,6 +20,12 @@ let
     basedpyright
     nil
     nixd
+    # Parallel multi-attr nix evaluator. Used by preflight to
+    # batch-evaluate the sampled drv paths in a single nix process
+    # with N workers, instead of forking ``nix eval`` once per
+    # variant (which re-walks each variant's cross-toolchain
+    # closure from scratch).
+    nix-eval-jobs
     #vscode-json-languageserver
     #bash-language-server
     #mcp-language-server

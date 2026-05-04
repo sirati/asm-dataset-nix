@@ -41,6 +41,34 @@ def _make_run_subprocess(responses: dict[str, object]):
 
     def runner(argv):
         calls.append(list(argv))
+        # nix-eval-jobs has its own JSONL output format; intercept it
+        # here and synthesise from the same fake response table by
+        # mapping ``dataset.<sys>.<pkg>.<arch>`` to the matching
+        # ``_drvPaths.<sys>.<pkg>.<arch>`` entry the fixture defined.
+        if argv and pathlib.Path(argv[0]).name == "nix-eval-jobs":
+            flake_idx = argv.index("--flake") if "--flake" in argv else -1
+            select_idx = argv.index("--select") if "--select" in argv else -1
+            if flake_idx == -1 or select_idx == -1:
+                return b"", b"missing --flake or --select", 1
+            flake_attr = argv[flake_idx + 1].split("#", 1)[1]
+            # dataset.<sys>.<pkg>.<arch> → _drvPaths.<sys>.<pkg>.<arch>
+            if not flake_attr.startswith("dataset."):
+                return b"", f"unexpected eval-jobs attr {flake_attr}".encode(), 1
+            drv_attr = "_drvPaths." + flake_attr[len("dataset."):]
+            payload = responses.get(drv_attr)
+            if not isinstance(payload, dict):
+                return b"", f"no fake for {drv_attr}".encode(), 1
+            select_expr = argv[select_idx + 1]
+            wanted = re.findall(r'"([A-Za-z0-9._-]+)"\s*=\s*null', select_expr)
+            wanted_set = set(wanted) if wanted else set(payload)
+            lines = []
+            for suffix, drv in payload.items():
+                if suffix not in wanted_set:
+                    continue
+                if not isinstance(drv, str):
+                    continue
+                lines.append(json.dumps({"attr": suffix, "drvPath": drv}))
+            return ("\n".join(lines) + "\n").encode("utf-8"), b"", 0
         # Find the flake#attr argument: it's the last token containing "#".
         # ``--apply`` mode shifts the lambda string to the very end of argv,
         # but the flake#attr token still appears earlier in the call.

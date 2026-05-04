@@ -25,6 +25,7 @@ import hashlib
 import json
 import random
 import re
+import shutil
 import subprocess
 from collections.abc import Callable
 from typing import Optional
@@ -127,38 +128,102 @@ def _eval_drv_paths_for_suffixes(
     arch: str,
     suffixes: list[str],
     *,
+    workers: int = 8,
     run_subprocess: Optional[RunSubprocess] = None,
 ) -> dict[str, str]:
-    """Evaluate drv paths for a specific list of suffixes only.
+    """Evaluate drv paths for a specific list of suffixes in parallel.
 
-    Uses ``nix eval --apply`` to pull just the requested attrs out of
-    the lazy ``_drvPaths.<sys>.<pkg>.<arch>`` attrset. Nix forces
-    only those attrs, so eval cost scales with the number of distinct
-    compilers in the sample (shared cross-toolchain + libc closures
-    are walked once per compiler, not per variant).
+    Uses ``nix-eval-jobs`` (a parallel multi-attr nix evaluator) over
+    ``dataset.<sys>.<pkg>.<arch>`` with a ``--select`` lambda that
+    projects to just the sampled suffixes. ``nix-eval-jobs`` spawns
+    ``workers`` parallel evaluator threads sharing one process, so
+    each compiler's cross-toolchain closure gets walked once and
+    drv instantiation parallelises across compilers.
 
-    Suffix names are matrix-generated and made of ``[A-Za-z0-9._-]``,
-    so naive string interpolation is safe; we still validate to
-    surface any future schema drift loudly instead of letting an
-    injected nix fragment slip through.
+    Output is JSONL — one line per attr with ``drvPath``. We collect
+    them into a ``{suffix: drv_path}`` dict.
+
+    Suffix names come from the matrix and are made of
+    ``[A-Za-z0-9._-]``; we validate before splicing into the
+    --select lambda so future schema drift surfaces loudly instead
+    of letting an injected nix fragment slip through.
+
+    Falls back to the inline ``nix eval --apply`` path if
+    ``nix-eval-jobs`` isn't on PATH (e.g. in the test harness with a
+    stubbed ``run_subprocess``).
     """
     runner = run_subprocess or _default_run_subprocess
     safe = re.compile(r"^[A-Za-z0-9._-]+$")
-    valid: list[str] = []
     for s in suffixes:
         if not safe.match(s):
             raise RuntimeError(
                 f"unexpected character in matrix suffix {s!r}"
-                " — refusing to splice into nix --apply expression"
+                " — refusing to splice into nix-eval-jobs --select"
             )
-        valid.append(s)
 
-    # Build the nix --apply lambda. Form:
-    #   m: { "${suffix1}" = m."${suffix1}"; ... }
-    # which forces nix to instantiate just those attrs.
-    body = "; ".join(f'"{s}" = m."{s}"' for s in valid)
+    if shutil.which("nix-eval-jobs") is None:
+        return _eval_drv_paths_for_suffixes_fallback(
+            flake_ref, sys_name, pkg, arch, suffixes, run_subprocess=runner,
+        )
+
+    # Build the --select lambda. Form:
+    #   m: builtins.intersectAttrs { S1 = null; S2 = null; ... } m
+    keys = " ".join(f'"{s}" = null;' for s in suffixes)
+    select_expr = f"m: builtins.intersectAttrs {{ {keys} }} m"
+
+    argv: list[str] = [
+        "nix-eval-jobs",
+        "--flake",
+        f"{flake_ref}#dataset.{sys_name}.{pkg}.{arch}",
+        "--select",
+        select_expr,
+        "--workers",
+        str(max(1, workers)),
+    ]
+    stdout, stderr, rc = runner(argv)
+    if rc != 0:
+        decoded_err = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"nix-eval-jobs {flake_ref}#dataset.{sys_name}.{pkg}.{arch}"
+            f" failed (rc={rc}): {decoded_err}"
+        )
+    drvs: dict[str, str] = {}
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            # nix-eval-jobs interleaves status/error lines; ignore
+            # anything that isn't a valid JSON object.
+            continue
+        if not isinstance(entry, dict):
+            continue
+        attr = entry.get("attr")
+        drv = entry.get("drvPath")
+        if isinstance(attr, str) and isinstance(drv, str) and drv:
+            drvs[attr] = drv
+    return drvs
+
+
+def _eval_drv_paths_for_suffixes_fallback(
+    flake_ref: str,
+    sys_name: str,
+    pkg: str,
+    arch: str,
+    suffixes: list[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> dict[str, str]:
+    """Single-threaded fallback used when ``nix-eval-jobs`` isn't on
+    PATH (mostly: the test harness with a stubbed ``run_subprocess``).
+
+    Form:  ``nix eval --apply 'm: { "S1" = m."S1"; ... }' .#_drvPaths.<...>``
+    """
+    runner = run_subprocess or _default_run_subprocess
+    body = "; ".join(f'"{s}" = m."{s}"' for s in suffixes)
     apply_expr = f"m: {{ {body}; }}"
-
     argv: list[str] = [
         "nix",
         "eval",
@@ -173,14 +238,13 @@ def _eval_drv_paths_for_suffixes(
     if rc != 0:
         decoded_err = stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(
-            f"nix eval (apply) {flake_ref}#_drvPaths.{sys_name}.{pkg}.{arch}"
+            f"nix eval (apply fallback) {flake_ref}#_drvPaths.{sys_name}.{pkg}.{arch}"
             f" failed (rc={rc}): {decoded_err}"
         )
-    text = stdout.decode("utf-8", errors="replace")
-    parsed = json.loads(text)
+    parsed = json.loads(stdout.decode("utf-8", errors="replace"))
     if not isinstance(parsed, dict):
         raise RuntimeError(
-            f"nix eval (apply) returned non-object (got {type(parsed).__name__})"
+            f"nix eval (apply fallback) returned non-object: {type(parsed).__name__}"
         )
     return parsed  # type: ignore[return-value]
 
