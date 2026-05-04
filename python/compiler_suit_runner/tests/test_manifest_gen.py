@@ -278,8 +278,10 @@ def test_emit_all_manifests_full_shape(tmp_path: pathlib.Path):
     assert result.target_dir == tmp_path
 
     grouped = result.by_class
-    assert len(grouped["phase1a_partition"]) == 4
-    assert len(grouped["phase1b_merge"]) == 1
+    # Phase 1a + 1b are now computed inline on the primary (job-list
+    # creation) and don't emit dispatch manifests.
+    assert len(grouped["phase1a_partition"]) == 0
+    assert len(grouped["phase1b_merge"]) == 0
     assert len(grouped["phase2_toolchain"]) == 4
     assert len(grouped["phase2_common_dep"]) == 2
     assert len(grouped["phase3_variant"]) == 12
@@ -308,10 +310,8 @@ def test_emit_all_manifests_iteration_order(tmp_path: pathlib.Path):
         common_deps=common_deps,
     )
     classes = [h.item_class for h in result.headers]
-    # Verify the canonical phase order in the in-memory listing.
+    # Phase 1a + 1b no longer dispatched; remaining phases keep order.
     expected_order = [
-        "phase1a_partition",
-        "phase1b_merge",
         "phase2_toolchain",
         "phase2_common_dep",
         "phase3_variant",
@@ -324,11 +324,7 @@ def test_emit_all_manifests_iteration_order(tmp_path: pathlib.Path):
 
 
 def test_emit_all_manifests_empty_inputs(tmp_path: pathlib.Path):
-    """A degenerate case: no variants, no toolchains, no deps.
-
-    The merge manifest is still emitted (the framework owns phase
-    drain detection now, so no barrier sentinels are produced).
-    """
+    """A degenerate case: no variants, no toolchains, no deps."""
     result = emit_all_manifests(
         target_dir=tmp_path,
         sys_name="x86_64-linux",
@@ -338,10 +334,10 @@ def test_emit_all_manifests_empty_inputs(tmp_path: pathlib.Path):
     )
     grouped = result.by_class
     assert grouped["phase1a_partition"] == ()
+    assert grouped["phase1b_merge"] == ()
     assert grouped["phase2_toolchain"] == ()
     assert grouped["phase2_common_dep"] == ()
     assert grouped["phase3_variant"] == ()
-    assert len(grouped["phase1b_merge"]) == 1
 
 
 def test_manifest_set_by_class_includes_all_known_classes(

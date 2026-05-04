@@ -783,18 +783,24 @@ def cmd_submit(args: argparse.Namespace) -> int:
         max_variants = getattr(args, "max_variants", None)
         if max_variants is not None and max_variants > 0:
             capped = pre.variants[:max_variants]
-            needed_pairs = {(v["arch"], v["compiler_id"]) for v in capped}
-            kept_tcs = tuple(
-                spec for spec in pre.toolchain_specs if spec in needed_pairs
-            )
             log.info(
-                "max-variants: capping %d -> %d variants; %d -> %d toolchains",
+                "max-variants: capping %d -> %d variants",
                 len(pre.variants), len(capped),
-                len(pre.toolchain_specs), len(kept_tcs),
             )
-            pre = dataclasses.replace(
-                pre, variants=capped, toolchain_specs=kept_tcs
-            )
+            pre = dataclasses.replace(pre, variants=capped)
+
+        # Drop the phase-2 toolchain pre-build: the secondaries pull
+        # the toolchain (and every other host dep) directly via the
+        # peer-cache federation when they realise a phase-3 variant
+        # drv. Pre-building separately would only matter as a perf
+        # optimisation for full-matrix runs (avoid N variants
+        # substituting the same toolchain in parallel) — and even
+        # then the right place to do it is the primary, not a
+        # secondary that has an empty /nix/store. Phase-2 common-deps
+        # are likewise empty until the primary-side partition step
+        # is implemented; without those the variant builds rely on
+        # substitution for everything beyond the toolchain too.
+        pre = dataclasses.replace(pre, toolchain_specs=(), common_dep_drvs=())
 
         try:
             _emit_manifests_from_preflight(
