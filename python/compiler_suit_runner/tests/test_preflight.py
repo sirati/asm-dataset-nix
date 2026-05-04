@@ -19,6 +19,7 @@ from compiler_suit_runner.preflight import (
     enumerate_toolchains,
     enumerate_variants,
     filter_existing_variants,
+    is_known_bad_combo,
     preflight,
     run_nix_eval,
 )
@@ -590,3 +591,113 @@ def test_filter_existing_drops_variants_with_existing_tarball(
     kept, skipped = filter_existing_variants(variants, dataset_dir=dataset)
     assert skipped == 2
     assert {v["label"] for v in kept} == {"b"}
+
+
+# ---------------------------------------------------------------------------
+# is_known_bad_combo
+# ---------------------------------------------------------------------------
+
+
+def _meta(**overrides) -> dict:
+    base = {
+        "compiler": "gcc15",
+        "compilerFamily": "gcc",
+        "compilerVersion": "15.2.0",
+        "optimization": "O2",
+        "flags": "baseline",
+        "hardening": "default",
+        "sanitizer": "san-off",
+        "march": "march-default",
+        "package": "hello",
+        "arch": "x86_64",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_known_bad_combo_o0_with_sanitizer() -> None:
+    reason = is_known_bad_combo(_meta(optimization="O0", sanitizer="san-undefined"))
+    assert reason is not None
+    assert "O0" in reason or "optim" in reason.lower()
+
+
+def test_known_bad_combo_o0_with_san_address() -> None:
+    assert is_known_bad_combo(_meta(optimization="O0", sanitizer="san-address")) is not None
+
+
+def test_known_bad_combo_o0_with_san_off_is_fine() -> None:
+    assert is_known_bad_combo(_meta(optimization="O0", sanitizer="san-off")) is None
+
+
+def test_known_bad_combo_old_clang_with_sanitizer() -> None:
+    reason = is_known_bad_combo(
+        _meta(
+            compiler="clang5",
+            compilerFamily="clang",
+            compilerVersion="5.0.2",
+            optimization="O2",
+            sanitizer="san-undefined",
+        )
+    )
+    assert reason is not None
+    assert "clang" in reason
+
+
+def test_known_bad_combo_modern_clang_with_sanitizer_is_fine() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang20",
+            compilerFamily="clang",
+            compilerVersion="20.1.8",
+            optimization="O2",
+            sanitizer="san-undefined",
+        )
+    ) is None
+
+
+def test_known_bad_combo_old_gcc_with_sanitizer() -> None:
+    reason = is_known_bad_combo(
+        _meta(
+            compiler="gcc4_8",
+            compilerFamily="gcc",
+            compilerVersion="4.8.5",
+            optimization="O2",
+            sanitizer="san-address",
+        )
+    )
+    assert reason is not None
+    assert "gcc" in reason
+
+
+def test_known_bad_combo_modern_gcc_with_sanitizer_is_fine() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="gcc15",
+            compilerFamily="gcc",
+            compilerVersion="15.2.0",
+            optimization="O2",
+            sanitizer="san-thread",
+        )
+    ) is None
+
+
+def test_known_bad_combo_ofast_with_san_undefined() -> None:
+    reason = is_known_bad_combo(_meta(optimization="Ofast", sanitizer="san-undefined"))
+    assert reason is not None
+    assert "fast" in reason.lower() or "Ofast" in reason
+
+
+def test_known_bad_combo_ofast_with_san_address_is_fine() -> None:
+    # Only san-undefined collides with -ffast-math; san-address is OK.
+    assert is_known_bad_combo(_meta(optimization="Ofast", sanitizer="san-address")) is None
+
+
+def test_known_bad_combo_san_off_never_fails() -> None:
+    # Spot-check: any combo with san-off should be acceptable regardless
+    # of optimization / compiler / hardening.
+    for opt in ("O0", "O1", "O2", "O3", "Os", "Oz", "Ofast"):
+        assert is_known_bad_combo(_meta(optimization=opt, sanitizer="san-off")) is None
+    for cc, ver in (("clang", "3.4.1"), ("clang", "20.1.8"), ("gcc", "4.4"), ("gcc", "15.2.0")):
+        assert is_known_bad_combo(
+            _meta(compilerFamily=cc, compilerVersion=ver, sanitizer="san-off")
+        ) is None
