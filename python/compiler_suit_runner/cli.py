@@ -166,6 +166,19 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--max-variants",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "After sampling + skip-existing, hard-cap the variant set "
+            "at the first N entries. Useful for end-to-end smoke tests "
+            "(e.g. `--max-variants 1` builds exactly one phase-3 item). "
+            "Toolchain set is narrowed to only the compilers/archs the "
+            "kept variants actually depend on."
+        ),
+    )
+    parser.add_argument(
         "--packaging",
         choices=_VALID_PACKAGING,
         default="none",
@@ -366,6 +379,7 @@ _CSR_FLAGS_WITH_VALUE: frozenset[str] = frozenset({
     "--build-max-concurrent",
     "--variant-sample",
     "--variant-seed",
+    "--max-variants",
     "--hash",
     # nargs="+" — may be followed by multiple values
     "--packages",
@@ -765,6 +779,22 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 skipped, len(kept_variants),
             )
             pre = dataclasses.replace(pre, variants=kept_variants)
+
+        max_variants = getattr(args, "max_variants", None)
+        if max_variants is not None and max_variants > 0:
+            capped = pre.variants[:max_variants]
+            needed_pairs = {(v["arch"], v["compiler_id"]) for v in capped}
+            kept_tcs = tuple(
+                spec for spec in pre.toolchain_specs if spec in needed_pairs
+            )
+            log.info(
+                "max-variants: capping %d -> %d variants; %d -> %d toolchains",
+                len(pre.variants), len(capped),
+                len(pre.toolchain_specs), len(kept_tcs),
+            )
+            pre = dataclasses.replace(
+                pre, variants=capped, toolchain_specs=kept_tcs
+            )
 
         try:
             _emit_manifests_from_preflight(
