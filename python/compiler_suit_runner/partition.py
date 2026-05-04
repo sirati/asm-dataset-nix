@@ -19,12 +19,26 @@ PARTITION_VERSION = 1
 
 
 class VariantSpec(TypedDict):
-    """Static description of one variant the matrix exposes."""
+    """Static description of one variant the matrix exposes.
+
+    ``label`` is the canonical full identifier
+    (``<pkg>-<arch>-<compiler>-<opt>-<flags>-<hardening>``), used as
+    a stable hash input. ``tarball_name`` and ``metadata_name`` are
+    derived shorter filenames (``<compiler>_<arch>_<opt>_<hash>``)
+    that get written to ``dataset_dir`` along with a sidecar JSON
+    carrying the full parameter set.
+    """
 
     label: str
     drv: str
     tarball_name: str
+    metadata_name: str
     compiler_id: str
+    compiler_family: str
+    compiler_version: str
+    optimization: str
+    flag_set: str
+    hardening: str
     tier: int
     pkg: str
     arch: str

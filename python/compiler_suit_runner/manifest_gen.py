@@ -184,7 +184,13 @@ def make_variant_header(
         "label": label,
         "drv": variant["drv"],
         "tarball_name": variant["tarball_name"],
+        "metadata_name": variant["metadata_name"],
         "compiler_id": variant["compiler_id"],
+        "compiler_family": variant.get("compiler_family", ""),
+        "compiler_version": variant.get("compiler_version", ""),
+        "optimization": variant.get("optimization", ""),
+        "flag_set": variant.get("flag_set", ""),
+        "hardening": variant.get("hardening", ""),
         "tier": variant["tier"],
         "attr": f"dataset.{sys_name}.{pkg}.{arch}.{suffix}",
     }

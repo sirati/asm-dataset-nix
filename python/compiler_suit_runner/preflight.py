@@ -21,13 +21,39 @@ unit tests stay hermetic — the real flake never has to be evaluated.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import random
+import re
 import subprocess
 from collections.abc import Callable
 from typing import Optional
 
 from compiler_suit_runner.partition import VariantSpec
+
+
+def _short_dataset_name(
+    *, compiler_id: str, arch: str, optimization: str, full_label: str
+) -> str:
+    """Return the short filesystem identifier for a variant.
+
+    Format: ``<compiler>_<arch>_<opt>_<8-hex-hash>``. The hash is
+    deterministic (sha256 of the full variant label), so the same
+    variant always maps to the same filename — re-running with new
+    flag dimensions added to the matrix doesn't shift previously-built
+    tarballs around. Filesystem-unsafe characters are scrubbed from
+    the leading fields (compilers like ``gcc-old-4_4`` keep their
+    hyphens / underscores; nothing else is currently problematic).
+    """
+    digest = hashlib.sha256(full_label.encode("utf-8")).hexdigest()[:8]
+    safe = re.compile(r"[^A-Za-z0-9._-]+")
+    parts = [
+        safe.sub("-", compiler_id) or "unknown-compiler",
+        safe.sub("-", arch) or "unknown-arch",
+        safe.sub("-", optimization) or "unknown-opt",
+        digest,
+    ]
+    return "_".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -170,14 +196,34 @@ def _build_variant_spec(
     meta_entry: dict,
     drv_path: str,
 ) -> VariantSpec:
-    """Assemble one :class:`VariantSpec` from the meta + drvPaths slices."""
+    """Assemble one :class:`VariantSpec` from the meta + drvPaths slices.
+
+    ``tarball_name`` and ``metadata_name`` are short-form file names
+    (``<compiler>_<arch>_<opt>_<hash>``) — keeps the filesystem layout
+    legible even when the matrix grows extra axes (sanitizer, march,
+    individual hardening flags). The full parameter set is written to
+    the sidecar JSON during phase-3 build.
+    """
     label = meta_entry.get("variantLabel", suffix)
     compiler_id = meta_entry.get("compiler", "")
+    optimization = meta_entry.get("optimization", "")
+    short = _short_dataset_name(
+        compiler_id=compiler_id,
+        arch=arch,
+        optimization=optimization,
+        full_label=label,
+    )
     return {
         "label": label,
         "drv": drv_path,
-        "tarball_name": f"{label}.tar.zst",
+        "tarball_name": f"{short}.tar.zst",
+        "metadata_name": f"{short}.json",
         "compiler_id": compiler_id,
+        "compiler_family": meta_entry.get("compilerFamily", ""),
+        "compiler_version": meta_entry.get("compilerVersion", ""),
+        "optimization": optimization,
+        "flag_set": meta_entry.get("flags", ""),
+        "hardening": meta_entry.get("hardening", ""),
         "tier": _tier_from_pkg(pkg),
         "pkg": pkg,
         "arch": arch,
