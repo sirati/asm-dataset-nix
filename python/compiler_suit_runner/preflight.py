@@ -120,6 +120,71 @@ def _default_run_subprocess(argv: list[str]) -> tuple[bytes, bytes, int]:
 # ---------------------------------------------------------------------------
 
 
+def _eval_drv_paths_for_suffixes(
+    flake_ref: str,
+    sys_name: str,
+    pkg: str,
+    arch: str,
+    suffixes: list[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> dict[str, str]:
+    """Evaluate drv paths for a specific list of suffixes only.
+
+    Uses ``nix eval --apply`` to pull just the requested attrs out of
+    the lazy ``_drvPaths.<sys>.<pkg>.<arch>`` attrset. Nix forces
+    only those attrs, so eval cost scales with the number of distinct
+    compilers in the sample (shared cross-toolchain + libc closures
+    are walked once per compiler, not per variant).
+
+    Suffix names are matrix-generated and made of ``[A-Za-z0-9._-]``,
+    so naive string interpolation is safe; we still validate to
+    surface any future schema drift loudly instead of letting an
+    injected nix fragment slip through.
+    """
+    runner = run_subprocess or _default_run_subprocess
+    safe = re.compile(r"^[A-Za-z0-9._-]+$")
+    valid: list[str] = []
+    for s in suffixes:
+        if not safe.match(s):
+            raise RuntimeError(
+                f"unexpected character in matrix suffix {s!r}"
+                " — refusing to splice into nix --apply expression"
+            )
+        valid.append(s)
+
+    # Build the nix --apply lambda. Form:
+    #   m: { "${suffix1}" = m."${suffix1}"; ... }
+    # which forces nix to instantiate just those attrs.
+    body = "; ".join(f'"{s}" = m."{s}"' for s in valid)
+    apply_expr = f"m: {{ {body}; }}"
+
+    argv: list[str] = [
+        "nix",
+        "eval",
+        "--extra-experimental-features",
+        "nix-command flakes",
+        "--json",
+        f"{flake_ref}#_drvPaths.{sys_name}.{pkg}.{arch}",
+        "--apply",
+        apply_expr,
+    ]
+    stdout, stderr, rc = runner(argv)
+    if rc != 0:
+        decoded_err = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"nix eval (apply) {flake_ref}#_drvPaths.{sys_name}.{pkg}.{arch}"
+            f" failed (rc={rc}): {decoded_err}"
+        )
+    text = stdout.decode("utf-8", errors="replace")
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"nix eval (apply) returned non-object (got {type(parsed).__name__})"
+        )
+    return parsed  # type: ignore[return-value]
+
+
 def run_nix_eval(
     flake_ref: str,
     attr: str,
@@ -359,15 +424,30 @@ def enumerate_variants(
                     sample_size=sample_size,
                     seed=sample_seed,
                 )
-            # One ``_drvPaths.<sys>.<pkg>.<arch>`` eval covers all
-            # suffixes for this (pkg, arch). Per-suffix evals would
-            # fork ``nix eval`` once per kept variant — each fork
-            # re-walks the entire shared dependency closure (cross
-            # toolchain, libc, etc.) from scratch since nix doesn't
-            # share evaluation state across processes — so the
-            # per-suffix path was an order of magnitude SLOWER on a
-            # 270-sample run despite touching fewer variants.
-            if full_drvs is None:
+            # Get drv paths for the kept suffixes. Three strategies:
+            #   - Sampled mode: single ``nix eval --apply`` that
+            #     pulls just the kept suffixes out of the lazy
+            #     ``_drvPaths.<sys>.<pkg>.<arch>`` attrset. Nix
+            #     evaluates only the requested attrs (lazy attrset
+            #     access) so the eval cost scales with O(num
+            #     compilers in the sample) — the shared cross-
+            #     toolchain closure dominates and only gets walked
+            #     once per compiler, not per variant.
+            #   - Full-matrix mode (no sampling, no top-level
+            #     ``_drvPaths.<sys>``): evaluate the full
+            #     per-(pkg, arch) attrset; nix forces every value.
+            #   - Top-level pre-evaluated: read from the cached
+            #     ``full_drvs`` dict.
+            if sample_size > 0 and suffix_attrs:
+                drvs_arch = _eval_drv_paths_for_suffixes(
+                    flake_ref,
+                    sys_name,
+                    pkg,
+                    arch,
+                    list(suffix_attrs),
+                    run_subprocess=run_subprocess,
+                )
+            elif full_drvs is None:
                 drvs_arch = run_nix_eval(
                     flake_ref,
                     f"_drvPaths.{sys_name}.{pkg}.{arch}",
