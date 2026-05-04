@@ -720,11 +720,17 @@ def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
     binary = shutil.which("nix-daemon") or "/bin/nix-daemon"
     if not os.path.exists(binary):
         raise FileNotFoundError("nix-daemon not found on PATH or /bin")
-    log_fh = open(
-        log_path or pathlib.Path("/tmp/nix-daemon.log"),
-        "ab",
-        buffering=0,
-    )
+    # Default log path is /tmp/nix-daemon.log, but containers built via
+    # dockerTools.buildLayeredImage don't get a /tmp by default — fall
+    # back to /dev/null rather than crashing the lifecycle hook over a
+    # missing log file. Daemon errors then surface on the secondary's
+    # own stderr (slurm_<jobid>.err) which is just as useful.
+    target = log_path or pathlib.Path("/tmp/nix-daemon.log")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(target, "ab", buffering=0)
+    except OSError:
+        log_fh = open(os.devnull, "wb")
     proc = subprocess.Popen(  # noqa: S603
         [binary],
         stdout=log_fh,

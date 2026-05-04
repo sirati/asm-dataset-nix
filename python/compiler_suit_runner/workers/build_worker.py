@@ -26,6 +26,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from typing import Optional
@@ -515,12 +516,28 @@ def build_worker(
         )
 
     if not success:
+        # Print the failure context to fd 2 (the secondary's stderr,
+        # which lands in slurm_<jobid>.err on the gateway). The
+        # framework only forwards ``error`` strings back to the
+        # primary; full nix log excerpts get dropped at the dispatch
+        # boundary, so without this print there's no way to diagnose
+        # a build failure from the dispatch.log.
+        excerpt = _excerpt_log(stderr, env.log_excerpt_lines)
+        try:
+            sys.stderr.write(
+                f"[build_worker] nix build failed for {name} ({item_class}); "
+                f"attr={attr!r}\n"
+                f"--- stderr excerpt ---\n{excerpt}\n--- end ---\n"
+            )
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001
+            pass
         return BuildWorkerResult(
             item_class=item_class,
             name=name,
             success=False,
             duration_seconds=max(0.0, clock() - start),
-            nix_log_excerpt=_excerpt_log(stderr, env.log_excerpt_lines),
+            nix_log_excerpt=excerpt,
             error="nix build returned non-zero",
         )
 
