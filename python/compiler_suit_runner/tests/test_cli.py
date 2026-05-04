@@ -145,7 +145,16 @@ def _stub_preflight(monkeypatch: pytest.MonkeyPatch, **overrides):
     )
     calls = []
 
-    def fake(flake_ref, sys_name, *, packages=None, archs=None, run_subprocess=None):
+    def fake(
+        flake_ref,
+        sys_name,
+        *,
+        packages=None,
+        archs=None,
+        sample_size=0,
+        sample_seed="42",
+        run_subprocess=None,
+    ):
         calls.append((flake_ref, sys_name, packages, archs))
         return pre
 

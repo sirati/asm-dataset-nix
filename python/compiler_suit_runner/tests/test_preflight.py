@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
+from typing import Optional
 
 import pytest
 
@@ -39,8 +41,22 @@ def _make_run_subprocess(responses: dict[str, object]):
 
     def runner(argv):
         calls.append(list(argv))
-        # Find the flake#attr argument; it's the last positional.
-        target = argv[-1]
+        # Find the flake#attr argument: it's the last token containing "#".
+        # ``--apply`` mode shifts the lambda string to the very end of argv,
+        # but the flake#attr token still appears earlier in the call.
+        target = next(
+            (tok for tok in reversed(argv) if "#" in tok),
+            argv[-1],
+        )
+        # Detect --apply mode: returning the full inner attrset is fine
+        # for tests because the fixture's responses are flat dicts and
+        # the lambda's "m: { ... = m.X; ... }" projection picks valid keys.
+        apply_expr: Optional[str] = None
+        if "--apply" in argv:
+            try:
+                apply_expr = argv[argv.index("--apply") + 1]
+            except IndexError:
+                apply_expr = None
         if "#" not in target:
             return b"", b"missing #attr", 1
         attr = target.split("#", 1)[1]
@@ -49,6 +65,15 @@ def _make_run_subprocess(responses: dict[str, object]):
         payload = responses[attr]
         if isinstance(payload, bytes):
             return payload, b"", 0
+        # When ``--apply`` is in play, mimic nix's behaviour of running
+        # the lambda on the resolved attrset. The lambda we emit has the
+        # form ``m: { "S1" = m."S1"; "S2" = m."S2"; ... }`` — pull the
+        # quoted suffix names out and project the response dict.
+        if apply_expr and isinstance(payload, dict):
+            suffixes = re.findall(r'"([A-Za-z0-9._-]+)"\s*=\s*m\."', apply_expr)
+            if suffixes:
+                projected = {s: payload[s] for s in suffixes if s in payload}
+                return json.dumps(projected).encode("utf-8"), b"", 0
         return json.dumps(payload).encode("utf-8"), b"", 0
 
     return runner, calls
