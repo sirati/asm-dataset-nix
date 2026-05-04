@@ -46,6 +46,10 @@ from compiler_suit_runner.incremental_cache import (
     compute_input_hash,
 )
 from compiler_suit_runner.manifest_gen import emit_all_manifests
+from compiler_suit_runner.partition_local import (
+    PartitionResult,
+    compute_partition_locally,
+)
 from compiler_suit_runner.preflight import (
     PreflightResult,
     filter_existing_variants,
@@ -789,18 +793,38 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
             pre = dataclasses.replace(pre, variants=capped)
 
-        # Drop the phase-2 toolchain pre-build: the secondaries pull
-        # the toolchain (and every other host dep) directly via the
-        # peer-cache federation when they realise a phase-3 variant
-        # drv. Pre-building separately would only matter as a perf
-        # optimisation for full-matrix runs (avoid N variants
-        # substituting the same toolchain in parallel) — and even
-        # then the right place to do it is the primary, not a
-        # secondary that has an empty /nix/store. Phase-2 common-deps
-        # are likewise empty until the primary-side partition step
-        # is implemented; without those the variant builds rely on
-        # substitution for everything beyond the toolchain too.
-        pre = dataclasses.replace(pre, toolchain_specs=(), common_dep_drvs=())
+        # Local partition: walk each variant's drv graph on the dev box
+        # (where preflight already instantiated them) and refcount input
+        # drvs to identify shared host deps. Recorded into pre.common_dep_drvs
+        # so the prebuild step (workstream 2) can realise them locally;
+        # secondaries then substitute via the federated dev-box harmonia
+        # instead of rebuilding glibc / libc / ... once per variant.
+        try:
+            partition = compute_partition_locally(
+                pre.variants,
+                toolchain_drvs=pre.toolchain_drvs,
+            )
+            log.info(
+                "partition: %d variants, %d common deps (refcount >= 10)",
+                len(pre.variants), len(partition.common_dep_drvs),
+            )
+            pre = dataclasses.replace(
+                pre, common_dep_drvs=partition.common_dep_drvs,
+            )
+        except Exception:  # noqa: BLE001 — partition is best-effort
+            log.exception(
+                "partition computation failed; proceeding without"
+                " common-dep classification (every variant rebuilds"
+                " its full closure)"
+            )
+
+        # TODO(prebuild): once prebuild_drvs() lands, realise toolchain_drvs
+        # ∪ common_dep_drvs locally on the dev box (parallel ``nix build``)
+        # so the dev-box harmonia serves them; secondaries then substitute
+        # instead of rebuilding. Until then we leave phase-2 dispatch
+        # cleared (toolchain_specs=()) and rely on per-variant substitution
+        # which still walks the closure but at least via dev-box harmonia.
+        pre = dataclasses.replace(pre, toolchain_specs=())
 
         try:
             _emit_manifests_from_preflight(
