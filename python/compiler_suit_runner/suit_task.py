@@ -304,16 +304,13 @@ class SuitTaskConfig:
 class SuitTask:
     """The single dynamic_runner :class:`TaskDefinition` for the run."""
 
-    # Items ARE files in the framework's sense: the primary stages each
-    # manifest JSON to the gateway and the secondary copies it into
-    # ``/app/src-tmp/<rel>``. Manifests are sub-kilobyte JSON now (the
-    # historical sparse-padding cliff is fixed in manifest_gen), so the
-    # primary's ``queue_initial_staging`` hash pass is trivial — opting
-    # out via ``uses_file_based_items=False`` would require either a
-    # side-channel for payload (framework doesn't support it) or
-    # encoding the manifest into the path itself, both of which are
-    # uglier than just letting the framework stage tiny files.
-    uses_file_based_items: bool = True
+    # Items are JSON manifests on the shared FS — workers resolve
+    # ``TaskInfo.path`` themselves against ``config.manifest_dir`` and
+    # the framework should NOT stat / hash / stage them. The path
+    # propagates to the worker as an opaque identifier over the comm
+    # fd. Skips the primary-side ``queue_initial_staging`` content-hash
+    # pass entirely (was 30+ min on a full matrix dispatch).
+    uses_file_based_items: bool = False
 
     def __init__(
         self,
