@@ -35,8 +35,9 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 __all__ = [
     "PeerInfo",
@@ -49,8 +50,13 @@ __all__ = [
     "assemble_substituter_env",
     "build_nix_extra_args",
     "PeerListWatcher",
+    "PeerNixConfWatcher",
     "prune_stale",
     "HarmoniaProcess",
+    "start_nix_daemon",
+    "NIX_DAEMON_SOCKET",
+    "PEER_CONF_PATH",
+    "SubmitterPeer",
 ]
 
 logger = logging.getLogger(__name__)
@@ -595,21 +601,65 @@ class HarmoniaProcess:
 
         Raises :class:`FileNotFoundError` if no suitable binary is
         on ``PATH``. Idempotent if already running (no-op).
+
+        Harmonia 3.x compatibility: harmonia-cache no longer takes
+        ``--bind`` on argv; the bind address goes in a TOML config
+        file referenced by ``CONFIG_FILE`` env. Nix-serve still uses
+        ``--bind``. We detect the binary basename and switch.
         """
         if self._proc is not None and self._proc.poll() is None:
             return  # already running
         binary = self._resolve_binary()
-        cmd = [binary, "--bind", self.bind_addr, *self.extra_args]
+        binary_name = os.path.basename(binary)
+
         env = dict(os.environ)
-        # harmonia / nix-serve consult these env vars for signing.
         env["SIGN_KEY_PATH"] = str(self.signing_key_path)
         env["NIX_SECRET_KEY_FILE"] = str(self.signing_key_path)
+        # harmonia 3.x renamed SIGN_KEY_PATH → SIGN_KEY_PATHS (plural,
+        # multi-key support). Set both so legacy + current both work.
+        env["SIGN_KEY_PATHS"] = str(self.signing_key_path)
+
+        if "harmonia-cache" in binary_name or binary_name == "harmonia":
+            # Harmonia 3.x: TOML config via CONFIG_FILE env. The wrapper
+            # binary at /bin/harmonia is a multi-tool launcher; the
+            # actual cache server is harmonia-cache.
+            cache_bin = binary
+            if binary_name == "harmonia":
+                # Resolve the harmonia-cache sibling.
+                cache_dir = os.path.dirname(os.path.realpath(binary))
+                candidate = os.path.join(cache_dir, "harmonia-cache")
+                if os.path.exists(candidate):
+                    cache_bin = candidate
+
+            # Write a TOML config in the same dir as the signing key
+            # (already user-private). Workers default to 2 — enough for
+            # cluster fan-in without saturating the secondary.
+            cfg_dir = self.signing_key_path.parent
+            cfg_path = cfg_dir / "harmonia.toml"
+            cfg_path.write_text(
+                f'bind = "{self.bind_addr}"\nworkers = 2\n'
+            )
+            env["CONFIG_FILE"] = str(cfg_path)
+            cmd = [cache_bin, *self.extra_args]
+        else:
+            # nix-serve (or anything else): legacy --bind flag.
+            cmd = [binary, "--bind", self.bind_addr, *self.extra_args]
+
         logger.info("starting binary cache server: %s", cmd)
-        self._proc = subprocess.Popen(  # noqa: S603 - command is constructed safely
+        # Detached + log-to-file (NOT PIPE — PIPE without a drainer
+        # blocks once kernel buffer fills, killing harmonia silently
+        # under heavy load. We tee to a file alongside the signing
+        # key so operators can find the log.)
+        log_path = self.signing_key_path.parent / "harmonia.log"
+        log_fh = open(log_path, "ab", buffering=0)
+        self._proc = subprocess.Popen(  # noqa: S603
             cmd,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
         )
 
     def stop(self, timeout: float = 10.0) -> Optional[int]:
@@ -643,3 +693,485 @@ class HarmoniaProcess:
     @property
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+
+# ---------------------------------------------------------------------------
+# nix-daemon helper
+# ---------------------------------------------------------------------------
+
+
+NIX_DAEMON_SOCKET = "/nix/var/nix/daemon-socket/socket"
+
+
+def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
+    """Start ``nix-daemon`` detached. No-op if its socket already exists.
+
+    Required by harmonia-cache 3.x — it queries the daemon over
+    ``/nix/var/nix/daemon-socket/socket`` for store info; without
+    a daemon every narinfo request 500s.
+
+    The image's ``nix.conf`` runs in single-user mode
+    (``build-users-group =``) so the daemon doesn't need nixbld* users.
+
+    Returns the PID, or None if the daemon was already running.
+    """
+    if os.path.exists(NIX_DAEMON_SOCKET):
+        return None
+    binary = shutil.which("nix-daemon") or "/bin/nix-daemon"
+    if not os.path.exists(binary):
+        raise FileNotFoundError("nix-daemon not found on PATH or /bin")
+    log_fh = open(
+        log_path or pathlib.Path("/tmp/nix-daemon.log"),
+        "ab",
+        buffering=0,
+    )
+    proc = subprocess.Popen(  # noqa: S603
+        [binary],
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    # Wait up to ~5s for the socket to appear.
+    for _ in range(20):
+        if os.path.exists(NIX_DAEMON_SOCKET):
+            return proc.pid
+        time.sleep(0.25)
+    return proc.pid
+
+
+# ---------------------------------------------------------------------------
+# /etc/nix/peer.conf live-rewriter
+# ---------------------------------------------------------------------------
+
+
+PEER_CONF_PATH = "/etc/nix/peer.conf"
+
+
+class PeerNixConfWatcher(threading.Thread):
+    """Translates a :class:`PeerListWatcher` snapshot into
+    ``/etc/nix/peer.conf`` continuously, so every nix invocation
+    inside the container picks up the live federation transparently.
+
+    The image's baseline ``/etc/nix/nix.conf`` does
+    ``!include /etc/nix/peer.conf`` (soft include — silently
+    skipped if missing). Each refresh writes::
+
+        extra-substituters = http://node-a:5000 http://node-b:5000
+        extra-trusted-public-keys = name-a:KEY name-b:KEY
+
+    so any subsequent ``nix-store --realise <path>`` /
+    ``nix build`` / ``nix shell`` resolves through every peer's
+    harmonia without the caller passing ``--from`` / ``--substituters``.
+
+    Daemon thread; ``stop()`` requests exit at the next tick.
+    """
+
+    def __init__(
+        self,
+        peer_watcher: "PeerListWatcher",
+        target_conf: str = PEER_CONF_PATH,
+        tick_seconds: float = 2.5,
+    ) -> None:
+        super().__init__(name="PeerNixConfWatcher", daemon=True)
+        self._watcher = peer_watcher
+        self._target = pathlib.Path(target_conf)
+        self._tick = float(tick_seconds)
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:  # pragma: no cover — exercised via integration
+        last_signature: tuple | None = None
+        while not self._stop.is_set():
+            try:
+                peers = list(self._watcher.peers)
+                urls = [p.substituter_url() for p in peers]
+                keys = [p.public_key for p in peers if p.public_key]
+                sig = (tuple(urls), tuple(keys))
+                if sig != last_signature:
+                    self._write_conf(urls, keys)
+                    last_signature = sig
+            except Exception:  # noqa: BLE001
+                logger.exception("PeerNixConfWatcher refresh failed")
+            self._stop.wait(self._tick)
+
+    def _write_conf(self, urls: list[str], keys: list[str]) -> None:
+        try:
+            self._target.parent.mkdir(parents=True, exist_ok=True)
+            body = ""
+            if urls:
+                body += "extra-substituters = " + " ".join(urls) + "\n"
+            if keys:
+                body += (
+                    "extra-trusted-public-keys = "
+                    + " ".join(keys)
+                    + "\n"
+                )
+            tmp = self._target.with_suffix(self._target.suffix + ".tmp")
+            tmp.write_text(body)
+            tmp.replace(self._target)
+            logger.debug(
+                "peer.conf updated: %d peer(s)", len(urls),
+            )
+        except OSError:
+            logger.exception("peer.conf write failed")
+
+
+# ---------------------------------------------------------------------------
+# Submitter-side peer integration
+# ---------------------------------------------------------------------------
+
+
+_SUBMITTER_KEY_DIR = pathlib.Path.home() / ".cache" / "asm-dataset-nix-runner"
+
+
+def _generate_submitter_signing_key(
+    key_dir: pathlib.Path,
+) -> tuple[pathlib.Path, str]:
+    """Make a fresh submitter signing keypair under ``key_dir``.
+
+    Independent of :func:`generate_signing_key` (which targets the
+    cluster-shared NFS dir): the submitter's keypair is short-lived,
+    regenerated each dispatch, and never leaves the local machine.
+    """
+    key_dir.mkdir(parents=True, exist_ok=True)
+    secret_path = key_dir / "submitter.key"
+    pub_path = key_dir / "submitter.key.pub"
+    name = f"asm-dataset-submitter-{int(time.time())}"
+
+    secret = subprocess.run(  # noqa: S603
+        ["nix", "--extra-experimental-features", "nix-command",
+         "key", "generate-secret", "--key-name", name],
+        check=True, capture_output=True,
+    ).stdout
+    if not secret:
+        raise RuntimeError("nix key generate-secret returned empty")
+    secret_path.write_bytes(secret)
+    secret_path.chmod(0o600)
+
+    public = subprocess.run(  # noqa: S603
+        ["nix", "--extra-experimental-features", "nix-command",
+         "key", "convert-secret-to-public"],
+        input=secret, check=True, capture_output=True,
+    ).stdout
+    pub_path.write_bytes(public)
+    pub_path.chmod(0o644)
+    return secret_path, public.decode("utf-8").strip()
+
+
+class SubmitterPeer:
+    """Adds the dispatching machine ("the submitter") to the cluster's
+    peer-cache federation.
+
+    Pairs with ``TaskDeploymentSpec.extra_port_forwards`` (added in
+    dynamic-runner ``afa024e``): the framework's primary opens an
+    SSH-R from the dev-box to the gateway as part of its existing
+    ControlMaster, binding ``0.0.0.0:<gateway_port>`` on the gateway
+    so compute-nodes reach our harmonia via cluster-internal network.
+
+    Responsibilities of this class — narrowed to what the framework
+    does NOT do:
+
+      1. Generate a fresh signing keypair under
+         ``~/.cache/asm-dataset-nix-runner/``. Short-lived; one per
+         dispatch.
+      2. Spawn ``harmonia-cache`` via
+         ``nix shell nixpkgs#harmonia --command harmonia-cache`` so
+         harmonia doesn't need to be in the dev shell's python env.
+         Listens on ``127.0.0.1:<local_port>``.
+      3. After the framework's dispatch creates the run dir on the
+         gateway, drop ``peers/submitter.json`` referencing
+         ``<gateway-host>:<gateway_port>`` and the public key. The
+         :class:`PeerListWatcher` in each container picks this up
+         within one tick (~3s).
+
+    Caller's responsibility: pass the matching
+    ``extra_port_forwards=((local_port, gateway_port),)`` to the
+    framework's :class:`TaskDeploymentSpec` BEFORE calling
+    ``dynamic_runner.run(...)``. The framework will refuse to bind
+    if ``gateway_port`` is taken on the gateway host — pick a
+    high randomised port if you may run multiple dispatches in
+    parallel.
+
+    Use as ``with SubmitterPeer(...) as p: ...`` so ``stop`` always
+    fires (best-effort peer-file removal + harmonia teardown).
+    """
+
+    def __init__(
+        self,
+        gateway_url: str,
+        slurm_root: str,
+        local_port: int = 5005,
+        gateway_port: int = 5005,
+        log: logging.Logger = logger,
+    ) -> None:
+        self.gateway_url = gateway_url
+        self.slurm_root = slurm_root.rstrip("/")
+        self.local_port = local_port
+        self.gateway_port = gateway_port
+        self.log = log
+
+        self._gateway_host: str | None = None
+        self._gateway_user: str | None = None
+        self._gateway_ssh_port: int = 22
+        self._harmonia: subprocess.Popen | None = None
+        self._signing_key_path: pathlib.Path | None = None
+        self._public_key: str | None = None
+
+        self._stop_evt = threading.Event()
+        self._poll_thread: threading.Thread | None = None
+        self._run_id: str | None = None
+        self._peer_published = False
+        # Captured at start(); _discover_run_id only accepts dirs we
+        # didn't see at submitter init. Without this, polling races
+        # the framework's run-dir creation and publishes the peer
+        # file into a stale dispatch's run dir (which the current
+        # dispatch's compute-nodes never read).
+        self._initial_run_ids: set[str] = set()
+
+    def __enter__(self) -> "SubmitterPeer":
+        self.start()
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.stop()
+
+    @property
+    def deployment_extra_port_forwards(self) -> tuple[tuple[int, int], ...]:
+        """Pass this into ``TaskDeploymentSpec.extra_port_forwards``
+        on the same dispatch — the framework will route the SSH-R."""
+        return ((self.local_port, self.gateway_port),)
+
+    def start(self) -> None:
+        # Parse the gateway URL once so stop() can issue cleanup ssh
+        # commands without re-parsing.
+        try:
+            from dynamic_runner.packaging.gateway import (  # type: ignore[import-not-found]
+                parse_gateway_url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log.error(
+                "dynamic_runner.packaging.gateway unavailable: %s; "
+                "submitter peer aborted",
+                exc,
+            )
+            return
+        cfg = parse_gateway_url(self.gateway_url)
+        if cfg.mode != "ssh":
+            self.log.warning(
+                "submitter-peer skipped: gateway is %s, not ssh",
+                cfg.mode,
+            )
+            return
+        self._gateway_host = cfg.ssh_host
+        self._gateway_user = cfg.ssh_user
+        self._gateway_ssh_port = cfg.ssh_port or 22
+
+        # 1. fresh signing keypair.
+        self._signing_key_path, self._public_key = (
+            _generate_submitter_signing_key(_SUBMITTER_KEY_DIR)
+        )
+        self.log.info(
+            "submitter signing key: %s...", self._public_key[:64],
+        )
+
+        # 2. harmonia-cache via nix shell nixpkgs#harmonia.
+        config_path = _SUBMITTER_KEY_DIR / "harmonia.toml"
+        config_path.write_text(
+            f'bind = "127.0.0.1:{self.local_port}"\nworkers = 2\n'
+        )
+        env = dict(os.environ)
+        env["CONFIG_FILE"] = str(config_path)
+        env["SIGN_KEY_PATH"] = str(self._signing_key_path)
+        env["SIGN_KEY_PATHS"] = str(self._signing_key_path)
+        cmd = [
+            "nix", "shell",
+            "--extra-experimental-features", "nix-command flakes",
+            "nixpkgs#harmonia",
+            "--command", "harmonia-cache",
+        ]
+        log_path = _SUBMITTER_KEY_DIR / "harmonia.log"
+        log_fh = open(log_path, "wb")
+        self._harmonia = subprocess.Popen(  # noqa: S603
+            cmd, env=env,
+            stdout=log_fh, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True,
+        )
+        probe = f"http://127.0.0.1:{self.local_port}/nix-cache-info"
+        for _ in range(40):
+            try:
+                with urllib.request.urlopen(probe, timeout=0.5):
+                    self.log.info(
+                        "submitter harmonia listening on 127.0.0.1:%d "
+                        "(framework will tunnel as 0.0.0.0:%d)",
+                        self.local_port, self.gateway_port,
+                    )
+                    break
+            except OSError:
+                time.sleep(0.25)
+        else:
+            self.log.warning(
+                "submitter harmonia did not respond on :%d within 10s",
+                self.local_port,
+            )
+
+        # Snapshot existing run dirs so we don't publish into a
+        # stale dispatch's dir that's still on the gateway.
+        self._initial_run_ids = self._list_run_ids()
+        if self._initial_run_ids:
+            self.log.debug(
+                "submitter peer: %d existing run-dir(s) ignored",
+                len(self._initial_run_ids),
+            )
+
+        # 3. polling thread that publishes the peer file after the
+        # framework creates the run dir.
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop,
+            name="SubmitterPeerPoll",
+            daemon=True,
+        )
+        self._poll_thread.start()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        # Best-effort peer-file removal so a future dispatch's
+        # PeerListWatcher doesn't see a stale URL pointing at a
+        # tunnel that's gone.
+        if self._run_id and self._peer_published:
+            remote_path = (
+                f"{self.slurm_root}/log/{self._run_id}"
+                "/peers/submitter.json"
+            )
+            self._ssh_oneshot([f"rm -f {remote_path}"])
+        if self._harmonia is not None:
+            try:
+                self._harmonia.terminate()
+            except OSError:
+                pass
+
+    def _poll_loop(self) -> None:
+        while not self._stop_evt.is_set():
+            try:
+                if self._run_id is None:
+                    self._run_id = self._discover_run_id()
+                if (
+                    self._run_id is not None
+                    and not self._peer_published
+                ):
+                    self._publish_peer_file()
+                    self._peer_published = True
+                    return
+            except Exception:  # noqa: BLE001
+                self.log.exception(
+                    "submitter-peer poll iteration failed"
+                )
+            self._stop_evt.wait(2.0)
+
+    def _ssh_oneshot(
+        self, remote_cmds: list[str], stdin_input: bytes | None = None,
+    ) -> tuple[int, str, str]:
+        """Run a one-shot ssh command against the gateway. We don't
+        share the framework's ControlMaster (it's owned by the
+        primary's pipeline thread) — but we don't need to either:
+        the file we're writing is small + infrequent, ad-hoc ssh
+        amortises just fine.
+        """
+        if self._gateway_user and self._gateway_host:
+            target = f"{self._gateway_user}@{self._gateway_host}"
+        elif self._gateway_host:
+            target = self._gateway_host
+        else:
+            return 1, "", "no gateway host"
+        argv = [
+            "ssh", "-o", "BatchMode=yes",
+            "-p", str(self._gateway_ssh_port),
+            target, "; ".join(remote_cmds),
+        ]
+        try:
+            res = subprocess.run(  # noqa: S603
+                argv, input=stdin_input, capture_output=True, timeout=15,
+            )
+            return (
+                res.returncode,
+                res.stdout.decode("utf-8", errors="replace"),
+                res.stderr.decode("utf-8", errors="replace"),
+            )
+        except (subprocess.SubprocessError, OSError) as exc:
+            return 1, "", str(exc)
+
+    def _list_run_ids(self) -> set[str]:
+        rc, out, _err = self._ssh_oneshot([
+            f"ls -1 {self.slurm_root}/log 2>/dev/null"
+            " | grep -E '^run_[0-9_]+$'",
+        ])
+        if rc != 0:
+            return set()
+        return {line.strip() for line in out.splitlines() if line.strip()}
+
+    def _discover_run_id(self) -> str | None:
+        """Wait for a run dir we didn't see at submitter init.
+
+        Without this guard, ``ls | sort -r | head -1`` races the
+        framework: if a stale run dir already exists on the gateway,
+        we'd publish into it (and the *current* dispatch's
+        compute-nodes — reading their *own* run dir — would never
+        see the submitter peer).
+        """
+        current = self._list_run_ids()
+        new = current - self._initial_run_ids
+        if not new:
+            return None
+        # Pick the lexicographically-newest of the new dirs (handles
+        # the unlikely "two dispatches start within the same poll
+        # tick" case by deterministic tie-break).
+        candidate = max(new)
+        self.log.info(
+            "submitter peer: discovered new run_id=%s", candidate
+        )
+        return candidate
+
+    def _publish_peer_file(self) -> None:
+        assert self._run_id is not None
+        assert self._public_key is not None
+        assert self._gateway_host is not None
+        # c89775c+: extra_port_forwards fan out per-compute-node as
+        # `ssh -J gateway -R <gateway_port>:localhost:<local_port>
+        # compute-node`. From every compute-node's perspective, the
+        # submitter's harmonia is reachable as
+        # `http://localhost:<gateway_port>` regardless of whether the
+        # gateway has GatewayPorts=on or =off — the fan-out makes the
+        # URL shape stable. Publish localhost so peers in the
+        # container hit the per-compute-node tunnel.
+        payload = {
+            "secondary_id": "submitter",
+            "hostname": "localhost",
+            "port": self.gateway_port,
+            "public_key": self._public_key,
+        }
+        body = json.dumps(payload, indent=2, sort_keys=True)
+        remote_dir = (
+            f"{self.slurm_root}/log/{self._run_id}/peers"
+        )
+        remote_path = f"{remote_dir}/submitter.json"
+
+        # base64-encode to keep the remote shell command quoting-safe.
+        import base64
+        b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
+        rc, _out, err = self._ssh_oneshot([
+            f"mkdir -p {remote_dir}",
+            f"echo {b64} | base64 -d > {remote_path}",
+        ])
+        if rc != 0:
+            self.log.warning(
+                "publish peer file failed: rc=%d err=%s", rc, err
+            )
+            return
+        self.log.info(
+            "submitter peer published: %s:%d (run %s)",
+            self._gateway_host, self.gateway_port, self._run_id,
+        )
