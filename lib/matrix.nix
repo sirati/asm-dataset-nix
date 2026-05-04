@@ -98,20 +98,62 @@ let
     )
   ) compilers.all;
 
-  # All (compiler, optLevel, flagSet, hardening) tuples
+  # Generic per-axis filter: an axis entry may declare
+  # ``minGccVersion`` / ``minClangVersion`` (default: no minimum),
+  # ``clangOnly`` (default false), and ``archs`` (default: null =
+  # all targets accepted).
+  noMin = {
+    major = 0;
+    minor = 0;
+  };
+
+  entryAcceptsCompiler =
+    entry: compiler:
+    let
+      cv = parseVersion compiler.version;
+      minV =
+        if compiler.family == "gcc" then
+          entry.minGccVersion or noMin
+        else
+          entry.minClangVersion or noMin;
+      familyOk =
+        if entry.clangOnly or false then compiler.family == "clang" else true;
+    in
+    familyOk && meetsMinVersion cv minV;
+
+  entryAcceptsArch =
+    entry: target:
+    let
+      allowed = entry.archs or null;
+    in
+    allowed == null || builtins.elem target.label allowed;
+
+  # All (compiler, optLevel, flagSet, hardening, sanitizer, march)
+  # tuples — compiler-only filtering happens here; arch filtering
+  # gets applied later in ``combosForTarget``. Each axis independent;
+  # mutually-exclusive options live within a single axis (one
+  # sanitizer per build, one march level per build).
   allFlagCombos = lib.concatMap (
     { compiler, opt }:
     lib.concatMap (
       flagSet:
-      map (hardening: {
-        inherit
-          compiler
-          opt
-          flagSet
-          hardening
-          ;
-      }) flagDefs.hardeningModes
-    ) flagDefs.flagSets
+      lib.concatMap (
+        hardening:
+        lib.concatMap (
+          sanitizer:
+          map (march: {
+            inherit
+              compiler
+              opt
+              flagSet
+              hardening
+              sanitizer
+              march
+              ;
+          }) (builtins.filter (e: entryAcceptsCompiler e compiler) flagDefs.marchLevels)
+        ) (builtins.filter (e: entryAcceptsCompiler e compiler) flagDefs.sanitizerModes)
+      ) (builtins.filter (e: entryAcceptsCompiler e compiler) flagDefs.hardeningModes)
+    ) (builtins.filter (e: entryAcceptsCompiler e compiler) flagDefs.flagSets)
   ) compilerOptPairs;
 
   # Compute the suffix key and metadata without creating any derivation.
@@ -121,12 +163,16 @@ let
       opt,
       flagSet,
       hardening,
+      sanitizer,
+      march,
     }:
     lib.concatStringsSep "-" [
       compiler.label
       opt.label
       flagSet.label
       hardening.label
+      sanitizer.label
+      march.label
     ];
 
   mkMeta =
@@ -136,6 +182,8 @@ let
       opt,
       flagSet,
       hardening,
+      sanitizer,
+      march,
     }:
     let
       suffix = mkSuffix {
@@ -144,6 +192,8 @@ let
           opt
           flagSet
           hardening
+          sanitizer
+          march
           ;
       };
     in
@@ -161,6 +211,8 @@ let
       optimization = opt.label;
       flags = flagSet.label;
       hardening = hardening.label;
+      sanitizer = sanitizer.label;
+      march = march.label;
     };
 
   # Build one variant entry (lazy — derivation not forced until .tarball/.rawPkg is accessed)
@@ -183,6 +235,8 @@ let
           optLevel = combo.opt;
           flagSet = combo.flagSet;
           hardening = combo.hardening;
+          sanitizer = combo.sanitizer;
+          march = combo.march;
         });
         rawPkg =
           (mkVariant {
@@ -192,13 +246,26 @@ let
             optLevel = combo.opt;
             flagSet = combo.flagSet;
             hardening = combo.hardening;
+            sanitizer = combo.sanitizer;
+            march = combo.march;
           }).variantPkg;
       };
     };
 
-  # Filter flag combos to only include compilers that meet the target's minimum version.
+  # Filter flag combos for a specific target: drop combos whose
+  # compiler doesn't meet the target's minimum version, AND drop
+  # combos whose flagSet/hardening/sanitizer/march entry has an
+  # ``archs`` allow-list that excludes this target.
   combosForTarget =
-    target: builtins.filter (combo: isValidArchCombo combo.compiler target) allFlagCombos;
+    target:
+    builtins.filter (
+      combo:
+      isValidArchCombo combo.compiler target
+      && entryAcceptsArch combo.flagSet target
+      && entryAcceptsArch combo.hardening target
+      && entryAcceptsArch combo.sanitizer target
+      && entryAcceptsArch combo.march target
+    ) allFlagCombos;
 
   # ── Nested attrset: dataset.<pkg>.<arch>.<suffix> ────────────────────────
   nestedMatrix = lib.genAttrs (map (p: p.label) pkgDefs.all) (

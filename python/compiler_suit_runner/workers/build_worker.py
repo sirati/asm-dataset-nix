@@ -575,6 +575,8 @@ def build_worker(
                 "optimization": payload.get("optimization"),
                 "flag_set": payload.get("flag_set"),
                 "hardening": payload.get("hardening"),
+                "sanitizer": payload.get("sanitizer"),
+                "march": payload.get("march"),
                 "drv": payload.get("drv"),
                 "tarball_name": tarball_name,
             }

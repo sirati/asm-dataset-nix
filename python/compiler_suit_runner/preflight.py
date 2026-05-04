@@ -224,6 +224,8 @@ def _build_variant_spec(
         "optimization": optimization,
         "flag_set": meta_entry.get("flags", ""),
         "hardening": meta_entry.get("hardening", ""),
+        "sanitizer": meta_entry.get("sanitizer", ""),
+        "march": meta_entry.get("march", ""),
         "tier": _tier_from_pkg(pkg),
         "pkg": pkg,
         "arch": arch,
