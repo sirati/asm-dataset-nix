@@ -32,13 +32,15 @@ import tarfile
 import tempfile
 import time
 from collections.abc import Sequence
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from compiler_suit_runner.partition import VariantSpec
 
 from compiler_suit_runner.incremental_cache import (
     CacheEntry,
     DEFAULT_CACHE_ROOT,
     IncrementalCache,
-    InputHashInputs,
     collect_input_hash_inputs,
     compute_input_hash,
 )
@@ -163,6 +165,60 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_CACHE_ROOT,
         help="Local incremental-cache root.",
     )
+    # Submitter-peer integration: makes the dispatching machine's
+    # local nix store available as a federated harmonia peer to
+    # every compute-node container. ON by default for slurm
+    # dispatch (it's the whole point of "the computer who started
+    # the slurm task can also be a peer"). --no-submitter-peer
+    # disables; --submitter-harmonia-port picks the listening port.
+    parser.add_argument(
+        "--no-submitter-peer",
+        dest="submitter_peer",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable the submitter-as-peer integration "
+            "(skip running harmonia + reverse-tunnel from this "
+            "machine to the gateway)."
+        ),
+    )
+    parser.add_argument(
+        "--submitter-harmonia-port",
+        type=int,
+        default=5005,
+        help=(
+            "Port to bind the submitter's harmonia on (locally and "
+            "via reverse-tunnel on the gateway). Default 5005; "
+            "compute-nodes hit <gateway-host>:<this-port>."
+        ),
+    )
+    # ssh-debug back-door: spawn sshd inside each container so an
+    # operator can ssh in mid-run for live debugging. Off by default
+    # — image always ships the bits, but the actual sshd process
+    # only starts when this flag is set.
+    parser.add_argument(
+        "--enable-ssh-debug",
+        action="store_true",
+        default=False,
+        help=(
+            "Spawn sshd in each SLURM container for live debugging "
+            "during compilation. Connect via "
+            "`ssh -i .ssh-debug/id_ed25519 -o IdentitiesOnly=yes "
+            "-J <gateway> root@<compute-node> -p <port>` once the "
+            "ready marker appears at "
+            "~/BIG/slurm/log/<run_id>/ssh-debug.<host>.<port>.ready."
+        ),
+    )
+    parser.add_argument(
+        "--ssh-debug-port",
+        type=int,
+        default=22222,
+        help=(
+            "Port the in-container sshd binds on (default 22222). "
+            "Container uses --network host so this is also the port "
+            "the operator hits on <compute-node>."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -250,6 +306,81 @@ def _resolve_jobs(args: argparse.Namespace) -> int:
     return max(1, os.cpu_count() or 1)
 
 
+# CSR-only flags that the framework's argparse doesn't know about.
+# The framework re-parses sys.argv when `dynamic_runner.run(task)` is
+# invoked, and chokes on any flag it can't resolve — so we strip these
+# before handing off. Flags taking a value (single or nargs="+") are
+# listed in `_CSR_FLAGS_WITH_VALUE`; boolean / store_true flags are in
+# `_CSR_BOOL_FLAGS`. Everything not in either set passes through
+# unchanged (e.g. --gateway, --multi-computer, --packaging,
+# --slurm-root-folder, --jobs — those the framework owns).
+_CSR_FLAGS_WITH_VALUE: frozenset[str] = frozenset({
+    "--flake",
+    "--shared-fs",
+    "--run-id",
+    "--sys",
+    "--cachix-cache",
+    "--cachix-auth-token-file",
+    "--cache-root",
+    "--submitter-harmonia-port",
+    "--ssh-debug-port",
+    "--hash",
+    # nargs="+" — may be followed by multiple values
+    "--packages",
+    "--archs",
+})
+_CSR_NARGS_PLUS: frozenset[str] = frozenset({
+    "--packages",
+    "--archs",
+})
+_CSR_BOOL_FLAGS: frozenset[str] = frozenset({
+    "--no-cache",
+    "--no-submitter-peer",
+    "--enable-ssh-debug",
+})
+_CSR_SUBCOMMANDS: frozenset[str] = frozenset({
+    "submit", "secondary", "preflight", "clear-cache",
+})
+
+
+def _strip_csr_argv_for_framework(argv: list[str]) -> list[str]:
+    """Remove CSR-only verbs and flags from argv before the framework
+    re-parses it. Preserves order of the remaining tokens.
+
+    Handles three forms:
+      ``--flag value``        (consumes one trailing token)
+      ``--flag=value``        (single token)
+      ``--flag v1 v2 ...``    (nargs="+" — consumes all following non-flag tokens)
+    """
+    out: list[str] = []
+    i = 0
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        if tok in _CSR_SUBCOMMANDS:
+            i += 1
+            continue
+        if tok in _CSR_BOOL_FLAGS:
+            i += 1
+            continue
+        if "=" in tok:
+            head = tok.split("=", 1)[0]
+            if head in _CSR_FLAGS_WITH_VALUE or head in _CSR_BOOL_FLAGS:
+                i += 1
+                continue
+        if tok in _CSR_FLAGS_WITH_VALUE:
+            i += 1
+            if tok in _CSR_NARGS_PLUS:
+                while i < n and not argv[i].startswith("-"):
+                    i += 1
+            elif i < n:
+                i += 1
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 def _config_from_args(
     args: argparse.Namespace,
     *,
@@ -257,7 +388,7 @@ def _config_from_args(
     secondary_id: str,
     input_hash: str,
     toolchain_drvs: frozenset[str],
-    variants: tuple,
+    variants: tuple["VariantSpec", ...],
 ) -> SuitTaskConfig:
     """Translate the parsed argparse namespace into a SuitTaskConfig.
 
@@ -284,7 +415,15 @@ def _config_from_args(
         variants=variants,
         # Defaults the user is unlikely to override from the CLI; tests
         # build SuitTaskConfig directly when they need to tweak these.
-        enable_harmonia=False,
+        # Harmonia ON by default — it's the whole point of cluster
+        # peer-cache federation. The on_run_start lifecycle hook
+        # starts nix-daemon + harmonia + PeerListWatcher +
+        # PeerNixConfWatcher as a single unit.
+        enable_harmonia=True,
+        # Opt-in ssh-debug back-door. Off by default; the user
+        # toggles via --enable-ssh-debug.
+        enable_ssh_debug=getattr(args, "enable_ssh_debug", False),
+        ssh_debug_port=getattr(args, "ssh_debug_port", 22222),
     )
 
 
@@ -348,18 +487,20 @@ def _restore_manifests_from_archive(
             "cache archive missing _preflight.json; cannot restore manifests"
         )
 
+    from compiler_suit_runner.partition import VariantSpec
+
     pre_dict = json.loads(preflight_blob.decode("utf-8"))
     sys_name = pre_dict.get("sys_name", "x86_64-linux")
-    variants = tuple(
-        {
-            "label": v["label"],
-            "drv": v["drv"],
-            "tarball_name": v["tarball_name"],
-            "compiler_id": v["compiler_id"],
-            "tier": int(v["tier"]),
-            "pkg": v["pkg"],
-            "arch": v["arch"],
-        }
+    variants: tuple[VariantSpec, ...] = tuple(
+        VariantSpec(
+            label=v["label"],
+            drv=v["drv"],
+            tarball_name=v["tarball_name"],
+            compiler_id=v["compiler_id"],
+            tier=int(v["tier"]),
+            pkg=v["pkg"],
+            arch=v["arch"],
+        )
         for v in pre_dict.get("variants", [])
     )
     toolchain_specs = tuple(
@@ -465,6 +606,7 @@ def _legacy_run_single_process(
     discovered item via :meth:`SuitTask.dispatch_binary`, then tears
     state back down.
     """
+    success = False
     try:
         task.on_run_start()
         binaries = task.find_binaries()
@@ -479,7 +621,6 @@ def _legacy_run_single_process(
         success = True
     except Exception:  # noqa: BLE001 — never raise out
         log.exception("legacy single-process run failed")
-        success = False
     finally:
         try:
             task.on_run_end(success)
@@ -587,19 +728,104 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # Defer to dynamic_runner's SLURM pipeline. Imported lazily so
         # the test environment does not require the native extension.
         try:
-            from dynamic_runner import run as dynamic_runner_run  # type: ignore
+            from dynamic_runner import (  # type: ignore[import-not-found]
+                TaskDeploymentSpec,
+                run as dynamic_runner_run,
+            )
         except Exception as exc:  # noqa: BLE001
             log.error(
                 "SLURM dispatch requires the dynamic-runner package: %s",
                 exc,
             )
             return 1
+
+        # Submitter-peer: makes the dispatching machine's local nix
+        # store reachable from compute-node containers as a federated
+        # peer cache. The framework's TaskDeploymentSpec.extra_port_forwards
+        # (added in dynamic-runner afa024e) does the SSH-R on the
+        # primary's existing ControlMaster — we just run harmonia
+        # locally + drop the peer-info file on the gateway.
+        # Skipped if --no-submitter-peer.
+        submitter = None
+        extra_pf: tuple[tuple[int, int], ...] = ()
+        if (
+            getattr(args, "submitter_peer", True)
+            and args.gateway
+            and args.slurm_root_folder
+        ):
+            try:
+                from .peer_cache import SubmitterPeer
+                port = getattr(args, "submitter_harmonia_port", 5005)
+                submitter = SubmitterPeer(
+                    gateway_url=args.gateway,
+                    slurm_root=str(args.slurm_root_folder),
+                    local_port=port,
+                    gateway_port=port,
+                    log=log,
+                )
+                submitter.start()
+                extra_pf = submitter.deployment_extra_port_forwards
+            except Exception:  # noqa: BLE001 — never block dispatch
+                log.exception(
+                    "submitter-peer startup failed; dispatch continues"
+                    " without dev-box harmonia"
+                )
+                submitter = None
+                extra_pf = ()
+
+        # Strip CSR-only flags from sys.argv before handing off:
+        # `dynamic_runner.run` re-parses sys.argv with its OWN
+        # argparse, which doesn't know about --shared-fs / --packages /
+        # --archs / --enable-ssh-debug / etc. Without this, the
+        # framework dies with "unrecognized arguments" right after
+        # preflight. The remaining tokens (--gateway, --multi-computer,
+        # --packaging, --slurm-root-folder, --jobs, --debug) flow
+        # through untouched.
+        original_argv = sys.argv
+        forwarded = _strip_csr_argv_for_framework(original_argv[1:])
+        # SuitTask doesn't have a real "source dir" — items come from
+        # the preflight-emitted manifests, not from walking a binaries
+        # tree. The framework still validates that `--source` exists,
+        # so point it at the run's shared FS root (`--shared-fs`) which
+        # we already created. Not a placeholder: it's the actual root
+        # of every artifact this run produces (manifests/, partition/,
+        # peers/, dataset/).
+        if "--source" not in forwarded and not any(
+            t.startswith("--source=") for t in forwarded
+        ):
+            forwarded += ["--source", str(shared_fs)]
+        # `--output` is the real destination for finished binary tars:
+        # SuitTask threads `config.dataset_dir` into every build worker
+        # via `--dataset-output-dir` (suit_task.py:_command_for_type),
+        # so the workers write `.tar.zst` artifacts directly into this
+        # directory. Mirror that here so the framework's `args.output`
+        # surface (used by lifecycle / stats reporting) points at the
+        # same location.
+        config.dataset_dir.mkdir(parents=True, exist_ok=True)
+        if "--output" not in forwarded and not any(
+            t.startswith("--output=") for t in forwarded
+        ):
+            forwarded += ["--output", str(config.dataset_dir)]
+        sys.argv = [original_argv[0]] + forwarded
+        log.debug("forwarded argv to dynamic_runner: %s", sys.argv)
         try:
             task = SuitTask(config)
-            dynamic_runner_run(task)
+            deployment = TaskDeploymentSpec(
+                secondary_module="compiler_suit_runner",
+                image_name="asm-dataset-nix-runner",
+                extra_port_forwards=extra_pf,
+            )
+            dynamic_runner_run(task, deployment=deployment)
         except Exception:  # noqa: BLE001
             log.exception("SLURM dispatch failed")
             return 1
+        finally:
+            sys.argv = original_argv
+            if submitter is not None:
+                try:
+                    submitter.stop()
+                except Exception:  # noqa: BLE001
+                    log.exception("submitter-peer shutdown failed")
     else:
         log.error("unknown --multi-computer mode %r", args.multi_computer)
         return 2
@@ -668,21 +894,60 @@ def cmd_secondary(args: argparse.Namespace) -> int:
 
     task = SuitTask(config)
     try:
-        from dynamic_runner.run import run as dynamic_runner_run  # type: ignore[import-not-found]
+        from dynamic_runner import (  # type: ignore[import-not-found]
+            TaskDeploymentSpec,
+            run as dynamic_runner_run,
+        )
     except Exception as exc:  # noqa: BLE001
         log.error(
             "secondary mode requires dynamic_runner: %s", exc
         )
         return 1
 
+    # Bring up secondary-local peer-cache state BEFORE handing off to
+    # the framework's secondary loop: nix-daemon, harmonia (signing
+    # key + bind), PeerListWatcher, PeerNixConfWatcher (rewrites
+    # /etc/nix/peer.conf as the peer set changes), and optionally an
+    # opt-in sshd back-door. ``SuitTask.on_run_start`` is the
+    # canonical setup path used on the primary; calling it here keeps
+    # the secondary's container in the same federation/peer-cache
+    # state, mirroring ssh_debug_runner.cli.cmd_secondary's explicit
+    # ``bootstrap()`` step. The hook is idempotent (guarded by an
+    # internal ``_setup_lock`` + ``_setup_done`` flag), so if the
+    # framework also fires it we'll no-op.
     try:
-        dynamic_runner_run(task)
+        task.on_run_start()
+    except Exception:  # noqa: BLE001 — never block dispatch
+        log.exception(
+            "secondary on_run_start failed; continuing without "
+            "peer-cache federation (workers will still run, but "
+            "won't fetch from sibling secondaries)"
+        )
+
+    # Same argv-strip as cmd_submit: framework re-parses sys.argv.
+    sys.argv = [sys.argv[0]] + _strip_csr_argv_for_framework(sys.argv[1:])
+    rc = 0
+    try:
+        deployment = TaskDeploymentSpec(
+            secondary_module="compiler_suit_runner",
+            image_name="asm-dataset-nix-runner",
+        )
+        dynamic_runner_run(task, deployment=deployment)
     except SystemExit as exc:
-        return int(exc.code) if exc.code is not None else 0
+        rc = int(exc.code) if exc.code is not None else 0
     except Exception:  # noqa: BLE001
         log.exception("secondary dispatch failed")
-        return 1
-    return 0
+        rc = 1
+    finally:
+        # Tear down peer-cache state (harmonia, watchers, sshd back-door
+        # if opted in) symmetrically. on_run_end is idempotent; we
+        # call it even if on_run_start partially failed so half-started
+        # state still gets unwound.
+        try:
+            task.on_run_end(rc == 0)
+        except Exception:  # noqa: BLE001
+            log.exception("secondary on_run_end failed")
+    return rc
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -742,6 +1007,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     funnels it through the return-code surface; this lets test code use
     ``main([...])`` without a try/except SystemExit dance.
     """
+    raw = list(sys.argv[1:] if argv is None else argv)
+
+    # Framework-spawned secondary path: the dynamic_runner pipeline
+    # invokes our image with ``python -m compiler_suit_runner
+    # --secondary tcp://… --secondary-id … --secondary-quic-port …``
+    # — no subcommand verb, no --shared-fs. Our argparse would
+    # otherwise reject the `tcp://…` URL as an invalid `command`
+    # choice. Mirror ssh_debug_runner's pattern: detect the framework
+    # flag and route directly to cmd_secondary with a synthesized
+    # namespace; the function fills in container-side defaults
+    # (shared-fs = /app/log-network — the run-id-scoped gateway dir
+    # bind-mounted into every secondary container).
+    if "--secondary" in raw:
+        # Pull the framework-assigned secondary id out of the raw argv
+        # so SuitTaskConfig.secondary_id matches what the primary
+        # coordinator dispatched. Framework spawns us with
+        # ``--secondary-id <id>`` (next-token form, never =VALUE).
+        sec_id: Optional[str] = None
+        for j, tok in enumerate(raw):
+            if tok == "--secondary-id" and j + 1 < len(raw):
+                sec_id = raw[j + 1]
+                break
+            if tok.startswith("--secondary-id="):
+                sec_id = tok.split("=", 1)[1]
+                break
+        ns = argparse.Namespace(
+            debug="--debug" in raw,
+            command="secondary",
+            flake=".",
+            shared_fs=pathlib.Path("/app/log-network"),
+            run_id=None,
+            sys_name="x86_64-linux",
+            packages=None,
+            archs=None,
+            multi_computer="slurm",
+            jobs=None,
+            packaging="podman",
+            gateway=None,
+            slurm_root_folder=None,
+            cachix_cache=None,
+            cachix_auth_token_file=None,
+            no_cache=False,
+            cache_root=DEFAULT_CACHE_ROOT,
+            submitter_peer=False,
+            submitter_harmonia_port=5005,
+            enable_ssh_debug=False,
+            ssh_debug_port=22222,
+            secondary_id=sec_id,
+        )
+        return cmd_secondary(ns)
+
     parser = build_parser()
     try:
         args = parser.parse_args(argv)

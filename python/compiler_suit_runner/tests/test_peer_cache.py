@@ -379,11 +379,29 @@ class _StubPopen:
 
     instances: list["_StubPopen"] = []
 
-    def __init__(self, cmd, env=None, stdout=None, stderr=None) -> None:
+    def __init__(
+        self,
+        cmd,
+        env=None,
+        stdout=None,
+        stderr=None,
+        stdin=None,
+        start_new_session: bool = False,
+        close_fds: bool = False,
+    ) -> None:
+        # Tracks the same kwargs HarmoniaProcess.start() passes to
+        # subprocess.Popen: stdin/stdout/stderr redirections plus the
+        # session/fd flags we use to detach the harmonia daemon from
+        # the worker's group. Accepting them all (rather than only the
+        # ones the test asserts on) keeps the stub forward-compatible
+        # with future kwargs HarmoniaProcess might need to pass.
         self.cmd = list(cmd)
         self.env = dict(env) if env is not None else None
         self.stdout = stdout
         self.stderr = stderr
+        self.stdin = stdin
+        self.start_new_session = start_new_session
+        self.close_fds = close_fds
         self.signals_sent: list[int] = []
         self.killed = False
         self._returncode: Optional[int] = None
@@ -436,11 +454,17 @@ def test_harmonia_start_invokes_subprocess(
     assert len(stub_popen.instances) == 1
     spawned = stub_popen.instances[0]
     assert spawned.cmd[0].endswith("harmonia")
-    assert "--bind" in spawned.cmd
-    assert "0.0.0.0:5000" in spawned.cmd
+    # Harmonia 3.x dropped the ``--bind`` argv flag; bind goes in a
+    # TOML config file referenced by ``CONFIG_FILE``. The cmd is just
+    # the binary path, no extra argv.
+    assert "--bind" not in spawned.cmd
     assert spawned.env is not None
     assert spawned.env.get("SIGN_KEY_PATH") == str(key)
     assert spawned.env.get("NIX_SECRET_KEY_FILE") == str(key)
+    assert spawned.env.get("SIGN_KEY_PATHS") == str(key)
+    cfg_path = pathlib.Path(spawned.env["CONFIG_FILE"])
+    assert cfg_path.exists()
+    assert 'bind = "0.0.0.0:5000"' in cfg_path.read_text()
     assert proc.is_running
 
     rc = proc.stop()
@@ -513,8 +537,8 @@ def test_harmonia_kill_on_timeout(
     """If the server doesn't exit on SIGTERM in time, fall back to SIGKILL."""
 
     class _StuckPopen(_StubPopen):
-        def __init__(self, cmd, env=None, stdout=None, stderr=None):
-            super().__init__(cmd, env=env, stdout=stdout, stderr=stderr)
+        def __init__(self, cmd, *args, **kwargs):
+            super().__init__(cmd, *args, **kwargs)
 
         def send_signal(self, sig: int) -> None:
             # Record but don't update returncode: we're "stuck".
