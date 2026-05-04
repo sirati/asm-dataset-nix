@@ -260,7 +260,16 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
         toolchain_drvs=frozenset(),
     )
 
-    def fake_preflight(flake_ref, sys_name, *, packages=None, archs=None, run_subprocess=None):
+    def fake_preflight(
+        flake_ref,
+        sys_name,
+        *,
+        packages=None,
+        archs=None,
+        sample_size=0,
+        sample_seed="42",
+        run_subprocess=None,
+    ):
         state["preflight_calls"].append((flake_ref, sys_name, packages, archs))
         return pre
 
