@@ -15,7 +15,11 @@ import pytest
 from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
 
 
-def _make_config(tmp_path: pathlib.Path) -> SuitTaskConfig:
+def _make_config(
+    tmp_path: pathlib.Path,
+    *,
+    build_max_concurrent: int | None = None,
+) -> SuitTaskConfig:
     return SuitTaskConfig(
         flake_ref=".",
         sys_name="x86_64-linux",
@@ -28,6 +32,7 @@ def _make_config(tmp_path: pathlib.Path) -> SuitTaskConfig:
         run_id="r1",
         secondary_id="primary",
         hostname="host",
+        build_max_concurrent=build_max_concurrent,
     )
 
 
@@ -111,3 +116,28 @@ def test_estimate_memory_returns_constant(tmp_path: pathlib.Path) -> None:
     task = SuitTask(_make_config(tmp_path))
     assert task.estimate_memory(None) == 1
     assert task.estimate_memory(object()) == 1
+
+
+def test_build_max_concurrent_unset_leaves_types_uncapped(
+    tmp_path: pathlib.Path,
+) -> None:
+    task = SuitTask(_make_config(tmp_path))
+    phases = _phases(task)
+    for phase in phases.values():
+        for t in phase.types:
+            assert getattr(t, "max_concurrent", None) is None
+
+
+def test_build_max_concurrent_caps_only_build_types(
+    tmp_path: pathlib.Path,
+) -> None:
+    task = SuitTask(_make_config(tmp_path, build_max_concurrent=3))
+    phases = _phases(task)
+    capped = {"toolchain", "common_dep", "variant"}
+    for phase in phases.values():
+        for t in phase.types:
+            cap = getattr(t, "max_concurrent", None)
+            if t.type_id in capped:
+                assert cap == 3, t.type_id
+            else:
+                assert cap is None, t.type_id
