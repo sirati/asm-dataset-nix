@@ -284,7 +284,9 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
 
     monkeypatch.setattr(cli_module, "run_preflight", fake_preflight)
 
-    def fake_emit(*, target_dir, sys_name, pre, num_workers):
+    def fake_emit(
+        *, target_dir, sys_name, pre, num_workers, toolchain_drvs=None,
+    ):
         state["emit_calls"].append((target_dir, sys_name, num_workers))
 
         # Simulate manifest_dir population so cache.store can pack it.

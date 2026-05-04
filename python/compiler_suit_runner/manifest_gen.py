@@ -31,7 +31,7 @@ import json
 import os
 import pathlib
 from collections.abc import Iterable
-from typing import Final, Literal
+from typing import Final, Literal, Optional
 
 from compiler_suit_runner.partition import Shard, VariantSpec, split_into_shards
 
@@ -323,6 +323,7 @@ def emit_all_manifests(
     toolchain_specs: Iterable[tuple[str, str]],
     common_deps: Iterable[tuple[str, str]],
     num_workers: int = 1,
+    toolchain_drvs: Optional[dict[tuple[str, str], str]] = None,
 ) -> ManifestSet:
     """Produce one ManifestHeader per queue item; write each to disk.
 
@@ -353,10 +354,16 @@ def emit_all_manifests(
     # implemented; phase 3 builds substitute their host deps directly
     # via the federated peer cache).
 
-    # Phase 2 — toolchains, then common deps.
+    # Phase 2 — toolchains, then common deps. Toolchain manifests
+    # carry the realised drv path when available so build_worker on
+    # the secondary builds via ``nix build <drv>^*`` (which can
+    # substitute) instead of ``nix build <flake>#<attr>`` (which
+    # would need flake.nix shipped to the secondary).
+    tc_drvs = toolchain_drvs or {}
     for arch, compiler_label in toolchain_specs:
+        drv = tc_drvs.get((arch, compiler_label))
         headers.append(
-            make_toolchain_header(sys_name, arch, compiler_label)
+            make_toolchain_header(sys_name, arch, compiler_label, drv=drv)
         )
     for drv, label in common_deps:
         headers.append(make_common_dep_header(drv, label))
