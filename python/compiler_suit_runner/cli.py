@@ -821,12 +821,19 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
         # Pre-build shared closure on the dev box so dev-box harmonia
         # serves it; every secondary then substitutes instead of
-        # rebuilding the same toolchain / libc / common dep N times.
+        # rebuilding the same libc / common dep N times.
         # Phase-2 dispatch stays cleared — pre-build is a more
         # efficient replacement.
+        #
+        # NOTE: ``pre.toolchain_drvs`` is the misleadingly-named
+        # canonical *variant root* drv set (one drv per matrix variant);
+        # it's used by ``compute_partition_locally`` as the EXCLUSION
+        # set so variant roots never get reclassified as common deps.
+        # We must NOT pre-build it — that would mean building every
+        # sampled variant locally on the dev box, defeating the whole
+        # point of distribution.
         prebuild_drv_set: list[str] = sorted(
-            set(pre.toolchain_drvs)
-            | {drv for _label, drv in pre.common_dep_drvs}
+            {drv for _label, drv in pre.common_dep_drvs}
         )
         if prebuild_drv_set:
             log.info(
