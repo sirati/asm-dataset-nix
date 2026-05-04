@@ -5,15 +5,20 @@ directory for manifest files. Each manifest carries:
 
 * JSON contents describing the item's class (which worker should pick
   it up) and class-specific payload (pkg/arch/drv/...).
-* An apparent on-disk size equal to the per-type memory budget in
-  bytes. ``estimate_memory`` on the :class:`SuitTask` reads
-  :class:`TaskInfo.size` to drive memory-aware packing; phase / type
-  ordering is owned by :class:`PhaseSpec` declared on the task.
+* A ``size`` field equal to the per-type memory budget in bytes.
+  :func:`SuitTask.discover_items` propagates that JSON field directly
+  into :class:`TaskInfo.size`, which ``estimate_memory`` reads for
+  memory-aware packing. Phase / type ordering is owned by
+  :class:`PhaseSpec` declared on the task.
 
-We write the JSON header to the file, then ``os.ftruncate`` the file
-to that memory-bytes value. Because the JSON content is sub-kilobyte
-and the budget is on the order of gigabytes, the file is *sparse* —
-no actual disk usage is incurred for the trailing zero-fill.
+The on-disk file is just the JSON document — a few hundred bytes.
+Earlier revisions ``os.ftruncate``-padded each file to ``header.size``
+so the framework could read the budget out of ``stat.st_size``, but
+the framework's primary now content-hashes every TaskInfo path during
+``queue_initial_staging`` (sparse zero extents included), so a 1 GiB
+sparse manifest cost ~1 GiB of zero-reads × N items at dispatch start.
+With the budget propagated via the JSON ``size`` field directly the
+padding is dead weight; we write the document and stop.
 
 This module produces manifests for all five item classes in the plan's
 phase sequence (the dynamic_runner framework now owns phase ordering
@@ -40,7 +45,6 @@ from collections.abc import Iterable
 from typing import Final, Literal
 
 from compiler_suit_runner.memory_budget import (
-    MEMORY_FLOOR_BYTES,
     common_dep_memory_bytes,
     merge_memory_bytes,
     partition_shard_memory_bytes,
@@ -79,9 +83,8 @@ class ManifestHeader:
     """JSON-serialisable description of one queue item.
 
     ``size`` is the per-type memory budget in bytes (see
-    :mod:`memory_budget`). It must equal the on-disk apparent size of
-    the manifest file — :func:`write_manifest` enforces this via
-    ``os.ftruncate``, and :func:`read_manifest` verifies it on load.
+    :mod:`memory_budget`). It is propagated via the JSON document
+    only; the on-disk file size is just the document length.
     """
 
     item_class: ItemClass
@@ -232,14 +235,21 @@ def write_manifest(
 ) -> pathlib.Path:
     """Write ``header`` to ``<target_dir>/<header.name>.json``.
 
-    The JSON content (a few hundred bytes) is written first, then the
-    file is extended with ``os.ftruncate`` so its apparent size matches
-    ``header.size`` (the per-type memory budget). The trailing region
-    is sparse — no real disk usage.
+    The on-disk file contains only the JSON document (a few hundred
+    bytes) — we DO NOT pad with ``os.ftruncate`` to ``header.size``.
 
-    The write is atomic against concurrent readers: contents are placed
-    in a sibling ``.tmp`` file (truncated to the budget size before
-    rename) and ``os.replace``\\ d into the final location.
+    Earlier revisions wrote a sparse multi-GiB file so the framework
+    could read the per-type memory budget from ``stat.st_size``. That
+    pre-dated :func:`SuitTask._make_task_info` which now propagates the
+    JSON ``header.size`` field directly into ``TaskInfo.size``, so the
+    framework no longer needs the file's apparent size. Keeping the
+    ftruncate would force the framework's StageFile hashing pass
+    (``RustPrimaryCoordinator.queue_initial_staging``) to read every
+    byte of the sparse extent — for a full matrix run that's 3794 ×
+    1 GiB = ~3.7 TiB of zero-reads before the Rust primary even starts,
+    so the dispatch hangs in pre-flight for 30+ minutes burning CPU.
+    Writing the JSON and stopping leaves the file at a few hundred
+    bytes; hashing is then trivial.
     """
     target_dir = pathlib.Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -248,19 +258,10 @@ def write_manifest(
 
     data = json.dumps(_header_to_jsonable(header), sort_keys=True, indent=2)
     encoded = data.encode("utf-8")
-    if len(encoded) > header.size:
-        # Defensive: callers should pick budgets larger than any plausible
-        # JSON header (we promise sub-kilobyte payloads). The framework's
-        # st_size-based decoding cannot recover from a content overflow.
-        raise ValueError(
-            f"manifest JSON ({len(encoded)} bytes) exceeds encoded size"
-            f" ({header.size}); pick a larger memory budget"
-        )
 
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
         os.write(fd, encoded)
-        os.ftruncate(fd, header.size)
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -277,25 +278,22 @@ _HEADER_READ_LIMIT_BYTES: Final[int] = 64 * 1024
 def read_manifest(path: pathlib.Path) -> ManifestHeader:
     """Inverse of :func:`write_manifest`.
 
-    Verifies that the file's apparent size matches the header's
-    declared ``size`` — a mismatch indicates corruption (e.g. a writer
-    crashed before the ``ftruncate``, or an external tool rewrote the
-    file without preserving its sparse extent).
-
-    Only the leading ``_HEADER_READ_LIMIT_BYTES`` are read from disk; the
-    trailing sparse zero-fill is never loaded into memory. The leading
-    region contains the JSON document followed by zero-fill we strip
-    before parsing.
+    Reads up to ``_HEADER_READ_LIMIT_BYTES`` from the file. Older
+    on-disk revisions used a sparse-padded file (apparent size ==
+    ``header.size``); current writers don't pad. We tolerate either
+    layout by reading a bounded prefix and stripping any trailing NULs
+    left over from a sparse extent before parsing — so manifests
+    written by an older copy of this module still load cleanly.
     """
     path = pathlib.Path(path)
-    stat = os.stat(path)
     fd = os.open(path, os.O_RDONLY)
     try:
         head = os.read(fd, _HEADER_READ_LIMIT_BYTES)
     finally:
         os.close(fd)
-    # Strip any trailing NULs left by ftruncate's zero-fill so json.loads
-    # sees only the document.
+    # Strip any trailing NULs from legacy sparse-padded manifests so
+    # json.loads sees only the document; harmless for current
+    # non-padded files (no NULs to strip).
     stripped = head.rstrip(b"\x00").decode("utf-8")
     parsed = json.loads(stripped)
     if not isinstance(parsed, dict):
@@ -312,12 +310,6 @@ def read_manifest(path: pathlib.Path) -> ManifestHeader:
         raise ValueError(f"{path}: 'item_class' must be a string")
     if not isinstance(parsed["name"], str):
         raise ValueError(f"{path}: 'name' must be a string")
-
-    if stat.st_size != parsed["size"]:
-        raise ValueError(
-            f"{path}: apparent size {stat.st_size} does not match"
-            f" declared size {parsed['size']}; manifest is corrupt"
-        )
 
     return ManifestHeader(
         item_class=parsed["item_class"],  # type: ignore[arg-type]
