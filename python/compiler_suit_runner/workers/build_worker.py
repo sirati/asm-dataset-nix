@@ -40,6 +40,7 @@ __all__ = [
     "parse_build_manifest",
     "build_attr",
     "copy_tarball",
+    "write_sidecar_metadata",
     "build_worker",
 ]
 
@@ -291,6 +292,37 @@ def _find_tarball(out_path: pathlib.Path) -> pathlib.Path:
     )
 
 
+def write_sidecar_metadata(
+    dest_dir: pathlib.Path,
+    metadata_name: str,
+    metadata: dict,
+) -> pathlib.Path:
+    """Write the variant's sidecar JSON (full param dump).
+
+    Same atomic pattern as :func:`copy_tarball` (``.tmp`` + replace).
+    The file mirrors the tarball's name with ``.json`` extension —
+    pairs them on disk for easy lookup.
+    """
+    dest_dir = pathlib.Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    final = dest_dir / metadata_name
+    tmp = dest_dir / (metadata_name + ".tmp")
+    if tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    payload = json.dumps(metadata, indent=2, sort_keys=True).encode("utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, final)
+    return final
+
+
 def copy_tarball(
     out_path: pathlib.Path,
     dest_dir: pathlib.Path,
@@ -301,8 +333,9 @@ def copy_tarball(
     ``out_path`` is the realised ``nix build`` output (a directory
     containing one ``*.tar.zst``, or the tarball file itself).
     ``dest_dir`` is the run-wide shared dataset directory.
-    ``tarball_name`` is the canonical filename (e.g.
-    ``hello__x86_64__gcc15__O2.tar.zst``) chosen by the manifest.
+    ``tarball_name`` is the canonical short name
+    (``<compiler>_<arch>_<opt>_<hash>.tar.zst``); the sibling JSON
+    sidecar is written separately by :func:`write_sidecar_metadata`.
 
     The copy is atomic from a reader's perspective: we copy to
     ``dest_dir/<tarball_name>.tmp`` first and ``os.replace`` into place.
@@ -526,6 +559,31 @@ def build_worker(
                 nix_log_excerpt=_excerpt_log(stderr, env.log_excerpt_lines),
                 error=f"tarball copy failed: {exc}",
             )
+        # Sidecar JSON: full param dump next to the tarball. Filename
+        # ``<tarball-stem>.json`` so the pair is trivial to look up.
+        # Skipped silently if the manifest didn't carry a metadata_name
+        # — older manifests in cached pre-flight dirs won't have it.
+        metadata_name = payload.get("metadata_name")
+        if isinstance(metadata_name, str) and metadata_name:
+            sidecar = {
+                "label": payload.get("label"),
+                "pkg": payload.get("pkg"),
+                "arch": payload.get("arch"),
+                "compiler": payload.get("compiler_id"),
+                "compiler_family": payload.get("compiler_family"),
+                "compiler_version": payload.get("compiler_version"),
+                "optimization": payload.get("optimization"),
+                "flag_set": payload.get("flag_set"),
+                "hardening": payload.get("hardening"),
+                "drv": payload.get("drv"),
+                "tarball_name": tarball_name,
+            }
+            try:
+                write_sidecar_metadata(
+                    env.dataset_output_dir, metadata_name, sidecar
+                )
+            except Exception:  # noqa: BLE001 - sidecar is best-effort
+                pass
 
     return BuildWorkerResult(
         item_class=item_class,
