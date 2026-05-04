@@ -391,6 +391,7 @@ def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
     optimization = meta_entry.get("optimization", "")
     compiler_family = meta_entry.get("compilerFamily", "")
     compiler_version = meta_entry.get("compilerVersion", "")
+    flag_set = meta_entry.get("flags", "")
     major = _parse_compiler_major(compiler_version)
 
     # Sanitizers need optimization passes to instrument correctly. At
@@ -417,6 +418,26 @@ def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
     # ``-ffast-math`` is allowed to assume don't happen).
     if sanitizer == "san-undefined" and optimization == "Ofast":
         return "Ofast enables fast-math which conflicts with san-undefined"
+
+    # LTO produces bitcode .o files that need an LTO-plugin-aware
+    # ``ar`` / ``ranlib`` to index static archives. The old nixpkgs
+    # cross stdenvs (nixpkgs-15.09 / 18.03 / 22.11) ship binutils
+    # without the LLVMgold plugin wired up for the cross target, so
+    # ``ld`` reports ``archive has no index; run ranlib`` mid-link.
+    # Current unstable ships clang ≥ 18 and gcc ≥ 13 with working
+    # LTO; everything older comes from the legacy inputs and fails.
+    # Observed on clang10+lto+x86_64.
+    if flag_set in ("lto", "ltothin"):
+        if compiler_family == "clang" and major is not None and major < 18:
+            return (
+                f"clang {major} sourced from legacy nixpkgs lacks "
+                "LTO-plugin-aware ar/ranlib for cross targets"
+            )
+        if compiler_family == "gcc" and major is not None and major < 13:
+            return (
+                f"gcc {major} sourced from legacy nixpkgs lacks "
+                "gcc-ar/gcc-ranlib wrapping for cross LTO"
+            )
 
     return None
 

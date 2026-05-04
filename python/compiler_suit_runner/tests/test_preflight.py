@@ -701,3 +701,93 @@ def test_known_bad_combo_san_off_never_fails() -> None:
         assert is_known_bad_combo(
             _meta(compilerFamily=cc, compilerVersion=ver, sanitizer="san-off")
         ) is None
+
+
+def test_known_bad_combo_old_clang_with_lto() -> None:
+    # clang10 from nixpkgs-22.11 + lto: archive index missing because
+    # the cross binutils there has no LLVMgold plugin wired in.
+    reason = is_known_bad_combo(
+        _meta(
+            compiler="clang10",
+            compilerFamily="clang",
+            compilerVersion="10.0.1",
+            flags="lto",
+            sanitizer="san-off",
+        )
+    )
+    assert reason is not None
+    assert "lto" in reason.lower() or "ar" in reason.lower()
+
+
+def test_known_bad_combo_old_clang_with_ltothin() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang14",
+            compilerFamily="clang",
+            compilerVersion="14.0.6",
+            flags="ltothin",
+            sanitizer="san-off",
+        )
+    ) is not None
+
+
+def test_known_bad_combo_modern_clang_with_lto_is_fine() -> None:
+    # Current unstable nixpkgs ships clang ≥ 18 with working LTO.
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang20",
+            compilerFamily="clang",
+            compilerVersion="20.1.8",
+            flags="lto",
+            sanitizer="san-off",
+        )
+    ) is None
+
+
+def test_known_bad_combo_old_gcc_with_lto() -> None:
+    reason = is_known_bad_combo(
+        _meta(
+            compiler="gcc11",
+            compilerFamily="gcc",
+            compilerVersion="11.4.0",
+            flags="lto",
+            sanitizer="san-off",
+        )
+    )
+    assert reason is not None
+    assert "lto" in reason.lower() or "ar" in reason.lower()
+
+
+def test_known_bad_combo_modern_gcc_with_lto_is_fine() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="gcc15",
+            compilerFamily="gcc",
+            compilerVersion="15.2.0",
+            flags="lto",
+            sanitizer="san-off",
+        )
+    ) is None
+
+
+def test_known_bad_combo_lto_only_filters_lto_flagsets() -> None:
+    # Only ``lto`` / ``ltothin`` are affected; old compilers with other
+    # flag sets stay sampled.
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang10",
+            compilerFamily="clang",
+            compilerVersion="10.0.1",
+            flags="baseline",
+            sanitizer="san-off",
+        )
+    ) is None
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang10",
+            compilerFamily="clang",
+            compilerVersion="10.0.1",
+            flags="unroll",
+            sanitizer="san-off",
+        )
+    ) is None
