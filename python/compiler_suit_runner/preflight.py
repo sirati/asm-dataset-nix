@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import random
 import subprocess
 from collections.abc import Callable
 from typing import Optional
@@ -183,18 +184,70 @@ def _build_variant_spec(
     }
 
 
+def _sample_suffix_attrs(
+    suffix_attrs: dict,
+    *,
+    arch: str,
+    sample_size: int,
+    seed: str,
+) -> dict:
+    """Down-sample ``{suffix: meta_entry}`` to ``sample_size`` per
+    ``(compiler, optimization)`` group, seeded deterministically.
+
+    The seed for each group is ``f"{seed}:{compiler}:{arch}:{opt}"`` so
+    changing the operator-supplied seed reshuffles every group, while
+    holding the seed fixed gives identical samples across runs (skip-
+    existing then guarantees we don't rebuild).
+
+    Suffixes lacking ``compiler`` / ``optimization`` in their meta entry
+    are passed through unchanged (we can't group them).
+    """
+    if sample_size <= 0:
+        return suffix_attrs
+    groups: dict[tuple[str, str], list[tuple[str, dict]]] = {}
+    passthrough: dict[str, dict] = {}
+    for suffix, meta_entry in suffix_attrs.items():
+        if not isinstance(meta_entry, dict):
+            passthrough[suffix] = meta_entry
+            continue
+        compiler = meta_entry.get("compiler")
+        opt = meta_entry.get("optimization")
+        if not isinstance(compiler, str) or not isinstance(opt, str):
+            passthrough[suffix] = meta_entry
+            continue
+        groups.setdefault((compiler, opt), []).append((suffix, meta_entry))
+
+    sampled: dict[str, dict] = dict(passthrough)
+    for (compiler, opt), candidates in groups.items():
+        candidates.sort(key=lambda kv: kv[0])
+        rng = random.Random(f"{seed}:{compiler}:{arch}:{opt}")
+        chosen = rng.sample(candidates, min(sample_size, len(candidates)))
+        for suffix, meta_entry in chosen:
+            sampled[suffix] = meta_entry
+    return sampled
+
+
 def enumerate_variants(
     flake_ref: str,
     sys_name: str,
     *,
     packages: Optional[list[str]] = None,
     archs: Optional[list[str]] = None,
+    sample_size: int = 0,
+    sample_seed: str = "42",
     run_subprocess: Optional[RunSubprocess] = None,
 ) -> tuple[tuple[VariantSpec, ...], frozenset[str]]:
     """Enumerate every ``(pkg, arch, suffix)`` variant the matrix exposes.
 
     Filters by ``packages`` and ``archs`` if provided (each is an inclusion
     list — None means "all").
+
+    When ``sample_size > 0`` each ``(compiler, arch, optimization)`` group
+    is down-sampled to that many ``(flag, hardening)`` combinations using
+    a deterministic seeded RNG keyed on ``sample_seed`` plus the group
+    identity — so changing the seed reshuffles every group. The slow
+    ``_drvPaths`` eval is still scoped per ``(pkg, arch)``; sampling
+    happens against the meta layer (instant) before any drv lookups.
 
     Returns ``(variants, toolchain_drvs)`` where ``toolchain_drvs`` is the
     set of nix drv paths corresponding to the variants. (The plan calls
@@ -251,6 +304,13 @@ def enumerate_variants(
                 continue
             if not isinstance(suffix_attrs, dict):
                 continue
+            if sample_size > 0:
+                suffix_attrs = _sample_suffix_attrs(
+                    suffix_attrs,
+                    arch=arch,
+                    sample_size=sample_size,
+                    seed=sample_seed,
+                )
             if full_drvs is None:
                 drvs_arch = run_nix_eval(
                     flake_ref,
@@ -340,19 +400,24 @@ def preflight(
     *,
     packages: Optional[list[str]] = None,
     archs: Optional[list[str]] = None,
+    sample_size: int = 0,
+    sample_seed: str = "42",
     run_subprocess: Optional[RunSubprocess] = None,
 ) -> PreflightResult:
     """Composite call: variants + toolchains.
 
-    ``common_dep_drvs`` is left empty here — phase 1b's merge worker
-    populates it on the cluster. The phase-2 manifests therefore only
-    cover toolchains until the merge runs.
+    See :func:`enumerate_variants` for the meaning of ``sample_size`` /
+    ``sample_seed``. ``common_dep_drvs`` is left empty here — phase 1b's
+    merge worker populates it on the cluster. The phase-2 manifests
+    therefore only cover toolchains until the merge runs.
     """
     variants, toolchain_drvs = enumerate_variants(
         flake_ref,
         sys_name,
         packages=packages,
         archs=archs,
+        sample_size=sample_size,
+        sample_seed=sample_seed,
         run_subprocess=run_subprocess,
     )
     toolchain_specs = enumerate_toolchains(
@@ -368,3 +433,31 @@ def preflight(
         common_dep_drvs=(),
         toolchain_drvs=toolchain_drvs,
     )
+
+
+def filter_existing_variants(
+    variants: tuple[VariantSpec, ...],
+    *,
+    dataset_dir,
+) -> tuple[tuple[VariantSpec, ...], int]:
+    """Drop variants whose tarball already lives in ``dataset_dir``.
+
+    Returns ``(remaining_variants, skipped_count)``. The output dir
+    layout is flat — phase-3 build_worker writes
+    ``<dataset_dir>/<tarball_name>`` directly — so a single existence
+    check per variant is enough.
+    """
+    import pathlib
+
+    dataset_dir = pathlib.Path(dataset_dir)
+    if not dataset_dir.is_dir():
+        return variants, 0
+    remaining: list[VariantSpec] = []
+    skipped = 0
+    for variant in variants:
+        tarball = dataset_dir / variant["tarball_name"]
+        if tarball.exists():
+            skipped += 1
+        else:
+            remaining.append(variant)
+    return tuple(remaining), skipped

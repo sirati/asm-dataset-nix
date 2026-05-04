@@ -16,6 +16,7 @@ from compiler_suit_runner.preflight import (
     PreflightResult,
     enumerate_toolchains,
     enumerate_variants,
+    filter_existing_variants,
     preflight,
     run_nix_eval,
 )
@@ -365,3 +366,164 @@ def test_preflight_filter_pipes_through():
     )
     assert all(v["pkg"] == "hello" and v["arch"] == "x86_64" for v in result.variants)
     assert all(arch == "x86_64" for arch, _ in result.toolchain_specs)
+
+
+# ---------------------------------------------------------------------------
+# Variant sampling
+# ---------------------------------------------------------------------------
+
+
+def _wide_meta() -> dict:
+    """A meta fixture with 6 (flag, hardening) combinations per
+    (compiler, arch, opt) group — needed to exercise sampling.
+    """
+    out: dict[str, dict[str, dict[str, dict]]] = {"hello": {"x86_64": {}}}
+    for flag in ("baseline", "frameptr", "noinline"):
+        for hardening in ("hardened", "unhardened"):
+            for opt in ("O0", "O2"):
+                suffix = f"gcc15-{opt}-{flag}-{hardening}"
+                out["hello"]["x86_64"][suffix] = {
+                    "variantLabel": f"hello-x86_64-{suffix}",
+                    "compiler": "gcc15",
+                    "optimization": opt,
+                    "flags": flag,
+                    "hardening": hardening,
+                }
+    return out
+
+
+def _wide_drvpaths() -> dict:
+    out: dict[str, dict[str, dict[str, str]]] = {"hello": {"x86_64": {}}}
+    for flag in ("baseline", "frameptr", "noinline"):
+        for hardening in ("hardened", "unhardened"):
+            for opt in ("O0", "O2"):
+                suffix = f"gcc15-{opt}-{flag}-{hardening}"
+                out["hello"]["x86_64"][suffix] = f"/nix/store/{suffix}.drv"
+    return out
+
+
+def _wide_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
+    drvs = _wide_drvpaths()
+    responses: dict[str, object] = {
+        f"_meta.{sys_name}": _wide_meta(),
+        f"_drvPaths.{sys_name}": drvs,
+        f"_crossToolchainsMeta.{sys_name}": _fake_toolchains(),
+    }
+    for pkg, arch_map in drvs.items():
+        for arch, suffix_map in arch_map.items():
+            responses[f"_drvPaths.{sys_name}.{pkg}.{arch}"] = suffix_map
+    return responses
+
+
+def test_enumerate_variants_sample_caps_per_group():
+    runner, _ = _make_run_subprocess(_wide_responses())
+    variants, _drvs = enumerate_variants(
+        ".",
+        "x86_64-linux",
+        sample_size=2,
+        sample_seed="alpha",
+        run_subprocess=runner,
+    )
+    # 2 opts × 2 sample = 4 variants total (one (compiler, arch, opt) group per opt).
+    assert len(variants) == 4
+    # Two per opt group.
+    by_opt: dict[str, list] = {}
+    for v in variants:
+        opt = v["label"].split("-")[3]  # hello-x86_64-gcc15-<opt>-...
+        by_opt.setdefault(opt, []).append(v)
+    assert {"O0", "O2"} == set(by_opt)
+    assert all(len(group) == 2 for group in by_opt.values())
+
+
+def test_enumerate_variants_sample_zero_returns_full():
+    runner, _ = _make_run_subprocess(_wide_responses())
+    variants, _ = enumerate_variants(
+        ".",
+        "x86_64-linux",
+        sample_size=0,
+        run_subprocess=runner,
+    )
+    # 6 (flag, hardening) × 2 opts = 12 variants.
+    assert len(variants) == 12
+
+
+def test_enumerate_variants_sample_seed_deterministic():
+    """Same seed → identical variant set; different seed → different set."""
+    runner1, _ = _make_run_subprocess(_wide_responses())
+    runner2, _ = _make_run_subprocess(_wide_responses())
+    runner3, _ = _make_run_subprocess(_wide_responses())
+    a, _ = enumerate_variants(
+        ".", "x86_64-linux",
+        sample_size=2, sample_seed="alpha",
+        run_subprocess=runner1,
+    )
+    b, _ = enumerate_variants(
+        ".", "x86_64-linux",
+        sample_size=2, sample_seed="alpha",
+        run_subprocess=runner2,
+    )
+    c, _ = enumerate_variants(
+        ".", "x86_64-linux",
+        sample_size=2, sample_seed="beta",
+        run_subprocess=runner3,
+    )
+    labels_a = {v["label"] for v in a}
+    labels_b = {v["label"] for v in b}
+    labels_c = {v["label"] for v in c}
+    assert labels_a == labels_b
+    assert labels_a != labels_c
+
+
+def test_enumerate_variants_sample_larger_than_group_keeps_all():
+    """When sample_size exceeds group size, no variants are dropped."""
+    runner, _ = _make_run_subprocess(_wide_responses())
+    variants, _ = enumerate_variants(
+        ".", "x86_64-linux",
+        sample_size=999,
+        run_subprocess=runner,
+    )
+    assert len(variants) == 12
+
+
+# ---------------------------------------------------------------------------
+# filter_existing_variants
+# ---------------------------------------------------------------------------
+
+
+def _make_variant(label: str) -> dict:
+    return {
+        "label": label,
+        "drv": f"/nix/store/{label}.drv",
+        "tarball_name": f"{label}.tar.zst",
+        "compiler_id": "gcc15",
+        "tier": 1,
+        "pkg": "hello",
+        "arch": "x86_64",
+    }
+
+
+def test_filter_existing_returns_all_when_dataset_dir_absent(tmp_path: pathlib.Path):
+    variants = (_make_variant("a"), _make_variant("b"))
+    kept, skipped = filter_existing_variants(
+        variants, dataset_dir=tmp_path / "missing"
+    )
+    assert kept == variants
+    assert skipped == 0
+
+
+def test_filter_existing_drops_variants_with_existing_tarball(
+    tmp_path: pathlib.Path,
+):
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    # Pretend "a" and "c" are already built; "b" is not.
+    (dataset / "a.tar.zst").write_bytes(b"")
+    (dataset / "c.tar.zst").write_bytes(b"")
+    variants = (
+        _make_variant("a"),
+        _make_variant("b"),
+        _make_variant("c"),
+    )
+    kept, skipped = filter_existing_variants(variants, dataset_dir=dataset)
+    assert skipped == 2
+    assert {v["label"] for v in kept} == {"b"}

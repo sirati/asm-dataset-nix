@@ -22,6 +22,7 @@ CLI; SLURM execution defers to dynamic_runner's pipeline.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import logging
 import os
@@ -47,6 +48,7 @@ from compiler_suit_runner.incremental_cache import (
 from compiler_suit_runner.manifest_gen import emit_all_manifests
 from compiler_suit_runner.preflight import (
     PreflightResult,
+    filter_existing_variants,
     preflight as run_preflight,
 )
 from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
@@ -137,6 +139,30 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "Each variant build itself spawns parallel compiler invocations,"
             " so a value around cpu_count/4 prevents oversubscription on "
             "small clusters."
+        ),
+    )
+    parser.add_argument(
+        "--variant-sample",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Down-sample the variant matrix: keep only N random "
+            "(flag, hardening) combinations per (compiler, arch, opt) "
+            "group. 0 (default) = no sampling, full matrix. Sample is "
+            "deterministic given --variant-seed; change the seed to "
+            "draw a different subset on a follow-up run (skip-existing "
+            "then unions the two)."
+        ),
+    )
+    parser.add_argument(
+        "--variant-seed",
+        default="42",
+        metavar="SEED",
+        help=(
+            "Seed string for --variant-sample (default: '42'). Per-group "
+            "RNG is keyed on f'{seed}:{compiler}:{arch}:{opt}', so "
+            "changing this value reshuffles every group independently."
         ),
     )
     parser.add_argument(
@@ -338,6 +364,8 @@ _CSR_FLAGS_WITH_VALUE: frozenset[str] = frozenset({
     "--submitter-harmonia-port",
     "--ssh-debug-port",
     "--build-max-concurrent",
+    "--variant-sample",
+    "--variant-seed",
     "--hash",
     # nargs="+" — may be followed by multiple values
     "--packages",
@@ -708,10 +736,36 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 args.sys_name,
                 packages=args.packages,
                 archs=args.archs,
+                sample_size=getattr(args, "variant_sample", 0) or 0,
+                sample_seed=getattr(args, "variant_seed", "42") or "42",
             )
         except Exception:  # noqa: BLE001
             log.exception("pre-flight failed")
             return 1
+
+        sample_size = getattr(args, "variant_sample", 0) or 0
+        if sample_size > 0:
+            log.info(
+                "variant sampling: %d kept (sample=%d, seed=%r)",
+                len(pre.variants), sample_size, getattr(args, "variant_seed", "42"),
+            )
+
+        # Skip-existing: drop variants whose tarball is already on disk.
+        # Phase-2 toolchains / common-deps go through nix's own
+        # substitution path so don't need an explicit skip; phase-3
+        # variants land as flat .tar.zst files in dataset_dir, so we
+        # check existence there.
+        dataset_dir = pathlib.Path(args.shared_fs) / "dataset"
+        kept_variants, skipped = filter_existing_variants(
+            pre.variants, dataset_dir=dataset_dir
+        )
+        if skipped:
+            log.info(
+                "skip-existing: %d variants already built; %d remain",
+                skipped, len(kept_variants),
+            )
+            pre = dataclasses.replace(pre, variants=kept_variants)
+
         try:
             _emit_manifests_from_preflight(
                 target_dir=manifest_dir,
