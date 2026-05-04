@@ -1,17 +1,10 @@
-"""Unit tests for ``compiler_suit_runner.manifest_gen``.
-
-Sparse-file note: manifest files have apparent sizes equal to their
-per-type memory budget (1-6 GiB). All common filesystems handle this
-fine, but we still re-root tmp on tmpfs to keep tests fast and avoid
-filling small disk-backed tmp dirs.
-"""
+"""Unit tests for ``compiler_suit_runner.manifest_gen``."""
 
 from __future__ import annotations
 
 import json
 import os
 import pathlib
-import tempfile
 
 import pytest
 
@@ -27,81 +20,7 @@ from compiler_suit_runner.manifest_gen import (
     read_manifest,
     write_manifest,
 )
-from compiler_suit_runner.memory_budget import (
-    MEMORY_FLOOR_BYTES,
-    common_dep_memory_bytes,
-    merge_memory_bytes,
-    partition_shard_memory_bytes,
-    toolchain_memory_bytes,
-    variant_memory_bytes,
-)
 from compiler_suit_runner.partition import Shard, VariantSpec
-
-
-# ---------------------------------------------------------------------------
-# Tmpfs override
-
-
-def _tmpfs_basetemp() -> pathlib.Path | None:
-    """Pick a tmpfs-backed directory in which to root pytest's tmp tree.
-
-    We probe (in order) ``$XDG_RUNTIME_DIR`` and ``/dev/shm``; the first
-    one that exists, is writable, and supports a 1 PiB sparse ftruncate
-    is used. Returns ``None`` if no such filesystem is available, in
-    which case the tmpfs-dependent tests are skipped.
-    """
-    candidates: list[pathlib.Path] = []
-    xdg = os.environ.get("XDG_RUNTIME_DIR")
-    if xdg:
-        candidates.append(pathlib.Path(xdg))
-    candidates.append(pathlib.Path("/dev/shm"))
-    for candidate in candidates:
-        if not candidate.is_dir() or not os.access(candidate, os.W_OK):
-            continue
-        # Probe with a 1 PiB sparse ftruncate; ext4 fails with EFBIG.
-        probe = candidate / f"manifest_gen_probe_{os.getpid()}"
-        try:
-            fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-        except OSError:
-            continue
-        try:
-            try:
-                os.ftruncate(fd, 1 << 50)
-            except OSError:
-                continue
-            return candidate
-        finally:
-            os.close(fd)
-            try:
-                probe.unlink()
-            except OSError:
-                pass
-    return None
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _tmp_path_on_tmpfs(tmp_path_factory: pytest.TempPathFactory):
-    """Re-root the per-session tmp tree on a tmpfs that supports the
-    multi-petabyte sparse files this module emits.
-
-    This patches the factory in place; tests that depend on tmp_path
-    transparently get a tmpfs-backed directory.
-    """
-    base = _tmpfs_basetemp()
-    if base is None:
-        pytest.skip(
-            "no tmpfs available for sparse-file manifest tests"
-            " (need /dev/shm or $XDG_RUNTIME_DIR)",
-            allow_module_level=True,
-        )
-        return
-    new_basetemp = pathlib.Path(
-        tempfile.mkdtemp(prefix="manifest_gen_", dir=str(base))
-    )
-    # Replace the factory's basetemp; subsequent tmp_path / tmp_path_factory
-    # calls will allocate beneath this tmpfs root.
-    tmp_path_factory._basetemp = new_basetemp  # type: ignore[attr-defined]
-    yield
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +51,7 @@ def _variant(
 # Header constructors
 
 
-def test_partition_shard_header_encodes_phase_and_memory():
+def test_partition_shard_header_encodes_phase():
     variants = (
         _variant("hello", "x86_64", "O0"),
         _variant("hello", "x86_64", "O2"),
@@ -143,7 +62,7 @@ def test_partition_shard_header_encodes_phase_and_memory():
 
     assert header.item_class == "phase1a_partition"
     assert header.name == "hello__x86_64"
-    assert header.size == partition_shard_memory_bytes()
+    assert header.size == 0
     assert header.payload["pkg"] == "hello"
     assert header.payload["arch"] == "x86_64"
     assert len(header.payload["variants"]) == 3
@@ -159,7 +78,7 @@ def test_merge_header():
     assert h.item_class == "phase1b_merge"
     assert h.name == "phase1b_merge"
     assert h.payload == {}
-    assert h.size == merge_memory_bytes()
+    assert h.size == 0
 
 
 def test_toolchain_header_without_drv():
@@ -175,7 +94,7 @@ def test_toolchain_header_without_drv():
         "attr": "_crossToolchainMap.x86_64-linux.aarch64.gcc14",
     }
     assert "drv" not in h.payload
-    assert h.size == toolchain_memory_bytes()
+    assert h.size == 0
 
 
 def test_toolchain_header_with_drv():
@@ -197,16 +116,15 @@ def test_common_dep_header():
         "label": "glibc",
         "attr": "/nix/store/glibc-x.drv",
     }
-    assert h.size == common_dep_memory_bytes()
+    assert h.size == 0
 
 
-def test_variant_header_tier1():
+def test_variant_header_payload():
     v = _variant("hello", "x86_64", "O2", tier=1)
     h = make_variant_header(v, "x86_64-linux")
     assert h.item_class == "phase3_variant"
     assert h.name == v["label"]
-    assert h.size == variant_memory_bytes("hello")
-    assert h.size == 1 * 1024 * 1024 * 1024
+    assert h.size == 0
     assert h.payload["sys"] == "x86_64-linux"
     assert h.payload["pkg"] == "hello"
     assert h.payload["arch"] == "x86_64"
@@ -218,23 +136,6 @@ def test_variant_header_tier1():
     assert h.payload["attr"] == (
         f"dataset.x86_64-linux.hello.x86_64.{v['label']}"
     )
-
-
-def test_variant_header_tier2():
-    v = _variant("sqlite", "aarch64", "O3", tier=2)
-    h = make_variant_header(v, "aarch64-linux")
-    assert h.size == variant_memory_bytes("sqlite")
-    assert h.size == 2 * 1024 * 1024 * 1024
-    assert h.payload["attr"] == (
-        f"dataset.aarch64-linux.sqlite.aarch64.{v['label']}"
-    )
-
-
-def test_variant_header_tier3():
-    v = _variant("coreutils", "x86_64", "O2", tier=3)
-    h = make_variant_header(v, "x86_64-linux")
-    assert h.size == variant_memory_bytes("coreutils")
-    assert h.size == 4 * 1024 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -288,18 +189,19 @@ def test_write_manifest_payload_round_trip(tmp_path: pathlib.Path):
 def test_read_manifest_handles_legacy_sparse_padded_file(
     tmp_path: pathlib.Path,
 ):
-    # Older copies of write_manifest padded the file to header.size
-    # with ftruncate (sparse zero-fill). New write_manifest doesn't,
-    # but read_manifest must still load files written by an older
-    # version — so we synthesise the legacy layout and confirm parse.
+    # Older copies of write_manifest padded the file with ftruncate
+    # (sparse zero-fill) to a multi-GiB tail. New write_manifest
+    # doesn't, but read_manifest must still load legacy files —
+    # synthesise the layout and confirm parse.
     h = make_merge_header()
     target = write_manifest(tmp_path, h)
+    legacy_size = 2 * 1024 * 1024 * 1024  # 2 GiB sparse tail
     fd = os.open(target, os.O_RDWR)
     try:
-        os.ftruncate(fd, h.size)
+        os.ftruncate(fd, legacy_size)
     finally:
         os.close(fd)
-    assert os.stat(target).st_size == h.size
+    assert os.stat(target).st_size == legacy_size
     loaded = read_manifest(target)
     assert loaded == h
 

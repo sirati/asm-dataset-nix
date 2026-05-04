@@ -49,14 +49,6 @@ from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
     read_manifest,
 )
-from compiler_suit_runner.memory_budget import (
-    MEMORY_FLOOR_BYTES,
-    common_dep_memory_bytes,
-    merge_memory_bytes,
-    partition_shard_memory_bytes,
-    toolchain_memory_bytes,
-    variant_memory_bytes,
-)
 from compiler_suit_runner.peer_cache import (
     SUBSTITUTERS_FILENAME,
     HarmoniaProcess,
@@ -188,6 +180,11 @@ def _phase_specs():
         TaskTypeSpec,
     )
 
+    # Memory budgeting is disabled for this task: every TaskTypeSpec
+    # uses the default ``estimator_attr = "estimate_memory"`` which
+    # resolves to :meth:`SuitTask.estimate_memory` and returns a
+    # 1-byte constant. The framework's resource scheduler then treats
+    # all items as zero-cost and packs purely by ``--jobs N``.
     return (
         PhaseSpec(
             phase_id="phase1a",
@@ -195,7 +192,6 @@ def _phase_specs():
                 TaskTypeSpec(
                     type_id="partition",
                     worker_module="compiler_suit_runner.workers.partition_worker",
-                    estimator_attr="estimate_partition_memory",
                 ),
             ),
         ),
@@ -206,7 +202,6 @@ def _phase_specs():
                 TaskTypeSpec(
                     type_id="merge",
                     worker_module="compiler_suit_runner.workers.merge_worker",
-                    estimator_attr="estimate_merge_memory",
                 ),
             ),
         ),
@@ -217,12 +212,10 @@ def _phase_specs():
                 TaskTypeSpec(
                     type_id="toolchain",
                     worker_module="compiler_suit_runner.workers.build_worker",
-                    estimator_attr="estimate_toolchain_memory",
                 ),
                 TaskTypeSpec(
                     type_id="common_dep",
                     worker_module="compiler_suit_runner.workers.build_worker",
-                    estimator_attr="estimate_common_dep_memory",
                 ),
             ),
         ),
@@ -233,7 +226,6 @@ def _phase_specs():
                 TaskTypeSpec(
                     type_id="variant",
                     worker_module="compiler_suit_runner.workers.build_worker",
-                    estimator_attr="estimate_variant_memory",
                 ),
             ),
         ),
@@ -394,60 +386,17 @@ class SuitTask:
                 payload=dict(header.payload),
             )
 
-    # ── Per-type memory estimators ─────────────────────────────────────
+    # ── Memory estimator (disabled) ───────────────────────────────────
 
-    def estimate_memory(self, item) -> int:
-        """Default per-item memory estimator, dispatching on ``type_id``.
+    def estimate_memory(self, item) -> int:  # noqa: ARG002 — all items same
+        """Return a 1-byte constant — memory budgeting is disabled.
 
-        The framework prefers the per-type estimator listed on each
-        :class:`TaskTypeSpec` (``estimator_attr``); this method is the
-        fallback when none is configured. Accepts either a
-        :class:`TaskInfo` or a raw ``size`` integer for backward
-        compatibility with the legacy in-process surface.
+        Empirical variance dominates any per-item memory model on this
+        matrix, so we don't try to model it. Returning a tiny constant
+        makes the framework's resource scheduler treat all items as
+        zero-cost; concurrency is then bounded purely by ``--jobs N``.
         """
-        type_id = getattr(item, "type_id", "") or ""
-        if type_id == "partition":
-            return partition_shard_memory_bytes()
-        if type_id == "merge":
-            return merge_memory_bytes()
-        if type_id == "toolchain":
-            return toolchain_memory_bytes()
-        if type_id == "common_dep":
-            return common_dep_memory_bytes()
-        if type_id == "variant":
-            return self.estimate_variant_memory(item)
-        # Fallback: trust ``item.size`` if present, else the floor.
-        size = getattr(item, "size", item)
-        try:
-            return max(int(size), MEMORY_FLOOR_BYTES)
-        except (TypeError, ValueError):
-            return MEMORY_FLOOR_BYTES
-
-    def estimate_partition_memory(self, item) -> int:  # noqa: ARG002
-        return partition_shard_memory_bytes()
-
-    def estimate_merge_memory(self, item) -> int:  # noqa: ARG002
-        return merge_memory_bytes()
-
-    def estimate_toolchain_memory(self, item) -> int:  # noqa: ARG002
-        return toolchain_memory_bytes()
-
-    def estimate_common_dep_memory(self, item) -> int:  # noqa: ARG002
-        return common_dep_memory_bytes()
-
-    def estimate_variant_memory(self, item) -> int:
-        """Tier-aware phase-3 variant estimator.
-
-        Variants are tier-aware (item.payload carries pkg). When the
-        payload doesn't include a pkg (legacy callers, raw int size)
-        we fall back to the floor.
-        """
-        payload = getattr(item, "payload", None)
-        if isinstance(payload, dict):
-            pkg = payload.get("pkg")
-            if isinstance(pkg, str) and pkg:
-                return variant_memory_bytes(pkg)
-        return MEMORY_FLOOR_BYTES
+        return 1
 
     # ── Worker plumbing ────────────────────────────────────────────────
 

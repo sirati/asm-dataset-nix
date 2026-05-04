@@ -1,29 +1,18 @@
 """Pre-flight manifest generation for the compiler-suit runner.
 
 The dynamic_runner framework discovers queue items by scanning a target
-directory for manifest files. Each manifest carries:
+directory for manifest files. Each manifest is a small JSON document
+describing the item's class (which worker should pick it up) and a
+class-specific payload (pkg/arch/drv/...).
 
-* JSON contents describing the item's class (which worker should pick
-  it up) and class-specific payload (pkg/arch/drv/...).
-* A ``size`` field equal to the per-type memory budget in bytes.
-  :func:`SuitTask.discover_items` propagates that JSON field directly
-  into :class:`TaskInfo.size`, which ``estimate_memory`` reads for
-  memory-aware packing. Phase / type ordering is owned by
-  :class:`PhaseSpec` declared on the task.
-
-The on-disk file is just the JSON document — a few hundred bytes.
-Earlier revisions ``os.ftruncate``-padded each file to ``header.size``
-so the framework could read the budget out of ``stat.st_size``, but
-the framework's primary now content-hashes every TaskInfo path during
-``queue_initial_staging`` (sparse zero extents included), so a 1 GiB
-sparse manifest cost ~1 GiB of zero-reads × N items at dispatch start.
-With the budget propagated via the JSON ``size`` field directly the
-padding is dead weight; we write the document and stop.
+Memory budgeting is disabled for this task: every ``size`` field is
+``0`` and :class:`SuitTask.estimate_memory` returns a fixed 1-byte
+constant, so the framework's resource scheduler treats all items as
+zero-cost and packs purely by ``--jobs N`` worker count. Phase / type
+ordering is owned by :class:`PhaseSpec.depends_on` declared on the task.
 
 This module produces manifests for all five item classes in the plan's
-phase sequence (the dynamic_runner framework now owns phase ordering
-and drain detection via :class:`PhaseSpec.depends_on`, so explicit
-barrier sentinels are no longer needed):
+phase sequence:
 
 * ``phase1a_partition`` — one per (pkg, arch) shard
 * ``phase1b_merge``     — exactly one merge item
@@ -44,13 +33,6 @@ import pathlib
 from collections.abc import Iterable
 from typing import Final, Literal
 
-from compiler_suit_runner.memory_budget import (
-    common_dep_memory_bytes,
-    merge_memory_bytes,
-    partition_shard_memory_bytes,
-    toolchain_memory_bytes,
-    variant_memory_bytes,
-)
 from compiler_suit_runner.partition import Shard, VariantSpec, split_into_shards
 
 
@@ -82,9 +64,9 @@ _ALL_ITEM_CLASSES: tuple[ItemClass, ...] = (
 class ManifestHeader:
     """JSON-serialisable description of one queue item.
 
-    ``size`` is the per-type memory budget in bytes (see
-    :mod:`memory_budget`). It is propagated via the JSON document
-    only; the on-disk file size is just the document length.
+    ``size`` is retained as a field for backward compatibility with the
+    framework's :class:`TaskInfo.size` slot but is always 0 — memory
+    budgeting is disabled for this task.
     """
 
     item_class: ItemClass
@@ -113,7 +95,7 @@ def make_partition_shard_header(shard: Shard) -> ManifestHeader:
     return ManifestHeader(
         item_class="phase1a_partition",
         name=shard.name,
-        size=partition_shard_memory_bytes(),
+        size=0,
         payload=payload,
     )
 
@@ -123,7 +105,7 @@ def make_merge_header() -> ManifestHeader:
     return ManifestHeader(
         item_class="phase1b_merge",
         name="phase1b_merge",
-        size=merge_memory_bytes(),
+        size=0,
         payload={},
     )
 
@@ -152,7 +134,7 @@ def make_toolchain_header(
     return ManifestHeader(
         item_class="phase2_toolchain",
         name=f"toolchain__{arch}__{compiler_label}",
-        size=toolchain_memory_bytes(),
+        size=0,
         payload=payload,
     )
 
@@ -166,7 +148,7 @@ def make_common_dep_header(drv: str, label: str) -> ManifestHeader:
     return ManifestHeader(
         item_class="phase2_common_dep",
         name=f"common_dep__{label}",
-        size=common_dep_memory_bytes(),
+        size=0,
         payload={
             "drv": drv,
             "label": label,
@@ -190,10 +172,7 @@ def _label_to_attr_suffix(label: str) -> str:
 def make_variant_header(
     variant: VariantSpec, sys_name: str
 ) -> ManifestHeader:
-    """Build a phase-3 variant manifest.
-
-    Memory budget is tier-aware (see :func:`memory_budget.variant_memory_bytes`).
-    """
+    """Build a phase-3 variant manifest."""
     pkg = variant["pkg"]
     arch = variant["arch"]
     label = variant["label"]
@@ -212,7 +191,7 @@ def make_variant_header(
     return ManifestHeader(
         item_class="phase3_variant",
         name=label,
-        size=variant_memory_bytes(pkg),
+        size=0,
         payload=payload,
     )
 
@@ -235,21 +214,7 @@ def write_manifest(
 ) -> pathlib.Path:
     """Write ``header`` to ``<target_dir>/<header.name>.json``.
 
-    The on-disk file contains only the JSON document (a few hundred
-    bytes) — we DO NOT pad with ``os.ftruncate`` to ``header.size``.
-
-    Earlier revisions wrote a sparse multi-GiB file so the framework
-    could read the per-type memory budget from ``stat.st_size``. That
-    pre-dated :func:`SuitTask._make_task_info` which now propagates the
-    JSON ``header.size`` field directly into ``TaskInfo.size``, so the
-    framework no longer needs the file's apparent size. Keeping the
-    ftruncate would force the framework's StageFile hashing pass
-    (``RustPrimaryCoordinator.queue_initial_staging``) to read every
-    byte of the sparse extent — for a full matrix run that's 3794 ×
-    1 GiB = ~3.7 TiB of zero-reads before the Rust primary even starts,
-    so the dispatch hangs in pre-flight for 30+ minutes burning CPU.
-    Writing the JSON and stopping leaves the file at a few hundred
-    bytes; hashing is then trivial.
+    The on-disk file is just the JSON document (a few hundred bytes).
     """
     target_dir = pathlib.Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -270,20 +235,16 @@ def write_manifest(
 
 
 # A manifest's JSON content is sub-kilobyte; reading 64 KiB is
-# generously safe and avoids ever loading the multi-petabyte sparse
-# tail into memory.
+# generously safe and tolerates legacy sparse-padded files (older
+# write_manifest revisions ftruncate'd to a multi-GiB tail).
 _HEADER_READ_LIMIT_BYTES: Final[int] = 64 * 1024
 
 
 def read_manifest(path: pathlib.Path) -> ManifestHeader:
     """Inverse of :func:`write_manifest`.
 
-    Reads up to ``_HEADER_READ_LIMIT_BYTES`` from the file. Older
-    on-disk revisions used a sparse-padded file (apparent size ==
-    ``header.size``); current writers don't pad. We tolerate either
-    layout by reading a bounded prefix and stripping any trailing NULs
-    left over from a sparse extent before parsing — so manifests
-    written by an older copy of this module still load cleanly.
+    Reads up to ``_HEADER_READ_LIMIT_BYTES`` and strips any trailing
+    NULs from legacy sparse-padded manifests before parsing.
     """
     path = pathlib.Path(path)
     fd = os.open(path, os.O_RDONLY)

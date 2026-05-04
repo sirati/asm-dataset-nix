@@ -148,13 +148,11 @@ def run_nix_eval(
 
 
 def _tier_from_pkg(pkg: str) -> int:
-    """Best-effort tier lookup that doesn't import memory_budget here.
+    """Coarse tier classification carried as variant metadata.
 
-    We deliberately avoid the import to keep this module's dependency
-    surface minimal — preflight is also imported by the CLI and we want
-    that startup to stay fast. The tier numbers track
-    ``memory_budget.tier_of`` (1/2/3); divergence would only affect
-    memory budgeting, not correctness.
+    Tier 1 = small (hello, busybox); tier 3 = large (coreutils, gawk);
+    tier 2 = everything else. Used as a payload hint only; the matrix
+    no longer uses it for memory budgeting.
     """
     if pkg in ("hello", "busybox"):
         return 1
