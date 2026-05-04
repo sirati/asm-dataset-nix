@@ -127,6 +127,19 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Workers per secondary (default: cpu_count).",
     )
     parser.add_argument(
+        "--build-max-concurrent",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Global concurrency cap on build-heavy task types "
+            "(toolchain, common_dep, variant). Unset = unconstrained. "
+            "Each variant build itself spawns parallel compiler invocations,"
+            " so a value around cpu_count/4 prevents oversubscription on "
+            "small clusters."
+        ),
+    )
+    parser.add_argument(
         "--packaging",
         choices=_VALID_PACKAGING,
         default="none",
@@ -324,6 +337,7 @@ _CSR_FLAGS_WITH_VALUE: frozenset[str] = frozenset({
     "--cache-root",
     "--submitter-harmonia-port",
     "--ssh-debug-port",
+    "--build-max-concurrent",
     "--hash",
     # nargs="+" — may be followed by multiple values
     "--packages",
@@ -424,6 +438,7 @@ def _config_from_args(
         # toggles via --enable-ssh-debug.
         enable_ssh_debug=getattr(args, "enable_ssh_debug", False),
         ssh_debug_port=getattr(args, "ssh_debug_port", 22222),
+        build_max_concurrent=getattr(args, "build_max_concurrent", None),
     )
 
 

@@ -167,13 +167,18 @@ def _make_task_info(
     )
 
 
-def _phase_specs():
+def _phase_specs(*, build_max_concurrent: Optional[int]):
     """Build the framework :class:`PhaseSpec` tuple for this run.
 
     Implemented as a function (rather than a module-level constant) so
     importing this module never fails when ``dynamic_runner`` is
     absent — the framework's :class:`PhaseSpec` and :class:`TaskTypeSpec`
     are imported lazily here and only matter at run time.
+
+    ``build_max_concurrent`` (when set) caps the global in-flight count
+    for the three build-heavy types (toolchain, common_dep, variant);
+    partition and merge are always uncapped (cheap, IO-bound). ``None``
+    leaves all types unconstrained.
     """
     from dynamic_runner.task_protocol import (  # type: ignore[import-not-found]
         PhaseSpec,
@@ -184,7 +189,12 @@ def _phase_specs():
     # uses the default ``estimator_attr = "estimate_memory"`` which
     # resolves to :meth:`SuitTask.estimate_memory` and returns a
     # 1-byte constant. The framework's resource scheduler then treats
-    # all items as zero-cost and packs purely by ``--jobs N``.
+    # all items as zero-cost; concurrency is bounded by ``--jobs N``
+    # plus the optional per-type ``max_concurrent`` cap below.
+    build_kwargs: dict = {}
+    if build_max_concurrent is not None:
+        build_kwargs["max_concurrent"] = build_max_concurrent
+
     return (
         PhaseSpec(
             phase_id="phase1a",
@@ -212,10 +222,12 @@ def _phase_specs():
                 TaskTypeSpec(
                     type_id="toolchain",
                     worker_module="compiler_suit_runner.workers.build_worker",
+                    **build_kwargs,
                 ),
                 TaskTypeSpec(
                     type_id="common_dep",
                     worker_module="compiler_suit_runner.workers.build_worker",
+                    **build_kwargs,
                 ),
             ),
         ),
@@ -226,6 +238,7 @@ def _phase_specs():
                 TaskTypeSpec(
                     type_id="variant",
                     worker_module="compiler_suit_runner.workers.build_worker",
+                    **build_kwargs,
                 ),
             ),
         ),
@@ -269,6 +282,14 @@ class SuitTaskConfig:
     # the bits.
     enable_ssh_debug: bool = False
     ssh_debug_port: int = 22222
+    # Global concurrency cap on the three build-heavy task types
+    # (toolchain, common_dep, variant). ``None`` = unconstrained;
+    # a positive int caps in-flight items of those types across the
+    # whole cluster. Useful for compile-throttling: each variant
+    # build forks ``nix build`` which itself spawns N parallel
+    # compiler invocations, so unbounded concurrency × workers
+    # quickly oversubscribes the underlying secondaries.
+    build_max_concurrent: Optional[int] = None
     input_hash: str = ""
     toolchain_drvs: frozenset[str] = frozenset()
     common_threshold: int = 10
@@ -332,7 +353,9 @@ class SuitTask:
 
     def get_phases(self):
         """Return the four-phase :class:`PhaseSpec` graph."""
-        return _phase_specs()
+        return _phase_specs(
+            build_max_concurrent=self.config.build_max_concurrent,
+        )
 
     # ── Item discovery ─────────────────────────────────────────────────
 
