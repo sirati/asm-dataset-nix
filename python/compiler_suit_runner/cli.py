@@ -1065,6 +1065,8 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             args.sys_name,
             packages=args.packages,
             archs=args.archs,
+            sample_size=getattr(args, "variant_sample", 0) or 0,
+            sample_seed=getattr(args, "variant_seed", "42") or "42",
         )
     except Exception:  # noqa: BLE001
         log.exception("preflight failed")

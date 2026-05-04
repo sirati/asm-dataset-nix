@@ -359,6 +359,14 @@ def enumerate_variants(
                     sample_size=sample_size,
                     seed=sample_seed,
                 )
+            # One ``_drvPaths.<sys>.<pkg>.<arch>`` eval covers all
+            # suffixes for this (pkg, arch). Per-suffix evals would
+            # fork ``nix eval`` once per kept variant — each fork
+            # re-walks the entire shared dependency closure (cross
+            # toolchain, libc, etc.) from scratch since nix doesn't
+            # share evaluation state across processes — so the
+            # per-suffix path was an order of magnitude SLOWER on a
+            # 270-sample run despite touching fewer variants.
             if full_drvs is None:
                 drvs_arch = run_nix_eval(
                     flake_ref,
