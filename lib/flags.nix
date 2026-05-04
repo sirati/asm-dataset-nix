@@ -78,8 +78,11 @@ let
       cflags = "-fno-PIC";
       cxxflags = "-fno-PIC";
       ldflags = "-no-pie";
-      # Must also disable PIE hardening, otherwise the linker re-adds -pie
-      extraHardeningDisable = [ "pie" ];
+      # Must also disable PIE/PIC hardening, otherwise the linker
+      # re-adds -pie. Newer nixpkgs renamed the flag pie → pic
+      # (the "pie" entry was removed from knownHardeningFlags); we
+      # disable both for back-compat across nixpkgs versions.
+      extraHardeningDisable = [ "pic" ];
     }
     {
       label = "novec";
