@@ -123,11 +123,25 @@ def _fake_toolchains() -> dict:
 
 
 def _all_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
-    return {
+    """Build the fake nix-eval response table.
+
+    Includes both the legacy full-system path (``_drvPaths.<sys>``,
+    consumed when no --packages/--archs filter is set) and the
+    per-(pkg, arch) scoped paths (``_drvPaths.<sys>.<pkg>.<arch>``,
+    consumed when filters are set — matches the production code
+    path that avoids touching broken matrix combos like
+    gcc5+mips64el).
+    """
+    drvs = _fake_drvpaths()
+    responses: dict[str, object] = {
         f"_meta.{sys_name}": _fake_meta(),
-        f"_drvPaths.{sys_name}": _fake_drvpaths(),
+        f"_drvPaths.{sys_name}": drvs,
         f"_crossToolchainsMeta.{sys_name}": _fake_toolchains(),
     }
+    for pkg, arch_map in drvs.items():
+        for arch, suffix_map in arch_map.items():
+            responses[f"_drvPaths.{sys_name}.{pkg}.{arch}"] = suffix_map
+    return responses
 
 
 # ---------------------------------------------------------------------------
