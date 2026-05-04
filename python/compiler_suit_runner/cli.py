@@ -50,6 +50,7 @@ from compiler_suit_runner.partition_local import (
     PartitionResult,
     compute_partition_locally,
 )
+from compiler_suit_runner.prebuild import prebuild_drvs
 from compiler_suit_runner.preflight import (
     PreflightResult,
     filter_existing_variants,
@@ -818,12 +819,40 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 " its full closure)"
             )
 
-        # TODO(prebuild): once prebuild_drvs() lands, realise toolchain_drvs
-        # ∪ common_dep_drvs locally on the dev box (parallel ``nix build``)
-        # so the dev-box harmonia serves them; secondaries then substitute
-        # instead of rebuilding. Until then we leave phase-2 dispatch
-        # cleared (toolchain_specs=()) and rely on per-variant substitution
-        # which still walks the closure but at least via dev-box harmonia.
+        # Pre-build shared closure on the dev box so dev-box harmonia
+        # serves it; every secondary then substitutes instead of
+        # rebuilding the same toolchain / libc / common dep N times.
+        # Phase-2 dispatch stays cleared — pre-build is a more
+        # efficient replacement.
+        prebuild_drv_set: list[str] = sorted(
+            set(pre.toolchain_drvs)
+            | {drv for _label, drv in pre.common_dep_drvs}
+        )
+        if prebuild_drv_set:
+            log.info(
+                "prebuilding %d shared drvs locally (toolchain + common deps)",
+                len(prebuild_drv_set),
+            )
+            try:
+                pb = prebuild_drvs(prebuild_drv_set, log=log)
+                log.info(
+                    "prebuild: %d succeeded, %d failed in %.1fs",
+                    len(pb.succeeded), len(pb.failed),
+                    pb.total_duration_seconds,
+                )
+                if pb.failed:
+                    log.warning(
+                        "prebuild had %d failures; secondaries may rebuild "
+                        "those drvs from scratch instead of substituting:",
+                        len(pb.failed),
+                    )
+                    for drv, excerpt in pb.failed[:3]:
+                        log.warning("  %s: %s", drv, excerpt[:200])
+            except Exception:  # noqa: BLE001 — prebuild is best-effort
+                log.exception(
+                    "prebuild step crashed; proceeding without "
+                    "pre-populated dev-box store"
+                )
         pre = dataclasses.replace(pre, toolchain_specs=())
 
         try:
