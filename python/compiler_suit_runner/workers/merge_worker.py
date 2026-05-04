@@ -312,9 +312,21 @@ def _load_toolchain_drvs_from_path(path: pathlib.Path) -> frozenset[str]:
 
 
 def main() -> int:
-    """Subprocess entry point for the phase-1b merge worker."""
+    """Subprocess entry point for the phase-1b merge worker.
+
+    Drives the framework's worker protocol via the comm fd
+    (``--dynamic_queue`` / ``--socket-path``). See
+    :mod:`compiler_suit_runner.workers._runner_protocol` for the
+    line-based protocol details.
+    """
     import argparse
-    import sys
+    import logging
+
+    from ._runner_protocol import (
+        DispatchResult,
+        connect_comm,
+        run_protocol_loop,
+    )
 
     parser = argparse.ArgumentParser(
         prog="compiler_suit_runner.workers.merge_worker",
@@ -351,6 +363,8 @@ def main() -> int:
     parser.add_argument("--skip-existing", action="store_true")
     args, _ = parser.parse_known_args()
 
+    log = logging.getLogger("compiler_suit_runner.workers.merge_worker")
+
     variants: tuple[VariantSpec, ...] = ()
     if args.variants_file:
         variants = _load_variants_from_path(pathlib.Path(args.variants_file))
@@ -370,18 +384,27 @@ def main() -> int:
         common_threshold=args.common_threshold,
     )
 
-    rc = 0
-    for line in sys.stdin:
-        manifest_path = pathlib.Path(line.strip())
-        if not str(manifest_path):
-            continue
-        try:
-            result = merge_worker(manifest_path, env)
-            if result.error is not None:
-                rc = 1
-        except Exception:  # noqa: BLE001
-            rc = 1
-    return rc
+    sock = connect_comm(
+        dynamic_queue=args.dynamic_queue,
+        socket_path=args.socket_path,
+        log=log,
+    )
+    if sock is None:
+        log.warning("no comm channel supplied; worker exiting (test mode)")
+        return 0
+
+    def dispatch(manifest_path: pathlib.Path) -> DispatchResult:
+        result = merge_worker(manifest_path, env)
+        if result.error is None:
+            return DispatchResult.ok()
+        return DispatchResult.error(result.error)
+
+    return run_protocol_loop(
+        sock=sock,
+        source=args.source,
+        dispatch=dispatch,
+        log=log,
+    )
 
 
 if __name__ == "__main__":

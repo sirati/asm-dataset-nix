@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import pathlib
 import threading
 from argparse import ArgumentParser, Namespace
@@ -268,6 +269,14 @@ class SuitTaskConfig:
     enable_harmonia: bool = True
     cachix_cache: Optional[str] = None
     cachix_token_file: Optional[pathlib.Path] = None
+    # Opt-in: also spawn sshd in each container so an operator can
+    # ssh in for live debugging while compilation work is running.
+    # See :mod:`compiler_suit_runner.ssh_debug`. Off by default —
+    # the auth surface (a sshd on a high port + the baked
+    # authorized_keys) is opt-in even though the image always ships
+    # the bits.
+    enable_ssh_debug: bool = False
+    ssh_debug_port: int = 22222
     input_hash: str = ""
     toolchain_drvs: frozenset[str] = frozenset()
     common_threshold: int = 10
@@ -294,6 +303,7 @@ class SuitTask:
         # Peer-cache state, lazily populated by ``on_run_start``.
         self._signing_key: Optional[SigningKey] = None
         self._peer_watcher: Optional[PeerListWatcher] = None
+        self._peer_nix_conf_watcher: Optional[Any] = None
         self._cachix_uploader: Optional[CachixUploader] = None
         self._harmonia: Optional[HarmoniaProcess] = None
         self._setup_done: bool = False
@@ -333,15 +343,18 @@ class SuitTask:
     ) -> Iterable:
         """Yield one :class:`TaskInfo` per manifest in the manifest dir.
 
-        ``source_dir`` and ``args`` are accepted for protocol
-        compatibility but the manifest directory itself is owned by
-        :class:`SuitTaskConfig` (preflight wrote it on the primary).
+        ``source_dir`` / ``args`` are accepted for protocol compatibility
+        but explicitly ignored: the framework passes ``args.source``
+        (the run's shared-fs root, not the ``manifests/`` subdir), while
+        the canonical manifest directory is owned by
+        :class:`SuitTaskConfig` and was written by preflight on the
+        primary. Honouring ``source_dir`` here would make the framework
+        list shared-fs/ instead of shared-fs/manifests/ and silently
+        return zero items (the dispatch then falls into the framework's
+        ``test/job-submission mode`` and never builds anything).
         """
-        target = (
-            pathlib.Path(source_dir)
-            if source_dir is not None
-            else self.config.manifest_dir
-        )
+        del source_dir, args
+        target = self.config.manifest_dir
         try:
             entries = sorted(target.iterdir())
         except (FileNotFoundError, NotADirectoryError):
@@ -582,8 +595,21 @@ class SuitTask:
                     )
                     self._cachix_uploader = None
 
-            # 5. Harmonia (optional).
+            # 5. Harmonia (optional). Requires nix-daemon (harmonia 3.x
+            # talks to the daemon over its socket for store queries).
             if self.config.enable_harmonia and self._signing_key is not None:
+                try:
+                    # Start nix-daemon FIRST. Idempotent — no-op if a
+                    # daemon socket already exists. Container's
+                    # nix.conf is in single-user mode so no nixbld*
+                    # group is needed.
+                    from .peer_cache import start_nix_daemon
+                    start_nix_daemon()
+                except Exception:  # noqa: BLE001 — log + continue
+                    self._logger.exception(
+                        "on_run_start: nix-daemon start failed"
+                        " (harmonia will likely 500 on store queries)"
+                    )
                 try:
                     self._harmonia = HarmoniaProcess(
                         bind_addr=f"0.0.0.0:{self.config.harmonia_port}",
@@ -603,12 +629,67 @@ class SuitTask:
                     )
                     self._harmonia = None
 
+            # 6. PeerNixConfWatcher — translate the live peer set
+            # into ``/etc/nix/peer.conf`` so the image's baseline
+            # ``/etc/nix/nix.conf`` (which `!include`s peer.conf)
+            # picks up substituters + trusted-public-keys for every
+            # other secondary. Lets a worker's ``nix-store --realise``
+            # transparently fetch built paths from peer harmonias
+            # without per-build CLI flags.
+            if self._peer_watcher is not None:
+                try:
+                    from .peer_cache import PeerNixConfWatcher
+                    self._peer_nix_conf_watcher = PeerNixConfWatcher(
+                        self._peer_watcher
+                    )
+                    self._peer_nix_conf_watcher.start()
+                except Exception:  # noqa: BLE001 — log + continue
+                    self._logger.exception(
+                        "on_run_start: PeerNixConfWatcher start failed"
+                    )
+
+            # 7. ssh_debug (opt-in) — spawn sshd as a detached session
+            # leader on ``config.ssh_debug_port`` and drop a ready
+            # marker on the gateway-readable mount. Survives this
+            # ``on_run_start`` call's death so even if the secondary
+            # restarts, the operator's session keeps working.
+            if self.config.enable_ssh_debug:
+                try:
+                    from .ssh_debug import (
+                        publish_ready_marker,
+                        start_sshd_detached,
+                    )
+                    sshd_pid = start_sshd_detached(
+                        port=self.config.ssh_debug_port,
+                    )
+                    if sshd_pid is not None or os.path.exists(
+                        "/tmp/ssh-debug/sshd.pid"
+                    ):
+                        publish_ready_marker(
+                            self.config.hostname,
+                            self.config.ssh_debug_port,
+                        )
+                except Exception:  # noqa: BLE001 — log + continue
+                    self._logger.exception(
+                        "on_run_start: ssh_debug start failed"
+                    )
+
             self._setup_done = True
 
     def on_run_end(self, success: bool = True) -> None:
         """Reverse :meth:`on_run_start`. Idempotent and best-effort."""
         del success  # informational only
         with self._setup_lock:
+            if self._peer_nix_conf_watcher is not None:
+                try:
+                    self._peer_nix_conf_watcher.stop()
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "on_run_end: PeerNixConfWatcher stop failed"
+                    )
+                finally:
+                    self._peer_nix_conf_watcher = None
+
             if self._harmonia is not None:
                 try:
                     self._harmonia.stop()
