@@ -235,22 +235,27 @@ let
       extraLdflags = "-pie";
     }
     {
+      # ``extraLdflags`` is appended to ``NIX_LDFLAGS`` which the
+      # binutils ld-wrapper feeds directly to ``ld``. Use raw ld
+      # syntax (``-z relro``) — ``-Wl,...`` is gcc/clang driver
+      # syntax and would reach ld as the literal token ``-Wl,...``,
+      # producing ``ld: unrecognized option '-Wl'``.
       label = "relro";
       hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
-      extraLdflags = "-Wl,-z,relro";
+      extraLdflags = "-z relro";
     }
     {
       label = "bindnow";
       hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
-      extraLdflags = "-Wl,-z,now";
+      extraLdflags = "-z now";
     }
     {
       label = "relro-bindnow";
       hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
-      extraLdflags = "-Wl,-z,relro -Wl,-z,now";
+      extraLdflags = "-z relro -z now";
     }
     {
       label = "format";
