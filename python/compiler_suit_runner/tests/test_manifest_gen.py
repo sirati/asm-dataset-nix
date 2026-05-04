@@ -241,14 +241,17 @@ def test_variant_header_tier3():
 # write_manifest / read_manifest
 
 
-def test_write_manifest_creates_sparse_file_with_correct_apparent_size(
+def test_write_manifest_writes_compact_json_file(
     tmp_path: pathlib.Path,
 ):
     h = make_merge_header()
     written = write_manifest(tmp_path, h)
     assert written == tmp_path / "phase1b_merge.json"
+    # The on-disk file is the JSON document only — no longer padded
+    # to ``h.size`` (see the dispatch hot-path note in
+    # manifest_gen.write_manifest).
     stat = os.stat(written)
-    assert stat.st_size == h.size
+    assert 0 < stat.st_size <= 4096
 
     # Round-trip via read_manifest.
     loaded = read_manifest(written)
@@ -282,18 +285,23 @@ def test_write_manifest_payload_round_trip(tmp_path: pathlib.Path):
     assert loaded.item_class == "phase3_variant"
 
 
-def test_read_manifest_size_mismatch_raises(tmp_path: pathlib.Path):
+def test_read_manifest_handles_legacy_sparse_padded_file(
+    tmp_path: pathlib.Path,
+):
+    # Older copies of write_manifest padded the file to header.size
+    # with ftruncate (sparse zero-fill). New write_manifest doesn't,
+    # but read_manifest must still load files written by an older
+    # version — so we synthesise the legacy layout and confirm parse.
     h = make_merge_header()
     target = write_manifest(tmp_path, h)
-    # Truncate the file so its apparent size no longer matches the
-    # encoded size in the JSON header.
     fd = os.open(target, os.O_RDWR)
     try:
-        os.ftruncate(fd, 1024)
+        os.ftruncate(fd, h.size)
     finally:
         os.close(fd)
-    with pytest.raises(ValueError):
-        read_manifest(target)
+    assert os.stat(target).st_size == h.size
+    loaded = read_manifest(target)
+    assert loaded == h
 
 
 def test_read_manifest_rejects_non_object_top_level(
@@ -374,11 +382,15 @@ def test_emit_all_manifests_full_shape(tmp_path: pathlib.Path):
     assert len(grouped["phase2_common_dep"]) == 2
     assert len(grouped["phase3_variant"]) == 12
 
-    # Every header has a corresponding file with the right apparent size.
+    # Every header has a corresponding file; on-disk size is just the
+    # JSON document (the framework's pre-flight hashing pass reads
+    # every byte of every TaskInfo path, so manifests are no longer
+    # padded to ``header.size`` — that's still propagated via the
+    # JSON ``size`` field for memory-budget ordering).
     for header in result.headers:
         path = tmp_path / f"{header.name}.json"
         assert path.exists()
-        assert os.stat(path).st_size == header.size
+        assert 0 < os.stat(path).st_size <= 4096
         # JSON content round-trips.
         loaded = read_manifest(path)
         assert loaded == header
