@@ -22,9 +22,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import pathlib
 import subprocess
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from typing import Optional
 
 from compiler_suit_runner.partition import VariantSpec
@@ -209,23 +208,37 @@ def enumerate_variants(
         f"_meta.{sys_name}",
         run_subprocess=run_subprocess,
     )
-    drvs = run_nix_eval(
-        flake_ref,
-        f"_drvPaths.{sys_name}",
-        run_subprocess=run_subprocess,
-    )
 
     if not isinstance(meta, dict):
         raise RuntimeError(
             f"_meta.{sys_name} is not a JSON object (got {type(meta).__name__})"
         )
-    if not isinstance(drvs, dict):
-        raise RuntimeError(
-            f"_drvPaths.{sys_name} is not a JSON object (got {type(drvs).__name__})"
-        )
 
     pkg_filter = set(packages) if packages else None
     arch_filter = set(archs) if archs else None
+
+    # Scope the (slow, drv-instantiating) `_drvPaths` eval to just the
+    # (pkg, arch) combos the operator actually asked for. The full-matrix
+    # eval `_drvPaths.<sys>` touches every (compiler, arch) cell — including
+    # broken combos like gcc5+mips64el (nixpkgs-18.03 lacks
+    # platform.kernelArch for the triple) whose errors raise from
+    # `derivationStrict` and cannot be caught by `tryEval`. When the user
+    # filters with --packages / --archs, evaluating per-(pkg, arch) keeps
+    # the eval inside the requested scope, so unrelated broken cells stay
+    # untouched. With no filter we have to evaluate the whole system —
+    # callers asking for "everything" implicitly accept the broken-cell risk.
+    full_drvs: dict | None = None
+    if pkg_filter is None and arch_filter is None:
+        full_drvs = run_nix_eval(
+            flake_ref,
+            f"_drvPaths.{sys_name}",
+            run_subprocess=run_subprocess,
+        )
+        if not isinstance(full_drvs, dict):
+            raise RuntimeError(
+                f"_drvPaths.{sys_name} is not a JSON object "
+                f"(got {type(full_drvs).__name__})"
+            )
 
     variants: list[VariantSpec] = []
     drv_set: set[str] = set()
@@ -235,15 +248,22 @@ def enumerate_variants(
             continue
         if not isinstance(arch_attrs, dict):
             continue
-        drvs_pkg = drvs.get(pkg)
-        if not isinstance(drvs_pkg, dict):
-            continue
         for arch, suffix_attrs in sorted(arch_attrs.items()):
             if arch_filter is not None and arch not in arch_filter:
                 continue
             if not isinstance(suffix_attrs, dict):
                 continue
-            drvs_arch = drvs_pkg.get(arch)
+            if full_drvs is None:
+                drvs_arch = run_nix_eval(
+                    flake_ref,
+                    f"_drvPaths.{sys_name}.{pkg}.{arch}",
+                    run_subprocess=run_subprocess,
+                )
+            else:
+                drvs_pkg = full_drvs.get(pkg)
+                drvs_arch = (
+                    drvs_pkg.get(arch) if isinstance(drvs_pkg, dict) else None
+                )
             if not isinstance(drvs_arch, dict):
                 continue
             for suffix, meta_entry in sorted(suffix_attrs.items()):
