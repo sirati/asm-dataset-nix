@@ -372,6 +372,8 @@ def _last_nonblank_line(stdout: bytes) -> Optional[str]:
 def build_worker(
     manifest_json_path: pathlib.Path,
     env: BuildWorkerEnv,
+    *,
+    manifest_data: Optional[dict] = None,
 ) -> BuildWorkerResult:
     """Execute the build described by ``manifest_json_path``.
 
@@ -398,11 +400,26 @@ def build_worker(
     start = clock()
 
     # Parse manifest. Use a sentinel name/class so the result object can
-    # always be constructed even on read failure.
+    # always be constructed even on read failure. With FR-3 the framework
+    # ships the parsed payload over the wire and ``manifest_data`` is set;
+    # legacy callers pass a path and the file is read.
     name: str = "<unknown>"
     item_class: str = "<unknown>"
     try:
-        header = parse_build_manifest(manifest_json_path)
+        if manifest_data is not None:
+            if not isinstance(manifest_data, dict):
+                raise ValueError(
+                    f"manifest_data must be a dict, got {type(manifest_data).__name__}"
+                )
+            header = manifest_data
+            cls = header.get("item_class")
+            if cls not in VALID_ITEM_CLASSES:
+                raise ValueError(
+                    f"manifest_data has unknown item_class={cls!r}; "
+                    f"expected one of {sorted(VALID_ITEM_CLASSES)}"
+                )
+        else:
+            header = parse_build_manifest(manifest_json_path)
         item_class = str(header.get("item_class", "<unknown>"))
         name = str(header.get("name", "<unknown>"))
     except Exception as exc:  # noqa: BLE001 - never raise out
@@ -586,8 +603,14 @@ def main() -> int:
         log.warning("no comm channel supplied; worker exiting (test mode)")
         return 0
 
-    def dispatch(manifest_path: pathlib.Path) -> DispatchResult:
-        result = build_worker(manifest_path, env)
+    def dispatch(
+        manifest_path: pathlib.Path,
+        payload: Optional[object] = None,
+    ) -> DispatchResult:
+        manifest_data = payload if isinstance(payload, dict) else None
+        result = build_worker(
+            manifest_path, env, manifest_data=manifest_data
+        )
         if result.success:
             return DispatchResult.ok()
         return DispatchResult.error(result.error or "build failed")

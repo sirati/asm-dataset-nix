@@ -104,35 +104,36 @@ def _atomic_write_json(target: pathlib.Path, payload: object) -> pathlib.Path:
 # Manifest parsing
 
 
-def parse_merge_manifest(manifest_json_path: pathlib.Path) -> dict:
-    """Read the phase-1b manifest JSON and validate its ``item_class``.
-
-    Returns the parsed payload dict on success. Raises:
-
-    * :class:`FileNotFoundError` if the manifest file does not exist.
-    * :class:`ValueError` if the JSON is not an object, or if
-      ``item_class`` is missing or does not equal ``'phase1b_merge'``.
-
-    The payload's other fields are not validated here — the merge
-    worker's behavior is fully driven by :class:`MergeWorkerEnv`, not the
-    manifest. This keeps the manifest schema free to evolve.
+def parse_merge_manifest(
+    manifest_json_path,
+    *,
+    manifest_data: dict | None = None,
+) -> dict:
+    """Resolve a phase-1b manifest. With FR-3 the manifest dict is
+    handed in via ``manifest_data`` (no file read); legacy callers
+    pass a path.
     """
-    manifest_json_path = pathlib.Path(manifest_json_path)
-    with open(manifest_json_path, "r", encoding="utf-8") as fh:
-        payload = json.load(fh)
+    if manifest_data is not None:
+        data = manifest_data
+        src_label = "<inline>"
+    else:
+        manifest_json_path = pathlib.Path(manifest_json_path)
+        src_label = str(manifest_json_path)
+        with open(manifest_json_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
 
-    if not isinstance(payload, dict):
+    if not isinstance(data, dict):
         raise ValueError(
-            f"{manifest_json_path}: manifest top-level JSON must be an object"
+            f"{src_label}: manifest top-level JSON must be an object"
         )
 
-    item_class = payload.get("item_class")
+    item_class = data.get("item_class")
     if item_class != PHASE_1B_ITEM_CLASS:
         raise ValueError(
-            f"{manifest_json_path}: expected item_class"
+            f"{src_label}: expected item_class"
             f" {PHASE_1B_ITEM_CLASS!r}, got {item_class!r}"
         )
-    return payload
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +167,10 @@ def collect_skip_list(
 
 
 def merge_worker(
-    manifest_json_path: pathlib.Path, env: MergeWorkerEnv
+    manifest_json_path: pathlib.Path,
+    env: MergeWorkerEnv,
+    *,
+    manifest_data: dict | None = None,
 ) -> MergeWorkerResult:
     """Phase-1b merge worker dispatch surface.
 
@@ -199,7 +203,7 @@ def merge_worker(
     skip_list_path = pathlib.Path(env.partition_dir) / "skip_list.json"
 
     try:
-        parse_merge_manifest(manifest_json_path)
+        parse_merge_manifest(manifest_json_path, manifest_data=manifest_data)
 
         shard_outputs: list[ShardOutput] = read_shard_outputs(
             env.raw_partition_dir
@@ -393,8 +397,14 @@ def main() -> int:
         log.warning("no comm channel supplied; worker exiting (test mode)")
         return 0
 
-    def dispatch(manifest_path: pathlib.Path) -> DispatchResult:
-        result = merge_worker(manifest_path, env)
+    def dispatch(
+        manifest_path: pathlib.Path,
+        payload: object | None = None,
+    ) -> DispatchResult:
+        manifest_data = payload if isinstance(payload, dict) else None
+        result = merge_worker(
+            manifest_path, env, manifest_data=manifest_data,
+        )
         if result.error is None:
             return DispatchResult.ok()
         return DispatchResult.error(result.error)
