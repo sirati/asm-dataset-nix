@@ -52,6 +52,7 @@ from compiler_suit_runner.partition_local import (
 )
 from compiler_suit_runner.preflight import (
     PreflightResult,
+    eval_toolchain_drvs,
     filter_existing_variants,
     preflight as run_preflight,
 )
@@ -494,6 +495,7 @@ def _emit_manifests_from_preflight(
     sys_name: str,
     pre: PreflightResult,
     num_workers: int,
+    toolchain_drvs: Optional[dict[tuple[str, str], str]] = None,
 ):
     """Bridge :mod:`preflight` output into ``emit_all_manifests``."""
     return emit_all_manifests(
@@ -503,6 +505,7 @@ def _emit_manifests_from_preflight(
         toolchain_specs=pre.toolchain_specs,
         common_deps=pre.common_dep_drvs,
         num_workers=num_workers,
+        toolchain_drvs=toolchain_drvs,
     )
 
 
@@ -846,12 +849,33 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # No local pre-build — distribution is the entire point. Each
         # secondary does its share of phase-2 in parallel.
 
+        # Resolve toolchain drv paths so the phase-2 toolchain manifest
+        # can carry an absolute drv (the build worker on a SLURM
+        # secondary has no flake.nix and would otherwise try to resolve
+        # ``flake_ref="."#_crossToolchainMap...`` against /app, which
+        # fails with "could not find a flake.nix file").
+        try:
+            tc_drvs = eval_toolchain_drvs(
+                args.flake, args.sys_name, pre.toolchain_specs,
+            )
+            log.info(
+                "toolchain drv eval: %d/%d resolved",
+                len(tc_drvs), len(pre.toolchain_specs),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "toolchain drv eval failed; manifests fall back to"
+                " flake-attr (will fail on secondaries)"
+            )
+            tc_drvs = {}
+
         try:
             _emit_manifests_from_preflight(
                 target_dir=manifest_dir,
                 sys_name=args.sys_name,
                 pre=pre,
                 num_workers=num_workers,
+                toolchain_drvs=tc_drvs,
             )
         except Exception:  # noqa: BLE001
             log.exception("manifest emission failed")

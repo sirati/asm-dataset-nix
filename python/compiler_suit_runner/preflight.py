@@ -548,6 +548,73 @@ def enumerate_variants(
 # ---------------------------------------------------------------------------
 
 
+def eval_toolchain_drvs(
+    flake_ref: str,
+    sys_name: str,
+    pairs: tuple[tuple[str, str], ...],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> dict[tuple[str, str], str]:
+    """Evaluate the drv path for each ``(arch, compiler)`` toolchain.
+
+    Without this, phase-2 toolchain manifests would only carry the
+    flake attribute path (``_crossToolchainMap.<sys>.<arch>.<compiler>``)
+    and the build_worker on a SLURM secondary would try to resolve it
+    against ``flake_ref="."`` which is the container's working dir
+    (no flake.nix shipped to the secondary). The drv path lets the
+    worker substitute / build via ``nix build <drv>^*`` instead.
+
+    Returns a dict ``(arch, compiler) -> drv_path``; entries with
+    failed evals are silently dropped (the manifest then falls back
+    to flake-attr resolution, which will fail loudly on the secondary
+    and surface in the build-failure log).
+    """
+    if not pairs:
+        return {}
+    runner = run_subprocess or _default_run_subprocess
+    safe = re.compile(r"^[A-Za-z0-9._-]+$")
+    out: dict[tuple[str, str], str] = {}
+    # One ``nix eval --apply`` call returns drv paths for all pairs;
+    # nix's lazy attrset access only forces the requested compilers.
+    body_parts: list[str] = []
+    for arch, compiler in pairs:
+        if not safe.match(arch) or not safe.match(compiler):
+            continue
+        body_parts.append(
+            f'"{arch}__{compiler}" = m."{arch}"."{compiler}".drvPath'
+        )
+    if not body_parts:
+        return {}
+    apply_expr = "m: { " + "; ".join(body_parts) + "; }"
+    argv = [
+        "nix",
+        "eval",
+        "--extra-experimental-features",
+        "nix-command flakes",
+        "--json",
+        f"{flake_ref}#_crossToolchainMap.{sys_name}",
+        "--apply",
+        apply_expr,
+    ]
+    stdout, stderr, rc = runner(argv)
+    if rc != 0:
+        # Surface but don't fail — toolchain manifests without drv
+        # paths fall back to flake-attr resolution downstream.
+        return {}
+    try:
+        parsed = json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    for arch, compiler in pairs:
+        key = f"{arch}__{compiler}"
+        drv = parsed.get(key)
+        if isinstance(drv, str) and drv.endswith(".drv"):
+            out[(arch, compiler)] = drv
+    return out
+
+
 def enumerate_toolchains(
     flake_ref: str,
     sys_name: str,
