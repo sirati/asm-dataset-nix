@@ -28,12 +28,10 @@ import logging
 import os
 import pathlib
 import socket
-import subprocess
 import sys
 import tarfile
 import tempfile
 import time
-from urllib.parse import urlparse
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Optional
 
@@ -882,46 +880,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # preflight. The remaining tokens (--gateway, --multi-computer,
         # --packaging, --slurm-root-folder, --jobs, --debug) flow
         # through untouched.
-        # The framework's queue_initial_staging assumes our manifest
-        # files are already on the gateway at
-        # ``<slurm-root>/image_bin/srcbins/manifests/`` — that path
-        # bind-mounts to ``/app/src-network`` inside each secondary
-        # container, where ``stage_file`` then copies into
-        # ``/app/src-tmp``. The framework does NOT upload the
-        # ``--source`` dir for us; we have to scp it ourselves before
-        # dispatch. (The proper fix is FR-3 — workers receive the
-        # payload directly via the comm fd and don't need files at
-        # all — but until that lands we stage the JSON manifests
-        # on the gateway.)
-        if args.gateway and args.slurm_root_folder and config.manifest_dir.is_dir():
-            try:
-                parsed = urlparse(args.gateway)
-                if parsed.scheme == "ssh" and parsed.hostname:
-                    user_host = (
-                        f"{parsed.username}@{parsed.hostname}"
-                        if parsed.username else parsed.hostname
-                    )
-                    slurm_root = str(args.slurm_root_folder).rstrip("/")
-                    remote_dir = f"{slurm_root}/image_bin/srcbins/manifests"
-                    log.info(
-                        "staging manifests to gateway: %s:%s",
-                        user_host, remote_dir,
-                    )
-                    subprocess.check_call([
-                        "ssh", "-o", "BatchMode=yes",
-                        user_host,
-                        f"mkdir -p {remote_dir}",
-                    ])
-                    subprocess.check_call([
-                        "rsync", "-az", "--delete",
-                        "-e", "ssh -o BatchMode=yes",
-                        f"{config.manifest_dir}/",
-                        f"{user_host}:{remote_dir}/",
-                    ])
-            except subprocess.CalledProcessError:
-                log.exception("manifest staging to gateway failed")
-                return 1
-
         original_argv = sys.argv
         forwarded = _strip_csr_argv_for_framework(original_argv[1:])
         # SuitTask doesn't have a real "source dir" — items come from
