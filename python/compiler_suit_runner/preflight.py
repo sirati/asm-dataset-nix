@@ -361,6 +361,66 @@ def _build_variant_spec(
     }
 
 
+def _parse_compiler_major(version: str) -> Optional[int]:
+    """Best-effort parse of a compiler version string's major number.
+
+    Accepts ``"15.2.0"`` (returns 15), ``"4.6"`` (returns 4),
+    ``"3.4.1-rc2"`` (returns 3). Returns ``None`` on anything that
+    doesn't start with a digit.
+    """
+    m = re.match(r"^(\d+)", version)
+    return int(m.group(1)) if m is not None else None
+
+
+def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
+    """Return a non-empty reason string if ``meta_entry`` describes a
+    combination known to fail at build time, or ``None`` if the combo
+    is plausible.
+
+    Generating a manifest for a known-bad combo wastes a worker slot,
+    a dispatch round-trip, and a few minutes of nix evaluation /
+    substitution before the inevitable ``configure: error: C compiler
+    cannot create executables``. Filter them out at sampling time so
+    we don't sample broken cells in the first place.
+
+    The list grows as we observe more failures. Each rule is keyed on
+    fields from ``meta_entry`` (``compilerFamily``, ``compilerVersion``,
+    ``optimization``, ``flags``, ``hardening``, ``sanitizer``, ``arch``).
+    """
+    sanitizer = meta_entry.get("sanitizer", "san-off")
+    optimization = meta_entry.get("optimization", "")
+    compiler_family = meta_entry.get("compilerFamily", "")
+    compiler_version = meta_entry.get("compilerVersion", "")
+    major = _parse_compiler_major(compiler_version)
+
+    # Sanitizers need optimization passes to instrument correctly. At
+    # -O0 the runtime libs don't get linked properly and the configure
+    # check ("can the C compiler create executables") fails before
+    # the build even starts. Observed on
+    # clang10+O0+san-undefined+relro-bindnow.
+    if sanitizer != "san-off" and optimization == "O0":
+        return "sanitizer requires -O1+; configure fails on -O0"
+
+    # Old clang shipped without complete sanitizer runtimes for cross
+    # targets. From clang 6+ the runtime support is uniform.
+    if sanitizer != "san-off" and compiler_family == "clang" and major is not None and major < 6:
+        return f"clang {major} predates uniform sanitizer runtime (need ≥6)"
+
+    # Old gcc had partial / broken sanitizer support. ASan landed in
+    # 4.8, UBSan in 4.9, but the runtime libs only became reliably
+    # available across cross targets from gcc 6+.
+    if sanitizer != "san-off" and compiler_family == "gcc" and major is not None and major < 6:
+        return f"gcc {major} predates uniform sanitizer runtime (need ≥6)"
+
+    # ``-Ofast`` enables ``-ffast-math`` which conflicts with
+    # ``-fsanitize=undefined`` (UBSan instruments operations
+    # ``-ffast-math`` is allowed to assume don't happen).
+    if sanitizer == "san-undefined" and optimization == "Ofast":
+        return "Ofast enables fast-math which conflicts with san-undefined"
+
+    return None
+
+
 def _sample_suffix_attrs(
     suffix_attrs: dict,
     *,
@@ -481,6 +541,15 @@ def enumerate_variants(
                 continue
             if not isinstance(suffix_attrs, dict):
                 continue
+            # Drop known-bad combinations BEFORE sampling so the
+            # operator's K-per-group budget isn't wasted on cells
+            # that will fail at build time anyway. See
+            # :func:`is_known_bad_combo` for the rule list.
+            suffix_attrs = {
+                s: m
+                for s, m in suffix_attrs.items()
+                if not (isinstance(m, dict) and is_known_bad_combo(m))
+            }
             if sample_size > 0:
                 suffix_attrs = _sample_suffix_attrs(
                     suffix_attrs,
