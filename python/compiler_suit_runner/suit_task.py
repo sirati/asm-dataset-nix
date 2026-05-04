@@ -408,13 +408,24 @@ class SuitTask:
                     entry,
                 )
                 continue
+            # Ship the full ManifestHeader as TaskInfo.payload — with
+            # FR-3 the framework propagates this dict through the wire
+            # to the worker, so workers never need to read the manifest
+            # file. ``path`` is just a synthetic identifier (the
+            # manifest filename) used for logging / dedup.
+            header_dict = {
+                "item_class": header.item_class,
+                "name": header.name,
+                "size": header.size,
+                "payload": dict(header.payload),
+            }
             yield _make_task_info(
-                entry,
+                pathlib.Path(entry.name),
                 header.size,
                 phase_id=phase_id,
                 type_id=type_id,
                 affinity_id=affinity_id,
-                payload=dict(header.payload),
+                payload=header_dict,
             )
 
     # ── Memory estimator (disabled) ───────────────────────────────────

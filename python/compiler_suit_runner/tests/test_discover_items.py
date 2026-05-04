@@ -182,7 +182,10 @@ def test_discover_items_classifies_each_manifest(tmp_path: pathlib.Path) -> None
     variant = by_phase["phase3"][0]
     assert variant.type_id == "variant"
     assert variant.affinity_id == "gcc15-x86_64"
-    assert variant.payload["pkg"] == "hello"
+    # TaskInfo.payload now carries the full ManifestHeader dict so
+    # workers can read it directly off the comm fd via FR-3.
+    assert variant.payload["item_class"] == "phase3_variant"
+    assert variant.payload["payload"]["pkg"] == "hello"
 
 
 def test_discover_items_yields_size_from_manifest(tmp_path: pathlib.Path) -> None:

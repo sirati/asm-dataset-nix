@@ -95,45 +95,56 @@ class PartitionWorkerResult:
 
 
 def parse_manifest_payload(
-    manifest_json_path: pathlib.Path,
+    manifest_json_path,
+    *,
+    manifest_data: dict | None = None,
 ) -> tuple[str, str, list[VariantSpec]]:
-    """Read ``manifest_json_path`` and unpack a phase-1a manifest.
+    """Resolve a phase-1a manifest into ``(pkg, arch, variants)``.
 
-    Returns ``(pkg, arch, variants)``. Raises :class:`ValueError` on
-    schema mismatch (missing keys, wrong ``item_class``, malformed
-    variant entries).
+    With FR-3 the framework ships the parsed manifest as
+    ``TaskInfo.payload`` over the wire and ``manifest_data`` is set;
+    no file is read. Legacy callers pass a path and we open the file.
+
+    Schema: top-level ``{item_class, name, size, payload: {...}}``;
+    pkg/arch/variants live under the inner ``payload`` subdict. We
+    also tolerate a legacy flat schema where these fields are at the
+    top level (only matters for old on-disk manifest files).
     """
-    manifest_json_path = pathlib.Path(manifest_json_path)
-    with open(manifest_json_path, "r", encoding="utf-8") as fh:
-        payload = json.load(fh)
+    if manifest_data is not None:
+        data = manifest_data
+        src_label = "<inline>"
+    else:
+        manifest_json_path = pathlib.Path(manifest_json_path)
+        src_label = str(manifest_json_path)
+        with open(manifest_json_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
 
-    if not isinstance(payload, dict):
-        raise ValueError(
-            f"{manifest_json_path}: top-level JSON must be an object"
-        )
+    if not isinstance(data, dict):
+        raise ValueError(f"{src_label}: top-level JSON must be an object")
 
-    item_class = payload.get("item_class")
+    item_class = data.get("item_class")
     if item_class != PHASE_1A_ITEM_CLASS:
         raise ValueError(
-            f"{manifest_json_path}: expected item_class "
+            f"{src_label}: expected item_class "
             f"{PHASE_1A_ITEM_CLASS!r}, got {item_class!r}"
         )
 
-    pkg = payload.get("pkg")
-    arch = payload.get("arch")
+    section = data.get("payload") if isinstance(data.get("payload"), dict) else data
+    pkg = section.get("pkg")
+    arch = section.get("arch")
     if not isinstance(pkg, str) or not pkg:
         raise ValueError(
-            f"{manifest_json_path}: missing/invalid 'pkg' (got {pkg!r})"
+            f"{src_label}: missing/invalid 'pkg' (got {pkg!r})"
         )
     if not isinstance(arch, str) or not arch:
         raise ValueError(
-            f"{manifest_json_path}: missing/invalid 'arch' (got {arch!r})"
+            f"{src_label}: missing/invalid 'arch' (got {arch!r})"
         )
 
-    raw_variants = payload.get("variants")
+    raw_variants = section.get("variants")
     if not isinstance(raw_variants, list):
         raise ValueError(
-            f"{manifest_json_path}: 'variants' must be a list"
+            f"{src_label}: 'variants' must be a list"
         )
 
     required_fields = ("label", "drv", "tarball_name", "compiler_id", "tier")
@@ -141,23 +152,23 @@ def parse_manifest_payload(
     for index, raw in enumerate(raw_variants):
         if not isinstance(raw, dict):
             raise ValueError(
-                f"{manifest_json_path}: variants[{index}] is not an object"
+                f"{src_label}: variants[{index}] is not an object"
             )
         for field in required_fields:
             if field not in raw:
                 raise ValueError(
-                    f"{manifest_json_path}: variants[{index}]"
+                    f"{src_label}: variants[{index}]"
                     f" missing field {field!r}"
                 )
         for field in ("label", "drv", "tarball_name", "compiler_id"):
             if not isinstance(raw[field], str):
                 raise ValueError(
-                    f"{manifest_json_path}: variants[{index}].{field}"
+                    f"{src_label}: variants[{index}].{field}"
                     " must be a string"
                 )
         if not isinstance(raw["tier"], int):
             raise ValueError(
-                f"{manifest_json_path}: variants[{index}].tier must be int"
+                f"{src_label}: variants[{index}].tier must be int"
             )
         variant: VariantSpec = {
             "label": raw["label"],
@@ -286,6 +297,8 @@ def extract_input_drvs(
 def partition_worker(
     manifest_json_path: pathlib.Path,
     env: WorkerEnv,
+    *,
+    manifest_data: dict | None = None,
 ) -> PartitionWorkerResult:
     """Phase-1a dispatch entry point.
 
@@ -317,7 +330,9 @@ def partition_worker(
     shard_name = pathlib.Path(manifest_json_path).stem
 
     try:
-        pkg, arch, variants = parse_manifest_payload(manifest_json_path)
+        pkg, arch, variants = parse_manifest_payload(
+            manifest_json_path, manifest_data=manifest_data,
+        )
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         return PartitionWorkerResult(
             shard_name=shard_name,
@@ -477,8 +492,14 @@ def main() -> int:
         log.warning("no comm channel supplied; worker exiting (test mode)")
         return 0
 
-    def dispatch(manifest_path: pathlib.Path) -> DispatchResult:
-        result = partition_worker(manifest_path, env)
+    def dispatch(
+        manifest_path: pathlib.Path,
+        payload: object | None = None,
+    ) -> DispatchResult:
+        manifest_data = payload if isinstance(payload, dict) else None
+        result = partition_worker(
+            manifest_path, env, manifest_data=manifest_data,
+        )
         if result.error is None:
             return DispatchResult.ok()
         return DispatchResult.error(result.error)

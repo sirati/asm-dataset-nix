@@ -3,19 +3,22 @@
 The dynamic_runner framework spawns each worker subprocess with
 ``--dynamic_queue <fd>`` (socketpair from the secondary's worker
 factory) or ``--socket-path <path>`` (out-of-band UNIX socket), then
-streams one ``ProcessBinaryCommand`` per line on that fd:
+streams one ``ProcessBinaryCommand`` per line on that fd. Two forms:
 
     ready\\n                              (worker → manager)
-    <relative_path>\\n                    (manager → worker)
+    <relative_path>\\n                    legacy form (manager → worker)
+    task:<json>\\n                        FR-3 form: <json> = {"path": ..., "payload": ...}
     done\\n  (or done:N:M\\n)              (worker → manager, success)
     error:non_recoverable:<msg>\\n         (worker → manager, fatal)
     stop\\n                                (manager → worker, drain)
 
-The relative path is interpreted against the worker's *source*
-directory — staged by the primary's ``queue_initial_staging`` and
-copied into the secondary container at ``--src-tmp`` (default
-``/app/src-tmp``). Workers that need access to peer-staged files via
-``--src-network`` read those independently of this loop.
+In legacy form the relative path is interpreted against the worker's
+*source* directory (staged by the primary into ``/app/src-tmp``).
+In FR-3 form the manager has shipped the entire task payload over the
+wire — ``payload`` is a JSON-encoded string the worker decodes
+directly (``json.loads``), no filesystem hop. ``compiler_suit_runner``
+uses FR-3 with ``uses_file_based_items=False`` so workers never read
+manifest files.
 
 Reading from ``sys.stdin`` would not work: the framework's
 ``subprocess_factory`` silences worker stdin/stdout/stderr
@@ -26,6 +29,7 @@ explicit comm fd is meant to carry protocol traffic.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import pathlib
@@ -44,11 +48,13 @@ __all__ = [
 ]
 
 
-# A worker dispatch callback consumes the resolved on-disk path of one
-# item (a manifest, in compiler_suit_runner's case) and returns a
-# :class:`DispatchResult` describing whether the work succeeded plus an
-# optional error message that gets surfaced via the
-# ``error:non_recoverable:<msg>`` line.
+# A worker dispatch callback consumes ``(path, payload)`` for one item
+# and returns a :class:`DispatchResult`. ``path`` is the manager-
+# supplied identifier (already passed through :func:`resolve_item_path`
+# for legacy form; verbatim for FR-3 form). ``payload`` is the parsed
+# task payload — ``None`` in legacy form, a ``dict`` (or list / string,
+# whatever the task declared) in FR-3 form. Workers that don't care
+# about payload can ignore it.
 class DispatchResult:
     """Outcome of one item's dispatch.
 
@@ -73,7 +79,7 @@ class DispatchResult:
         return cls(False, message)
 
 
-DispatchFn = Callable[[pathlib.Path], DispatchResult]
+DispatchFn = Callable[[pathlib.Path, Optional[object]], DispatchResult]
 
 
 def connect_comm(
@@ -198,10 +204,38 @@ def run_protocol_loop(
             except OSError:
                 pass
             return rc
-        manifest_path = resolve_item_path(cmd, source=source)
+        # Two wire forms:
+        #   "task:<json>"   FR-3 — ship payload over the wire
+        #   "<rel-path>"    legacy — worker reads the file
+        if cmd.startswith("task:"):
+            try:
+                envelope = json.loads(cmd[len("task:"):])
+            except json.JSONDecodeError as exc:
+                log.exception("malformed task envelope; treating as fatal")
+                _send(
+                    sock,
+                    f"error:non_recoverable:bad task envelope: {exc!r}\n".encode("ascii"),
+                    log,
+                )
+                rc = 1
+                continue
+            raw_path = envelope.get("path", "")
+            raw_payload = envelope.get("payload")
+            payload_obj: Optional[object] = None
+            if isinstance(raw_payload, str) and raw_payload:
+                try:
+                    payload_obj = json.loads(raw_payload)
+                except json.JSONDecodeError:
+                    payload_obj = raw_payload  # let the worker decide
+            elif raw_payload is not None:
+                payload_obj = raw_payload
+            manifest_path = pathlib.Path(raw_path) if raw_path else pathlib.Path("<inline>")
+        else:
+            payload_obj = None
+            manifest_path = resolve_item_path(cmd, source=source)
         log.info("dispatching item %s", manifest_path)
         try:
-            result = dispatch(manifest_path)
+            result = dispatch(manifest_path, payload_obj)
         except Exception as exc:  # noqa: BLE001 — never let the loop die
             log.exception("dispatch raised; treating as non-recoverable")
             result = DispatchResult.error(f"unhandled exception: {exc!r}")

@@ -81,7 +81,10 @@ def _drive_loop(
     dispatched: list[pathlib.Path] = []
     pending = list(dispatch_results)
 
-    def dispatch(path: pathlib.Path) -> DispatchResult:
+    def dispatch(
+        path: pathlib.Path,
+        payload: object | None = None,  # noqa: ARG001
+    ) -> DispatchResult:
         dispatched.append(path)
         if pending:
             return pending.pop(0)
@@ -227,7 +230,10 @@ def test_loop_treats_unhandled_dispatch_exception_as_non_recoverable(
 ) -> None:
     worker_sock, manager_sock = socket.socketpair()
 
-    def dispatch(_path: pathlib.Path) -> DispatchResult:
+    def dispatch(
+        _path: pathlib.Path,
+        _payload: object | None = None,
+    ) -> DispatchResult:
         raise RuntimeError("oops")
 
     rc_holder: dict[str, int] = {}
