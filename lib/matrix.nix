@@ -327,7 +327,21 @@ let
         lib.concatMap (
           comp:
           let
-            tried = builtins.tryEval (comp.mkStdenv targetPkgs' target).cc;
+            # ``deepSeq cc.drvPath cc`` forces full evaluation of the
+            # cross-compiler derivation INSIDE the tryEval scope.
+            # Without the force, ``mkStdenv ... .cc`` returns lazily;
+            # ``tryEval`` succeeds at the wrapper level but downstream
+            # consumers (``nix-eval-jobs``, ``nix eval --json``) later
+            # hit the deferred throw outside any tryEval scope and
+            # crash the whole arch's ``listToAttrs`` evaluation. With
+            # the force, deferred throws (e.g. nixpkgs-18.03 pkgsCross
+            # for ppc32 missing ``platform.kernelArch``) become
+            # eval-time throws inside the tryEval and we cleanly drop
+            # that one combo while keeping the rest of the arch.
+            tried = builtins.tryEval (
+              let cc = (comp.mkStdenv targetPkgs' target).cc;
+              in builtins.deepSeq cc.drvPath cc
+            );
           in
           if tried.success then
             [
@@ -337,7 +351,12 @@ let
               }
             ]
           else
-            [ ]
+            # Log to stderr so operators see which combos got dropped.
+            # Visible in ``nix eval`` / ``nix-eval-jobs`` stderr; can
+            # be grep'd by consumers for matrix-coverage diagnostics.
+            builtins.trace
+              "matrix.nix: dropping ${target.label}+${comp.label} (eval failed inside tryEval)"
+              [ ]
         ) validCompilers
       )
   ) archDefs.targets;

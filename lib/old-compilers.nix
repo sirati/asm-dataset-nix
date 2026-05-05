@@ -184,10 +184,17 @@ let
       # Modern nixpkgs: use pkgsCross directly (returns null if cross attr missing)
       archLib.getPkgsForTarget oldPkgs target
     else if nixpkgsSrc != null && system != null then
-      # Pre-pkgsCross nixpkgs: re-import with crossSystem
+      # Pre-pkgsCross nixpkgs: re-import with crossSystem.
+      # Prefer ``target.crossSystem`` when defined — that's the
+      # complete crossSystem attrset (including ``platform.kernelArch``
+      # for archs whose legacy nixpkgs ``lib.systems`` lookup is
+      # missing it; e.g. ppc32 in nixpkgs-18.03 throws
+      # ``attribute 'kernelArch' missing`` from kernel-headers
+      # without an explicit value). Fall back to the bare config
+      # triple for archs that don't need any platform overrides.
       import nixpkgsSrc {
         inherit system;
-        crossSystem = {
+        crossSystem = target.crossSystem or {
           config = target.crossConfig;
         };
         config.allowUnfree = true;
