@@ -378,155 +378,160 @@ def _parse_compiler_major(version: str) -> Optional[int]:
     return int(m.group(1)) if m is not None else None
 
 
+# --- Primitives ----------------------------------------------------------
+#
+# Every rule below is one of three shapes:
+#   1. unconditional flag-vs-flag conflict (compiler-independent)
+#   2. flag rejected on legacy-nixpkgs compilers (any value of that flag)
+#   3. flag value rejected on legacy-nixpkgs compilers (subset of values)
+#
+# To extend: add to ``_LEGACY_BROKEN_*`` or ``_FLAG_CONFLICTS`` below.
+# Don't write new if/return blocks unless the rule genuinely doesn't
+# fit any of these shapes — keeping the surface tiny is what makes the
+# filter audit-able.
+
+
+# Compiler-version cutoffs for "this is from a legacy nixpkgs input"
+# (15.09 / 18.03 / 22.11 / 23.11 / 24.05). Modern unstable ships
+# clang ≥ 18 and gcc ≥ 13 with cc-wrapper, binutils, and runtime libs
+# correctly wired up for both native and cross targets.
+_LEGACY_CLANG_MAX = 18  # exclusive
+_LEGACY_GCC_MAX = 13    # exclusive
+
+
+def _is_legacy_compiler(family: str, major: Optional[int]) -> bool:
+    """True if (family, major) corresponds to a legacy-nixpkgs compiler.
+
+    Used as a uniform precondition for every "feature X doesn't work
+    with legacy compilers" rule. Pinning the cutoff in one place means
+    bumping nixpkgs revisions only requires editing two constants.
+    """
+    if major is None:
+        return False
+    if family == "clang" and major < _LEGACY_CLANG_MAX:
+        return True
+    if family == "gcc" and major < _LEGACY_GCC_MAX:
+        return True
+    return False
+
+
+# Flag values that legacy-nixpkgs cc-wrappers / binutils don't support.
+# Each entry maps the value to the missing facility — only used to
+# render a helpful error message.
+
+# values of meta_entry["flags"]
+_LEGACY_BROKEN_FLAG_SET = {
+    "lto":       "LTO-plugin-aware ar/ranlib",
+    "ltothin":   "LTO-plugin-aware ar/ranlib",
+    "staticpie": "static-pie crt files (rcrt1.o)",
+}
+# values of meta_entry["hardening"]
+_LEGACY_BROKEN_HARDENING = {
+    "pie": "Scrt1.o (PIE crt)",
+    "cet": "binutils support for Intel CET (-fcf-protection=full) ELF notes",
+}
+# values of meta_entry["march"]
+_LEGACY_BROKEN_MARCH = {
+    "march-v2": "crt baseline (psABI v2)",
+    "march-v3": "crt baseline (psABI v3)",
+    "march-v4": "crt baseline (psABI v4)",
+}
+
+
+# Compiler-independent flag-vs-flag conflicts. Each entry is a
+# predicate over the meta_entry that returns a reason string when
+# the combination is known-bad, or None when the entry is fine.
+def _conflict_sanitizer_o0(meta: dict) -> Optional[str]:
+    if meta.get("sanitizer", "san-off") != "san-off" and meta.get("optimization") == "O0":
+        return "sanitizer requires -O1+; configure fails on -O0"
+    return None
+
+
+def _conflict_fastmath_san_undefined(meta: dict) -> Optional[str]:
+    # ``-ffast-math`` lets the compiler assume ops UBSan instruments
+    # don't happen → false positives or link errors. Hits both via
+    # the dedicated ``fastmath`` flag set and via ``-Ofast`` which
+    # implies ``-ffast-math``.
+    if meta.get("sanitizer") != "san-undefined":
+        return None
+    if meta.get("optimization") == "Ofast":
+        return "Ofast implies -ffast-math which conflicts with san-undefined"
+    if meta.get("flags") == "fastmath":
+        return "fastmath flag set implies -ffast-math which conflicts with san-undefined"
+    return None
+
+
+_FLAG_CONFLICTS = (
+    _conflict_sanitizer_o0,
+    _conflict_fastmath_san_undefined,
+)
+
+
 def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
     """Return a non-empty reason string if ``meta_entry`` describes a
     combination known to fail at build time, or ``None`` if the combo
     is plausible.
 
-    Generating a manifest for a known-bad combo wastes a worker slot,
-    a dispatch round-trip, and a few minutes of nix evaluation /
-    substitution before the inevitable ``configure: error: C compiler
-    cannot create executables``. Filter them out at sampling time so
-    we don't sample broken cells in the first place.
+    Filtered combos never enter the variant matrix; this avoids
+    wasting a worker slot, a dispatch round-trip, and several minutes
+    of nix evaluation on combinations that always fail the configure
+    executability test (or fail mid-link).
 
-    The list grows as we observe more failures. Each rule is keyed on
-    fields from ``meta_entry`` (``compilerFamily``, ``compilerVersion``,
-    ``optimization``, ``flags``, ``hardening``, ``sanitizer``, ``arch``).
+    Two rule families:
+
+    1. **Flag-vs-flag conflicts** (``_FLAG_CONFLICTS``): combinations
+       that fail regardless of which compiler is in play. Examples:
+       sanitizer + ``-O0``, ``-ffast-math`` + ``san-undefined``.
+    2. **Legacy-compiler-rejects-flag**: a flag value that requires
+       runtime/crt/binutils support legacy-nixpkgs cc-wrappers don't
+       provide. Examples: LTO, static-pie, PIE hardening, CET, modern
+       x86_64-vN march levels. Filtered for clang < 18 / gcc < 13.
+
+    Adding a new rule typically means adding to one of the
+    ``_LEGACY_BROKEN_*`` dicts above — not writing new branches here.
     """
+    # Flag-vs-flag conflicts (compiler-independent).
+    for predicate in _FLAG_CONFLICTS:
+        reason = predicate(meta_entry)
+        if reason is not None:
+            return reason
+
+    family = meta_entry.get("compilerFamily", "")
+    major = _parse_compiler_major(meta_entry.get("compilerVersion", ""))
+    if not _is_legacy_compiler(family, major):
+        return None
+
+    # Sanitizer + legacy-compiler. Always bad regardless of which
+    # sanitizer (libasan / libubsan / libtsan / libmsan all come from
+    # the same legacy stdenv that doesn't wire them up).
     sanitizer = meta_entry.get("sanitizer", "san-off")
-    optimization = meta_entry.get("optimization", "")
-    compiler_family = meta_entry.get("compilerFamily", "")
-    compiler_version = meta_entry.get("compilerVersion", "")
+    if sanitizer != "san-off":
+        return (
+            f"{family} {major} sourced from legacy nixpkgs cannot locate "
+            f"the {sanitizer} runtime library; configure fails to link"
+        )
+
+    # Legacy-broken flag values, looked up by axis.
     flag_set = meta_entry.get("flags", "")
-    major = _parse_compiler_major(compiler_version)
-
-    # Sanitizers need optimization passes to instrument correctly. At
-    # -O0 the runtime libs don't get linked properly and the configure
-    # check ("can the C compiler create executables") fails before
-    # the build even starts. Observed on
-    # clang10+O0+san-undefined+relro-bindnow.
-    if sanitizer != "san-off" and optimization == "O0":
-        return "sanitizer requires -O1+; configure fails on -O0"
-
-    # Sanitizer runtime libs (libasan / libubsan / libtsan / libmsan)
-    # come from the compiler's stdenv. Modern unstable nixpkgs
-    # ships clang ≥ 18 / gcc ≥ 13 with the runtimes wired up for
-    # both native and cross targets; the legacy nixpkgs inputs
-    # (15.09 / 18.03 / 22.11 / 23.11 / 24.05) supply a stdenv whose
-    # cc-wrapper can't locate the matching sanitizer runtime, so
-    # the configure executability test fails before the build
-    # starts. Observed on clang10+san-{address,thread,memory}.
-    if sanitizer != "san-off" and compiler_family == "clang" and major is not None and major < 18:
+    if flag_set in _LEGACY_BROKEN_FLAG_SET:
         return (
-            f"clang {major} sourced from legacy nixpkgs cannot locate "
-            f"the {sanitizer} runtime library; configure fails to link"
-        )
-    if sanitizer != "san-off" and compiler_family == "gcc" and major is not None and major < 13:
-        return (
-            f"gcc {major} sourced from legacy nixpkgs cannot locate "
-            f"the {sanitizer} runtime library; configure fails to link"
+            f"{family} {major} sourced from legacy nixpkgs lacks "
+            f"{_LEGACY_BROKEN_FLAG_SET[flag_set]}"
         )
 
-    # ``-Ofast`` enables ``-ffast-math`` which conflicts with
-    # ``-fsanitize=undefined`` (UBSan instruments operations
-    # ``-ffast-math`` is allowed to assume don't happen).
-    if sanitizer == "san-undefined" and optimization == "Ofast":
-        return "Ofast enables fast-math which conflicts with san-undefined"
-
-    # LTO produces bitcode .o files that need an LTO-plugin-aware
-    # ``ar`` / ``ranlib`` to index static archives. The old nixpkgs
-    # cross stdenvs (nixpkgs-15.09 / 18.03 / 22.11) ship binutils
-    # without the LLVMgold plugin wired up for the cross target, so
-    # ``ld`` reports ``archive has no index; run ranlib`` mid-link.
-    # Current unstable ships clang ≥ 18 and gcc ≥ 13 with working
-    # LTO; everything older comes from the legacy inputs and fails.
-    # Observed on clang10+lto+x86_64.
-    if flag_set in ("lto", "ltothin"):
-        if compiler_family == "clang" and major is not None and major < 18:
-            return (
-                f"clang {major} sourced from legacy nixpkgs lacks "
-                "LTO-plugin-aware ar/ranlib for cross targets"
-            )
-        if compiler_family == "gcc" and major is not None and major < 13:
-            return (
-                f"gcc {major} sourced from legacy nixpkgs lacks "
-                "gcc-ar/gcc-ranlib wrapping for cross LTO"
-            )
-
-    # Static-PIE flag set requires the cc-wrapper to inject the
-    # static-pie crt files (rcrt1.o, scrt1.o) and the linker to
-    # know `-static-pie`. Legacy nixpkgs cc-wrappers don't wire up
-    # the static-pie crt for clang < 18 / gcc < 13; the configure
-    # executability test fails to link. Observed on
-    # clang11+staticpie+cet, clang12+staticpie+relro-bindnow+march-v2.
     hardening = meta_entry.get("hardening", "")
+    if hardening in _LEGACY_BROKEN_HARDENING:
+        return (
+            f"{family} {major} sourced from legacy nixpkgs lacks "
+            f"{_LEGACY_BROKEN_HARDENING[hardening]}"
+        )
+
     march = meta_entry.get("march", "march-default")
-    if flag_set == "staticpie":
-        if compiler_family == "clang" and major is not None and major < 18:
-            return (
-                f"clang {major} sourced from legacy nixpkgs lacks "
-                "static-pie crt files (rcrt1.o); configure fails to link"
-            )
-        if compiler_family == "gcc" and major is not None and major < 13:
-            return (
-                f"gcc {major} sourced from legacy nixpkgs lacks "
-                "static-pie crt files (rcrt1.o); configure fails to link"
-            )
-
-    # PIE hardening (-fPIE -pie) needs the cc-wrapper to inject
-    # Scrt1.o (PIE crt1) which legacy nixpkgs cc-wrappers don't
-    # for clang < 18 / gcc < 13. Observed on
-    # clang10+Os+fastmath+pie, clang10+Oz+noinline+pie,
-    # clang12+Ofast+frameptr+pie+march-v3.
-    if hardening == "pie":
-        if compiler_family == "clang" and major is not None and major < 18:
-            return (
-                f"clang {major} sourced from legacy nixpkgs lacks "
-                "Scrt1.o (PIE crt); configure fails to link"
-            )
-        if compiler_family == "gcc" and major is not None and major < 13:
-            return (
-                f"gcc {major} sourced from legacy nixpkgs lacks "
-                "Scrt1.o (PIE crt); configure fails to link"
-            )
-
-    # Intel CET hardening (-fcf-protection=full) requires both the
-    # compiler to emit endbr64 and the linker/binutils to handle
-    # the CET marking in ELF notes. Legacy nixpkgs binutils versions
-    # paired with clang < 18 / gcc < 13 don't reliably support the
-    # CET ELF note format → configure executability test fails.
-    # Observed on clang11+staticpie+cet+O0.
-    if hardening == "cet":
-        if compiler_family == "clang" and major is not None and major < 18:
-            return (
-                f"clang {major} paired with legacy binutils does not "
-                "fully support Intel CET (-fcf-protection=full)"
-            )
-        if compiler_family == "gcc" and major is not None and major < 13:
-            return (
-                f"gcc {major} paired with legacy binutils does not "
-                "fully support Intel CET (-fcf-protection=full)"
-            )
-
-    # x86-64 micro-architecture levels (march-v2/v3/v4) target
-    # CPUs / instruction sets newer than what the legacy-nixpkgs
-    # crt was assembled for. Even though the matrix's flags.nix
-    # already gates these on minClangVersion=12, the actual crt /
-    # libc startup files come from the legacy-nixpkgs cc-wrapper,
-    # which was built without the relevant CPU baseline. Configure
-    # link fails. Observed on clang12+staticpie+march-v2,
-    # clang12+frameptr+pie+march-v3.
-    if march in ("march-v2", "march-v3", "march-v4"):
-        if compiler_family == "clang" and major is not None and major < 18:
-            return (
-                f"clang {major} sourced from legacy nixpkgs cannot link "
-                f"binaries targeting {march} (crt baseline mismatch)"
-            )
-        if compiler_family == "gcc" and major is not None and major < 13:
-            return (
-                f"gcc {major} sourced from legacy nixpkgs cannot link "
-                f"binaries targeting {march} (crt baseline mismatch)"
-            )
+    if march in _LEGACY_BROKEN_MARCH:
+        return (
+            f"{family} {major} sourced from legacy nixpkgs cannot link "
+            f"{march}: missing {_LEGACY_BROKEN_MARCH[march]}"
+        )
 
     return None
 
