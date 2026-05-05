@@ -818,73 +818,100 @@ def eval_toolchain_drvs(
     if not pairs:
         return {}
     runner = run_subprocess or _default_run_subprocess
+
+    # ``nix-eval-jobs`` walks each (arch, compiler) leaf independently
+    # with per-entry isolation: a single broken combo (e.g. gcc5 +
+    # mips64el throws ``cross-compiler not available in nixpkgs-18.03``)
+    # produces an "error" line for that one entry while every other
+    # entry still yields its drvPath. The previous one-giant-``nix
+    # eval --apply`` call had the opposite shape — one bad combo
+    # crashed the whole evaluation and returned 0/N resolved.
+    #
+    # ``--force-recurse`` makes nix-eval-jobs descend through the
+    # nested ``arch.compiler`` levels of ``_crossToolchainMap.<sys>``;
+    # without it the walker would stop at ``arch`` and never see the
+    # individual compiler entries.
+    if shutil.which("nix-eval-jobs") is None:
+        return _eval_toolchain_drvs_fallback(
+            flake_ref, sys_name, pairs, run_subprocess=runner
+        )
+
+    requested = {(arch, compiler) for arch, compiler in pairs}
+    argv: list[str] = [
+        "nix-eval-jobs",
+        "--flake",
+        f"{flake_ref}#_crossToolchainMap.{sys_name}",
+        "--force-recurse",
+        "--workers",
+        "16",
+    ]
+    stdout, _stderr, rc = runner(argv)
+    if rc != 0:
+        # nix-eval-jobs returns rc!=0 only on catastrophic failures
+        # (no flake found, etc.). Per-entry errors are reported on
+        # stdout as JSONL ``{"attr": ..., "error": ...}`` lines and
+        # don't affect rc. Fallback to the inline path so callers
+        # still get something.
+        return _eval_toolchain_drvs_fallback(
+            flake_ref, sys_name, pairs, run_subprocess=runner
+        )
+
+    out: dict[tuple[str, str], str] = {}
+    for line in stdout.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        attr_path = entry.get("attrPath")
+        drv = entry.get("drvPath")
+        if (
+            isinstance(attr_path, list)
+            and len(attr_path) == 2
+            and isinstance(drv, str)
+            and drv.endswith(".drv")
+        ):
+            pair = (attr_path[0], attr_path[1])
+            if pair in requested:
+                out[pair] = drv
+    return out
+
+
+def _eval_toolchain_drvs_fallback(
+    flake_ref: str,
+    sys_name: str,
+    pairs: tuple[tuple[str, str], ...],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> dict[tuple[str, str], str]:
+    """One ``nix eval`` per (arch, compiler) — used when
+    ``nix-eval-jobs`` isn't on PATH (test harness, hermetic
+    environments). Slower than the parallel evaluator but still
+    per-entry isolated.
+    """
+    runner = run_subprocess or _default_run_subprocess
     safe = re.compile(r"^[A-Za-z0-9._-]+$")
     out: dict[tuple[str, str], str] = {}
-
-    # Filter (arch, compiler) pairs through table.md before asking nix
-    # to evaluate them. Combos marked FAIL or n/a in the support
-    # matrix throw at eval time (e.g. gcc5+mips64el → "cross-compiler
-    # not available in nixpkgs-18.03"); without this filter even one
-    # such combo in the pairs list crashes the entire ``nix eval`` and
-    # leaves us with 0 resolved drvs, falling all toolchains back to
-    # flake-attr resolution which crashes on the secondary
-    # (``could not find a flake.nix file``).
-    from compiler_suit_runner.support_table import (  # noqa: PLC0415
-        is_supported,
-        load_support_table,
-    )
-    support = load_support_table()
-    filtered_pairs = [
-        (arch, compiler)
-        for arch, compiler in pairs
-        if is_supported(support, compiler, arch)
-    ]
-    if not filtered_pairs:
-        return {}
-
-    # One ``nix eval --apply`` call returns drv paths for all pairs;
-    # nix's lazy attrset access only forces the requested compilers.
-    # Each entry is wrapped in ``builtins.tryEval`` so a per-combo
-    # failure (which table.md should already prevent, but defence in
-    # depth) yields ``null`` for that entry rather than killing the
-    # whole eval.
-    body_parts: list[str] = []
-    for arch, compiler in filtered_pairs:
+    for arch, compiler in pairs:
         if not safe.match(arch) or not safe.match(compiler):
             continue
-        body_parts.append(
-            f'"{arch}__{compiler}" = '
-            f"let r = builtins.tryEval m.\"{arch}\".\"{compiler}\".drvPath; "
-            f"in if r.success then r.value else null"
-        )
-    if not body_parts:
-        return {}
-    apply_expr = "m: { " + "; ".join(body_parts) + "; }"
-    argv = [
-        "nix",
-        "eval",
-        "--extra-experimental-features",
-        "nix-command flakes",
-        "--json",
-        f"{flake_ref}#_crossToolchainMap.{sys_name}",
-        "--apply",
-        apply_expr,
-    ]
-    stdout, stderr, rc = runner(argv)
-    if rc != 0:
-        # Surface but don't fail — toolchain manifests without drv
-        # paths fall back to flake-attr resolution downstream.
-        return {}
-    try:
-        parsed = json.loads(stdout.decode("utf-8", errors="replace"))
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(parsed, dict):
-        return {}
-    for arch, compiler in pairs:
-        key = f"{arch}__{compiler}"
-        drv = parsed.get(key)
-        if isinstance(drv, str) and drv.endswith(".drv"):
+        argv = [
+            "nix",
+            "eval",
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "--raw",
+            f"{flake_ref}#_crossToolchainMap.{sys_name}.{arch}.{compiler}.drvPath",
+        ]
+        stdout, _stderr, rc = runner(argv)
+        if rc != 0:
+            continue
+        drv = stdout.decode("utf-8", errors="replace").strip()
+        if drv.endswith(".drv"):
             out[(arch, compiler)] = drv
     return out
 
