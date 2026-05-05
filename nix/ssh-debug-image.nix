@@ -72,23 +72,53 @@ let
     chmod 600 $out/root/.ssh/authorized_keys
   '';
 
+  # nixbld build-user fan-out — same rationale as docker-image.nix:
+  # multi-user nix gives each concurrent build a non-root euid so
+  # GNU tar's ``unpackPhase`` defaults to ``--no-same-owner`` and
+  # legacy nixpkgs source tarballs unpack cleanly even in rootless
+  # containers whose subuid range doesn't cover whatever uid the
+  # tarball happened to record.
+  # See docker-image.nix for the count rationale: 512 is generous
+  # headroom for any node we might land on; daemon only consumes
+  # slots up to ``max-jobs``, excess users are inert.
+  nixbldCount = 512;
+  nixbldGid = 30000;
+  nixbldUidBase = 30000;
+  nixbldUserList = lib.genList (
+    n:
+    let
+      idx = n + 1;
+      uid = nixbldUidBase + idx;
+    in
+    "nixbld${toString idx}:x:${toString uid}:${toString nixbldGid}:Nix build user ${toString idx}:/var/empty:/run/current-system/sw/bin/nologin"
+  ) nixbldCount;
+  nixbldShadowList = lib.genList (
+    n: "nixbld${toString (n + 1)}:!:1::::::"
+  ) nixbldCount;
+  nixbldGroupMembers = lib.concatStringsSep "," (
+    lib.genList (n: "nixbld${toString (n + 1)}") nixbldCount
+  );
+
   # /etc/passwd, /etc/group, /etc/shadow — sshd needs a real `root`
-  # entry to authenticate the login. dockerTools.buildLayeredImage
+  # entry to authenticate the login; nix-daemon multi-user mode
+  # needs the nixbld_N entries for fork-setuid. dockerTools.buildLayeredImage
   # does NOT bake any nss DB by default; without these podman /
   # `User = "root"` configurations fail with "no matching entries
   # in passwd file" before sshd even starts.
   nssFiles = pkgs.runCommand "ssh-debug-nss" { } ''
     mkdir -p $out/etc
-    cat > $out/etc/passwd <<EOF
+    cat > $out/etc/passwd <<'EOF'
     root:x:0:0:root:/root:${pkgs.bash}/bin/bash
     sshd:x:74:74:Privilege-separated SSH:/var/empty:/run/current-system/sw/bin/nologin
     nobody:x:65534:65534:Nobody:/var/empty:/run/current-system/sw/bin/nologin
+    ${lib.concatStringsSep "\n    " nixbldUserList}
     EOF
     sed -i 's/^    //' $out/etc/passwd
     cat > $out/etc/group <<EOF
     root:x:0:
     sshd:x:74:
     nogroup:x:65534:
+    nixbld:x:${toString nixbldGid}:${nixbldGroupMembers}
     EOF
     sed -i 's/^    //' $out/etc/group
     # Empty password field for root: sshd's locked-account check
@@ -97,10 +127,13 @@ let
     # which is fine because PasswordAuthentication=no in sshd_config
     # blocks password auth entirely — only pubkey via the baked
     # authorized_keys works.
-    cat > $out/etc/shadow <<EOF
+    # nixbld_N users get `!` (locked) — never logged into; only
+    # setuid'd to by the daemon.
+    cat > $out/etc/shadow <<'EOF'
     root::1::::::
     sshd:!:1::::::
     nobody:!:1::::::
+    ${lib.concatStringsSep "\n    " nixbldShadowList}
     EOF
     sed -i 's/^    //' $out/etc/shadow
     chmod 644 $out/etc/passwd $out/etc/group
@@ -184,21 +217,25 @@ let
     chmod 600 $out/root/.ssh/environment
   '';
 
-  # Default /etc/nix/nix.conf. Single-user mode (build-users-group
-  # empty) is required because podman containers don't have nixbld*
-  # users. Sandbox is disabled because podman's user namespace doesn't
-  # allow the nested mount/cgroup ops sandboxed builds need.
+  # Default /etc/nix/nix.conf. Multi-user mode: ``build-users-group =
+  # nixbld`` makes the daemon fork-setuid into ``nixbld_N`` per
+  # derivation. See docker-image.nix nssFiles for the full rationale
+  # — short version: multi-user gives builds a non-root euid so GNU
+  # tar in unpackPhase doesn't try to chown extracted files to
+  # whatever uid the upstream tarball recorded. Sandbox stays off
+  # because podman's user namespace doesn't allow the nested
+  # mount/cgroup ops sandboxed builds need.
   #
   # The `!include /etc/nix/peer.conf` directive does a SOFT include
   # of the peer-cache federation snippet that
-  # ssh_debug_runner.bootstrap (`_PeerNixConfWatcher`) rewrites at
-  # runtime as containers join/leave the SLURM run. Soft = nix
-  # silently skips the directive if the file doesn't exist (e.g.
-  # `podman run image:tag serve` standalone with no peers yet).
+  # ssh_debug_runner.bootstrap rewrites at runtime as containers
+  # join/leave the SLURM run. Soft = nix silently skips the directive
+  # if the file doesn't exist (e.g. `podman run image:tag serve`
+  # standalone with no peers yet).
   nixConfFile = pkgs.writeText "nix.conf" ''
     experimental-features = nix-command flakes
     sandbox = false
-    build-users-group =
+    build-users-group = nixbld
     # See docker-image.nix nixConfFile for the rationale: without
     # max-jobs > 1 the daemon serializes every concurrent ``nix build``
     # from the worker pool. ``auto`` matches the container's CPU count.
