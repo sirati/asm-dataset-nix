@@ -252,58 +252,15 @@ let
       };
     };
 
-  # ``isCompilerCrossSupported``: true iff ``compiler.mkStdenv`` can
-  # actually instantiate a working cross stdenv for ``target``. Some
-  # legacy-nixpkgs compilers (e.g. gcc5 from nixpkgs-18.03) only ship
-  # cross-bootstrap infra for a subset of targets and throw at eval
-  # time for the rest. ``isValidArchCombo`` (version-based) catches
-  # the easy cases; this catches the throw-at-stdenv-build cases that
-  # would otherwise crash ``nix eval _drvPaths`` on the runner side.
-  # Mirrors the ``tryEval`` filter ``crossToolchainMap`` already uses.
-  #
-  # The result is computed once per (compiler, target) pair rather
-  # than per-combo (which would force the same stdenv 100x).
-  isCompilerCrossSupported =
-    compiler: target:
-    let
-      targetPkgs' = archDefs.getPkgsForTarget pkgs target;
-      tried =
-        if targetPkgs' == null then
-          { success = false; }
-        else
-          builtins.tryEval (compiler.mkStdenv targetPkgs' target).cc;
-    in
-    tried.success or false;
-
-  # Memoised per (compiler.label, target.label).
-  crossSupportCache = lib.genAttrs (builtins.attrNames archDefs.targets) (
-    archName:
-    let
-      target = archDefs.targets.${archName};
-    in
-    builtins.listToAttrs (
-      map (comp: {
-        name = comp.label;
-        value = isCompilerCrossSupported comp target;
-      }) compilers.all
-    )
-  );
-
   # Filter flag combos for a specific target: drop combos whose
-  # compiler doesn't meet the target's minimum version, drop combos
-  # whose compiler can't actually instantiate a cross stdenv for the
-  # target (legacy nixpkgs gaps), AND drop combos whose
-  # flagSet/hardening/sanitizer/march entry has an ``archs``
-  # allow-list that excludes this target.
+  # compiler doesn't meet the target's minimum version, AND drop
+  # combos whose flagSet/hardening/sanitizer/march entry has an
+  # ``archs`` allow-list that excludes this target.
   combosForTarget =
     target:
-    let
-      supported = crossSupportCache.${target.label} or { };
-    in
     builtins.filter (
       combo:
       isValidArchCombo combo.compiler target
-      && (supported.${combo.compiler.label} or false)
       && entryAcceptsArch combo.flagSet target
       && entryAcceptsArch combo.hardening target
       && entryAcceptsArch combo.sanitizer target
