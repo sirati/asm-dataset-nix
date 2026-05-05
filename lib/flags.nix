@@ -96,11 +96,16 @@ let
       extraHardeningDisable = [ "pic" ];
     }
     {
+      # Use the GCC form for both compilers — clang silently accepts
+      # ``-fno-tree-vectorize`` as an alias for ``-fno-vectorize``,
+      # but GCC does not accept ``-fno-vectorize``. Packages whose
+      # build runs HOSTCC (gcc) on flags meant for the cross CC
+      # (e.g. busybox: ``HOSTCC scripts/basic/fixdep`` invokes the
+      # native gcc with the matrix's NIX_CFLAGS) reject the
+      # clang-only spelling. Keep one spelling that both accept.
       label = "novec";
-      cflags = null;
-      cxxflags = null;
-      gccFlag = "-fno-tree-vectorize";
-      clangFlag = "-fno-vectorize";
+      cflags = "-fno-tree-vectorize";
+      cxxflags = "-fno-tree-vectorize";
     }
 
     # ── Tier-A/B/C additions ────────────────────────────────────────
