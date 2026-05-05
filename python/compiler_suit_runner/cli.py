@@ -201,6 +201,23 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         help="SLURM root folder on the gateway.",
     )
     parser.add_argument(
+        "--slurm-partition",
+        default=None,
+        help=(
+            "SLURM partition to submit jobs against (sbatch --partition). "
+            "Pass-through to the framework; defaults to the framework's "
+            "SlurmConfig.partition value when unset."
+        ),
+    )
+    parser.add_argument(
+        "--slurm-time-limit",
+        default=None,
+        help=(
+            "Per-secondary SLURM job wallclock limit (sbatch --time format, "
+            "e.g. '1:00:00'). Pass-through to the framework."
+        ),
+    )
+    parser.add_argument(
         "--cachix-cache",
         default=None,
         help="Cachix cache name to push toolchain outputs to (optional).",
