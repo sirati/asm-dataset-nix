@@ -32,6 +32,7 @@ import os
 import pathlib
 import shutil
 import signal
+import socket as _socket
 import subprocess
 import threading
 import time
@@ -430,18 +431,49 @@ def prune_stale(
 SUBSTITUTERS_FILENAME = "_substituters.txt"
 
 
+def substituters_filename_for(secondary_id: str | None) -> str:
+    """Return the per-secondary substituters file name.
+
+    Each secondary's PeerListWatcher excludes itself from the peer
+    list (we don't want a secondary to list its own harmonia as a
+    substituter — would deadlock on self-fetch). That makes the
+    "live peer set" view per-secondary, so writers in different
+    secondaries produce DIFFERENT contents for the same shared
+    file. Last-writer-wins clobbers earlier writers' views.
+
+    Per-secondary filename eliminates the collision: each writer
+    owns its own file, the local build_worker reads it. Falls back
+    to the legacy shared name only when ``secondary_id`` is unset
+    (single-process / dev-box mode where there's only one writer).
+    """
+    if secondary_id:
+        return f"_substituters.{secondary_id}.txt"
+    return SUBSTITUTERS_FILENAME
+
+
 def _write_substituters_file(
     target: pathlib.Path, args: list[str]
 ) -> None:
     """Atomically write ``args`` (one per line) to ``target``.
 
-    Uses a sibling ``.tmp`` + ``os.replace`` so concurrent readers
-    never observe a partially-written file. Empty ``args`` produces
-    an empty (but present) file, which workers treat as "no peers".
+    Uses a writer-unique sibling ``.tmp`` + ``os.replace`` so
+    concurrent readers never observe a partially-written file AND
+    concurrent writers from different secondaries don't collide on
+    a shared ``.tmp`` filename (the substituters file lives on
+    ``/app/log-network/peers/`` — NFS-shared across every
+    secondary's PeerListWatcher). Empty ``args`` produces an empty
+    (but present) file, which workers treat as "no peers".
     """
     target = pathlib.Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + ".tmp")
+    # Per-writer suffix: hostname + pid uniquely names this writer
+    # across the cluster. Without this, two secondaries' watchers
+    # racing each other's ``os.replace`` produced
+    #   FileNotFoundError: ``_substituters.txt.tmp`` -> ``_substituters.txt``
+    # because the tmp file name was identical and one watcher's
+    # replace already consumed it.
+    writer_id = f"{_socket.gethostname()}.{os.getpid()}"
+    tmp = target.with_suffix(target.suffix + f".{writer_id}.tmp")
     payload = "\n".join(args)
     if payload:
         payload += "\n"
@@ -489,8 +521,11 @@ class PeerListWatcher(threading.Thread):
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._peers: list[PeerInfo] = []
+        # Per-secondary file so concurrent writers from different
+        # secondaries don't clobber each other's self-excluded views.
         self._substituters_path = (
-            _peers_dir(self._shared_fs) / SUBSTITUTERS_FILENAME
+            _peers_dir(self._shared_fs)
+            / substituters_filename_for(exclude_id)
         )
         # Prime the snapshot + published file once synchronously so
         # callers that read immediately after .start() see a meaningful
