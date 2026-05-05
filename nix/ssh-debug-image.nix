@@ -199,6 +199,11 @@ let
     experimental-features = nix-command flakes
     sandbox = false
     build-users-group =
+    # See docker-image.nix nixConfFile for the rationale: without
+    # max-jobs > 1 the daemon serializes every concurrent ``nix build``
+    # from the worker pool. ``auto`` matches the container's CPU count.
+    max-jobs = auto
+    cores = 0
     substituters = https://cache.nixos.org
     trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
     extra-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
@@ -324,6 +329,11 @@ pkgs.dockerTools.buildLayeredImage {
       "PYTHONPATH=/app/python"
       "PATH=/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin"
       "SSH_DEBUG_SSHD_PORT=${toString sshdPort}"
+      # See docker-image.nix Env for the rationale: without this, every
+      # parallel ``nix build`` opens db.sqlite directly and they
+      # contend on the SQLite write lock instead of serializing through
+      # the running nix-daemon socket.
+      "NIX_REMOTE=daemon"
       # TEMPORARY — gathering trace-level transport logs for the
       # primary-timeout diagnosis the dynamic_runner peer asked for.
       # Drop once the LMU CIP reverse-connection mode bug is fixed.
