@@ -820,14 +820,42 @@ def eval_toolchain_drvs(
     runner = run_subprocess or _default_run_subprocess
     safe = re.compile(r"^[A-Za-z0-9._-]+$")
     out: dict[tuple[str, str], str] = {}
+
+    # Filter (arch, compiler) pairs through table.md before asking nix
+    # to evaluate them. Combos marked FAIL or n/a in the support
+    # matrix throw at eval time (e.g. gcc5+mips64el → "cross-compiler
+    # not available in nixpkgs-18.03"); without this filter even one
+    # such combo in the pairs list crashes the entire ``nix eval`` and
+    # leaves us with 0 resolved drvs, falling all toolchains back to
+    # flake-attr resolution which crashes on the secondary
+    # (``could not find a flake.nix file``).
+    from compiler_suit_runner.support_table import (  # noqa: PLC0415
+        is_supported,
+        load_support_table,
+    )
+    support = load_support_table()
+    filtered_pairs = [
+        (arch, compiler)
+        for arch, compiler in pairs
+        if is_supported(support, compiler, arch)
+    ]
+    if not filtered_pairs:
+        return {}
+
     # One ``nix eval --apply`` call returns drv paths for all pairs;
     # nix's lazy attrset access only forces the requested compilers.
+    # Each entry is wrapped in ``builtins.tryEval`` so a per-combo
+    # failure (which table.md should already prevent, but defence in
+    # depth) yields ``null`` for that entry rather than killing the
+    # whole eval.
     body_parts: list[str] = []
-    for arch, compiler in pairs:
+    for arch, compiler in filtered_pairs:
         if not safe.match(arch) or not safe.match(compiler):
             continue
         body_parts.append(
-            f'"{arch}__{compiler}" = m."{arch}"."{compiler}".drvPath'
+            f'"{arch}__{compiler}" = '
+            f"let r = builtins.tryEval m.\"{arch}\".\"{compiler}\".drvPath; "
+            f"in if r.success then r.value else null"
         )
     if not body_parts:
         return {}
@@ -885,6 +913,18 @@ def enumerate_toolchains(
             f" (got {type(meta).__name__})"
         )
 
+    # Filter combos by table.md before they enter the toolchain-specs
+    # list: combos marked FAIL or n/a would otherwise be dispatched to
+    # secondaries as phase-2 toolchain tasks, fail at build time
+    # (because their drvPath couldn't be evaluated either, see
+    # ``eval_toolchain_drvs``), and consume worker slots producing
+    # nothing.
+    from compiler_suit_runner.support_table import (  # noqa: PLC0415
+        is_supported,
+        load_support_table,
+    )
+    support = load_support_table()
+
     arch_filter = set(archs) if archs else None
     pairs: list[tuple[str, str]] = []
     for arch, comps in sorted(meta.items()):
@@ -896,8 +936,11 @@ def enumerate_toolchains(
             if not isinstance(entry, dict):
                 continue
             label = entry.get("compiler")
-            if isinstance(label, str) and label:
-                pairs.append((arch, label))
+            if not isinstance(label, str) or not label:
+                continue
+            if not is_supported(support, label, arch):
+                continue
+            pairs.append((arch, label))
     pairs.sort()
     return tuple(pairs)
 
