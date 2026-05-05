@@ -91,8 +91,28 @@ in
     };
     ppc32 = {
       label = "ppc32";
-      crossAttr = "ppc32";
+      # nixpkgs-18.03's ``pkgsCross.ppc32`` ships a hostPlatform whose
+      # ``platform`` attrset is missing ``kernelArch``, so building
+      # ``linux-headers`` for ppc32 throws
+      #   error: attribute 'kernelArch' missing
+      #   at .../kernel-headers/default.nix:17  (old line numbering)
+      # Modern nixpkgs computes ``platform.kernelArch`` from the GNU
+      # triple via ``lib.systems.elaborate``; legacy nixpkgs has gaps.
+      # Bypass the per-nixpkgs ``pkgsCross.ppc32`` lookup and re-import
+      # nixpkgs with an explicit ``crossSystem`` that pins
+      # ``kernelArch`` so every nixpkgs revision sees the same
+      # well-formed platform attrset. Costs one extra ``import nixpkgs``
+      # per legacy nixpkgs version (~1-2s) but eliminates the
+      # whole-arch ``listToAttrs`` failure that took down all 18 ppc32
+      # toolchains in the K=2 dispatch.
+      crossAttr = null;
       crossConfig = "powerpc-unknown-linux-gnu";
+      crossSystem = {
+        config = "powerpc-unknown-linux-gnu";
+        platform = {
+          kernelArch = "powerpc";
+        };
+      };
       system = "powerpc-linux";
       minGccVersion = noMin;
       minClangVersion = noMin;

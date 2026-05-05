@@ -238,10 +238,15 @@ let
     }:
     targetPkgs: target:
     let
-      # Re-import old nixpkgs with crossSystem
+      # Re-import old nixpkgs with crossSystem.
+      # Prefer ``target.crossSystem`` so platform overrides (e.g.
+      # ppc32's ``platform.kernelArch = "powerpc"``) propagate into
+      # the legacy nixpkgs's lib.systems lookup. Falling back to the
+      # bare config triple keeps backwards compatibility for archs
+      # that don't need overrides.
       oldCrossPkgs = import nixpkgsSrc {
         inherit system;
-        crossSystem = {
+        crossSystem = target.crossSystem or {
           config = target.crossConfig;
         };
         config.allowUnfree = true;
