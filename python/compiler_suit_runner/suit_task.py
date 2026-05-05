@@ -105,16 +105,21 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
         return ("phase1a", "partition", None)
     if item_class == "phase1b_merge":
         return ("phase1b", "merge", None)
+    # All build-shaped tasks (toolchain, common_dep, variant) share
+    # the single ``phase_build`` phase. Nix's daemon serializes
+    # shared dependencies via its build lock, so toolchain builds
+    # complete-or-substitute before their dependent variants finish
+    # their own build call — no explicit phase ordering needed.
     if item_class == "phase2_toolchain":
         compiler = header.payload.get("compiler_label", "?")
         arch = header.payload.get("arch", "?")
-        return ("phase2", "toolchain", f"{compiler}-{arch}")
+        return ("phase_build", "toolchain", f"{compiler}-{arch}")
     if item_class == "phase2_common_dep":
-        return ("phase2", "common_dep", None)
+        return ("phase_build", "common_dep", None)
     if item_class == "phase3_variant":
         compiler = header.payload.get("compiler_id", "?")
         arch = header.payload.get("arch", "?")
-        return ("phase3", "variant", f"{compiler}-{arch}")
+        return ("phase_build", "variant", f"{compiler}-{arch}")
     raise ValueError(f"unknown item_class {item_class!r}")
 
 
@@ -195,17 +200,27 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
     if build_max_concurrent is not None:
         build_kwargs["max_concurrent"] = build_max_concurrent
 
-    # Phase 1a (partition) and 1b (merge) are job-list-creation steps:
-    # walking the matrix's drv graph to classify "this drv is a
-    # toolchain", "this is a common host dep", "this is incidental".
-    # They belong on the primary (which has the drvs locally from
-    # preflight evaluation), not on secondaries (which have empty
-    # /nix/stores). When the primary has populated common_dep_drvs
-    # before dispatch, the framework only needs phase 2 + phase 3
-    # — both real builds, both substitutable from peer caches.
+    # Single phase: toolchain + common_dep + variant all dispatched
+    # together. Nix's daemon naturally serializes shared dependencies
+    # via its build lock — when worker A starts a variant whose
+    # toolchain isn't built yet, the nix-build call walks the drv
+    # graph, builds (or substitutes) the toolchain, then the variant.
+    # Worker B picking up the toolchain task at the same time hits
+    # the same daemon lock and either waits or substitutes the
+    # finished result. With harmonia federation between secondaries,
+    # the first toolchain build is amortized across the fleet.
+    #
+    # The artificial phase-2 → phase-3 boundary used to gate variants
+    # on all toolchains finishing first, which created a stall in
+    # the dispatch pipeline (no continuous tarball production until
+    # every toolchain was done) and a known cascade trigger when
+    # secondaries idled at the boundary. Collapsing to one phase
+    # lets the workload flow continuously: toolchains finish, their
+    # downstream variants unblock via the nix dep graph, tarballs
+    # emerge as soon as their full closure is realized.
     return (
         PhaseSpec(
-            phase_id="phase2",
+            phase_id="phase_build",
             types=(
                 TaskTypeSpec(
                     type_id="toolchain",
@@ -217,12 +232,6 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
                     worker_module="compiler_suit_runner.workers.build_worker",
                     **build_kwargs,
                 ),
-            ),
-        ),
-        PhaseSpec(
-            phase_id="phase3",
-            depends_on=("phase2",),
-            types=(
                 TaskTypeSpec(
                     type_id="variant",
                     worker_module="compiler_suit_runner.workers.build_worker",

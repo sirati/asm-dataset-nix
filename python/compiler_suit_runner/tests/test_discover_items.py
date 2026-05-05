@@ -167,8 +167,7 @@ def test_discover_items_classifies_each_manifest(tmp_path: pathlib.Path) -> None
     assert set(by_phase.keys()) == {
         "phase1a",
         "phase1b",
-        "phase2",
-        "phase3",
+        "phase_build",
     }
 
     # Spot-check classification.
@@ -176,19 +175,20 @@ def test_discover_items_classifies_each_manifest(tmp_path: pathlib.Path) -> None
     assert by_phase["phase1a"][0].affinity_id is None
     assert by_phase["phase1b"][0].type_id == "merge"
 
-    phase2_types = {item.type_id for item in by_phase["phase2"]}
-    assert phase2_types == {"toolchain", "common_dep"}
+    build_types = {item.type_id for item in by_phase["phase_build"]}
+    assert build_types == {"toolchain", "common_dep", "variant"}
     toolchain = next(
-        item for item in by_phase["phase2"] if item.type_id == "toolchain"
+        item for item in by_phase["phase_build"] if item.type_id == "toolchain"
     )
     assert toolchain.affinity_id == "gcc15-x86_64"
     common_dep = next(
-        item for item in by_phase["phase2"] if item.type_id == "common_dep"
+        item for item in by_phase["phase_build"] if item.type_id == "common_dep"
     )
     assert common_dep.affinity_id is None
 
-    variant = by_phase["phase3"][0]
-    assert variant.type_id == "variant"
+    variant = next(
+        item for item in by_phase["phase_build"] if item.type_id == "variant"
+    )
     assert variant.affinity_id == "gcc15-x86_64"
     # TaskInfo.payload now carries the full ManifestHeader dict so
     # workers can read it directly off the comm fd via FR-3.
