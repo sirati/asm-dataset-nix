@@ -47,20 +47,20 @@ def _phases(task: SuitTask):
     return {p.phase_id: p for p in task.get_phases()}
 
 
-def test_get_phases_returns_two_build_phases(tmp_path: pathlib.Path) -> None:
-    """Phase 1a (partition) + 1b (merge) are job-list creation steps now
-    handled inline on the primary; only phase 2 (toolchain / common-dep)
-    + phase 3 (variant) builds dispatch to secondaries."""
+def test_get_phases_returns_single_build_phase(tmp_path: pathlib.Path) -> None:
+    """All build-shaped tasks (toolchain, common_dep, variant) live in
+    one ``phase_build``; nix's daemon serializes shared deps via its
+    build lock so an explicit phase 2 → phase 3 boundary isn't needed.
+    Phase 1a (partition) + 1b (merge) run inline on the primary."""
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    assert set(phases.keys()) == {"phase2", "phase3"}
+    assert set(phases.keys()) == {"phase_build"}
 
 
-def test_phase_dependency_chain(tmp_path: pathlib.Path) -> None:
+def test_phase_build_has_no_dependencies(tmp_path: pathlib.Path) -> None:
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    assert phases["phase2"].depends_on == ()
-    assert phases["phase3"].depends_on == ("phase2",)
+    assert phases["phase_build"].depends_on == ()
 
 
 def test_phase1a_phase1b_no_longer_dispatched(tmp_path: pathlib.Path) -> None:
@@ -73,31 +73,21 @@ def test_phase1a_phase1b_no_longer_dispatched(tmp_path: pathlib.Path) -> None:
     assert "phase1b" not in phases
 
 
-def test_phase2_has_toolchain_and_common_dep_types(
+def test_phase_build_carries_all_three_task_types(
     tmp_path: pathlib.Path,
 ) -> None:
+    """All three build-shaped types (toolchain, common_dep, variant)
+    live in the single phase_build, all routed to build_worker."""
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    type_ids = {t.type_id for t in phases["phase2"].types}
-    assert type_ids == {"toolchain", "common_dep"}
-    # Both share the same build worker module.
-    for t in phases["phase2"].types:
+    types = phases["phase_build"].types
+    type_ids = {t.type_id for t in types}
+    assert type_ids == {"toolchain", "common_dep", "variant"}
+    for t in types:
         assert (
             t.worker_module
             == "compiler_suit_runner.workers.build_worker"
         )
-
-
-def test_phase3_has_variant_type(tmp_path: pathlib.Path) -> None:
-    task = SuitTask(_make_config(tmp_path))
-    phases = _phases(task)
-    types = phases["phase3"].types
-    assert len(types) == 1
-    assert types[0].type_id == "variant"
-    assert (
-        types[0].worker_module
-        == "compiler_suit_runner.workers.build_worker"
-    )
 
 
 def test_estimate_memory_returns_constant(tmp_path: pathlib.Path) -> None:

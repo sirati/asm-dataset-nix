@@ -37,13 +37,13 @@ def test_classify_phase2_toolchain_uses_compiler_arch_affinity() -> None:
         "phase2_toolchain",
         payload={"compiler_label": "gcc15", "arch": "aarch64"},
     )
-    assert _classify(h) == ("phase2", "toolchain", "gcc15-aarch64")
+    assert _classify(h) == ("phase_build", "toolchain", "gcc15-aarch64")
 
 
 def test_classify_phase2_toolchain_unknown_payload() -> None:
     """Affinity falls back to the literal '?' marker, never raises."""
     h = _header("phase2_toolchain", payload={})
-    assert _classify(h) == ("phase2", "toolchain", "?-?")
+    assert _classify(h) == ("phase_build", "toolchain", "?-?")
 
 
 def test_classify_phase2_common_dep() -> None:
@@ -51,7 +51,7 @@ def test_classify_phase2_common_dep() -> None:
         "phase2_common_dep",
         payload={"drv": "/nix/store/glibc.drv", "label": "glibc"},
     )
-    assert _classify(h) == ("phase2", "common_dep", None)
+    assert _classify(h) == ("phase_build", "common_dep", None)
 
 
 def test_classify_phase3_variant_uses_compiler_id_arch_affinity() -> None:
@@ -59,12 +59,12 @@ def test_classify_phase3_variant_uses_compiler_id_arch_affinity() -> None:
         "phase3_variant",
         payload={"compiler_id": "gcc15", "arch": "x86_64", "pkg": "hello"},
     )
-    assert _classify(h) == ("phase3", "variant", "gcc15-x86_64")
+    assert _classify(h) == ("phase_build", "variant", "gcc15-x86_64")
 
 
 def test_classify_phase3_variant_unknown_payload() -> None:
     h = _header("phase3_variant", payload={})
-    assert _classify(h) == ("phase3", "variant", "?-?")
+    assert _classify(h) == ("phase_build", "variant", "?-?")
 
 
 def test_classify_unknown_item_class_raises() -> None:
