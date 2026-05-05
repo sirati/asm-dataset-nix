@@ -206,14 +206,15 @@ in
   }
 
   # ── nixpkgs 24.05: Clang 17 ──
+  # llvmPackages_17 from 24.05 is currently disabled. Building it
+  # forces a from-source build of compiler-rt-libc-17.0.6 which
+  # contains ``-Wmaybe-uninitialized`` warnings that the build
+  # infra elevates to errors under the current host gcc 15.2.
+  # Re-enable when 24.05's compiler-rt patch set is updated or
+  # when we pin a pre-built substituter for the artifact.
   {
     oldPkgs = oldPkgs_24_05;
-    clangSpecs = [
-      {
-        attr = "llvmPackages_17";
-        label = "17";
-      }
-    ];
+    clangSpecs = [ ];
     gccSpecs = [ ];
   }
 ]
