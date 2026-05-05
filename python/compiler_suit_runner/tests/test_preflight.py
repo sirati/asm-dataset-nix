@@ -814,3 +814,128 @@ def test_known_bad_combo_lto_only_filters_lto_flagsets() -> None:
             sanitizer="san-off",
         )
     ) is None
+
+
+def test_known_bad_combo_old_clang_with_staticpie() -> None:
+    # legacy clang's cc-wrapper lacks rcrt1.o; configure link fails.
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang10",
+            compilerFamily="clang",
+            compilerVersion="10.0.1",
+            flags="staticpie",
+            sanitizer="san-off",
+        )
+    ) is not None
+
+
+def test_known_bad_combo_modern_clang_with_staticpie_is_fine() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang20",
+            compilerFamily="clang",
+            compilerVersion="20.1.8",
+            flags="staticpie",
+            sanitizer="san-off",
+        )
+    ) is None
+
+
+def test_known_bad_combo_old_clang_with_pie_hardening() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang11",
+            compilerFamily="clang",
+            compilerVersion="11.1.0",
+            hardening="pie",
+            sanitizer="san-off",
+        )
+    ) is not None
+
+
+def test_known_bad_combo_modern_clang_with_pie_hardening_is_fine() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang20",
+            compilerFamily="clang",
+            compilerVersion="20.1.8",
+            hardening="pie",
+            sanitizer="san-off",
+        )
+    ) is None
+
+
+def test_known_bad_combo_old_clang_with_cet_hardening() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang11",
+            compilerFamily="clang",
+            compilerVersion="11.1.0",
+            hardening="cet",
+            sanitizer="san-off",
+        )
+    ) is not None
+
+
+def test_known_bad_combo_modern_clang_with_cet_hardening_is_fine() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang20",
+            compilerFamily="clang",
+            compilerVersion="20.1.8",
+            hardening="cet",
+            sanitizer="san-off",
+        )
+    ) is None
+
+
+def test_known_bad_combo_old_clang_with_march_v2() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang12",
+            compilerFamily="clang",
+            compilerVersion="12.0.1",
+            march="march-v2",
+            sanitizer="san-off",
+        )
+    ) is not None
+
+
+def test_known_bad_combo_old_gcc_with_march_v3() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="gcc11",
+            compilerFamily="gcc",
+            compilerVersion="11.4.0",
+            march="march-v3",
+            sanitizer="san-off",
+        )
+    ) is not None
+
+
+def test_known_bad_combo_modern_clang_with_march_v4_is_fine() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang20",
+            compilerFamily="clang",
+            compilerVersion="20.1.8",
+            march="march-v4",
+            sanitizer="san-off",
+        )
+    ) is None
+
+
+def test_known_bad_combo_default_hardening_and_march_never_fails() -> None:
+    # Old compilers with the default hardening + march should remain
+    # buildable for non-LTO / non-sanitizer combos.
+    assert is_known_bad_combo(
+        _meta(
+            compiler="clang10",
+            compilerFamily="clang",
+            compilerVersion="10.0.1",
+            flags="baseline",
+            hardening="default",
+            march="march-default",
+            sanitizer="san-off",
+        )
+    ) is None
