@@ -828,23 +828,35 @@ class PeerNixConfWatcher(threading.Thread):
         self._target = pathlib.Path(target_conf)
         self._tick = float(tick_seconds)
         self._stop = threading.Event()
+        self._last_signature: tuple | None = None
+        # Prime peer.conf synchronously from the watcher's already-snapshotted
+        # peer set so the first ``nix build`` invocation (which the framework
+        # may dispatch within ~280 ms of bootstrap returning) sees the live
+        # substituter set instead of an empty / missing file. The poll thread
+        # below then keeps it fresh; without this prime, the first wave of
+        # tasks falls back to cache.nixos.org and rebuilds toolchains that
+        # would otherwise substitute from the dev-box harmonia.
+        self._refresh_once(suppress_log=True)
 
     def stop(self) -> None:
         self._stop.set()
 
-    def run(self) -> None:  # pragma: no cover — exercised via integration
-        last_signature: tuple | None = None
-        while not self._stop.is_set():
-            try:
-                peers = list(self._watcher.peers)
-                urls = [p.substituter_url() for p in peers]
-                keys = [p.public_key for p in peers if p.public_key]
-                sig = (tuple(urls), tuple(keys))
-                if sig != last_signature:
-                    self._write_conf(urls, keys)
-                    last_signature = sig
-            except Exception:  # noqa: BLE001
+    def _refresh_once(self, *, suppress_log: bool = False) -> None:
+        try:
+            peers = list(self._watcher.peers)
+            urls = [p.substituter_url() for p in peers]
+            keys = [p.public_key for p in peers if p.public_key]
+            sig = (tuple(urls), tuple(keys))
+            if sig != self._last_signature:
+                self._write_conf(urls, keys)
+                self._last_signature = sig
+        except Exception:  # noqa: BLE001
+            if not suppress_log:
                 logger.exception("PeerNixConfWatcher refresh failed")
+
+    def run(self) -> None:  # pragma: no cover — exercised via integration
+        while not self._stop.is_set():
+            self._refresh_once()
             self._stop.wait(self._tick)
 
     def _write_conf(self, urls: list[str], keys: list[str]) -> None:

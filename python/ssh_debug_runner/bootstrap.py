@@ -41,7 +41,6 @@ import logging
 import os
 import socket as _socket
 import subprocess
-import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -125,72 +124,6 @@ def start_harmonia(port: int, signing_key_path: Path) -> int | None:
     return proc.pid
 
 
-class _PeerNixConfWatcher(threading.Thread):
-    """Polls a :class:`PeerListWatcher` snapshot and rewrites
-    ``/etc/nix/peer.conf`` whenever the peer set changes.
-
-    The conf snippet looks like::
-
-        extra-substituters = http://node-a:5000 http://node-b:5000
-        extra-trusted-public-keys = ssh-debug-cluster:abc... ssh-debug-cluster:xyz...
-
-    The image's baseline nix.conf does ``!include /etc/nix/peer.conf``,
-    so every nix invocation in the container picks up the live set
-    automatically.
-    """
-
-    def __init__(
-        self,
-        peer_watcher: Any,
-        target_conf: str = PEER_CONF_PATH,
-        tick_seconds: float = 2.5,
-    ) -> None:
-        super().__init__(name="PeerNixConfWatcher", daemon=True)
-        self._watcher = peer_watcher
-        self._target = Path(target_conf)
-        self._tick = float(tick_seconds)
-        self._stop = threading.Event()
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def run(self) -> None:
-        last_signature: tuple | None = None
-        # Always write at least once so the file exists (even with zero
-        # peers) — that way the baseline `!include` finds it.
-        while not self._stop.is_set():
-            peers = list(self._watcher.peers)
-            urls = [p.substituter_url() for p in peers]
-            keys = [p.public_key for p in peers if p.public_key]
-            sig = (tuple(urls), tuple(keys))
-            if sig != last_signature:
-                self._write_conf(urls, keys)
-                last_signature = sig
-            self._stop.wait(self._tick)
-
-    def _write_conf(self, urls: list[str], keys: list[str]) -> None:
-        try:
-            self._target.parent.mkdir(parents=True, exist_ok=True)
-            body = ""
-            if urls:
-                body += "extra-substituters = " + " ".join(urls) + "\n"
-            if keys:
-                body += (
-                    "extra-trusted-public-keys = "
-                    + " ".join(keys)
-                    + "\n"
-                )
-            tmp = self._target.with_suffix(self._target.suffix + ".tmp")
-            tmp.write_text(body)
-            tmp.replace(self._target)
-            _diag(
-                f"peer.conf updated: {len(urls)} peer(s)"
-                f"{' — none' if not urls else ''}"
-            )
-        except OSError as exc:
-            _diag(f"peer.conf write failed: {exc}")
-
-
 def bootstrap(
     secondary_id: str,
     *,
@@ -237,6 +170,7 @@ def bootstrap(
         from compiler_suit_runner.peer_cache import (
             PeerInfo,
             PeerListWatcher,
+            PeerNixConfWatcher,
             announce_self,
             generate_signing_key,
         )
@@ -293,7 +227,12 @@ def bootstrap(
         peer_watcher.start()
         state["peer_watcher"] = peer_watcher
 
-        nix_conf_watcher = _PeerNixConfWatcher(peer_watcher)
+        # Use the canonical peer_cache.PeerNixConfWatcher so the
+        # debug image inherits the synchronous initial peer.conf
+        # write — without that, the first ``nix build`` invocation
+        # in the container races the watcher's first poll tick and
+        # falls back to cache.nixos.org.
+        nix_conf_watcher = PeerNixConfWatcher(peer_watcher)
         nix_conf_watcher.start()
         state["nix_conf_watcher"] = nix_conf_watcher
         _diag("peer watcher + nix.conf watcher running")
