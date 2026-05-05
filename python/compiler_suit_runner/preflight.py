@@ -453,6 +453,81 @@ def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
                 "gcc-ar/gcc-ranlib wrapping for cross LTO"
             )
 
+    # Static-PIE flag set requires the cc-wrapper to inject the
+    # static-pie crt files (rcrt1.o, scrt1.o) and the linker to
+    # know `-static-pie`. Legacy nixpkgs cc-wrappers don't wire up
+    # the static-pie crt for clang < 18 / gcc < 13; the configure
+    # executability test fails to link. Observed on
+    # clang11+staticpie+cet, clang12+staticpie+relro-bindnow+march-v2.
+    hardening = meta_entry.get("hardening", "")
+    march = meta_entry.get("march", "march-default")
+    if flag_set == "staticpie":
+        if compiler_family == "clang" and major is not None and major < 18:
+            return (
+                f"clang {major} sourced from legacy nixpkgs lacks "
+                "static-pie crt files (rcrt1.o); configure fails to link"
+            )
+        if compiler_family == "gcc" and major is not None and major < 13:
+            return (
+                f"gcc {major} sourced from legacy nixpkgs lacks "
+                "static-pie crt files (rcrt1.o); configure fails to link"
+            )
+
+    # PIE hardening (-fPIE -pie) needs the cc-wrapper to inject
+    # Scrt1.o (PIE crt1) which legacy nixpkgs cc-wrappers don't
+    # for clang < 18 / gcc < 13. Observed on
+    # clang10+Os+fastmath+pie, clang10+Oz+noinline+pie,
+    # clang12+Ofast+frameptr+pie+march-v3.
+    if hardening == "pie":
+        if compiler_family == "clang" and major is not None and major < 18:
+            return (
+                f"clang {major} sourced from legacy nixpkgs lacks "
+                "Scrt1.o (PIE crt); configure fails to link"
+            )
+        if compiler_family == "gcc" and major is not None and major < 13:
+            return (
+                f"gcc {major} sourced from legacy nixpkgs lacks "
+                "Scrt1.o (PIE crt); configure fails to link"
+            )
+
+    # Intel CET hardening (-fcf-protection=full) requires both the
+    # compiler to emit endbr64 and the linker/binutils to handle
+    # the CET marking in ELF notes. Legacy nixpkgs binutils versions
+    # paired with clang < 18 / gcc < 13 don't reliably support the
+    # CET ELF note format → configure executability test fails.
+    # Observed on clang11+staticpie+cet+O0.
+    if hardening == "cet":
+        if compiler_family == "clang" and major is not None and major < 18:
+            return (
+                f"clang {major} paired with legacy binutils does not "
+                "fully support Intel CET (-fcf-protection=full)"
+            )
+        if compiler_family == "gcc" and major is not None and major < 13:
+            return (
+                f"gcc {major} paired with legacy binutils does not "
+                "fully support Intel CET (-fcf-protection=full)"
+            )
+
+    # x86-64 micro-architecture levels (march-v2/v3/v4) target
+    # CPUs / instruction sets newer than what the legacy-nixpkgs
+    # crt was assembled for. Even though the matrix's flags.nix
+    # already gates these on minClangVersion=12, the actual crt /
+    # libc startup files come from the legacy-nixpkgs cc-wrapper,
+    # which was built without the relevant CPU baseline. Configure
+    # link fails. Observed on clang12+staticpie+march-v2,
+    # clang12+frameptr+pie+march-v3.
+    if march in ("march-v2", "march-v3", "march-v4"):
+        if compiler_family == "clang" and major is not None and major < 18:
+            return (
+                f"clang {major} sourced from legacy nixpkgs cannot link "
+                f"binaries targeting {march} (crt baseline mismatch)"
+            )
+        if compiler_family == "gcc" and major is not None and major < 13:
+            return (
+                f"gcc {major} sourced from legacy nixpkgs cannot link "
+                f"binaries targeting {march} (crt baseline mismatch)"
+            )
+
     return None
 
 
