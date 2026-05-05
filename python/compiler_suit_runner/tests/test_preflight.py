@@ -597,14 +597,18 @@ def test_filter_existing_returns_all_when_dataset_dir_absent(tmp_path: pathlib.P
     assert skipped == 0
 
 
-def test_filter_existing_drops_variants_with_existing_tarball(
+def test_filter_existing_drops_variants_with_existing_sidecar(
     tmp_path: pathlib.Path,
 ):
+    """Skip-existing matches by sidecar JSON ``label`` (not filename)."""
+    import json as _json
+
     dataset = tmp_path / "dataset"
-    dataset.mkdir()
-    # Pretend "a" and "c" are already built; "b" is not.
-    (dataset / "a.tar.zst").write_bytes(b"")
-    (dataset / "c.tar.zst").write_bytes(b"")
+    pkg_dir = dataset / "hello"
+    pkg_dir.mkdir(parents=True)
+    # Sidecars for "a" and "c" exist; "b" is not built yet.
+    (pkg_dir / "a.json").write_text(_json.dumps({"label": "a"}))
+    (pkg_dir / "c.json").write_text(_json.dumps({"label": "c"}))
     variants = (
         _make_variant("a"),
         _make_variant("b"),
@@ -613,5 +617,27 @@ def test_filter_existing_drops_variants_with_existing_tarball(
     kept, skipped = filter_existing_variants(variants, dataset_dir=dataset)
     assert skipped == 2
     assert {v["label"] for v in kept} == {"b"}
+
+
+def test_filter_existing_handles_legacy_flat_layout(
+    tmp_path: pathlib.Path,
+):
+    """Variants with no ``pkg`` field fall back to scanning
+    ``dataset_dir`` itself (legacy flat layout)."""
+    import json as _json
+
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    (dataset / "a.json").write_text(_json.dumps({"label": "a"}))
+
+    def _v(label: str) -> dict:
+        v = _make_variant(label)
+        v.pop("pkg", None)
+        return v
+
+    variants = (_v("a"), _v("b"))
+    kept, skipped = filter_existing_variants(variants, dataset_dir=dataset)
+    assert skipped == 1
+    assert [v["label"] for v in kept] == ["b"]
 
 

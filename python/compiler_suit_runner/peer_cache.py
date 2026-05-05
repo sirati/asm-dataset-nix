@@ -763,8 +763,19 @@ def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
         log_fh = open(target, "ab", buffering=0)
     except OSError:
         log_fh = open(os.devnull, "wb")
+    # Strip ``NIX_REMOTE`` from the daemon's env: the image sets it to
+    # "daemon" so client processes route through this daemon, but if the
+    # daemon ITSELF inherits it the daemon's forked workers will then
+    # try to connect to themselves as a client (infinite-loop reset).
+    # Symptom on the client side: ``error: cannot open connection to
+    # remote store 'daemon': error: read of 32768 bytes: Connection
+    # reset by peer`` while the daemon's log keeps logging
+    # ``accepted connection from pid X, user root (trusted)``
+    # without ever serving a single request.
+    daemon_env = {k: v for k, v in os.environ.items() if k != "NIX_REMOTE"}
     proc = subprocess.Popen(  # noqa: S603
         [binary],
+        env=daemon_env,
         stdout=log_fh,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,

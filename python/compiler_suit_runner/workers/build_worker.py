@@ -595,9 +595,20 @@ def build_worker(
                 duration_seconds=max(0.0, clock() - start),
                 error="phase3_variant manifest missing 'payload.tarball_name'",
             )
+        # Group tarballs by package: ``dataset/<pkg>/<tarball_name>``
+        # so an operator can ``ls dataset/hello/`` to see every variant
+        # of one package. Filename intentionally doesn't repeat the pkg
+        # — the directory carries that, the file carries the matrix
+        # axes (compiler, arch, opt, hash).
+        pkg = payload.get("pkg")
+        per_pkg_dir = (
+            env.dataset_output_dir / pkg
+            if isinstance(pkg, str) and pkg
+            else env.dataset_output_dir
+        )
         try:
             output_path = copy_tarball(
-                out_store, env.dataset_output_dir, tarball_name
+                out_store, per_pkg_dir, tarball_name
             )
         except Exception as exc:  # noqa: BLE001 - never raise out
             return BuildWorkerResult(
@@ -616,7 +627,7 @@ def build_worker(
         if isinstance(metadata_name, str) and metadata_name:
             sidecar = {
                 "label": payload.get("label"),
-                "pkg": payload.get("pkg"),
+                "pkg": pkg,
                 "arch": payload.get("arch"),
                 "compiler": payload.get("compiler_id"),
                 "compiler_family": payload.get("compiler_family"),
@@ -631,7 +642,7 @@ def build_worker(
             }
             try:
                 write_sidecar_metadata(
-                    env.dataset_output_dir, metadata_name, sidecar
+                    per_pkg_dir, metadata_name, sidecar
                 )
             except Exception:  # noqa: BLE001 - sidecar is best-effort
                 pass
