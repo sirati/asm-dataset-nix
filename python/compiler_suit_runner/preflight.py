@@ -929,23 +929,72 @@ def filter_existing_variants(
     *,
     dataset_dir,
 ) -> tuple[tuple[VariantSpec, ...], int]:
-    """Drop variants whose tarball already lives in ``dataset_dir``.
+    """Drop variants whose sidecar already records the same ``label``.
 
-    Returns ``(remaining_variants, skipped_count)``. The output dir
-    layout is flat — phase-3 build_worker writes
-    ``<dataset_dir>/<tarball_name>`` directly — so a single existence
-    check per variant is enough.
+    Returns ``(remaining_variants, skipped_count)``. The output layout
+    is per-package: phase-3 build_worker writes the tarball + sidecar
+    JSON at ``<dataset_dir>/<pkg>/<tarball_name>{.tar.zst,.json}``.
+
+    Match is on the ``label`` field of each sidecar, NOT the filename.
+    The filename is a sha256-derived short hash of label; matching the
+    hash works as long as the hash function never changes, but reading
+    ``label`` directly is the canonical precise-flags identifier and
+    survives short-name refactors. A bonus consequence: a tarball
+    written under a different short-name scheme is still recognised as
+    "we already have this combo", so we never rebuild what's already
+    on disk.
+
+    Sidecars per pkg are scanned at most once each (O(existing+todo)
+    rather than per-variant ``stat``).
     """
     import pathlib
 
     dataset_dir = pathlib.Path(dataset_dir)
     if not dataset_dir.is_dir():
         return variants, 0
+
+    # Lazy: only scan a pkg's subdir once we encounter a variant
+    # claiming that pkg. Variants without ``pkg`` fall back to the
+    # legacy flat-layout scan in ``dataset_dir`` itself.
+    labels_by_pkg: dict[str, set[str]] = {}
+
+    def _labels_for(pkg_dir: pathlib.Path) -> set[str]:
+        seen: set[str] = set()
+        try:
+            entries = list(pkg_dir.iterdir())
+        except OSError:
+            return seen
+        for entry in entries:
+            if not entry.is_file() or entry.suffix != ".json":
+                continue
+            try:
+                with entry.open("rb") as fh:
+                    data = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+            label = data.get("label") if isinstance(data, dict) else None
+            if isinstance(label, str) and label:
+                seen.add(label)
+        return seen
+
     remaining: list[VariantSpec] = []
     skipped = 0
     for variant in variants:
-        tarball = dataset_dir / variant["tarball_name"]
-        if tarball.exists():
+        pkg = variant.get("pkg") if isinstance(variant, dict) else None
+        label = variant.get("label") if isinstance(variant, dict) else None
+        if not isinstance(label, str) or not label:
+            remaining.append(variant)
+            continue
+        # Cache lookup; fill the cache the first time we see each pkg.
+        cache_key = pkg if isinstance(pkg, str) and pkg else ""
+        if cache_key not in labels_by_pkg:
+            scan_dir = (
+                dataset_dir / pkg
+                if isinstance(pkg, str) and pkg
+                else dataset_dir
+            )
+            labels_by_pkg[cache_key] = _labels_for(scan_dir)
+        if label in labels_by_pkg[cache_key]:
             skipped += 1
         else:
             remaining.append(variant)
