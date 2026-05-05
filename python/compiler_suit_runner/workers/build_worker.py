@@ -259,18 +259,23 @@ def build_attr(
     else:
         argv.append(f"{env.flake_ref}#{attr}")
 
-    # Retry on transient SQLite-busy errors. Multiple concurrent
-    # workers in the same secondary container all hit the same
-    # local nix store; nix's SQLite busy timeout is too short for
-    # bursty dispatch on Krater (~10 secondaries × many workers
-    # each), so a fresh build that just needs to register a new
-    # output gets racey ``SQLite database is busy`` aborts. The
+    # Retry on transient nix-store init / contention errors. Multiple
+    # concurrent workers in the same secondary container all hit the
+    # same local nix store; the first invocation has to create the
+    # SQLite DB and schema file, and subsequent invocations can race
+    # on either the lock (``SQLite database is busy``) or the not-
+    # yet-fully-written schema file (``schema is corrupt``). The
     # contention window is short — back off briefly and retry.
     for attempt in range(_SQLITE_BUSY_MAX_RETRIES):
         stdout, stderr, rc = runner(argv)
         if rc == 0:
             return True, stdout, stderr
-        if b"is busy" not in stderr and b"SQLite" not in stderr:
+        is_transient = (
+            b"is busy" in stderr
+            or b"SQLite" in stderr
+            or b"schema" in stderr and b"corrupt" in stderr
+        )
+        if not is_transient:
             return False, stdout, stderr
         # Last attempt — give up and return the error to the caller.
         if attempt == _SQLITE_BUSY_MAX_RETRIES - 1:
