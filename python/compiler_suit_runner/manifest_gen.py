@@ -67,12 +67,64 @@ class ManifestHeader:
     ``size`` is retained as a field for backward compatibility with the
     framework's :class:`TaskInfo.size` slot but is always 0 — memory
     budgeting is disabled for this task.
+
+    ``task_id`` is the framework's per-task identifier (Phase-1 of the
+    task-deps API; required once the framework's PendingPool starts
+    enforcing). Stable + unique across the run.
+
+    ``task_depends_on`` is the tuple of ``task_id``s that must complete
+    before this task is dispatchable. Empty means no deps (e.g.
+    toolchains). Variants reference their toolchain's task_id so the
+    scheduler can hold them until the toolchain build finishes.
     """
 
     item_class: ItemClass
     name: str
     size: int
     payload: dict
+    task_id: str = ""
+    task_depends_on: tuple[str, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# Task-id helpers
+#
+# The framework's task-deps API (Phase 1: ``a1ebbaa``) carries
+# ``task_id`` + ``task_depends_on`` per :class:`TaskInfo`. We mint
+# ids that are stable (deterministic from the manifest's identity)
+# and human-readable (no hashing) so log lines reference combos
+# operators recognise. Charset is double-underscore-separated ASCII.
+
+
+def toolchain_task_id(sys_name: str, arch: str, compiler_label: str) -> str:
+    """Stable id for a phase-2 toolchain task."""
+    return f"toolchain__{sys_name}__{arch}__{compiler_label}"
+
+
+def common_dep_task_id(drv: str) -> str:
+    """Stable id for a phase-2 common-dep task. Uses the drv's
+    short hash (the ``hash-name`` segment of the store path) so two
+    common deps with the same human-readable label but different
+    derivations don't collide.
+    """
+    base = pathlib.Path(drv).name
+    return f"common_dep__{base}"
+
+
+def variant_task_id(variant: VariantSpec, sys_name: str) -> str:
+    """Stable id for a phase-3 variant task. Uses the full variant
+    label (already unique per dispatch — encodes pkg, arch, compiler,
+    every flag axis) so it round-trips identifiably in logs.
+    """
+    return f"variant__{sys_name}__{variant['label']}"
+
+
+def partition_task_id(shard: Shard) -> str:
+    """Stable id for a phase-1a partition shard."""
+    return f"partition__{shard.pkg}__{shard.arch}"
+
+
+MERGE_TASK_ID = "merge__singleton"
 
 
 # ---------------------------------------------------------------------------
@@ -97,16 +149,21 @@ def make_partition_shard_header(shard: Shard) -> ManifestHeader:
         name=shard.name,
         size=0,
         payload=payload,
+        task_id=partition_task_id(shard),
     )
 
 
 def make_merge_header() -> ManifestHeader:
-    """Build the singleton phase-1b merge manifest."""
+    """Build the singleton phase-1b merge manifest. Depends on every
+    partition shard (in practice the framework's phase-level
+    ``depends_on=("phase1a",)`` makes this redundant, but we set it
+    explicitly so the dep graph is self-describing in the manifest)."""
     return ManifestHeader(
         item_class="phase1b_merge",
         name="phase1b_merge",
         size=0,
         payload={},
+        task_id=MERGE_TASK_ID,
     )
 
 
@@ -136,6 +193,7 @@ def make_toolchain_header(
         name=f"toolchain__{arch}__{compiler_label}",
         size=0,
         payload=payload,
+        task_id=toolchain_task_id(sys_name, arch, compiler_label),
     )
 
 
@@ -154,6 +212,7 @@ def make_common_dep_header(drv: str, label: str) -> ManifestHeader:
             "label": label,
             "attr": drv,
         },
+        task_id=common_dep_task_id(drv),
     )
 
 
@@ -172,10 +231,19 @@ def _label_to_attr_suffix(label: str) -> str:
 def make_variant_header(
     variant: VariantSpec, sys_name: str
 ) -> ManifestHeader:
-    """Build a phase-3 variant manifest."""
+    """Build a phase-3 variant manifest.
+
+    ``task_depends_on`` references the corresponding toolchain task —
+    when the framework's task-dep scheduler enforces (Phase 2 of the
+    task-deps API), this variant won't be dispatched until its
+    toolchain has been built/substituted, eliminating the worker-slot
+    waste of variants spinning on nix-daemon's build-lock waiting for
+    their toolchain to come online.
+    """
     pkg = variant["pkg"]
     arch = variant["arch"]
     label = variant["label"]
+    compiler_id = variant["compiler_id"]
     suffix = _label_to_attr_suffix(label)
     payload = {
         "sys": sys_name,
@@ -185,7 +253,7 @@ def make_variant_header(
         "drv": variant["drv"],
         "tarball_name": variant["tarball_name"],
         "metadata_name": variant["metadata_name"],
-        "compiler_id": variant["compiler_id"],
+        "compiler_id": compiler_id,
         "compiler_family": variant.get("compiler_family", ""),
         "compiler_version": variant.get("compiler_version", ""),
         "optimization": variant.get("optimization", ""),
@@ -201,6 +269,8 @@ def make_variant_header(
         name=label,
         size=0,
         payload=payload,
+        task_id=variant_task_id(variant, sys_name),
+        task_depends_on=(toolchain_task_id(sys_name, arch, compiler_id),),
     )
 
 
@@ -209,12 +279,20 @@ def make_variant_header(
 
 
 def _header_to_jsonable(header: ManifestHeader) -> dict:
-    return {
+    out = {
         "item_class": header.item_class,
         "name": header.name,
         "size": header.size,
         "payload": header.payload,
     }
+    # task_id / task_depends_on are emitted only when populated so
+    # legacy manifests round-trip unchanged (older preflight outputs
+    # without these fields parse cleanly via the read-side defaults).
+    if header.task_id:
+        out["task_id"] = header.task_id
+    if header.task_depends_on:
+        out["task_depends_on"] = list(header.task_depends_on)
+    return out
 
 
 def write_manifest(
@@ -280,11 +358,28 @@ def read_manifest(path: pathlib.Path) -> ManifestHeader:
     if not isinstance(parsed["name"], str):
         raise ValueError(f"{path}: 'name' must be a string")
 
+    # task_id / task_depends_on are optional on disk: legacy manifests
+    # don't have them, and the framework's default-empty serde on the
+    # wire makes that a no-op for older runs. Pre-validate types so a
+    # malformed sidecar doesn't crash the secondary's manifest scan.
+    raw_task_id = parsed.get("task_id", "")
+    if not isinstance(raw_task_id, str):
+        raise ValueError(f"{path}: 'task_id' must be a string")
+    raw_deps = parsed.get("task_depends_on", [])
+    if not isinstance(raw_deps, list) or not all(
+        isinstance(d, str) for d in raw_deps
+    ):
+        raise ValueError(
+            f"{path}: 'task_depends_on' must be a list of strings"
+        )
+
     return ManifestHeader(
         item_class=parsed["item_class"],  # type: ignore[arg-type]
         name=parsed["name"],
         size=parsed["size"],
         payload=parsed["payload"],
+        task_id=raw_task_id,
+        task_depends_on=tuple(raw_deps),
     )
 
 

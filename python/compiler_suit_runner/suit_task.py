@@ -132,6 +132,8 @@ def _make_task_info(
     type_id: str,
     affinity_id: Optional[str],
     payload: dict,
+    task_id: str = "",
+    task_depends_on: tuple[str, ...] = (),
 ):
     """Return a framework-compatible :class:`TaskInfo`, falling back to a stub.
 
@@ -139,6 +141,11 @@ def _make_task_info(
     :class:`TaskInfo`; otherwise we synthesise an attribute-compatible
     stub via :class:`types.SimpleNamespace` so unit tests run without
     the framework on ``sys.path``.
+
+    ``task_id`` + ``task_depends_on`` are populated when the manifest
+    has them (Phase 1 of the framework's task-deps API,
+    ``a1ebbaa``); empty defaults so legacy manifests / older
+    framework builds round-trip cleanly.
     """
     try:
         from dynamic_runner._shared import (  # type: ignore[import-not-found]
@@ -153,6 +160,8 @@ def _make_task_info(
             type_id=type_id,
             affinity_id=affinity_id,
             payload=payload,
+            task_id=task_id,
+            task_depends_on=task_depends_on,
         )
 
     identifier = BinaryIdentifier(
@@ -162,15 +171,32 @@ def _make_task_info(
         version="0",
         opt_level="manifest",
     )
-    return TaskInfo(
-        path=path,
-        size=size,
-        identifier=identifier,
-        phase_id=phase_id,
-        type_id=type_id,
-        affinity_id=affinity_id,
-        payload=dict(payload),
-    )
+    # ``TaskInfo`` gained ``task_id`` + ``task_depends_on`` in
+    # framework commit a1ebbaa. Older framework builds don't have
+    # the kwargs; fall back to constructing without them so a stale
+    # pin doesn't fail-import.
+    try:
+        return TaskInfo(
+            path=path,
+            size=size,
+            identifier=identifier,
+            phase_id=phase_id,
+            type_id=type_id,
+            affinity_id=affinity_id,
+            payload=dict(payload),
+            task_id=task_id,
+            task_depends_on=task_depends_on,
+        )
+    except TypeError:
+        return TaskInfo(
+            path=path,
+            size=size,
+            identifier=identifier,
+            phase_id=phase_id,
+            type_id=type_id,
+            affinity_id=affinity_id,
+            payload=dict(payload),
+        )
 
 
 def _phase_specs(*, build_max_concurrent: Optional[int]):
@@ -430,6 +456,8 @@ class SuitTask:
                 type_id=type_id,
                 affinity_id=affinity_id,
                 payload=header_dict,
+                task_id=header.task_id,
+                task_depends_on=header.task_depends_on,
             )
 
     # ── Memory estimator (disabled) ───────────────────────────────────
