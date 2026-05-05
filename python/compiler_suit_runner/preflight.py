@@ -408,16 +408,24 @@ def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
     if sanitizer != "san-off" and optimization == "O0":
         return "sanitizer requires -O1+; configure fails on -O0"
 
-    # Old clang shipped without complete sanitizer runtimes for cross
-    # targets. From clang 6+ the runtime support is uniform.
-    if sanitizer != "san-off" and compiler_family == "clang" and major is not None and major < 6:
-        return f"clang {major} predates uniform sanitizer runtime (need ≥6)"
-
-    # Old gcc had partial / broken sanitizer support. ASan landed in
-    # 4.8, UBSan in 4.9, but the runtime libs only became reliably
-    # available across cross targets from gcc 6+.
-    if sanitizer != "san-off" and compiler_family == "gcc" and major is not None and major < 6:
-        return f"gcc {major} predates uniform sanitizer runtime (need ≥6)"
+    # Sanitizer runtime libs (libasan / libubsan / libtsan / libmsan)
+    # come from the compiler's stdenv. Modern unstable nixpkgs
+    # ships clang ≥ 18 / gcc ≥ 13 with the runtimes wired up for
+    # both native and cross targets; the legacy nixpkgs inputs
+    # (15.09 / 18.03 / 22.11 / 23.11 / 24.05) supply a stdenv whose
+    # cc-wrapper can't locate the matching sanitizer runtime, so
+    # the configure executability test fails before the build
+    # starts. Observed on clang10+san-{address,thread,memory}.
+    if sanitizer != "san-off" and compiler_family == "clang" and major is not None and major < 18:
+        return (
+            f"clang {major} sourced from legacy nixpkgs cannot locate "
+            f"the {sanitizer} runtime library; configure fails to link"
+        )
+    if sanitizer != "san-off" and compiler_family == "gcc" and major is not None and major < 13:
+        return (
+            f"gcc {major} sourced from legacy nixpkgs cannot locate "
+            f"the {sanitizer} runtime library; configure fails to link"
+        )
 
     # ``-Ofast`` enables ``-ffast-math`` which conflicts with
     # ``-fsanitize=undefined`` (UBSan instruments operations
