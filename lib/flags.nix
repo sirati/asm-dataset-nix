@@ -88,11 +88,16 @@ let
       label = "nopic";
       cflags = "-fno-PIC";
       cxxflags = "-fno-PIC";
-      ldflags = "-no-pie";
-      # Must also disable PIE/PIC hardening, otherwise the linker
-      # re-adds -pie. Newer nixpkgs renamed the flag pie → pic
-      # (the "pie" entry was removed from knownHardeningFlags); we
-      # disable both for back-compat across nixpkgs versions.
+      # Don't push ``-no-pie`` into NIX_LDFLAGS: it gets applied
+      # to every ld invocation including partial relinks (``ld -r``),
+      # where it overrides ``-r`` and forces the linker to emit
+      # an executable instead of a relocatable. Packages that do
+      # multi-stage linking (busybox: ``applets/built-in.o`` →
+      # partial-link then final link) then fail with
+      # ``cannot use executable file 'applets/built-in.o' as input``.
+      # ``extraHardeningDisable = ["pic"]`` already suppresses the
+      # cc-wrapper's automatic ``-pie`` injection, which is what we
+      # actually need.
       extraHardeningDisable = [ "pic" ];
     }
     {
