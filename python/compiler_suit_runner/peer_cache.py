@@ -927,17 +927,44 @@ _SUBMITTER_KEY_DIR = pathlib.Path.home() / ".cache" / "asm-dataset-nix-runner"
 def _generate_submitter_signing_key(
     key_dir: pathlib.Path,
 ) -> tuple[pathlib.Path, str]:
-    """Make a fresh submitter signing keypair under ``key_dir``.
+    """Get the submitter signing keypair, generating a stable one once.
 
-    Independent of :func:`generate_signing_key` (which targets the
-    cluster-shared NFS dir): the submitter's keypair is short-lived,
-    regenerated each dispatch, and never leaves the local machine.
+    The keypair is **persistent across dispatches**, not regenerated
+    each time. Reasoning: a previous dispatch's harmonia process can
+    outlive its SubmitterPeer (e.g. when the dispatch crashes or
+    Ctrl-C exits before ``stop()`` runs cleanly, or when SubmitterPeer
+    fails to bind a fresh harmonia because the port's still held by
+    the old one). The stale harmonia keeps signing artifacts with
+    whatever signing key was loaded at its startup. If the next
+    dispatch generated a NEW signing key, the secondaries' published
+    ``trusted-public-keys`` would mismatch the stale harmonia's
+    signatures and nix would refuse to substitute (signature check
+    failure → fall back to building from source). Pinning the key
+    name + reusing the on-disk keypair when present makes the key
+    invariant across dispatches; any harmonia (running or freshly
+    spawned) signs with the same key and every dispatch's secondaries
+    trust it.
+
+    Key name is stable (``asm-dataset-submitter-local``) — no
+    timestamp suffix. The keypair is private to the dev-box and
+    never leaves it, so single-name is fine for security.
     """
     key_dir.mkdir(parents=True, exist_ok=True)
     secret_path = key_dir / "submitter.key"
     pub_path = key_dir / "submitter.key.pub"
-    name = f"asm-dataset-submitter-{int(time.time())}"
 
+    # Reuse on-disk keypair if both halves are present + non-empty.
+    # Idempotent across dispatches; a future operator can rotate by
+    # deleting both files (next dispatch generates fresh).
+    if secret_path.is_file() and pub_path.is_file():
+        try:
+            public_existing = pub_path.read_text("utf-8").strip()
+            if public_existing.startswith("asm-dataset-submitter-"):
+                return secret_path, public_existing
+        except OSError:
+            pass  # fall through to regenerate
+
+    name = "asm-dataset-submitter-local"
     secret = subprocess.run(  # noqa: S603
         ["nix", "--extra-experimental-features", "nix-command",
          "key", "generate-secret", "--key-name", name],
