@@ -1011,6 +1011,13 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 secondary_module="compiler_suit_runner",
                 image_name="asm-dataset-nix-runner",
                 extra_port_forwards=extra_pf,
+                # Bump podman's default pids-limit (2048 is too tight
+                # for compile-heavy workloads — autotools configure
+                # scripts and gcc/clang fan out hundreds of transient
+                # processes per parallel build, and 14-core SLURM
+                # nodes with max-jobs=auto easily run 4000+ PIDs in
+                # flight during peak fan-out).
+                extra_run_args=("--pids-limit=16384",),
             )
             dynamic_runner_run(task, deployment=deployment)
         except Exception:  # noqa: BLE001

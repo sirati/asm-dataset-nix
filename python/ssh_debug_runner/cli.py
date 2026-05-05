@@ -71,6 +71,9 @@ def _build_deployment_spec(
         image_name=_DEPLOYMENT_IMAGE_NAME,
         nix_build_target=_DEPLOYMENT_NIX_TARGET,
         extra_port_forwards=extra_port_forwards,
+        # See compiler_suit_runner.cli for the rationale: 2048 podman
+        # default is too tight for compile-heavy workloads.
+        extra_run_args=("--pids-limit=16384",),
     )
 
 
