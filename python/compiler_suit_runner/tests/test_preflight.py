@@ -95,10 +95,18 @@ def _make_run_subprocess(responses: dict[str, object]):
         if isinstance(payload, bytes):
             return payload, b"", 0
         # When ``--apply`` is in play, mimic nix's behaviour of running
-        # the lambda on the resolved attrset. The lambda we emit has the
-        # form ``m: { "S1" = m."S1"; "S2" = m."S2"; ... }`` — pull the
-        # quoted suffix names out and project the response dict.
+        # the lambda on the resolved attrset. The lambdas we emit are
+        # one of:
+        #   - ``m: { "S1" = m."S1"; ... }`` — projection by suffix list
+        #   - ``m: builtins.mapAttrs (_: a: builtins.attrNames a) m``
+        #     — pkg → [arch] index for the scoped-meta path
         if apply_expr and isinstance(payload, dict):
+            if "mapAttrs" in apply_expr and "attrNames" in apply_expr:
+                projected = {
+                    pkg: list(arches.keys()) if isinstance(arches, dict) else []
+                    for pkg, arches in payload.items()
+                }
+                return json.dumps(projected).encode("utf-8"), b"", 0
             suffixes = re.findall(r'"([A-Za-z0-9._-]+)"\s*=\s*m\."', apply_expr)
             if suffixes:
                 projected = {s: payload[s] for s in suffixes if s in payload}
@@ -188,14 +196,21 @@ def _all_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
     gcc5+mips64el).
     """
     drvs = _fake_drvpaths()
+    meta = _fake_meta()
     responses: dict[str, object] = {
-        f"_meta.{sys_name}": _fake_meta(),
+        f"_meta.{sys_name}": meta,
         f"_drvPaths.{sys_name}": drvs,
         f"_crossToolchainsMeta.{sys_name}": _fake_toolchains(),
     }
     for pkg, arch_map in drvs.items():
         for arch, suffix_map in arch_map.items():
             responses[f"_drvPaths.{sys_name}.{pkg}.{arch}"] = suffix_map
+    # Per-(pkg, arch) meta cells — the production code now scopes
+    # the meta eval the same way the drv-path eval is scoped, to
+    # avoid forcing the full ~420k-entry tree on big package lists.
+    for pkg, arch_map in meta.items():
+        for arch, suffix_map in arch_map.items():
+            responses[f"_meta.{sys_name}.{pkg}.{arch}"] = suffix_map
     return responses
 
 
@@ -400,12 +415,16 @@ def test_preflight_composes_both_calls():
     assert isinstance(result.toolchain_drvs, frozenset)
     assert len(result.toolchain_drvs) == 4
 
-    # Three nix eval invocations — meta, drvPaths, toolchains.
-    eval_attrs = {
-        argv[-1].split("#", 1)[1] for argv in calls
-    }
+    # Three nix-eval flavours — meta, drvPaths, toolchains. Find the
+    # ``flake#attr`` token in each argv (with --apply present, the
+    # attr is no longer at argv[-1]; the lambda string is).
+    eval_attrs = set()
+    for argv in calls:
+        target = next((tok for tok in argv if "#" in tok), None)
+        if target is not None:
+            eval_attrs.add(target.split("#", 1)[1])
     assert "_meta.x86_64-linux" in eval_attrs
-    assert "_drvPaths.x86_64-linux" in eval_attrs
+    assert any(a.startswith("_drvPaths.x86_64-linux") for a in eval_attrs)
     assert "_crossToolchainsMeta.x86_64-linux" in eval_attrs
 
 
@@ -458,8 +477,9 @@ def _wide_drvpaths() -> dict:
 
 def _wide_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
     drvs = _wide_drvpaths()
+    meta = _wide_meta()
     responses: dict[str, object] = {
-        f"_meta.{sys_name}": _wide_meta(),
+        f"_meta.{sys_name}": meta,
         f"_drvPaths.{sys_name}": drvs,
         f"_crossToolchainsMeta.{sys_name}": _fake_toolchains(),
     }
@@ -468,6 +488,9 @@ def _wide_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
             responses[f"_drvPaths.{sys_name}.{pkg}.{arch}"] = suffix_map
             for suffix, drv in suffix_map.items():
                 responses[f"_drvPaths.{sys_name}.{pkg}.{arch}.{suffix}"] = drv
+    for pkg, arch_map in meta.items():
+        for arch, suffix_map in arch_map.items():
+            responses[f"_meta.{sys_name}.{pkg}.{arch}"] = suffix_map
     return responses
 
 

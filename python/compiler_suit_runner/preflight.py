@@ -254,13 +254,17 @@ def run_nix_eval(
     attr: str,
     *,
     raw: bool = False,
+    apply: Optional[str] = None,
     run_subprocess: Optional[RunSubprocess] = None,
 ):
     """Invoke ``nix eval`` on a single attribute.
 
     By default returns the parsed JSON result. With ``raw=True`` the
     function returns the stdout as a :class:`str` (useful for
-    ``--raw`` outputs like single drv paths).
+    ``--raw`` outputs like single drv paths). With ``apply`` set, the
+    given lambda is applied to the evaluated value (``--apply``); use
+    this to project a large attrset down to just the keys / shapes
+    needed, which avoids forcing the full lazy tree.
 
     Raises :class:`RuntimeError` on non-zero exit; the stderr is
     embedded in the exception message so callers can surface it.
@@ -278,6 +282,8 @@ def run_nix_eval(
     else:
         argv.append("--json")
     argv.append(f"{flake_ref}#{attr}")
+    if apply is not None:
+        argv.extend(["--apply", apply])
 
     stdout, stderr, rc = runner(argv)
     if rc != 0:
@@ -512,19 +518,57 @@ def enumerate_variants(
     this the canonical set; phase 1b uses it to filter "toolchain" from
     "common host dep" classification.)
     """
-    meta = run_nix_eval(
-        flake_ref,
-        f"_meta.{sys_name}",
-        run_subprocess=run_subprocess,
-    )
-
-    if not isinstance(meta, dict):
-        raise RuntimeError(
-            f"_meta.{sys_name} is not a JSON object (got {type(meta).__name__})"
-        )
-
     pkg_filter = set(packages) if packages else None
     arch_filter = set(archs) if archs else None
+
+    # Scope the ``_meta`` eval the same way ``_drvPaths`` is scoped
+    # below: when the operator asks for a subset, only force the
+    # requested cells. The full ``_meta.<sys>`` eval iterates every
+    # (pkg, arch, suffix) combo into JSON; with ~250 packages × 6
+    # archs × ~280 combos per cell that's ~420k entries and tips
+    # nix into a multi-minute eval that the daemon eventually
+    # interrupts. Per-(pkg, arch) eval keeps each call ~instant.
+    meta: dict = {}
+    if pkg_filter is None or arch_filter is None:
+        # Need a list of all (pkg, arch) labels first. ``builtins.attrNames``
+        # is cheap because it doesn't force values.
+        full_meta_keys = run_nix_eval(
+            flake_ref,
+            f"_meta.{sys_name}",
+            run_subprocess=run_subprocess,
+            apply="m: builtins.mapAttrs (_: a: builtins.attrNames a) m",
+        )
+        if not isinstance(full_meta_keys, dict):
+            raise RuntimeError(
+                f"_meta.{sys_name} is not a JSON object "
+                f"(got {type(full_meta_keys).__name__})"
+            )
+        pkg_arch_pairs = [
+            (pkg, arch)
+            for pkg, archs_list in full_meta_keys.items()
+            if pkg_filter is None or pkg in pkg_filter
+            for arch in (archs_list if isinstance(archs_list, list) else [])
+            if arch_filter is None or arch in arch_filter
+        ]
+    else:
+        pkg_arch_pairs = [
+            (pkg, arch) for pkg in pkg_filter for arch in arch_filter
+        ]
+
+    for pkg, arch in pkg_arch_pairs:
+        try:
+            cell = run_nix_eval(
+                flake_ref,
+                f"_meta.{sys_name}.{pkg}.{arch}",
+                run_subprocess=run_subprocess,
+            )
+        except RuntimeError:
+            # Cell may not exist (e.g. arch not configured for this
+            # package); skip silently.
+            continue
+        if not isinstance(cell, dict):
+            continue
+        meta.setdefault(pkg, {})[arch] = cell
 
     # Scope the (slow, drv-instantiating) `_drvPaths` eval to just the
     # (pkg, arch) combos the operator actually asked for. The full-matrix
