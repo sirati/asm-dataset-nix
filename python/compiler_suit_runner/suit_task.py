@@ -51,6 +51,7 @@ from compiler_suit_runner.manifest_gen import (
 )
 from compiler_suit_runner.peer_cache import (
     SUBSTITUTERS_FILENAME,
+    substituters_filename_for,
     HarmoniaProcess,
     PeerInfo,
     PeerListWatcher,
@@ -344,7 +345,13 @@ class SuitTask:
     def _substituters_file_path(self) -> Optional[pathlib.Path]:
         if self.config.peers_dir is None:
             return None
-        return self.config.peers_dir / SUBSTITUTERS_FILENAME
+        # Per-secondary substituters file so concurrent writers from
+        # different secondaries don't clobber each other's
+        # self-excluded views (each secondary's peer list naturally
+        # differs from every other's).
+        return self.config.peers_dir / substituters_filename_for(
+            self.config.secondary_id
+        )
 
     # ── Topology ───────────────────────────────────────────────────────
 
