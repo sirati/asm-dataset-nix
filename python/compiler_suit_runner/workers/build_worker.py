@@ -235,6 +235,17 @@ def build_attr(
         "build",
         "--no-link",
         "--print-out-paths",
+        # Multiple workers in the same secondary container hit one
+        # nix-daemon simultaneously; the default SQLite busy timeout
+        # is short enough that under sustained ~10×/sec dispatch
+        # bursts (Krater × 16-worker secondaries), readers/writers
+        # collide and ``nix build`` aborts with
+        # ``SQLite database '/nix/var/nix/db/db.sqlite' is busy``.
+        # 5 minutes is generous; a build never sits in DB-lock
+        # contention that long under healthy load.
+        "--option",
+        "sqlite-busy-timeout",
+        "300000",
     ]
     if env.substituters_file is not None:
         argv.extend(_read_substituters_file(env.substituters_file))
