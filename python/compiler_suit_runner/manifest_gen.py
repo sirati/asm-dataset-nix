@@ -437,6 +437,20 @@ def emit_all_manifests(
     target_dir = pathlib.Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
 
+    # Stale manifests from a prior dispatch in the same shared-fs would
+    # land in PendingPool with whatever task_id they had on disk —
+    # including the empty-string default that pre-dates Phase-1
+    # plumbing — and the framework's duplicate-id check rejects them.
+    # Keep underscore- and dot-prefixed files (``_meta.json``, etc.)
+    # because :meth:`SuitTask.discover_items` already filters them out
+    # of the dispatch.
+    for stale in target_dir.iterdir():
+        if not stale.is_file() or stale.suffix != ".json":
+            continue
+        if stale.name.startswith(("_", ".")):
+            continue
+        stale.unlink()
+
     variants_tuple = tuple(variants)
 
     headers: list[ManifestHeader] = []
