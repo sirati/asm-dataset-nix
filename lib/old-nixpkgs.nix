@@ -153,22 +153,15 @@ in
       }
     ];
     clangSpecs = [
-      {
-        attr = "llvmPackages_5";
-        label = "5";
-      }
-      {
-        attr = "llvmPackages_6";
-        label = "6";
-      }
-      {
-        attr = "llvmPackages_7";
-        label = "7";
-      }
-      {
-        attr = "llvmPackages_8";
-        label = "8";
-      }
+      # llvmPackages_5/6/7/8: compiler-rt source tarballs from this
+      # era of LLVM bake in uid 101195/gid 101195 metadata; unpacking
+      # under a rootless podman container (the SLURM secondary
+      # context) fails with ``tar: ... Cannot change ownership to
+      # uid 101195, gid 101195: Invalid argument`` because the host
+      # user namespace doesn't map that uid. clang3_4-clang_4 use a
+      # different source layout and work fine; clang_9+ use later
+      # tarballs without the metadata. Skipped until we either
+      # patch unpackPhase or run the secondary as root.
       {
         attr = "llvmPackages_9";
         label = "9";
