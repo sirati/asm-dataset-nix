@@ -684,6 +684,19 @@ def enumerate_variants(
     variants: list[VariantSpec] = []
     drv_set: set[str] = set()
 
+    # Authoritative (compiler, arch) support matrix from table.md at
+    # the flake root. Used to drop combos marked FAIL/n/a *before*
+    # asking nix to evaluate ``_drvPaths`` — without this filter,
+    # forcing a broken cell can crash preflight with hard
+    # ``builtins.throw`` errors that escape ``tryEval`` (e.g.
+    # ``gcc5: cross-compiler not available in nixpkgs-18.03 for
+    # mips64el`` from ``lib/old-gcc-cross.nix``).
+    from compiler_suit_runner.support_table import (  # noqa: PLC0415
+        is_supported,
+        load_support_table,
+    )
+    support = load_support_table()
+
     for pkg, arch_attrs in sorted(meta.items()):
         if pkg_filter is not None and pkg not in pkg_filter:
             continue
@@ -694,6 +707,17 @@ def enumerate_variants(
                 continue
             if not isinstance(suffix_attrs, dict):
                 continue
+            # Drop variants whose (compiler, arch) is FAIL or n/a per
+            # table.md. The compiler axis is encoded in each meta
+            # entry's ``compiler`` field. Suffixes lacking the field
+            # (shouldn't happen on a well-formed matrix) are passed
+            # through and caught by other filters.
+            suffix_attrs = {
+                s: m
+                for s, m in suffix_attrs.items()
+                if not isinstance(m, dict)
+                or is_supported(support, m.get("compiler", ""), arch)
+            }
             # Drop known-bad combinations BEFORE sampling so the
             # operator's K-per-group budget isn't wasted on cells
             # that will fail at build time anyway. See
