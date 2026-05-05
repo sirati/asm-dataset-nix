@@ -99,9 +99,30 @@ def test_known_bad_combo_ofast_with_san_undefined() -> None:
     assert "fast" in reason.lower() or "Ofast" in reason
 
 
+def test_known_bad_combo_fastmath_flagset_with_san_undefined() -> None:
+    # Same root cause as Ofast+san-undefined — the dedicated fastmath
+    # flag set also injects -ffast-math, conflicts with UBSan.
+    reason = is_known_bad_combo(_meta(flags="fastmath", sanitizer="san-undefined"))
+    assert reason is not None
+    assert "fast" in reason.lower()
+
+
 def test_known_bad_combo_ofast_with_san_address_is_fine() -> None:
     # Only san-undefined collides with -ffast-math; san-address is OK.
     assert is_known_bad_combo(_meta(optimization="Ofast", sanitizer="san-address")) is None
+
+
+def test_known_bad_combo_fastmath_flagset_with_san_address_is_fine() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            flags="fastmath",
+            sanitizer="san-address",
+            optimization="O2",
+            compiler="clang20",
+            compilerFamily="clang",
+            compilerVersion="20.1.8",
+        )
+    ) is None
 
 
 def test_known_bad_combo_san_off_never_fails() -> None:
