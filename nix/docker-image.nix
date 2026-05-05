@@ -104,34 +104,81 @@ let
       ''
     else null;
 
+  # nixbld build-user fan-out: one user per concurrent build slot.
+  # The daemon forks and setuids to ``nixbld_N`` per derivation,
+  # giving each build uid isolation and (critically) a non-root
+  # euid so GNU tar in ``unpackPhase`` defaults to
+  # ``--no-same-owner`` instead of trying to chown extracted
+  # files to whatever uid the upstream tarball happened to record
+  # (e.g. uid 101195 in LLVM's compiler-rt-5.0.2.src.tar.xz —
+  # that chown fails with EINVAL in a rootless container whose
+  # subuid range doesn't cover that exact uid).
+  #
+  # 512 slots is generous headroom for any node we might land on
+  # (most SLURM hardware tops out around 96-256 cores). Excess
+  # users are inert: the daemon only consumes slots up to
+  # ``max-jobs`` (``auto`` → container CPU count, cgroup-aware),
+  # so a 14-core secondary uses 14 of them and leaves the rest
+  # untouched. Image cost is trivial (~40 KB of /etc/passwd +
+  # /etc/group + /etc/shadow text). Uids 30001-30512 sit in the
+  # standard rootless-podman subuid range — kruppb's allocation
+  # is typically 65536-uid wide so 512 uids fit with room to
+  # spare.
+  nixbldCount = 512;
+  nixbldGid = 30000;
+  nixbldUidBase = 30000;
+  nixbldUserList = lib.genList (
+    n:
+    let
+      idx = n + 1;
+      uid = nixbldUidBase + idx;
+    in
+    "nixbld${toString idx}:x:${toString uid}:${toString nixbldGid}:Nix build user ${toString idx}:/var/empty:/run/current-system/sw/bin/nologin"
+  ) nixbldCount;
+  nixbldShadowList = lib.genList (
+    n: "nixbld${toString (n + 1)}:!:1::::::"
+  ) nixbldCount;
+  nixbldGroupMembers = lib.concatStringsSep "," (
+    lib.genList (n: "nixbld${toString (n + 1)}") nixbldCount
+  );
+
   # /etc/passwd, /etc/group, /etc/shadow, /etc/nsswitch.conf —
   # required by harmonia-cache 3.x (which talks to nix-daemon as
-  # root) and by anything that does name lookups (sshd, sudo, ...).
+  # root), by anything that does name lookups (sshd, sudo, ...),
+  # and by nix-daemon multi-user mode (which looks up
+  # ``build-users-group = nixbld`` and the ``nixbld_N`` user
+  # entries via the local NSS DB before fork-setuid'ing into
+  # them).
   # `dockerTools.buildLayeredImage` does NOT bake an NSS DB by
   # default; without these podman/runtime fail with "no matching
   # entries in passwd file" when User="root" or when sshd's
   # locked-account check fires on `!` in shadow.
   nssFiles = pkgs.runCommand "asm-dataset-nix-runner-nss" { } ''
     mkdir -p $out/etc
-    cat > $out/etc/passwd <<EOF
+    cat > $out/etc/passwd <<'EOF'
     root:x:0:0:root:/root:${pkgs.bash}/bin/bash
     sshd:x:74:74:Privilege-separated SSH:/var/empty:/run/current-system/sw/bin/nologin
     nobody:x:65534:65534:Nobody:/var/empty:/run/current-system/sw/bin/nologin
+    ${lib.concatStringsSep "\n    " nixbldUserList}
     EOF
     sed -i 's/^    //' $out/etc/passwd
     cat > $out/etc/group <<EOF
     root:x:0:
     sshd:x:74:
     nogroup:x:65534:
+    nixbld:x:${toString nixbldGid}:${nixbldGroupMembers}
     EOF
     sed -i 's/^    //' $out/etc/group
     # Empty password field for root: sshd's locked-account check
     # treats `!` / `*` prefixes as locked and refuses login. Empty
     # = "no password required"; password auth is blocked elsewhere.
-    cat > $out/etc/shadow <<EOF
+    # nixbld_N users get `!` (locked) — they're never logged into,
+    # only setuid'd to by the daemon.
+    cat > $out/etc/shadow <<'EOF'
     root::1::::::
     sshd:!:1::::::
     nobody:!:1::::::
+    ${lib.concatStringsSep "\n    " nixbldShadowList}
     EOF
     sed -i 's/^    //' $out/etc/shadow
     chmod 644 $out/etc/passwd $out/etc/group
@@ -150,17 +197,21 @@ let
     chmod 644 $out/etc/nsswitch.conf
   '';
 
-  # Default /etc/nix/nix.conf. Single-user mode (build-users-group
-  # empty) because podman containers don't have nixbld* users;
-  # sandbox=false because the user namespace can't nest mount/cgroup
-  # ops sandboxed builds need. The `!include /etc/nix/peer.conf`
-  # is a SOFT include — silently skipped if the file's missing —
-  # populated at runtime by ``compiler_suit_runner.peer_cache``'s
-  # PeerNixConfWatcher with the live federation peer set.
+  # Default /etc/nix/nix.conf. Multi-user mode: ``build-users-group
+  # = nixbld`` makes the daemon fork-setuid into ``nixbld_N`` per
+  # derivation. This gives each concurrent build uid isolation AND
+  # a non-root euid (so GNU tar's ``unpackPhase`` defaults to
+  # ``--no-same-owner`` — see nssFiles for the full bug story).
+  # Sandbox stays off because podman's user namespace doesn't allow
+  # the nested mount/cgroup ops sandboxed builds need.
+  # The `!include /etc/nix/peer.conf` is a SOFT include (silently
+  # skipped if the file's missing), populated at runtime by
+  # ``compiler_suit_runner.peer_cache``'s PeerNixConfWatcher with
+  # the live federation peer set.
   nixConfFile = pkgs.writeText "nix.conf" ''
     experimental-features = nix-command flakes
     sandbox = false
-    build-users-group =
+    build-users-group = nixbld
     # max-jobs: how many derivations the daemon will build in parallel.
     # Defaults to 1 — without this, every concurrent ``nix build`` from
     # the worker pool queues serially at the daemon, wasting the worker
@@ -299,13 +350,15 @@ pkgs.dockerTools.buildLayeredImage {
       "PATH=/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin"
       # Force every ``nix`` client to talk to nix-daemon over the unix
       # socket instead of opening /nix/var/nix/db/db.sqlite directly.
-      # In single-user mode (build-users-group =) running as root, nix
-      # otherwise defaults to direct-mode access; concurrent ``nix
-      # build`` invocations from the worker pool then race on the
-      # SQLite write lock and surface as
+      # Even in multi-user mode, ``nix`` running as root with the
+      # store directory writable will sometimes choose direct-DB
+      # access; concurrent invocations from the worker pool then
+      # race on the SQLite write lock and surface as
       # ``error: SQLite database '/nix/var/nix/db/db.sqlite' is busy``.
-      # Daemon mode serializes all DB writes through the daemon's
-      # single connection, eliminating the contention.
+      # ``NIX_REMOTE=daemon`` forces routing through the daemon's
+      # single connection so all DB writes serialise correctly and
+      # builds run as the daemon's nixbld_N user (giving us the
+      # non-root euid that fixes tar's ``--same-owner`` default).
       "NIX_REMOTE=daemon"
       # cacert is in basePkgs but its bundle path needs to be exposed
       # explicitly for nix / curl / openssl to find it. Without these,
