@@ -30,29 +30,35 @@ from compiler_suit_runner.partition_local import (
 
 
 def _make_run_subprocess(graphs: dict[str, dict[str, Any]]):
-    """Return a fake ``run_subprocess`` that maps a root drv -> sub-graph.
+    """Return a fake ``run_subprocess`` that maps a set of root drvs to
+    the union of their sub-graphs.
 
-    Each entry of ``graphs`` is the JSON object that
-    ``nix derivation show --recursive <drv>`` would print: a flat
-    ``{drv_path: node, ...}`` map covering the variant's transitive
-    sub-graph. The argv format from
-    :mod:`compiler_suit_runner.partition_local` is
+    ``compute_partition_locally`` calls ``nix derivation show
+    --recursive a b c …`` once per chunk (batched to amortise
+    subprocess + JSON-parse overhead — see ``_show_drvs_recursive_batch``).
+    The fake replicates that: every positional drv arg in the trailing
+    argv is looked up in ``graphs`` and the union of their flat-map
+    payloads is returned. Argv shape:
 
         ["nix", "--extra-experimental-features", "nix-command flakes",
-         "derivation", "show", "--recursive", "<drv>"]
+         "derivation", "show", "--recursive", "<drv1>", "<drv2>", …]
 
-    so we read the final positional arg as the root drv and look it up
-    in ``graphs``. Unknown drvs raise (return rc=1) to surface mistakes
-    loudly.
+    Unknown drvs return rc=1 to surface mistakes loudly.
     """
     calls: list[list[str]] = []
+    # Trailing positional drv args start after this fixed prefix length.
+    _PREFIX_LEN = 6
 
     def runner(argv):
         calls.append(list(argv))
-        target = argv[-1]
-        if target not in graphs:
-            return b"", f"no fake for {target}".encode(), 1
-        return json.dumps(graphs[target]).encode("utf-8"), b"", 0
+        targets = argv[_PREFIX_LEN:]
+        unknown = [t for t in targets if t not in graphs]
+        if unknown:
+            return b"", f"no fake for {unknown}".encode(), 1
+        merged: dict[str, Any] = {}
+        for t in targets:
+            merged.update(graphs[t])
+        return json.dumps(merged).encode("utf-8"), b"", 0
 
     return runner, calls
 
@@ -389,18 +395,17 @@ def test_invalid_json_propagates_as_runtime_error():
         )
 
 
-def test_graph_cache_avoids_redundant_show_calls():
-    """Two variants whose roots already live in the cumulative cache
-    should not re-trigger ``nix derivation show``.
+def test_batched_show_reduces_subprocess_count():
+    """Variant roots are folded into a single ``nix derivation show
+    --recursive`` invocation, so 4000+ variants don't fork 4000+ nix
+    processes.
 
     This is a behavioural property of the implementation — the
-    cumulative cache merges every sub-graph as it goes, so if a later
-    variant's root is already known we should skip the call. In the
-    fixture below, v2's root happens to live in v1's sub-graph, so v2
-    must not produce a second call.
+    cumulative graph cache is populated up-front via batched calls
+    (chunks of 1000 unique drv roots) before the per-variant input
+    extraction loop runs. End result: 1 subprocess for any variant
+    set under 1000 unique roots.
     """
-    # v1 transitively contains v2's root drv, simulating a case where
-    # the first --recursive show already returned everything we need.
     other_root = "/nix/store/zzz-other.drv"
     graphs = {
         _ROOT_V1: {
@@ -408,8 +413,10 @@ def test_graph_cache_avoids_redundant_show_calls():
             other_root: _node([_SHARED_DEP]),
             _SHARED_DEP: _node([]),
         },
-        # other_root would have its own graph if asked, but we expect
-        # the cumulative cache to make this unnecessary.
+        other_root: {
+            other_root: _node([_SHARED_DEP]),
+            _SHARED_DEP: _node([]),
+        },
     }
     runner, calls = _make_run_subprocess(graphs)
     result = compute_partition_locally(
@@ -421,8 +428,10 @@ def test_graph_cache_avoids_redundant_show_calls():
         threshold=1,
         run_subprocess=runner,
     )
-    # Only one call: the second variant's root was already cached.
+    # One subprocess, two roots in its argv (sorted for determinism):
     assert len(calls) == 1
+    drv_args = calls[0][6:]  # skip ``nix … derivation show --recursive``
+    assert sorted(drv_args) == sorted([_ROOT_V1, other_root])
     # Both variants resolved their inputs correctly:
     assert result.per_variant_inputs["v1"] == frozenset(
         {other_root, _SHARED_DEP}
