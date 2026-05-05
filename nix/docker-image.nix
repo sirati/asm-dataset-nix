@@ -161,6 +161,16 @@ let
     experimental-features = nix-command flakes
     sandbox = false
     build-users-group =
+    # max-jobs: how many derivations the daemon will build in parallel.
+    # Defaults to 1 — without this, every concurrent ``nix build`` from
+    # the worker pool queues serially at the daemon, wasting the worker
+    # concurrency the framework set up. ``auto`` = match the container's
+    # CPU count (cgroup-aware in modern nix). cores = 0 keeps each
+    # individual build using all visible cores for its own ``make -jN``,
+    # which interacts fine with max-jobs > 1 because builds with heavy
+    # parallelism alternate I/O and compute phases.
+    max-jobs = auto
+    cores = 0
     substituters = https://cache.nixos.org
     trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
     extra-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
@@ -287,6 +297,16 @@ pkgs.dockerTools.buildLayeredImage {
       "LANG=C.UTF-8"
       "PYTHONPATH=/app/python"
       "PATH=/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin"
+      # Force every ``nix`` client to talk to nix-daemon over the unix
+      # socket instead of opening /nix/var/nix/db/db.sqlite directly.
+      # In single-user mode (build-users-group =) running as root, nix
+      # otherwise defaults to direct-mode access; concurrent ``nix
+      # build`` invocations from the worker pool then race on the
+      # SQLite write lock and surface as
+      # ``error: SQLite database '/nix/var/nix/db/db.sqlite' is busy``.
+      # Daemon mode serializes all DB writes through the daemon's
+      # single connection, eliminating the contention.
+      "NIX_REMOTE=daemon"
       # cacert is in basePkgs but its bundle path needs to be exposed
       # explicitly for nix / curl / openssl to find it. Without these,
       # `nix build` over HTTPS fails to verify substituter TLS certs.

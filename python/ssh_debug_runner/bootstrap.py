@@ -54,7 +54,6 @@ RUNTIME = "/tmp/ssh-debug"
 BOOTSTRAP_LOG = f"{RUNTIME}/bootstrap.log"
 NIX_DAEMON_LOG = f"{RUNTIME}/nix-daemon.log"
 HARMONIA_LOG = f"{RUNTIME}/harmonia.log"
-NIX_DAEMON_SOCKET = "/nix/var/nix/daemon-socket/socket"
 
 # Default port for our own harmonia. Pinning it per-container is fine
 # because every SLURM container gets its own host network namespace
@@ -81,35 +80,6 @@ def _diag(msg: str) -> None:
             f.flush()
     except OSError:
         pass
-
-
-def start_nix_daemon() -> int | None:
-    """Start ``/bin/nix-daemon`` detached. No-op if socket already present.
-
-    Required by harmonia 3.0+ (which talks to the daemon over the
-    socket for store queries) and by any privileged nix operation
-    the user runs inside an ssh session.
-    """
-    if os.path.exists(NIX_DAEMON_SOCKET):
-        _diag(f"nix-daemon: socket {NIX_DAEMON_SOCKET} already present")
-        return None
-    Path(NIX_DAEMON_LOG).parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen(
-        ["/bin/nix-daemon"],
-        stdout=open(NIX_DAEMON_LOG, "ab"),
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
-    # Wait up to ~5s for the daemon to create its socket.
-    for _ in range(20):
-        if os.path.exists(NIX_DAEMON_SOCKET):
-            _diag(f"nix-daemon: PID={proc.pid} socket ready")
-            return proc.pid
-        time.sleep(0.25)
-    _diag(f"nix-daemon: PID={proc.pid} but socket not ready within 5s")
-    return proc.pid
 
 
 def start_harmonia(port: int, signing_key_path: Path) -> int | None:
@@ -242,7 +212,16 @@ def bootstrap(
         "nix_conf_watcher": None,
     }
 
-    state["nix_daemon_pid"] = start_nix_daemon()
+    # Delegate to compiler_suit_runner.peer_cache.start_nix_daemon so the
+    # debug image inherits the synchronous ``nix-store --init`` race fix
+    # for the SQLite schema (see peer_cache.py docstring).
+    try:
+        from compiler_suit_runner.peer_cache import (
+            start_nix_daemon as _start_nix_daemon,
+        )
+        state["nix_daemon_pid"] = _start_nix_daemon(Path(NIX_DAEMON_LOG))
+    except Exception as exc:  # noqa: BLE001
+        _diag(f"start_nix_daemon failed: {exc}")
 
     shared = Path(LOG_NETWORK_DIR)
     standalone = not shared.is_dir()
