@@ -474,6 +474,13 @@ def _config_from_args(
     peers/) are derived from ``--shared-fs``.
     """
     shared = pathlib.Path(args.shared_fs)
+    # ``dataset_dir`` defaults to a subdir of shared_fs (the dispatcher
+    # case where shared_fs IS the run-wide scratch + output root).
+    # In the secondary-container case the synthesized namespace
+    # overrides this with the framework's actual ``--output`` mount
+    # (``/app/out-network``) so finished tarballs don't end up wedged
+    # under the per-run log dir.
+    dataset_dir = pathlib.Path(getattr(args, "dataset_dir", None) or shared / "dataset")
     return SuitTaskConfig(
         flake_ref=args.flake,
         sys_name=args.sys_name,
@@ -481,7 +488,7 @@ def _config_from_args(
         manifest_dir=shared / "manifests",
         raw_partition_dir=shared / "partition" / "raw",
         partition_dir=shared / "partition",
-        dataset_dir=shared / "dataset",
+        dataset_dir=dataset_dir,
         peers_dir=shared / "peers",
         run_id=run_id,
         secondary_id=secondary_id,
@@ -1228,7 +1235,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             debug="--debug" in raw,
             command="secondary",
             flake=".",
+            # log-network = per-run scratch (manifests, partition,
+            # peers) bind-mounted into every secondary container.
             shared_fs=pathlib.Path("/app/log-network"),
+            # out-network = the framework's actual --output mount,
+            # i.e. the gateway-shared output folder. The ``dataset``
+            # subdir keeps our ``.tar.zst`` outputs separate from
+            # other consumers (e.g. asm-tokenizer) of the same
+            # shared output dir on the gateway.
+            dataset_dir=pathlib.Path("/app/out-network/dataset"),
             run_id=None,
             sys_name="x86_64-linux",
             packages=None,
