@@ -715,10 +715,40 @@ def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
     The image's ``nix.conf`` runs in single-user mode
     (``build-users-group =``) so the daemon doesn't need nixbld* users.
 
+    Pre-initializes ``/nix/var/nix/db/schema`` synchronously before
+    spawning the daemon. dockerTools.buildLayeredImage does not bake
+    the store DB into the image, so the first nix invocation in a
+    fresh container has to create ``schema``, ``db.sqlite`` and
+    ``temproots/``. With multiple workers in the same container all
+    invoking ``nix build`` concurrently they race the create-empty-
+    then-write-content sequence and one of them sees a half-written
+    schema file, aborting with ``error: "/nix/var/nix/db/schema" is
+    corrupt``. ``nix-store --init`` is idempotent and forces the
+    init synchronously in this single process before any other
+    nix invocation can race it.
+
     Returns the PID, or None if the daemon was already running.
     """
     if os.path.exists(NIX_DAEMON_SOCKET):
         return None
+    # Synchronously initialize the local store DB so concurrent
+    # workers (and harmonia, which is started right after this
+    # function returns) see a fully-formed schema. Best-effort —
+    # if nix-store is missing or the call fails we let the daemon
+    # retry the init itself, preserving the existing behaviour.
+    nix_store = shutil.which("nix-store") or "/bin/nix-store"
+    if os.path.exists(nix_store):
+        try:
+            subprocess.run(  # noqa: S603 - argv constructed in-module
+                [nix_store, "--init"],
+                check=False,
+                capture_output=True,
+                shell=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            # fall through to daemon spawn; daemon will retry init
+            pass
     binary = shutil.which("nix-daemon") or "/bin/nix-daemon"
     if not os.path.exists(binary):
         raise FileNotFoundError("nix-daemon not found on PATH or /bin")
