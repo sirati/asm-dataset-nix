@@ -117,25 +117,42 @@ def _show_drv_recursive(
     Equivalent to the worker's :func:`show_drv_recursive` but
     parametrised on ``runner`` directly rather than a ``WorkerEnv``.
     """
-    cmd = [*_NIX_BASE_CMD, drv]
+    return _show_drvs_recursive_batch([drv], runner)
+
+
+def _show_drvs_recursive_batch(
+    drvs: list[str], runner: RunSubprocess
+) -> dict[str, Any]:
+    """Run a single ``nix derivation show --recursive a b c …`` over many
+    drvs and return the merged JSON.
+
+    nix walks the union of all subgraphs and emits one combined object,
+    so this is far cheaper than N separate subprocess invocations.
+    Fork + json-parse overhead drops from O(num_variants) to O(1) per
+    chunk; the per-drv graph is content-addressed inside nix so shared
+    nodes are visited only once on the C++ side too.
+    """
+    if not drvs:
+        return {}
+    cmd = [*_NIX_BASE_CMD, *drvs]
     stdout, stderr, returncode = runner(cmd)
     if returncode != 0:
         raise RuntimeError(
-            f"nix derivation show --recursive {drv!r} exited"
-            f" {returncode}: "
+            f"nix derivation show --recursive (batch of {len(drvs)} drvs)"
+            f" exited {returncode}: "
             f"{stderr.decode('utf-8', errors='replace').strip()}"
         )
     try:
         parsed = json.loads(stdout.decode("utf-8"))
     except json.JSONDecodeError as exc:
         raise RuntimeError(
-            f"nix derivation show --recursive {drv!r} produced invalid"
-            f" JSON: {exc}"
+            f"nix derivation show --recursive (batch of {len(drvs)} drvs)"
+            f" produced invalid JSON: {exc}"
         ) from exc
     if not isinstance(parsed, dict):
         raise RuntimeError(
-            f"nix derivation show --recursive {drv!r} did not return a"
-            " JSON object"
+            f"nix derivation show --recursive (batch of {len(drvs)} drvs)"
+            " did not return a JSON object"
         )
     return parsed
 
@@ -270,10 +287,23 @@ def compute_partition_locally(
     """
     runner = run_subprocess or _default_run_subprocess
 
-    # Cumulative ``nix derivation show --recursive`` cache. Each call
-    # returns the variant's full transitive sub-graph; identical nodes
-    # across variants are idempotent (nix is content-addressed).
+    # Cumulative graph cache. Populated up-front via batched
+    # ``nix derivation show --recursive`` calls — N subprocess
+    # invocations instead of one-per-variant. With 4000+ variants
+    # that drops preflight from ~3h sequential down to a couple of
+    # minutes (most of the work is shared subgraphs that nix walks
+    # once even when many variants are passed in the same batch).
     graph_cache: dict[str, Any] = {}
+
+    # Cap ARG_MAX exposure: 1000 drvs × ~100 chars/drv = ~100 KB
+    # of argv, well under the typical 2 MB Linux limit. Larger
+    # batches mean fewer subprocess spawns but bigger JSON outputs;
+    # 1000 keeps each chunk's stdout under ~50 MB on our matrix.
+    _BATCH_SIZE = 1000
+    unique_drvs = sorted({v["drv"] for v in variants})
+    for i in range(0, len(unique_drvs), _BATCH_SIZE):
+        chunk = unique_drvs[i : i + _BATCH_SIZE]
+        graph_cache.update(_show_drvs_recursive_batch(chunk, runner))
 
     per_variant: dict[str, frozenset[str]] = {}
     refcounts: dict[str, int] = {}
@@ -281,10 +311,6 @@ def compute_partition_locally(
     for variant in variants:
         drv = variant["drv"]
         label = variant["label"]
-        if drv not in graph_cache:
-            sub_graph = _show_drv_recursive(drv, runner)
-            graph_cache.update(sub_graph)
-
         inputs = _extract_input_drvs(graph_cache, drv)
         per_variant[label] = inputs
         for input_drv in inputs:
