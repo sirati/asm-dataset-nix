@@ -66,6 +66,13 @@ VALID_ITEM_CLASSES: frozenset[str] = frozenset(
 # failure without blowing it up.
 _LOG_EXCERPT_BYTE_LIMIT = 8 * 1024
 
+# Retry policy for transient ``SQLite database is busy`` aborts during
+# concurrent ``nix build`` operations. Total worst-case extra wait =
+# 0.5 + 1.0 + 1.5 + 2.0 + 2.5 = 7.5 s, which is short relative to a
+# real build but long enough for typical contention windows to clear.
+_SQLITE_BUSY_MAX_RETRIES = 6
+_SQLITE_BUSY_BACKOFF_SECONDS = 0.5
+
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -252,8 +259,24 @@ def build_attr(
     else:
         argv.append(f"{env.flake_ref}#{attr}")
 
-    stdout, stderr, rc = runner(argv)
-    return rc == 0, stdout, stderr
+    # Retry on transient SQLite-busy errors. Multiple concurrent
+    # workers in the same secondary container all hit the same
+    # local nix store; nix's SQLite busy timeout is too short for
+    # bursty dispatch on Krater (~10 secondaries × many workers
+    # each), so a fresh build that just needs to register a new
+    # output gets racey ``SQLite database is busy`` aborts. The
+    # contention window is short — back off briefly and retry.
+    for attempt in range(_SQLITE_BUSY_MAX_RETRIES):
+        stdout, stderr, rc = runner(argv)
+        if rc == 0:
+            return True, stdout, stderr
+        if b"is busy" not in stderr and b"SQLite" not in stderr:
+            return False, stdout, stderr
+        # Last attempt — give up and return the error to the caller.
+        if attempt == _SQLITE_BUSY_MAX_RETRIES - 1:
+            return False, stdout, stderr
+        time.sleep(_SQLITE_BUSY_BACKOFF_SECONDS * (1 + attempt))
+    return False, stdout, stderr
 
 
 # ---------------------------------------------------------------------------
