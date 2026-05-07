@@ -149,12 +149,12 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--variant-sample",
         type=int,
-        default=0,
+        default=2,
         metavar="N",
         help=(
             "Down-sample the variant matrix: keep only N random "
             "(flag, hardening) combinations per (compiler, arch, opt) "
-            "group. 0 (default) = no sampling, full matrix. Sample is "
+            "group. 0 = no sampling, full matrix. Default: 2. Sample is "
             "deterministic given --variant-seed; change the seed to "
             "draw a different subset on a follow-up run (skip-existing "
             "then unions the two)."
@@ -583,7 +583,7 @@ def _restore_manifests_from_archive(
         VariantSpec(
             label=v["label"],
             drv=v["drv"],
-            tarball_name=v["tarball_name"],
+            variant_dir=v["variant_dir"],
             compiler_id=v["compiler_id"],
             tier=int(v["tier"]),
             pkg=v["pkg"],
@@ -1245,12 +1245,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # log-network = per-run scratch (manifests, partition,
             # peers) bind-mounted into every secondary container.
             shared_fs=pathlib.Path("/app/log-network"),
-            # out-network = the framework's actual --output mount,
-            # i.e. the gateway-shared output folder. The ``dataset``
-            # subdir keeps our ``.tar.zst`` outputs separate from
-            # other consumers (e.g. asm-tokenizer) of the same
+            # out-tmp = the framework's per-task staging root.
+            # Workers write tarballs/sidecars here, then call
+            # ``task.publish_all`` to atomically deliver them to the
+            # gateway-shared output mount (``/app/out-network``). The
+            # ``dataset`` subdir keeps our ``.tar.zst`` outputs separate
+            # from other consumers (e.g. asm-tokenizer) of the same
             # shared output dir on the gateway.
-            dataset_dir=pathlib.Path("/app/out-network/dataset"),
+            dataset_dir=pathlib.Path("/app/out-tmp/dataset"),
             run_id=None,
             sys_name="x86_64-linux",
             packages=None,
