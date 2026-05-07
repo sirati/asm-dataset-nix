@@ -218,6 +218,17 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--slurm-cpus-per-task",
+        type=int,
+        default=None,
+        help=(
+            "Per-secondary SLURM cpus-per-task (sbatch --cpus-per-task). "
+            "Pass-through to the framework; defaults to the framework's "
+            "SlurmConfig.cpus_per_task value (14) when unset. Must not "
+            "exceed the cluster's per-node CPU count."
+        ),
+    )
+    parser.add_argument(
         "--ssh-identity-file",
         default=None,
         help=(
