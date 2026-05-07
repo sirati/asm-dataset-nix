@@ -39,7 +39,7 @@ def _variant(
     return {
         "label": label,
         "drv": f"/nix/store/{label}.drv",
-        "tarball_name": f"{label}.tar.zst",
+        "variant_dir": label,
         "compiler_id": compiler_id,
         "tier": tier,
         "pkg": pkg,
@@ -331,7 +331,7 @@ def test_partition_json_roundtrip(tmp_path: pathlib.Path):
         assert set(variant_blob) == {
             "label",
             "drv",
-            "tarball_name",
+            "variant_dir",
             "compiler_id",
             "tier",
         }
@@ -347,7 +347,7 @@ def test_partition_json_roundtrip(tmp_path: pathlib.Path):
         for field in (
             "label",
             "drv",
-            "tarball_name",
+            "variant_dir",
             "compiler_id",
             "tier",
         ):
@@ -403,7 +403,7 @@ def test_read_partition_json_rejects_bad_variant(tmp_path: pathlib.Path):
                     {
                         "label": "hello",
                         "drv": "/nix/store/x.drv",
-                        "tarball_name": "hello.tar.zst",
+                        "variant_dir": "hello",
                         "compiler_id": "gcc15",
                         # tier missing
                     }

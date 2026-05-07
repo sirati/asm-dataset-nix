@@ -110,7 +110,7 @@ def _variant(
     return {
         "label": label,
         "drv": f"/nix/store/{label}.drv",
-        "tarball_name": f"{label}.tar.zst",
+        "variant_dir": label,
         "metadata_name": f"{label}.json",
         "compiler_id": compiler_id,
         "compiler_family": "gcc",

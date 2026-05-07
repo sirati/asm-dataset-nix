@@ -39,7 +39,7 @@ def _variant(
     return {
         "label": label,
         "drv": f"/nix/store/{label}.drv",
-        "tarball_name": f"{label}.tar.zst",
+        "variant_dir": label,
         "metadata_name": f"{label}.json",
         "compiler_id": compiler_id,
         "compiler_family": "gcc",
@@ -138,7 +138,7 @@ def test_variant_header_payload():
     assert h.payload["arch"] == "x86_64"
     assert h.payload["label"] == v["label"]
     assert h.payload["drv"] == v["drv"]
-    assert h.payload["tarball_name"] == v["tarball_name"]
+    assert h.payload["variant_dir"] == v["variant_dir"]
     assert h.payload["compiler_id"] == v["compiler_id"]
     assert h.payload["tier"] == 1
     assert h.payload["attr"] == (

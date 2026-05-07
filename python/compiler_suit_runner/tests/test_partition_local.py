@@ -76,7 +76,7 @@ def _variant(label: str, drv: str, *, pkg: str = "hello", arch: str = "x86_64") 
     return {
         "label": label,
         "drv": drv,
-        "tarball_name": f"{label}.tar.zst",
+        "variant_dir": label,
         "compiler_id": "gcc15",
         "tier": 1,
         "pkg": pkg,
