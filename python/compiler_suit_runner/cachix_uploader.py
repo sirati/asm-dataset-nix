@@ -1,8 +1,8 @@
 """Cachix federation uploader.
 
 Watches the local nix store for newly-added paths and pushes them to a
-Cachix cache. Variant tarballs (``*.tar.zst`` produced by
-``mkBinaryTarball``) are filtered out — they ARE the dataset and must
+Cachix cache. Variant elf-folder outputs (``*-elf-folder`` produced by
+``mkBinaryFolder``) are filtered out — they ARE the dataset and must
 not leak into the public binary cache.
 
 The uploader is a daemon thread; on each tick it diffs the current
@@ -49,14 +49,14 @@ ListNewPaths = Callable[[set[str]], tuple[set[str], set[str]]]
 def is_pushable(store_path: "str | pathlib.Path") -> bool:
     """Return True iff ``store_path`` should be pushed to the public cache.
 
-    Reject paths whose basename ends with ``.tar.zst`` (these are the
-    ``mkBinaryTarball`` variant outputs — the dataset itself).
+    Reject paths whose basename ends with ``-elf-folder`` (these are the
+    ``mkBinaryFolder`` variant outputs — the dataset itself).
 
     Reject paths whose basename does not match the standard nix store
     convention (32 lowercase hex/base32 chars + ``-`` + name).
     """
     name = pathlib.Path(store_path).name
-    if name.endswith(".tar.zst"):
+    if name.endswith("-elf-folder"):
         return False
     if not _STORE_NAME_RE.match(name):
         return False

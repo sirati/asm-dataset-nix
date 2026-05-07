@@ -81,7 +81,18 @@ _SQLITE_BUSY_BACKOFF_SECONDS = 0.5
 
 @dataclasses.dataclass
 class BuildWorkerResult:
-    """Outcome of a single :func:`build_worker` call."""
+    """Outcome of a single :func:`build_worker` call.
+
+    ``staged_outputs`` lists every file the worker wrote into the
+    staging root (``BuildWorkerEnv.dataset_output_dir`` — by default
+    ``/app/out-tmp/dataset``). The dynamic_runner subprocess wrapper
+    in :func:`main` hands these to ``task.publish_all()`` so the
+    framework atomically delivers them to the destination NFS root
+    (``/app/out-network/dataset``). For phase-2 builds the tuple is
+    empty: nix's substituter path moves toolchain / common-dep store
+    paths between secondaries, so phase-2 has no per-secondary
+    artifact to publish.
+    """
 
     item_class: str
     name: str
@@ -90,11 +101,22 @@ class BuildWorkerResult:
     nix_log_excerpt: Optional[str] = None
     error: Optional[str] = None
     output_path: Optional[pathlib.Path] = None
+    staged_outputs: tuple[pathlib.Path, ...] = ()
 
 
 @dataclasses.dataclass
 class BuildWorkerEnv:
-    """Process-wide configuration / dependencies for the build worker."""
+    """Process-wide configuration / dependencies for the build worker.
+
+    ``dataset_output_dir`` is the **staging** root the worker writes
+    finished tarballs and sidecar JSON into. In production it points at
+    the framework's tmpfs staging mount (``/app/out-tmp/dataset``); the
+    runtime then hands the staged paths to ``Task.publish_all()`` for
+    atomic stage→destination delivery onto the NFS output mount
+    (``/app/out-network/dataset``). Tests pass any local tmpdir; no
+    publish is invoked from :func:`build_worker` itself, so the worker
+    stays decoupled from the framework's runtime in unit tests.
+    """
 
     flake_ref: str
     dataset_output_dir: pathlib.Path
@@ -285,40 +307,31 @@ def build_attr(
 
 
 # ---------------------------------------------------------------------------
-# Tarball copy (phase 3 only)
+# ELF folder deref-copy (phase 3 only)
 # ---------------------------------------------------------------------------
 
 
-def _find_tarball(out_path: pathlib.Path) -> pathlib.Path:
-    """Locate the ``.tar.zst`` under (or at) ``out_path``.
+def _find_elf_dir(out_path: pathlib.Path) -> pathlib.Path:
+    """Locate the ``elf/`` directory under ``out_path``.
 
     ``out_path`` is what ``nix build --print-out-paths`` printed as the
-    realised store path. ``mkBinaryTarball`` packages an ELF directory
-    into a directory containing a single ``*.tar.zst`` file, but we
-    tolerate the case where the realised path IS the tarball file
-    directly (legacy / single-file derivations).
+    realised store path. ``mkBinaryFolder`` produces a directory shaped
+    as ``$out/elf/<basename>`` (symlinks pointing into the variant's
+    store path) plus a top-level ``$out/meta.json``.
 
-    Raises :class:`FileNotFoundError` if no tarball can be located.
+    Raises :class:`FileNotFoundError` if ``out_path`` is not a directory
+    or the ``elf`` subdir is missing.
     """
-    if out_path.is_file() and out_path.name.endswith(".tar.zst"):
-        return out_path
-    if out_path.is_dir():
-        candidates = sorted(out_path.glob("*.tar.zst"))
-        if len(candidates) == 0:
-            raise FileNotFoundError(
-                f"no *.tar.zst found in build output directory {out_path}"
-            )
-        if len(candidates) > 1:
-            # Multiple tarballs shouldn't happen for the matrix outputs,
-            # but if it does we pick the lexicographically first and log
-            # nothing — the caller's manifest dictates the destination
-            # name, so ambiguity here only matters if the user changed
-            # mkBinaryTarball semantics.
-            pass
-        return candidates[0]
-    raise FileNotFoundError(
-        f"build output {out_path} is neither a *.tar.zst file nor a directory"
-    )
+    if not out_path.is_dir():
+        raise FileNotFoundError(
+            f"build output {out_path} is not a directory (expected mkBinaryFolder layout)"
+        )
+    elf_dir = out_path / "elf"
+    if not elf_dir.is_dir():
+        raise FileNotFoundError(
+            f"no 'elf/' subdir found under build output {out_path}"
+        )
+    return elf_dir
 
 
 def write_sidecar_metadata(
@@ -328,9 +341,8 @@ def write_sidecar_metadata(
 ) -> pathlib.Path:
     """Write the variant's sidecar JSON (full param dump).
 
-    Same atomic pattern as :func:`copy_tarball` (``.tmp`` + replace).
-    The file mirrors the tarball's name with ``.json`` extension —
-    pairs them on disk for easy lookup.
+    Atomic pattern: ``.tmp`` + ``os.replace``. The file lives next to
+    the variant's ELF subdir as ``<dest_dir>/<variant_dir>.json``.
     """
     dest_dir = pathlib.Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -352,44 +364,57 @@ def write_sidecar_metadata(
     return final
 
 
-def copy_tarball(
+def copy_elf_folder(
     out_path: pathlib.Path,
     dest_dir: pathlib.Path,
-    tarball_name: str,
-) -> pathlib.Path:
-    """Copy the variant's ``.tar.zst`` from the nix store into the dataset dir.
+    variant_dir: str,
+) -> list[pathlib.Path]:
+    """Deref-copy each ELF symlink from the variant's elf-folder into staging.
 
-    ``out_path`` is the realised ``nix build`` output (a directory
-    containing one ``*.tar.zst``, or the tarball file itself).
-    ``dest_dir`` is the run-wide shared dataset directory.
-    ``tarball_name`` is the canonical short name
-    (``<compiler>_<arch>_<opt>_<hash>.tar.zst``); the sibling JSON
-    sidecar is written separately by :func:`write_sidecar_metadata`.
+    ``out_path`` is the realised ``nix build`` output of an
+    ``mkBinaryFolder`` derivation (``$out/elf/<basename>`` symlinks +
+    ``$out/meta.json``). ``dest_dir`` is the run-wide staging root
+    (``BuildWorkerEnv.dataset_output_dir``, e.g.
+    ``/app/out-tmp/dataset/<pkg>``). ``variant_dir`` is the
+    per-variant subdirectory name carried in the manifest payload.
 
-    The copy is atomic from a reader's perspective: we copy to
-    ``dest_dir/<tarball_name>.tmp`` first and ``os.replace`` into place.
-    Metadata (mtime) is preserved via :func:`shutil.copy2`.
+    Each ELF lands at ``dest_dir/<variant_dir>/<basename>`` with the
+    actual bytes (``shutil.copy2(follow_symlinks=True)``), atomically
+    placed via ``.tmp`` + ``os.replace``. The framework's
+    ``task.publish_all`` then mirrors these staged files onto the
+    destination NFS root.
 
-    Raises :class:`FileNotFoundError` when no tarball can be found under
-    ``out_path``.
+    Returns the list of staged destination paths in deterministic
+    (sorted-basename) order. Raises :class:`FileNotFoundError` when
+    no ``elf/`` subdir is present under ``out_path``.
     """
     out_path = pathlib.Path(out_path)
     dest_dir = pathlib.Path(dest_dir)
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    elf_dir = _find_elf_dir(out_path)
 
-    src = _find_tarball(out_path)
+    variant_subdir = dest_dir / variant_dir
+    variant_subdir.mkdir(parents=True, exist_ok=True)
 
-    final_dest = dest_dir / tarball_name
-    tmp_dest = dest_dir / (tarball_name + ".tmp")
-    # In case a previous interrupted run left a stale tmp file behind.
-    if tmp_dest.exists():
-        try:
-            tmp_dest.unlink()
-        except OSError:
-            pass
-    shutil.copy2(src, tmp_dest)
-    os.replace(tmp_dest, final_dest)
-    return final_dest
+    staged: list[pathlib.Path] = []
+    for src in sorted(elf_dir.iterdir()):
+        if not src.is_file() and not src.is_symlink():
+            continue
+        basename = src.name
+        final_dest = variant_subdir / basename
+        tmp_dest = variant_subdir / (basename + ".tmp")
+        if tmp_dest.exists():
+            try:
+                tmp_dest.unlink()
+            except OSError:
+                pass
+        # follow_symlinks=True is the default for copy2, but stating it
+        # explicitly here documents the intent: we want the ELF bytes
+        # in staging, not a symlink into /nix/store (which the framework
+        # cannot follow on the destination side).
+        shutil.copy2(src, tmp_dest, follow_symlinks=True)
+        os.replace(tmp_dest, final_dest)
+        staged.append(final_dest)
+    return staged
 
 
 # ---------------------------------------------------------------------------
@@ -586,20 +611,20 @@ def build_worker(
                 error="nix build succeeded but produced no out-path on stdout",
             )
         out_store = pathlib.Path(last)
-        tarball_name = payload.get("tarball_name")
-        if not isinstance(tarball_name, str) or not tarball_name:
+        variant_dir = payload.get("variant_dir")
+        if not isinstance(variant_dir, str) or not variant_dir:
             return BuildWorkerResult(
                 item_class=item_class,
                 name=name,
                 success=False,
                 duration_seconds=max(0.0, clock() - start),
-                error="phase3_variant manifest missing 'payload.tarball_name'",
+                error="phase3_variant manifest missing 'payload.variant_dir'",
             )
-        # Group tarballs by package: ``dataset/<pkg>/<tarball_name>``
+        # Group variants by package: ``dataset/<pkg>/<variant_dir>/<elf>``
         # so an operator can ``ls dataset/hello/`` to see every variant
-        # of one package. Filename intentionally doesn't repeat the pkg
-        # — the directory carries that, the file carries the matrix
-        # axes (compiler, arch, opt, hash).
+        # of one package. Subdir name doesn't repeat the pkg — the
+        # parent dir carries that, the subdir carries the matrix axes
+        # (compiler, arch, opt, hash).
         pkg = payload.get("pkg")
         per_pkg_dir = (
             env.dataset_output_dir / pkg
@@ -607,8 +632,8 @@ def build_worker(
             else env.dataset_output_dir
         )
         try:
-            output_path = copy_tarball(
-                out_store, per_pkg_dir, tarball_name
+            elf_paths = copy_elf_folder(
+                out_store, per_pkg_dir, variant_dir
             )
         except Exception as exc:  # noqa: BLE001 - never raise out
             return BuildWorkerResult(
@@ -617,11 +642,16 @@ def build_worker(
                 success=False,
                 duration_seconds=max(0.0, clock() - start),
                 nix_log_excerpt=_excerpt_log(stderr, env.log_excerpt_lines),
-                error=f"tarball copy failed: {exc}",
+                error=f"elf folder copy failed: {exc}",
             )
-        # Sidecar JSON: full param dump next to the tarball. Filename
-        # ``<tarball-stem>.json`` so the pair is trivial to look up.
-        # Skipped silently if the manifest didn't carry a metadata_name
+        # ``output_path`` historically pointed at the single tarball file;
+        # under the elf-folder layout the equivalent is the per-variant
+        # subdirectory we just populated.
+        output_path = per_pkg_dir / variant_dir
+        staged: list[pathlib.Path] = list(elf_paths)
+        # Sidecar JSON: full param dump next to the variant subdir.
+        # Filename ``<variant_dir>.json`` so the pair is trivial to look
+        # up. Skipped silently if the manifest didn't carry a metadata_name
         # — older manifests in cached pre-flight dirs won't have it.
         metadata_name = payload.get("metadata_name")
         if isinstance(metadata_name, str) and metadata_name:
@@ -638,14 +668,24 @@ def build_worker(
                 "sanitizer": payload.get("sanitizer"),
                 "march": payload.get("march"),
                 "drv": payload.get("drv"),
-                "tarball_name": tarball_name,
+                "variant_dir": variant_dir,
             }
             try:
-                write_sidecar_metadata(
+                sidecar_path = write_sidecar_metadata(
                     per_pkg_dir, metadata_name, sidecar
                 )
+                staged.append(sidecar_path)
             except Exception:  # noqa: BLE001 - sidecar is best-effort
                 pass
+
+        return BuildWorkerResult(
+            item_class=item_class,
+            name=name,
+            success=True,
+            duration_seconds=max(0.0, clock() - start),
+            output_path=output_path,
+            staged_outputs=tuple(staged),
+        )
 
     return BuildWorkerResult(
         item_class=item_class,
@@ -660,52 +700,42 @@ def build_worker(
 # Subprocess entry point
 #
 # Spawned by the dynamic_runner framework as
-# ``python -m compiler_suit_runner.workers.build_worker``. Reads one
-# manifest path per line from stdin and dispatches each through
-# :func:`build_worker`. Phase-2 toolchains, phase-2 common deps, and
-# phase-3 variants all share this entry point — the per-manifest
-# ``item_class`` field decides the routing inside :func:`build_worker`.
-#
-# TODO(phase 8 follow-up): wire to ``dynamic_runner.comm`` once the
-# comm shape for TaskInfo dispatch is stabilised.
+# ``python -m compiler_suit_runner.workers.build_worker``. The per-task
+# wire driving (Ready handshake, command framing, exception → wire
+# mapping, SIGTERM → SystemExit) is owned by ``dynamic_runner.worker.run``;
+# this module only supplies the per-task body.
 
 
 def main() -> int:
     """Subprocess entry point for the build worker.
 
-    Drives the framework's worker protocol via the comm fd
-    (``--dynamic_queue`` / ``--socket-path``), routing each manager-
-    supplied relative path through :func:`build_worker`. See
-    :mod:`compiler_suit_runner.workers._runner_protocol` for the
-    line-based protocol details.
+    Builds a :class:`BuildWorkerEnv` from CLI flags, hands a
+    :func:`_handle` closure to :func:`dynamic_runner.worker.run`, and
+    lets the framework runtime own the comm channel. Build failures
+    are surfaced to the manager as ``error:non_recoverable:`` lines via
+    :class:`NonRecoverableError`.
     """
     import argparse
-    import logging
 
-    from ._runner_protocol import (
-        DispatchResult,
-        connect_comm,
-        run_protocol_loop,
+    from dynamic_runner.worker import (
+        NonRecoverableError,
+        PublishError,
+        Task,
+        WorkerOutput,
+        run,
     )
 
     parser = argparse.ArgumentParser(
         prog="compiler_suit_runner.workers.build_worker",
     )
-    parser.add_argument("--dynamic_queue", type=int, default=None)
-    parser.add_argument("--socket-path", type=str, default=None)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--dynamic_queue", type=int)
+    group.add_argument("--socket-path", type=str)
     parser.add_argument("--source", type=str, default=None)
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--log-file", type=str, default=None)
-    parser.add_argument(
-        "--flake-ref",
-        type=str,
-        required=True,
-    )
-    parser.add_argument(
-        "--dataset-output-dir",
-        type=str,
-        required=True,
-    )
+    parser.add_argument("--flake-ref", type=str, required=True)
+    parser.add_argument("--dataset-output-dir", type=str, required=True)
     parser.add_argument(
         "--substituters-file",
         type=str,
@@ -718,8 +748,6 @@ def main() -> int:
     parser.add_argument("--skip-existing", action="store_true")
     args, _ = parser.parse_known_args()
 
-    log = logging.getLogger("compiler_suit_runner.workers.build_worker")
-
     env = BuildWorkerEnv(
         flake_ref=args.flake_ref,
         dataset_output_dir=pathlib.Path(args.dataset_output_dir),
@@ -730,36 +758,35 @@ def main() -> int:
         ),
     )
 
-    sock = connect_comm(
-        dynamic_queue=args.dynamic_queue,
-        socket_path=args.socket_path,
-        log=log,
-    )
-    if sock is None:
-        log.warning("no comm channel supplied; worker exiting (test mode)")
-        return 0
-
-    def dispatch(
-        manifest_path: pathlib.Path,
-        payload: Optional[object] = None,
-    ) -> DispatchResult:
-        manifest_data = payload if isinstance(payload, dict) else None
-        result = build_worker(
-            manifest_path, env, manifest_data=manifest_data
+    def handle(task: Task) -> Optional[WorkerOutput]:
+        manifest_data = task.payload if isinstance(task.payload, dict) else None
+        manifest_path = (
+            pathlib.Path(task.relative_path)
+            if task.relative_path
+            else pathlib.Path("<inline>")
         )
-        if result.success:
-            return DispatchResult.ok()
-        return DispatchResult.error(result.error or "build failed")
+        result = build_worker(manifest_path, env, manifest_data=manifest_data)
+        if not result.success:
+            raise NonRecoverableError(result.error or "build failed")
+        # Atomic stage→destination publish via the framework: the
+        # worker wrote into ``DYNRUNNER_PUBLISH_SRC_ROOT`` (tmpfs);
+        # ``task.publish_all`` mirrors each staged path under
+        # ``DYNRUNNER_PUBLISH_DST_ROOT`` (NFS) with a single rename
+        # at the destination. Phase-2 builds have nothing staged
+        # (toolchains/common-deps fan out via harmonia substitution,
+        # not file delivery) so the call is a no-op for those.
+        if result.staged_outputs:
+            try:
+                task.publish_all(*result.staged_outputs)
+            except PublishError as exc:
+                raise NonRecoverableError(
+                    f"publish failed: {exc}"
+                ) from exc
+        return WorkerOutput()
 
-    return run_protocol_loop(
-        sock=sock,
-        source=args.source,
-        dispatch=dispatch,
-        log=log,
-    )
+    run(handle, args=args)
+    return 0
 
 
 if __name__ == "__main__":
-    import sys
-
     sys.exit(main())
