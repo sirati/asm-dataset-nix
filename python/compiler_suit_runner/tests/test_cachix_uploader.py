@@ -84,8 +84,8 @@ def test_is_pushable_accepts_normal_store_path():
     assert cu.is_pushable("/nix/store/abcdefghijklmnopqrstuvwxyz012345-hello-2.12")
 
 
-def test_is_pushable_rejects_tar_zst_variant_tarball():
-    path = "/nix/store/abcdefghijklmnopqrstuvwxyz012345-hello-x86_64-O2.tar.zst"
+def test_is_pushable_rejects_elf_folder_variant():
+    path = "/nix/store/abcdefghijklmnopqrstuvwxyz012345-hello-x86_64-O2-elf-folder"
     assert not cu.is_pushable(path)
 
 
@@ -100,9 +100,9 @@ def test_is_pushable_accepts_pathlib_input():
     assert cu.is_pushable(p)
 
 
-def test_is_pushable_rejects_pathlib_tar_zst():
+def test_is_pushable_rejects_pathlib_elf_folder():
     p = pathlib.Path(
-        "/nix/store/abcdefghijklmnopqrstuvwxyz012345-variant-O0.tar.zst"
+        "/nix/store/abcdefghijklmnopqrstuvwxyz012345-variant-O0-elf-folder"
     )
     assert not cu.is_pushable(p)
 
@@ -306,8 +306,8 @@ def test_push_one_429_exhausts_retries(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_uploader_filters_tarballs_and_pushes_only_pushable(tmp_path):
-    """One tick discovers two paths: one pushable, one tarball.
+def test_uploader_filters_elf_folders_and_pushes_only_pushable(tmp_path):
+    """One tick discovers two paths: one pushable, one elf-folder variant.
 
     Drives ``run()`` directly (no thread) by setting the stop event after
     the first iteration via the injected clock.
@@ -316,7 +316,7 @@ def test_uploader_filters_tarballs_and_pushes_only_pushable(tmp_path):
     cfg = _make_config(token, poll_interval_seconds=30.0)
 
     pushable = "/nix/store/abcdefghijklmnopqrstuvwxyz012345-gcc-cross"
-    tarball = "/nix/store/00000000000000000000000000000000-variant-O0.tar.zst"
+    elf_folder = "/nix/store/00000000000000000000000000000000-variant-O0-elf-folder"
 
     # The list_new_paths injection: first call returns the two paths,
     # second call (if reached) returns nothing new.
@@ -325,7 +325,7 @@ def test_uploader_filters_tarballs_and_pushes_only_pushable(tmp_path):
     def fake_list_new_paths(seen):
         call_counter["n"] += 1
         if call_counter["n"] == 1:
-            current = {pushable, tarball}
+            current = {pushable, elf_folder}
             return current, current - seen
         return seen, set()
 
@@ -354,7 +354,7 @@ def test_uploader_filters_tarballs_and_pushes_only_pushable(tmp_path):
 
     uploader.run()  # drive directly, not via .start()
 
-    # Exactly one push: the pushable path. The tarball was filtered out.
+    # Exactly one push: the pushable path. The elf-folder was filtered out.
     assert len(runner.calls) == 1
     argv, _ = runner.calls[0]
     assert argv == ("cachix", "push", cfg.cache_name, pushable)
