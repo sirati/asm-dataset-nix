@@ -39,7 +39,7 @@ def _write_manifest(
             {
                 "label": "hello-x86_64-gcc15-O2",
                 "drv": "/nix/store/aaa-hello.drv",
-                "tarball_name": "hello-x86_64-gcc15-O2.tar.zst",
+                "variant_dir": "hello-x86_64-gcc15-O2",
                 "compiler_id": "gcc15",
                 "tier": 1,
             }
@@ -108,14 +108,14 @@ def test_parse_manifest_payload_happy(tmp_path: pathlib.Path) -> None:
             {
                 "label": "hello-aarch64-gcc15-O0",
                 "drv": "/nix/store/aaa.drv",
-                "tarball_name": "hello-aarch64-gcc15-O0.tar.zst",
+                "variant_dir": "hello-aarch64-gcc15-O0",
                 "compiler_id": "gcc15",
                 "tier": 1,
             },
             {
                 "label": "hello-aarch64-gcc15-O2",
                 "drv": "/nix/store/bbb.drv",
-                "tarball_name": "hello-aarch64-gcc15-O2.tar.zst",
+                "variant_dir": "hello-aarch64-gcc15-O2",
                 "compiler_id": "gcc15",
                 "tier": 1,
             },
@@ -363,21 +363,21 @@ def test_partition_worker_end_to_end(tmp_path: pathlib.Path) -> None:
             {
                 "label": "hello-aarch64-gcc15-O0",
                 "drv": "/nix/store/v1.drv",
-                "tarball_name": "hello-aarch64-gcc15-O0.tar.zst",
+                "variant_dir": "hello-aarch64-gcc15-O0",
                 "compiler_id": "gcc15",
                 "tier": 1,
             },
             {
                 "label": "hello-aarch64-gcc15-O2",
                 "drv": "/nix/store/v2.drv",
-                "tarball_name": "hello-aarch64-gcc15-O2.tar.zst",
+                "variant_dir": "hello-aarch64-gcc15-O2",
                 "compiler_id": "gcc15",
                 "tier": 1,
             },
             {
                 "label": "hello-aarch64-gcc15-O3",
                 "drv": "/nix/store/v3.drv",
-                "tarball_name": "hello-aarch64-gcc15-O3.tar.zst",
+                "variant_dir": "hello-aarch64-gcc15-O3",
                 "compiler_id": "gcc15",
                 "tier": 1,
             },
@@ -434,7 +434,7 @@ def test_partition_worker_failing_nix_call_records_error(
             {
                 "label": "hello-x86_64-gcc15-O0",
                 "drv": "/nix/store/v1.drv",
-                "tarball_name": "hello-x86_64-gcc15-O0.tar.zst",
+                "variant_dir": "hello-x86_64-gcc15-O0",
                 "compiler_id": "gcc15",
                 "tier": 1,
             }
@@ -498,7 +498,7 @@ def test_partition_worker_creates_output_dir(tmp_path: pathlib.Path) -> None:
             {
                 "label": "busybox-armv7l-gcc15-Os",
                 "drv": "/nix/store/v1.drv",
-                "tarball_name": "busybox-armv7l-gcc15-Os.tar.zst",
+                "variant_dir": "busybox-armv7l-gcc15-Os",
                 "compiler_id": "gcc15",
                 "tier": 1,
             }

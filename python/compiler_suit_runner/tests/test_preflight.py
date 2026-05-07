@@ -278,7 +278,7 @@ def test_enumerate_variants_full_matrix():
         assert v["arch"]
         assert v["compiler_id"] == "gcc15"
         assert v["drv"].startswith("/nix/store/")
-        assert v["tarball_name"].endswith(".tar.zst")
+        assert v["variant_dir"] and not v["variant_dir"].endswith(".tar.zst")
         assert isinstance(v["tier"], int)
 
     # toolchain_drvs covers all distinct drv paths.
@@ -572,7 +572,7 @@ def _make_variant(label: str) -> dict:
     return {
         "label": label,
         "drv": f"/nix/store/{label}.drv",
-        "tarball_name": f"{label}.tar.zst",
+        "variant_dir": label,
         "metadata_name": f"{label}.json",
         "compiler_id": "gcc15",
         "compiler_family": "gcc",

@@ -43,7 +43,7 @@ def _variant(
     return {
         "label": label,
         "drv": f"/nix/store/{label}.drv",
-        "tarball_name": f"{label}.tar.zst",
+        "variant_dir": label,
         "compiler_id": compiler_id,
         "tier": tier,
         "pkg": pkg,
