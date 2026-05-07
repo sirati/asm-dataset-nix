@@ -2,8 +2,9 @@
 
 A single worker entry point handles all three nix-build classes; the
 class is encoded in the manifest header's ``item_class``. For phase-3
-variants the worker additionally copies the resulting ``<label>.tar.zst``
-from the realised nix output into the shared dataset directory.
+variants the worker additionally deref-copies the ELF symlinks from the
+realised nix output's ``elf/`` subdir (mkBinaryFolder layout) into the
+shared dataset directory under ``<pkg>/<variant_dir>/<basename>``.
 
 Subprocess execution and the wall clock are dependency-injected so the
 test suite stays hermetic — no real ``nix build`` invocations and no
@@ -40,7 +41,7 @@ __all__ = [
     "ITEM_CLASS_PHASE3_VARIANT",
     "parse_build_manifest",
     "build_attr",
-    "copy_tarball",
+    "copy_elf_folder",
     "write_sidecar_metadata",
     "build_worker",
 ]

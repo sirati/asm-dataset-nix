@@ -21,7 +21,7 @@ from compiler_suit_runner.workers.build_worker import (
     BuildWorkerResult,
     build_attr,
     build_worker,
-    copy_tarball,
+    copy_elf_folder,
     parse_build_manifest,
 )
 
@@ -239,73 +239,99 @@ def test_build_attr_uses_custom_flake_ref(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# copy_tarball
+# copy_elf_folder
 # ---------------------------------------------------------------------------
 
 
-def test_copy_tarball_from_directory(tmp_path):
+def _make_elf_folder(out_dir: pathlib.Path, files: dict[str, bytes]) -> None:
+    """Build a fake mkBinaryFolder out_path: ``out_dir/elf/<name>`` files."""
+    elf_dir = out_dir / "elf"
+    elf_dir.mkdir(parents=True, exist_ok=True)
+    for name, data in files.items():
+        (elf_dir / name).write_bytes(data)
+
+
+def test_copy_elf_folder_basic(tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    src = out_dir / "build-output.tar.zst"
-    src.write_bytes(b"zstd-payload")
+    _make_elf_folder(out_dir, {"hello": b"elf-bytes-hello", "world": b"world"})
     dest_dir = tmp_path / "dataset"
-    name = "hello__x86_64__gcc15__O2.tar.zst"
-    final = copy_tarball(out_dir, dest_dir, name)
-    assert final == dest_dir / name
-    assert final.read_bytes() == b"zstd-payload"
+    variant_dir = "hello__x86_64__gcc15__O2"
+    staged = copy_elf_folder(out_dir, dest_dir, variant_dir)
+    expected_dir = dest_dir / variant_dir
+    assert sorted(p.name for p in staged) == ["hello", "world"]
+    assert (expected_dir / "hello").read_bytes() == b"elf-bytes-hello"
+    assert (expected_dir / "world").read_bytes() == b"world"
 
 
-def test_copy_tarball_from_file(tmp_path):
-    src = tmp_path / "single.tar.zst"
-    src.write_bytes(b"x")
-    dest_dir = tmp_path / "dataset"
-    name = "renamed.tar.zst"
-    final = copy_tarball(src, dest_dir, name)
-    assert final.read_bytes() == b"x"
-    assert (dest_dir / name).is_file()
-
-
-def test_copy_tarball_creates_dest_dir(tmp_path):
+def test_copy_elf_folder_creates_dest_dir(tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    (out_dir / "a.tar.zst").write_bytes(b"data")
+    _make_elf_folder(out_dir, {"x": b"data"})
     dest_dir = tmp_path / "deep" / "nested" / "dataset"
-    final = copy_tarball(out_dir, dest_dir, "x.tar.zst")
-    assert final.exists()
-    assert dest_dir.is_dir()
+    staged = copy_elf_folder(out_dir, dest_dir, "v")
+    assert staged
+    assert (dest_dir / "v" / "x").read_bytes() == b"data"
 
 
-def test_copy_tarball_no_tarball_raises(tmp_path):
+def test_copy_elf_folder_no_elf_dir_raises(tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    (out_dir / "not-a-tarball.txt").write_bytes(b"")
+    # No elf/ subdir created — only meta.json is present.
+    (out_dir / "meta.json").write_text("{}", encoding="utf-8")
     with pytest.raises(FileNotFoundError):
-        copy_tarball(out_dir, tmp_path / "dataset", "x.tar.zst")
+        copy_elf_folder(out_dir, tmp_path / "dataset", "v")
 
 
-def test_copy_tarball_overwrites_stale_tmp(tmp_path):
+def test_copy_elf_folder_out_path_not_a_dir_raises(tmp_path):
+    out_path = tmp_path / "not-a-dir"
+    out_path.write_bytes(b"")
+    with pytest.raises(FileNotFoundError):
+        copy_elf_folder(out_path, tmp_path / "dataset", "v")
+
+
+def test_copy_elf_folder_dereferences_symlinks(tmp_path):
+    """ELF entries are symlinks into /nix/store; we want the bytes copied."""
+    real_target = tmp_path / "real" / "binary"
+    real_target.parent.mkdir(parents=True)
+    real_target.write_bytes(b"real-elf-bytes")
+    out_dir = tmp_path / "out"
+    elf_dir = out_dir / "elf"
+    elf_dir.mkdir(parents=True)
+    (elf_dir / "binary").symlink_to(real_target)
+    dest_dir = tmp_path / "dataset"
+    staged = copy_elf_folder(out_dir, dest_dir, "v")
+    final = dest_dir / "v" / "binary"
+    assert final in staged
+    # Must be regular bytes, not a symlink — destination FS may not be able
+    # to resolve into /nix/store.
+    assert not final.is_symlink()
+    assert final.read_bytes() == b"real-elf-bytes"
+
+
+def test_copy_elf_folder_overwrites_stale_tmp(tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    (out_dir / "a.tar.zst").write_bytes(b"new")
-    dest_dir = tmp_path / "dataset"
-    dest_dir.mkdir()
+    _make_elf_folder(out_dir, {"x": b"new"})
+    dest_dir = tmp_path / "dataset" / "v"
+    dest_dir.mkdir(parents=True)
     # Simulate a leftover from a crashed prior run.
-    stale = dest_dir / "x.tar.zst.tmp"
-    stale.write_bytes(b"old-stale")
-    final = copy_tarball(out_dir, dest_dir, "x.tar.zst")
-    assert final.read_bytes() == b"new"
+    (dest_dir / "x.tmp").write_bytes(b"old-stale")
+    staged = copy_elf_folder(out_dir, tmp_path / "dataset", "v")
+    assert (dest_dir / "x").read_bytes() == b"new"
+    assert staged == [dest_dir / "x"]
 
 
-def test_copy_tarball_atomic_replace(tmp_path):
+def test_copy_elf_folder_atomic_replace(tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    (out_dir / "a.tar.zst").write_bytes(b"v2")
-    dest_dir = tmp_path / "dataset"
-    dest_dir.mkdir()
+    _make_elf_folder(out_dir, {"x": b"v2"})
+    dest_dir = tmp_path / "dataset" / "v"
+    dest_dir.mkdir(parents=True)
     # Pre-existing file at the final destination.
-    (dest_dir / "x.tar.zst").write_bytes(b"v1")
-    final = copy_tarball(out_dir, dest_dir, "x.tar.zst")
-    assert final.read_bytes() == b"v2"
+    (dest_dir / "x").write_bytes(b"v1")
+    copy_elf_folder(out_dir, tmp_path / "dataset", "v")
+    assert (dest_dir / "x").read_bytes() == b"v2"
 
 
 # ---------------------------------------------------------------------------
@@ -360,17 +386,18 @@ def test_build_worker_phase2_common_dep_passes_skip_existing(tmp_path):
     assert "--skip-existing" in argv
 
 
-def test_build_worker_phase3_variant_copies_tarball(tmp_path):
+def test_build_worker_phase3_variant_copies_elf_folder(tmp_path):
     out_dir = tmp_path / "nix-out"
-    out_dir.mkdir()
-    (out_dir / "build.tar.zst").write_bytes(b"variant-data")
+    _make_elf_folder(out_dir, {"hello": b"elf-bytes"})
+    variant_dir = "hello__x86_64__gcc15__O2"
     manifest = _write_manifest(
         tmp_path / "m.json",
         item_class=ITEM_CLASS_PHASE3_VARIANT,
-        name="hello__x86_64__gcc15__O2",
+        name=variant_dir,
         payload={
             "attr": "dataset.x86_64-linux.hello.x86_64.gcc15.O2",
-            "tarball_name": "hello__x86_64__gcc15__O2.tar.zst",
+            "variant_dir": variant_dir,
+            "pkg": "hello",
         },
     )
     runner = RecordingRunner(
@@ -384,21 +411,20 @@ def test_build_worker_phase3_variant_copies_tarball(tmp_path):
     )
     result = build_worker(manifest, env)
     assert result.success is True
-    expected = dataset / "hello__x86_64__gcc15__O2.tar.zst"
-    assert result.output_path == expected
-    assert expected.read_bytes() == b"variant-data"
+    expected_subdir = dataset / "hello" / variant_dir
+    assert result.output_path == expected_subdir
+    assert (expected_subdir / "hello").read_bytes() == b"elf-bytes"
 
 
 def test_build_worker_phase3_variant_uses_last_stdout_line(tmp_path):
     """If nix prints diagnostics first, the realised path is the LAST line."""
     out_dir = tmp_path / "nix-out"
-    out_dir.mkdir()
-    (out_dir / "x.tar.zst").write_bytes(b"v")
+    _make_elf_folder(out_dir, {"bin": b"v"})
     manifest = _write_manifest(
         tmp_path / "m.json",
         item_class=ITEM_CLASS_PHASE3_VARIANT,
         name="v",
-        payload={"attr": "v", "tarball_name": "v.tar.zst"},
+        payload={"attr": "v", "variant_dir": "v", "pkg": "p"},
     )
     runner = RecordingRunner(
         stdout=f"warning: some-warning\n{out_dir}\n\n".encode("utf-8"),
@@ -410,7 +436,7 @@ def test_build_worker_phase3_variant_uses_last_stdout_line(tmp_path):
     )
     result = build_worker(manifest, env)
     assert result.success is True
-    assert result.output_path == tmp_path / "dataset" / "v.tar.zst"
+    assert result.output_path == tmp_path / "dataset" / "p" / "v"
 
 
 # ---------------------------------------------------------------------------
@@ -519,15 +545,15 @@ def test_build_worker_does_not_raise_on_subprocess_exception(tmp_path):
     assert "crashed" in result.error
 
 
-def test_build_worker_phase3_missing_tarball(tmp_path):
+def test_build_worker_phase3_missing_elf_folder(tmp_path):
     out_dir = tmp_path / "nix-out"
     out_dir.mkdir()
-    # No *.tar.zst placed inside.
+    # No elf/ subdir placed inside — copy_elf_folder will raise.
     manifest = _write_manifest(
         tmp_path / "m.json",
         item_class=ITEM_CLASS_PHASE3_VARIANT,
         name="nope",
-        payload={"attr": "x", "tarball_name": "nope.tar.zst"},
+        payload={"attr": "x", "variant_dir": "nope", "pkg": "p"},
     )
     runner = RecordingRunner(stdout=f"{out_dir}\n".encode("utf-8"))
     env = BuildWorkerEnv(
@@ -537,18 +563,17 @@ def test_build_worker_phase3_missing_tarball(tmp_path):
     )
     result = build_worker(manifest, env)
     assert result.success is False
-    assert "tarball copy failed" in (result.error or "")
+    assert "elf folder copy failed" in (result.error or "")
 
 
-def test_build_worker_phase3_missing_tarball_name(tmp_path):
+def test_build_worker_phase3_missing_variant_dir(tmp_path):
     out_dir = tmp_path / "nix-out"
-    out_dir.mkdir()
-    (out_dir / "x.tar.zst").write_bytes(b"v")
+    _make_elf_folder(out_dir, {"x": b"v"})
     manifest = _write_manifest(
         tmp_path / "m.json",
         item_class=ITEM_CLASS_PHASE3_VARIANT,
         name="v",
-        payload={"attr": "x"},  # no tarball_name
+        payload={"attr": "x"},  # no variant_dir
     )
     runner = RecordingRunner(stdout=f"{out_dir}\n".encode("utf-8"))
     env = BuildWorkerEnv(
@@ -558,7 +583,7 @@ def test_build_worker_phase3_missing_tarball_name(tmp_path):
     )
     result = build_worker(manifest, env)
     assert result.success is False
-    assert "tarball_name" in (result.error or "")
+    assert "variant_dir" in (result.error or "")
 
 
 def test_build_worker_bad_manifest_returns_failure(tmp_path):
@@ -599,7 +624,7 @@ def test_module_exports():
     assert hasattr(bw, "BuildWorkerEnv")
     assert hasattr(bw, "parse_build_manifest")
     assert hasattr(bw, "build_attr")
-    assert hasattr(bw, "copy_tarball")
+    assert hasattr(bw, "copy_elf_folder")
     assert hasattr(bw, "build_worker")
     assert ITEM_CLASS_PHASE2_TOOLCHAIN in bw.VALID_ITEM_CLASSES
     assert ITEM_CLASS_PHASE2_COMMON_DEP in bw.VALID_ITEM_CLASSES
