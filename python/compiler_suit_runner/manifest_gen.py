@@ -251,7 +251,7 @@ def make_variant_header(
         "arch": arch,
         "label": label,
         "drv": variant["drv"],
-        "tarball_name": variant["tarball_name"],
+        "variant_dir": variant["variant_dir"],
         "metadata_name": variant["metadata_name"],
         "compiler_id": compiler_id,
         "compiler_family": variant.get("compiler_family", ""),

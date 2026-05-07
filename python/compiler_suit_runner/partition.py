@@ -23,15 +23,16 @@ class VariantSpec(TypedDict):
 
     ``label`` is the canonical full identifier
     (``<pkg>-<arch>-<compiler>-<opt>-<flags>-<hardening>``), used as
-    a stable hash input. ``tarball_name`` and ``metadata_name`` are
-    derived shorter filenames (``<compiler>_<arch>_<opt>_<hash>``)
-    that get written to ``dataset_dir`` along with a sidecar JSON
-    carrying the full parameter set.
+    a stable hash input. ``variant_dir`` is the per-variant subdir
+    name (``<compiler>_<arch>_<opt>_<hash>``); each variant's ELFs
+    land at ``dataset_dir/<pkg>/<variant_dir>/<elf>`` and the sidecar
+    JSON at ``dataset_dir/<pkg>/<variant_dir>.json``. ``metadata_name``
+    is the sidecar file name (``<compiler>_<arch>_<opt>_<hash>.json``).
     """
 
     label: str
     drv: str
-    tarball_name: str
+    variant_dir: str
     metadata_name: str
     compiler_id: str
     compiler_family: str
@@ -289,7 +290,7 @@ def build_partition(
 _VARIANT_FIELDS = (
     "label",
     "drv",
-    "tarball_name",
+    "variant_dir",
     "compiler_id",
     "tier",
 )
@@ -369,7 +370,7 @@ def read_partition_json(source: pathlib.Path) -> Partition:
             raise ValueError(
                 f"{source}: variants[{index}].tier must be an int"
             )
-        for field in ("label", "drv", "tarball_name", "compiler_id"):
+        for field in ("label", "drv", "variant_dir", "compiler_id"):
             if not isinstance(raw[field], str):
                 raise ValueError(
                     f"{source}: variants[{index}].{field} must be a string"
@@ -383,7 +384,7 @@ def read_partition_json(source: pathlib.Path) -> Partition:
         variant: VariantSpec = {
             "label": raw["label"],
             "drv": raw["drv"],
-            "tarball_name": raw["tarball_name"],
+            "variant_dir": raw["variant_dir"],
             "compiler_id": raw["compiler_id"],
             "tier": raw["tier"],
             "pkg": raw.get("pkg", "") if isinstance(raw.get("pkg", ""), str) else "",

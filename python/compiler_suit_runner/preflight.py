@@ -333,11 +333,10 @@ def _build_variant_spec(
 ) -> VariantSpec:
     """Assemble one :class:`VariantSpec` from the meta + drvPaths slices.
 
-    ``tarball_name`` and ``metadata_name`` are short-form file names
-    (``<compiler>_<arch>_<opt>_<hash>``) — keeps the filesystem layout
-    legible even when the matrix grows extra axes (sanitizer, march,
-    individual hardening flags). The full parameter set is written to
-    the sidecar JSON during phase-3 build.
+    ``variant_dir`` is the per-variant subdir name
+    (``<compiler>_<arch>_<opt>_<hash>``) under ``dataset/<pkg>/``;
+    each variant's ELFs land at ``<variant_dir>/<elf>`` and the
+    sidecar JSON sits beside it as ``<variant_dir>.json``.
     """
     label = meta_entry.get("variantLabel", suffix)
     compiler_id = meta_entry.get("compiler", "")
@@ -351,7 +350,7 @@ def _build_variant_spec(
     return {
         "label": label,
         "drv": drv_path,
-        "tarball_name": f"{short}.tar.zst",
+        "variant_dir": short,
         "metadata_name": f"{short}.json",
         "compiler_id": compiler_id,
         "compiler_family": meta_entry.get("compilerFamily", ""),
@@ -1026,14 +1025,15 @@ def filter_existing_variants(
     """Drop variants whose sidecar already records the same ``label``.
 
     Returns ``(remaining_variants, skipped_count)``. The output layout
-    is per-package: phase-3 build_worker writes the tarball + sidecar
-    JSON at ``<dataset_dir>/<pkg>/<tarball_name>{.tar.zst,.json}``.
+    is per-package: phase-3 build_worker writes the ELF folder + sidecar
+    JSON at ``<dataset_dir>/<pkg>/<variant_dir>/<elf>`` and
+    ``<dataset_dir>/<pkg>/<variant_dir>.json``.
 
     Match is on the ``label`` field of each sidecar, NOT the filename.
     The filename is a sha256-derived short hash of label; matching the
     hash works as long as the hash function never changes, but reading
     ``label`` directly is the canonical precise-flags identifier and
-    survives short-name refactors. A bonus consequence: a tarball
+    survives short-name refactors. A bonus consequence: a variant
     written under a different short-name scheme is still recognised as
     "we already have this combo", so we never rebuild what's already
     on disk.

@@ -147,7 +147,7 @@ def parse_manifest_payload(
             f"{src_label}: 'variants' must be a list"
         )
 
-    required_fields = ("label", "drv", "tarball_name", "compiler_id", "tier")
+    required_fields = ("label", "drv", "variant_dir", "compiler_id", "tier")
     variants: list[VariantSpec] = []
     for index, raw in enumerate(raw_variants):
         if not isinstance(raw, dict):
@@ -160,7 +160,7 @@ def parse_manifest_payload(
                     f"{src_label}: variants[{index}]"
                     f" missing field {field!r}"
                 )
-        for field in ("label", "drv", "tarball_name", "compiler_id"):
+        for field in ("label", "drv", "variant_dir", "compiler_id"):
             if not isinstance(raw[field], str):
                 raise ValueError(
                     f"{src_label}: variants[{index}].{field}"
@@ -173,7 +173,7 @@ def parse_manifest_payload(
         variant: VariantSpec = {
             "label": raw["label"],
             "drv": raw["drv"],
-            "tarball_name": raw["tarball_name"],
+            "variant_dir": raw["variant_dir"],
             "compiler_id": raw["compiler_id"],
             "tier": raw["tier"],
             "pkg": pkg,
@@ -417,19 +417,10 @@ def partition_worker(
 # ---------------------------------------------------------------------------
 # Subprocess entry point
 #
-# The dynamic_runner framework spawns this module as
-# ``python -m compiler_suit_runner.workers.partition_worker`` with its
-# standard worker-protocol argv (``--dynamic_queue`` / ``--socket-path``,
-# plus shared-fs / output paths). The framework's per-task IPC is owned
-# by ``dynamic_runner.comm``; in this best-effort shim the per-manifest
-# loop reads one manifest path per line from stdin so the entry point
-# can be exercised both by the framework's worker protocol (driven via
-# its dispatcher's stdin pipe) and by unit tests.
-#
-# TODO(phase 8 follow-up): wire this up to ``dynamic_runner.comm``
-# (ReadyResponse / ProcessTask / DoneResponse) once the comm shape for
-# TaskInfo dispatch is stabilised. For now the manifest-per-line stdin
-# protocol is enough to satisfy the per-worker entry-point contract.
+# Spawned by the dynamic_runner framework as
+# ``python -m compiler_suit_runner.workers.partition_worker``. The
+# per-task wire driving is owned by ``dynamic_runner.worker.run``; this
+# module only supplies the per-task body.
 
 
 def _build_env_from_args(args) -> "WorkerEnv":
@@ -443,25 +434,25 @@ def _build_env_from_args(args) -> "WorkerEnv":
 def main() -> int:
     """Subprocess entry point for the phase-1a partition worker.
 
-    Drives the framework's worker protocol via the comm fd
-    (``--dynamic_queue`` / ``--socket-path``). See
-    :mod:`compiler_suit_runner.workers._runner_protocol` for the
-    line-based protocol details.
+    Builds a :class:`WorkerEnv` from CLI flags and hands a per-task
+    closure to :func:`dynamic_runner.worker.run`. Failed shards surface
+    as ``error:non_recoverable:`` lines via :class:`NonRecoverableError`.
     """
     import argparse
-    import logging
 
-    from ._runner_protocol import (
-        DispatchResult,
-        connect_comm,
-        run_protocol_loop,
+    from dynamic_runner.worker import (
+        NonRecoverableError,
+        Task,
+        WorkerOutput,
+        run,
     )
 
     parser = argparse.ArgumentParser(
         prog="compiler_suit_runner.workers.partition_worker",
     )
-    parser.add_argument("--dynamic_queue", type=int, default=None)
-    parser.add_argument("--socket-path", type=str, default=None)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--dynamic_queue", type=int)
+    group.add_argument("--socket-path", type=str)
     parser.add_argument("--source", type=str, default=None)
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--log-file", type=str, default=None)
@@ -480,36 +471,24 @@ def main() -> int:
     parser.add_argument("--skip-existing", action="store_true")
     args, _ = parser.parse_known_args()
 
-    log = logging.getLogger("compiler_suit_runner.workers.partition_worker")
     env = _build_env_from_args(args)
 
-    sock = connect_comm(
-        dynamic_queue=args.dynamic_queue,
-        socket_path=args.socket_path,
-        log=log,
-    )
-    if sock is None:
-        log.warning("no comm channel supplied; worker exiting (test mode)")
-        return 0
-
-    def dispatch(
-        manifest_path: pathlib.Path,
-        payload: object | None = None,
-    ) -> DispatchResult:
-        manifest_data = payload if isinstance(payload, dict) else None
+    def handle(task: Task) -> WorkerOutput | None:
+        manifest_data = task.payload if isinstance(task.payload, dict) else None
+        manifest_path = (
+            pathlib.Path(task.relative_path)
+            if task.relative_path
+            else pathlib.Path("<inline>")
+        )
         result = partition_worker(
             manifest_path, env, manifest_data=manifest_data,
         )
         if result.error is None:
-            return DispatchResult.ok()
-        return DispatchResult.error(result.error)
+            return WorkerOutput()
+        raise NonRecoverableError(result.error)
 
-    return run_protocol_loop(
-        sock=sock,
-        source=args.source,
-        dispatch=dispatch,
-        log=log,
-    )
+    run(handle, args=args)
+    return 0
 
 
 if __name__ == "__main__":
