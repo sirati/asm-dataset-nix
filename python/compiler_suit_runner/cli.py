@@ -218,6 +218,26 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--ssh-identity-file",
+        default=None,
+        help=(
+            "Explicit private-key path for the gateway SSH connection. "
+            "Pass-through to the framework (dynamic_runner cli flag of "
+            "the same name); the value is forwarded verbatim. Use this "
+            "to bypass ssh-agent / IdentityFile defaults when the "
+            "gateway accepts only a specific key."
+        ),
+    )
+    parser.add_argument(
+        "--ssh-config",
+        default=None,
+        help=(
+            "Explicit ssh-config path for the gateway SSH connection. "
+            "Pass-through to the framework. Composes with "
+            "--ssh-identity-file."
+        ),
+    )
+    parser.add_argument(
         "--cachix-cache",
         default=None,
         help="Cachix cache name to push toolchain outputs to (optional).",
