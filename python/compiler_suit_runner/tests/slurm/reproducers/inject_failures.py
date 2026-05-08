@@ -1306,3 +1306,514 @@ __all__ += [
     "OomResult",
     "oom_one_worker_via_cgroup",
 ]
+
+
+# ---------------------------------------------------------------------------
+# T10 — port-bind collision injection
+# ---------------------------------------------------------------------------
+
+
+# Worker-side script that pre-binds a port and prints the listener PID.
+#
+# Implementation choice: a Python one-liner that creates a socket,
+# binds, listens, and then ``os.read``s on stdin to keep the process
+# alive until the controlling SSH channel sends ``SIGTERM`` /
+# ``SIGKILL`` via ``release_port_grab``. We pick Python over ``nc``
+# because:
+#
+# 1. ``nc -l`` flavours differ (BSD vs OpenBSD vs ncat); the BSD
+#    variant in nixpkgs occasionally lacks ``-k`` and exits on first
+#    accept, defeating the hold.
+# 2. We can capture the bound process's PID from Python directly via
+#    ``os.getpid()`` and emit it with a deterministic prefix that the
+#    helper parses; ``nc``'s pid would have to be extracted from
+#    ``$$`` echoed via the parent shell, which is fragile across
+#    shells and the SSH server's choice of login shell.
+# 3. SO_REUSEADDR=0 (Python's HTTPServer default is True; we
+#    override with ``setsockopt(SOL_SOCKET, SO_REUSEADDR, 0)`` for
+#    parity with the secondary's bind) guarantees the secondary's
+#    bind WILL collide; with SO_REUSEADDR=1 the kernel might allow
+#    the second bind on some kernel versions, defeating the test.
+#
+# The script writes ``LISTENER_PID=<pid>`` and ``LISTENER_BOUND=<port>``
+# to stdout BEFORE starting the recv loop so the helper can return
+# early once it sees those markers. We use ``sys.stdout.flush()``
+# explicitly because Python buffers stdout when its parent is a pipe.
+#
+# Lifetime: the listener process is detached via ``setsid`` + double-
+# fork so it survives the SSH channel close that follows once the
+# helper has captured the PID. Without the detach, openssh's
+# session-leader cleanup would kill the listener as soon as the SSH
+# command returned, releasing the port before the dispatch even
+# starts.
+#
+# Cleanup: the helper or the test's teardown SSHes back into the
+# worker and runs ``kill -TERM <pid>`` (then ``-KILL``) using the
+# captured PID; see :func:`release_port_grab`.
+_PORT_GRAB_SCRIPT_TMPL: str = r"""
+set +e
+PORT=__PORT__
+TIMEOUT_S=__TIMEOUT_S__
+PIDFILE=__PIDFILE_Q__
+
+# Prefer python3, fall back to python (the slurm-test-env image
+# carries python3 by default).
+PYBIN=$(command -v python3 || command -v python)
+if [ -z "$PYBIN" ]; then
+  echo "ERROR=no_python_on_worker"
+  exit 0
+fi
+
+# Detach the listener from the SSH session so closing the channel
+# does not kill it. ``setsid`` reparents to PID-1 (the cgroup leader);
+# ``nohup`` plus ``> /dev/null 2>&1 < /dev/null`` keeps the FDs
+# clean. The PID we publish is the listener's, NOT the shell's, so
+# we read it back from $PIDFILE after the python process flushes it.
+rm -f "$PIDFILE"
+
+# The python child writes its own PID to $PIDFILE then enters a sleep
+# loop bounded by $TIMEOUT_S so a forgotten release_port_grab cannot
+# leak the listener forever. The default cap is generous (matches
+# the test's wall-clock cap so a timeout in the dispatch never out-
+# lives the listener) but keeps us from accumulating zombie
+# listeners across CI runs.
+nohup setsid "$PYBIN" -c "
+import os, socket, sys, time
+pid = os.getpid()
+with open('$PIDFILE', 'w') as fh:
+    fh.write(str(pid))
+    fh.flush()
+    os.fsync(fh.fileno())
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# SO_REUSEADDR=0 forces the colliding bind to fail with EADDRINUSE.
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+s.bind(('0.0.0.0', $PORT))
+s.listen(8)
+print(f'LISTENER_PID={pid}', flush=True)
+print(f'LISTENER_BOUND=$PORT', flush=True)
+sys.stdout.flush()
+deadline = time.monotonic() + $TIMEOUT_S
+while time.monotonic() < deadline:
+    time.sleep(1.0)
+" > /dev/null 2>&1 < /dev/null &
+
+# Wait for the child to write the pidfile (bounded so a startup
+# failure surfaces as ERROR=pidfile_missing rather than hanging).
+WAIT=0
+while [ ! -s "$PIDFILE" ] && [ $WAIT -lt 50 ]; do
+  WAIT=$((WAIT + 1))
+  sleep 0.1
+done
+if [ ! -s "$PIDFILE" ]; then
+  echo "ERROR=pidfile_missing"
+  exit 0
+fi
+LISTENER_PID=$(cat "$PIDFILE")
+echo "LISTENER_PID=$LISTENER_PID"
+echo "LISTENER_BOUND=$PORT"
+echo "PIDFILE=$PIDFILE"
+
+# Verify the bind landed: ``ss -lntp`` should show our PID. We do
+# this best-effort; a missing ss binary just leaves BIND_VERIFIED
+# unset and the helper logs a softer note rather than failing.
+if command -v ss >/dev/null 2>&1; then
+  if ss -lntp 2>/dev/null | awk -v p="$PORT" '
+      $4 ~ ":"p"$" {found=1} END {exit found?0:1}'; then
+    echo "BIND_VERIFIED=1"
+  else
+    echo "BIND_VERIFIED=0"
+  fi
+fi
+"""
+
+
+# Worker-side cleanup script: kill the listener PID we captured.
+# ``kill -0`` first probes liveness so we can report whether the
+# listener was already gone (a benign cleanup state) vs whether the
+# kill succeeded (the typical state) vs whether the kill failed
+# (e.g. EPERM, which would indicate something else is using that
+# PID and we should NOT proceed). We escalate to SIGKILL after a
+# brief grace window because the python listener catches no
+# signals and SIGTERM alone is sufficient, but the escalation
+# guards against an interpreter wedged on shutdown.
+_PORT_GRAB_RELEASE_SCRIPT_TMPL: str = r"""
+set +e
+PID=__PID__
+PIDFILE=__PIDFILE_Q__
+PORT=__PORT__
+
+if ! kill -0 "$PID" 2>/dev/null; then
+  echo "STATE=already_gone"
+  rm -f "$PIDFILE"
+  exit 0
+fi
+kill -TERM "$PID" 2>/dev/null
+# Brief grace; the listener is a one-line python sleep loop, so it
+# typically exits within a tick.
+for i in 1 2 3 4 5; do
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo "STATE=terminated"
+    rm -f "$PIDFILE"
+    exit 0
+  fi
+  sleep 0.2
+done
+kill -KILL "$PID" 2>/dev/null
+for i in 1 2 3 4 5; do
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo "STATE=killed"
+    rm -f "$PIDFILE"
+    exit 0
+  fi
+  sleep 0.2
+done
+echo "STATE=stuck"
+echo "PORT=$PORT"
+"""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PortGrabResult:
+    """Outcome of a :func:`prebind_port_on_worker` call.
+
+    ``bound``: ``True`` iff the helper SSHed into ``target_worker``
+    AND the worker-side script published a ``LISTENER_PID=`` line
+    (and a ``LISTENER_BOUND=`` line matching ``port``). A ``False``
+    here means either SSH itself failed or the worker reported one
+    of the script's ``ERROR=...`` short labels (e.g. python missing
+    or pidfile never appeared); ``notes`` carries the diagnostic.
+
+    ``target_worker``: the worker hostname the helper drove its SSH
+    against, recorded even on failure so the test's failure surface
+    surfaces which worker we tried.
+
+    ``port``: the port the helper attempted to pre-bind. Mirrored
+    from the input so the caller does not have to thread its own
+    constant through.
+
+    ``listener_pid``: the python listener's PID on the target
+    worker, captured from the ``LISTENER_PID=`` line. ``None`` when
+    ``bound`` is ``False``. Required input to :func:`release_port_grab`.
+
+    ``pidfile``: the path on the target worker where the listener
+    wrote its PID. The release helper deletes this file on success;
+    surfaced for triage when a release fails to clear it.
+
+    ``started_at``: UTC timestamp captured immediately after the
+    worker script returned with the ``LISTENER_PID=`` line. ``None``
+    when no listener ever started.
+
+    ``bind_verified``: ``True`` iff the worker-side ``ss`` probe
+    confirmed the listener was bound at the requested port.
+    ``False`` means the bind landed but the verification step
+    couldn't confirm it (e.g. ``ss`` missing); ``None`` means the
+    verification step did not run at all (grow path: future
+    framework version that drops the ``ss`` probe).
+
+    ``notes``: free-form per-call notes (SSH errors, ``ERROR=...``
+    labels surfaced by the worker script, etc.). The helper is
+    intentionally fail-safe and surfaces every conceivable error
+    this way rather than raising, mirroring :class:`KillResult`,
+    :class:`DisconnectResult`, and :class:`OomResult`.
+    """
+
+    bound: bool
+    target_worker: str
+    port: int
+    listener_pid: str | None = None
+    pidfile: str | None = None
+    started_at: datetime | None = None
+    bind_verified: bool | None = None
+    notes: tuple[str, ...] = ()
+
+
+def _parse_port_grab_output(stdout: str) -> dict[str, str]:
+    """Parse the worker-side port-grab script's ``key=value`` line output.
+
+    Mirrors :func:`_parse_oom_script_output` exactly — extra whitespace
+    and any non ``=`` line is silently ignored; repeated keys are
+    last-wins (the script does not emit duplicates by design).
+    """
+    pairs: dict[str, str] = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        pairs[key.strip()] = value.strip()
+    return pairs
+
+
+def prebind_port_on_worker(
+    probe: _WorkerRunner,
+    *,
+    target_worker: str = "slurm-worker1",
+    port: int = 5050,
+    pidfile: str | None = None,
+    listener_timeout_s: float = 600.0,
+    ssh_timeout_s: float = 30.0,
+    now_utc: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> PortGrabResult:
+    """Pre-bind ``port`` on ``target_worker`` via a detached python listener.
+
+    Drives a single SSH call into ``target_worker`` and runs
+    :data:`_PORT_GRAB_SCRIPT_TMPL`, which:
+
+    1. spawns a detached (``nohup setsid``) python listener bound to
+       ``port`` with ``SO_REUSEADDR=0`` so the secondary's bind WILL
+       collide with EADDRINUSE;
+    2. writes the listener's PID to ``pidfile`` on the worker;
+    3. emits ``LISTENER_PID=<pid>`` / ``LISTENER_BOUND=<port>`` /
+       ``PIDFILE=<path>`` lines on stdout AND, when ``ss`` is
+       available, a ``BIND_VERIFIED=1|0`` line confirming the bind.
+
+    The helper returns AS SOON AS the listener process has flushed
+    its PID; the listener itself stays alive on the worker until
+    :func:`release_port_grab` SSHes back to terminate it OR until
+    its internal ``listener_timeout_s`` deadline fires (whichever
+    comes first). The internal timeout is the safety net against a
+    forgotten ``release_port_grab`` leaking a port-holder across CI
+    runs.
+
+    Parameters:
+
+    * ``probe``: a :class:`ClusterProbe`-shaped object exposing
+      ``worker_ssh``. Loose-typed via :class:`_WorkerRunner` so the
+      unit test can pass a stub.
+    * ``target_worker``: hostname to SSH into. Defaults to
+      ``slurm-worker1`` per the plan; tests on a cluster where
+      worker1 is down should pass ``slurm-worker2``.
+    * ``port``: TCP port to pre-bind. Default ``5050`` matches the
+      port the smoke16 retrospective documented as the leaky one
+      (``DEFAULT_CLEANUP_PORTS = (5000, 5050)``); tests probing a
+      different framework version should override.
+    * ``pidfile``: absolute path on the target worker where the
+      listener writes its PID. ``None`` (default) picks a unique
+      ``/tmp/asm-portgrab-<port>.pid`` path; pass an explicit value
+      only when two parallel pre-binds need disambiguation.
+    * ``listener_timeout_s``: internal lifetime cap for the worker-
+      side listener (in seconds). Even if the test forgets to call
+      :func:`release_port_grab`, the listener self-terminates after
+      this elapses. Default ``600`` matches the T10 wall-clock cap.
+    * ``ssh_timeout_s``: per-call SSH timeout for the spawn step.
+      The script runs in <2s under normal conditions; ``30`` covers
+      a slow-spawning worker without leaving the harness blocked
+      indefinitely on a hung SSH.
+    * ``now_utc``: injectable for unit tests.
+
+    Returns a :class:`PortGrabResult`. The helper never raises; every
+    conceivable error (ssh timeout, ``ERROR=...`` label, missing
+    PID line) lands in :attr:`PortGrabResult.notes`.
+
+    CRITICAL: this helper SSHes into a worker and spawns a detached
+    process. The process's lifetime is bounded by ``listener_timeout_s``
+    OR by an explicit :func:`release_port_grab` call. Tests MUST
+    schedule the release call in their teardown (typically via a
+    pytest finalizer / try-finally block) — the test's ``cleanup_cluster``
+    fixture does NOT know about the listener's PID, so it cannot
+    automatically clean it up; the listener_timeout_s safety net is
+    the only line of defence against a forgotten release.
+    """
+    if pidfile is None:
+        pidfile = f"/tmp/asm-portgrab-{int(port)}.pid"
+
+    notes: list[str] = []
+
+    # Build the worker-side script. We use literal-token substitution
+    # rather than ``.format()`` because the embedded shell + python
+    # script uses ``{`` / ``}`` syntax that would collide with
+    # str.format's brace grammar.
+    import shlex as _shlex  # noqa: PLC0415 — local import keeps top clean
+
+    script = (
+        _PORT_GRAB_SCRIPT_TMPL
+        .replace("__PORT__", str(int(port)))
+        .replace("__TIMEOUT_S__", str(int(max(listener_timeout_s, 0))))
+        .replace("__PIDFILE_Q__", _shlex.quote(pidfile))
+    )
+
+    try:
+        cp = probe.worker_ssh(
+            target_worker, script, timeout=ssh_timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        notes.append(f"ssh worker_ssh timed out: {exc}")
+        return PortGrabResult(
+            bound=False,
+            target_worker=target_worker,
+            port=int(port),
+            pidfile=pidfile,
+            notes=tuple(notes),
+        )
+    except OSError as exc:
+        notes.append(f"ssh worker_ssh OSError: {exc}")
+        return PortGrabResult(
+            bound=False,
+            target_worker=target_worker,
+            port=int(port),
+            pidfile=pidfile,
+            notes=tuple(notes),
+        )
+
+    pairs = _parse_port_grab_output(cp.stdout or "")
+
+    if cp.returncode != 0:
+        notes.append(
+            f"worker_ssh rc={cp.returncode}; "
+            f"stderr={(cp.stderr or '').strip()[:200]!r}"
+        )
+
+    error_label = pairs.get("ERROR")
+    if error_label is not None:
+        notes.append(f"worker reported error: {error_label}")
+        return PortGrabResult(
+            bound=False,
+            target_worker=target_worker,
+            port=int(port),
+            pidfile=pidfile,
+            notes=tuple(notes),
+        )
+
+    listener_pid = pairs.get("LISTENER_PID") or None
+    bound_port_str = pairs.get("LISTENER_BOUND")
+    bound_port: Optional[int] = None
+    if bound_port_str is not None:
+        try:
+            bound_port = int(bound_port_str)
+        except ValueError:
+            bound_port = None
+
+    bind_verified: Optional[bool] = None
+    raw_verified = pairs.get("BIND_VERIFIED")
+    if raw_verified is not None:
+        bind_verified = raw_verified == "1"
+
+    if listener_pid is None or bound_port is None:
+        notes.append(
+            "worker did not publish LISTENER_PID and LISTENER_BOUND; "
+            f"stdout tail: {(cp.stdout or '').strip()[-200:]!r}"
+        )
+        return PortGrabResult(
+            bound=False,
+            target_worker=target_worker,
+            port=int(port),
+            listener_pid=listener_pid,
+            pidfile=pidfile,
+            bind_verified=bind_verified,
+            notes=tuple(notes),
+        )
+
+    if bound_port != int(port):
+        notes.append(
+            f"worker reported LISTENER_BOUND={bound_port} but "
+            f"requested port={port}"
+        )
+        return PortGrabResult(
+            bound=False,
+            target_worker=target_worker,
+            port=int(port),
+            listener_pid=listener_pid,
+            pidfile=pidfile,
+            bind_verified=bind_verified,
+            notes=tuple(notes),
+        )
+
+    return PortGrabResult(
+        bound=True,
+        target_worker=target_worker,
+        port=int(port),
+        listener_pid=listener_pid,
+        pidfile=pairs.get("PIDFILE") or pidfile,
+        started_at=now_utc(),
+        bind_verified=bind_verified,
+        notes=tuple(notes),
+    )
+
+
+def release_port_grab(
+    probe: _WorkerRunner,
+    grab: PortGrabResult,
+    *,
+    ssh_timeout_s: float = 30.0,
+) -> tuple[bool, tuple[str, ...]]:
+    """Release a listener previously installed by :func:`prebind_port_on_worker`.
+
+    SSHes back into ``grab.target_worker`` and runs
+    :data:`_PORT_GRAB_RELEASE_SCRIPT_TMPL` against ``grab.listener_pid``.
+    Sends SIGTERM, waits up to ~1s for graceful shutdown, then
+    escalates to SIGKILL if the listener is still alive.
+
+    Returns ``(released, notes)`` where ``released`` is ``True`` iff
+    the worker reported one of ``STATE=terminated`` /
+    ``STATE=killed`` / ``STATE=already_gone``. ``STATE=stuck`` (the
+    listener survived SIGKILL — usually means the PID was reused
+    by something else) leaves ``released=False``; the caller's
+    teardown should escalate to a manual investigation.
+
+    The helper is fail-safe: a non-bound ``grab`` (i.e.
+    ``grab.bound=False`` or ``grab.listener_pid=None``) returns
+    ``(True, ())`` immediately because there is nothing to release.
+    Per project policy nothing here ever raises; any subprocess
+    exception is folded into the returned ``notes`` tuple.
+
+    Tests typically wire this via ``try/finally`` so the release
+    runs on both pass and fail paths:
+
+    .. code-block:: python
+
+        grab = prebind_port_on_worker(probe, target_worker="slurm-worker1")
+        try:
+            ...  # run the dispatch
+        finally:
+            release_port_grab(probe, grab)
+    """
+    if not grab.bound or grab.listener_pid is None:
+        return True, ()
+
+    notes: list[str] = []
+
+    pidfile = grab.pidfile or f"/tmp/asm-portgrab-{int(grab.port)}.pid"
+
+    import shlex as _shlex  # noqa: PLC0415 — local import keeps top clean
+
+    script = (
+        _PORT_GRAB_RELEASE_SCRIPT_TMPL
+        .replace("__PID__", _shlex.quote(grab.listener_pid))
+        .replace("__PIDFILE_Q__", _shlex.quote(pidfile))
+        .replace("__PORT__", str(int(grab.port)))
+    )
+
+    try:
+        cp = probe.worker_ssh(
+            grab.target_worker, script, timeout=ssh_timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        notes.append(f"release ssh worker_ssh timed out: {exc}")
+        return False, tuple(notes)
+    except OSError as exc:
+        notes.append(f"release ssh worker_ssh OSError: {exc}")
+        return False, tuple(notes)
+
+    if cp.returncode != 0:
+        notes.append(
+            f"release worker_ssh rc={cp.returncode}; "
+            f"stderr={(cp.stderr or '').strip()[:200]!r}"
+        )
+
+    pairs = _parse_port_grab_output(cp.stdout or "")
+    state = pairs.get("STATE")
+    if state in ("terminated", "killed", "already_gone"):
+        return True, tuple(notes)
+    notes.append(
+        f"listener pid={grab.listener_pid!r} did not release "
+        f"(state={state!r}); stdout tail: "
+        f"{(cp.stdout or '').strip()[-200:]!r}"
+    )
+    return False, tuple(notes)
+
+
+__all__ += [
+    "PortGrabResult",
+    "prebind_port_on_worker",
+    "release_port_grab",
+]
