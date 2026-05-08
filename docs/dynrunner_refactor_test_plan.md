@@ -146,16 +146,32 @@ existing `docs/slurm_test_plan.md` already documents.
   the framework's command-relay subshell starts spinning (peer-flagged
   bug; tokenizer hit it on 2026-05-08). Watch host disk usage between
   tests: `df -h /home/sirati/.local | tail -1`. If a file >1 GB
-  appears, kill the relay (`podman exec slurm-workerN-ds-test pkill -f
-  slurm_script`) and `podman unshare rm` the file.
-- If `slurm-worker1` is in DOWN+NOT_RESPONDING after a hang, bring
-  the cluster down + up cleanly:
-  `INSTANCE_ID=ds-test SSH_PORT=2244 nix run \
-  /home/sirati/devel/python/dynamic_runner/slurm-test-env#down`,
-  then `#up`, then `#provision-user -- sirati .ssh-debug/id_ed25519.pub`.
-  The `--purge` flag on bring-up wipes the simulated /home — usually
-  unwanted (loses the previous run-log dirs); skip unless explicitly
-  asked.
+  appears, escalate to `dynrunner-owner-slurm-test-env-owner` (via
+  claude-comm) — they own removal of in-cluster state and have
+  tooling that doesn't reach behind the flake apps. **Do NOT** run
+  `podman exec` / `podman unshare rm` directly; that bypasses the
+  flake's image-pin and state-dir contract (memory:
+  `feedback_slurm_test_env_flake_only.md`).
+- If `slurm-worker1` is in DOWN+NOT_RESPONDING after a hang, prefer a
+  single-node restart over a full cluster cycle:
+  `INSTANCE_ID=ds-test nix run /home/sirati/devel/python/
+  dynamic_runner/slurm-test-env#reboot-node -- slurm-worker1`.
+  Falls back to a full cycle only if reboot-node doesn't recover:
+  `INSTANCE_ID=ds-test SSH_PORT=2244 nix run .#down` then `.#up` then
+  `.#provision-user -- sirati .ssh-debug/id_ed25519.pub`. The `--purge`
+  flag on bring-up wipes the simulated /home — usually unwanted
+  (loses the previous run-log dirs); skip unless explicitly asked.
+- An end-to-end self-test of the cluster itself is available via
+  `INSTANCE_ID=ds-test nix run .#smoke-test` — useful to confirm the
+  bring-up actually produced a working cluster before running our
+  consumer-side T1 baseline.
+- **Flake apps only.** Never run `podman ...`, `bash deploy/*.sh`, or
+  manually edit `~/.local/state/slurm-test-env/<id>/` against the
+  slurm-test-env. The only allowed access is `nix run .#{up,down,
+  provision-user,smoke-test,reboot-node}` plus `ssh -p <SSH_PORT>
+  <user>@localhost` for in-cluster usage. If something looks wrong
+  with a flake app, escalate via claude-comm rather than working
+  around.
 
 ## Stop conditions
 
