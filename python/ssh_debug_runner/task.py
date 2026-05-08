@@ -9,8 +9,7 @@ from argparse import ArgumentParser, Namespace
 from collections.abc import Iterable
 from pathlib import Path
 
-from dynamic_runner._shared import TaskInfo
-from dynamic_runner._shared.binary_info import BinaryIdentifier
+from dynamic_runner._shared import BinaryIdentifier, TaskInfo
 from dynamic_runner.task_protocol import (
     PhaseSpec,
     TaskTypeSpec,

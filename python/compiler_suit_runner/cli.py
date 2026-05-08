@@ -1083,6 +1083,19 @@ def cmd_submit(args: argparse.Namespace) -> int:
         log.debug("forwarded argv to dynamic_runner: %s", sys.argv)
         try:
             task = SuitTask(config)
+            # Propagate --enable-ssh-debug to the secondary container
+            # via an env var. The framework rebuilds the secondary's
+            # argv from a synthesized ``--secondary tcp://... --
+            # secondary-id ...`` and does not forward primary CLI
+            # flags, so the env-var shim is the only reliable path.
+            run_args: list[str] = ["--pids-limit=16384"]
+            if getattr(args, "enable_ssh_debug", False):
+                run_args += [
+                    "-e", "CSR_ENABLE_SSH_DEBUG=1",
+                    "-e",
+                    f"CSR_SSH_DEBUG_PORT="
+                    f"{getattr(args, 'ssh_debug_port', 22222)}",
+                ]
             deployment = TaskDeploymentSpec(
                 secondary_module="compiler_suit_runner",
                 image_name="asm-dataset-nix-runner",
@@ -1093,7 +1106,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 # processes per parallel build, and 14-core SLURM
                 # nodes with max-jobs=auto easily run 4000+ PIDs in
                 # flight during peak fan-out).
-                extra_run_args=("--pids-limit=16384",),
+                extra_run_args=tuple(run_args),
             )
             dynamic_runner_run(task, deployment=deployment)
         except Exception:  # noqa: BLE001
@@ -1347,8 +1360,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cache_root=DEFAULT_CACHE_ROOT,
             submitter_peer=False,
             submitter_harmonia_port=5005,
-            enable_ssh_debug=False,
-            ssh_debug_port=22222,
+            # The primary side propagates --enable-ssh-debug via the
+            # ``CSR_ENABLE_SSH_DEBUG`` env var (the framework rebuilds
+            # this argv synthetically and does not forward our CLI
+            # flags). Read it here so the secondary's SuitTask config
+            # picks up the operator's intent.
+            enable_ssh_debug=os.environ.get(
+                "CSR_ENABLE_SSH_DEBUG", "0"
+            ) == "1",
+            ssh_debug_port=int(
+                os.environ.get("CSR_SSH_DEBUG_PORT", "22222")
+            ),
             secondary_id=sec_id,
         )
         return cmd_secondary(ns)
