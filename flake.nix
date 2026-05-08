@@ -240,12 +240,27 @@
 
           # drvPaths — expensive to eval (forces derivation instantiation).
           # Use: nix eval .#_drvPaths.<sys>.<pkg>.<arch> --json
-          _drvPaths = lib.mapAttrs (
-            pkgLabel: archAttrs:
-            lib.mapAttrs (
-              archLabel: variantAttrs: lib.mapAttrs (suffix: v: v.elfFolder.drvPath) variantAttrs
-            ) archAttrs
-          ) matrix.nestedMatrix;
+          _drvPaths =
+            (lib.mapAttrs (
+              pkgLabel: archAttrs:
+              lib.mapAttrs (
+                archLabel: variantAttrs: lib.mapAttrs (suffix: v: v.elfFolder.drvPath) variantAttrs
+              ) archAttrs
+            ) matrix.nestedMatrix)
+            // {
+              # Hidden namespace used by the SLURM post-promotion-with-failure
+              # repro (test_t02_post_promotion_hang). Deliberately broken
+              # build that fails fast (<1s) with deterministic stderr so the
+              # secondary surfaces a build_failed event without doing real
+              # work. The double-underscore prefix keeps it out of the
+              # normal matrix iteration: preflight scopes its `nix-eval-jobs`
+              # call to `dataset.<sys>.<pkg>.<arch>`, which never enumerates
+              # this attr.
+              __test_broken__ = pkgs.runCommandLocal "asm-test-broken" { } ''
+                echo TEST_BROKEN >&2
+                exit 1
+              '';
+            };
 
           # Debug outputs
           _debug = {
