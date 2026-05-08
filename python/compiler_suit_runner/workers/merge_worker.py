@@ -277,12 +277,9 @@ def merge_worker(
 # Subprocess entry point
 #
 # Spawned by the dynamic_runner framework as
-# ``python -m compiler_suit_runner.workers.merge_worker``. Reads one
-# manifest path per line from stdin and dispatches each through
-# :func:`merge_worker`.
-#
-# TODO(phase 8 follow-up): wire to ``dynamic_runner.comm`` once the
-# comm shape for TaskInfo dispatch is stabilised.
+# ``python -m compiler_suit_runner.workers.merge_worker``. The per-task
+# wire driving is owned by ``dynamic_runner.worker.run``; this module
+# only supplies the per-task body.
 
 
 def _load_variants_from_path(path: pathlib.Path) -> tuple[VariantSpec, ...]:
@@ -318,38 +315,35 @@ def _load_toolchain_drvs_from_path(path: pathlib.Path) -> frozenset[str]:
 def main() -> int:
     """Subprocess entry point for the phase-1b merge worker.
 
-    Drives the framework's worker protocol via the comm fd
-    (``--dynamic_queue`` / ``--socket-path``). See
-    :mod:`compiler_suit_runner.workers._runner_protocol` for the
-    line-based protocol details.
+    Builds a :class:`MergeWorkerEnv` from CLI flags, hands a per-task
+    closure to :func:`dynamic_runner.worker.run`, and lets the framework
+    runtime own the comm channel.
+
+    :func:`merge_worker` re-raises with a ``merge_worker_result``
+    attribute attached to the exception; the closure unpacks that
+    attribute (when present) so the wire-side error message carries the
+    classifier's original ``error`` string rather than ``str(exc)``.
     """
     import argparse
-    import logging
 
-    from ._runner_protocol import (
-        DispatchResult,
-        connect_comm,
-        run_protocol_loop,
+    from dynamic_runner.worker import (
+        NonRecoverableError,
+        Task,
+        WorkerOutput,
+        run,
     )
 
     parser = argparse.ArgumentParser(
         prog="compiler_suit_runner.workers.merge_worker",
     )
-    parser.add_argument("--dynamic_queue", type=int, default=None)
-    parser.add_argument("--socket-path", type=str, default=None)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--dynamic_queue", type=int)
+    group.add_argument("--socket-path", type=str)
     parser.add_argument("--source", type=str, default=None)
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--log-file", type=str, default=None)
-    parser.add_argument(
-        "--raw-partition-dir",
-        type=str,
-        required=True,
-    )
-    parser.add_argument(
-        "--partition-dir",
-        type=str,
-        required=True,
-    )
+    parser.add_argument("--raw-partition-dir", type=str, required=True)
+    parser.add_argument("--partition-dir", type=str, required=True)
     parser.add_argument("--input-hash", type=str, default="")
     parser.add_argument(
         "--variants-file",
@@ -366,8 +360,6 @@ def main() -> int:
     parser.add_argument("--common-threshold", type=int, default=10)
     parser.add_argument("--skip-existing", action="store_true")
     args, _ = parser.parse_known_args()
-
-    log = logging.getLogger("compiler_suit_runner.workers.merge_worker")
 
     variants: tuple[VariantSpec, ...] = ()
     if args.variants_file:
@@ -388,33 +380,30 @@ def main() -> int:
         common_threshold=args.common_threshold,
     )
 
-    sock = connect_comm(
-        dynamic_queue=args.dynamic_queue,
-        socket_path=args.socket_path,
-        log=log,
-    )
-    if sock is None:
-        log.warning("no comm channel supplied; worker exiting (test mode)")
-        return 0
-
-    def dispatch(
-        manifest_path: pathlib.Path,
-        payload: object | None = None,
-    ) -> DispatchResult:
-        manifest_data = payload if isinstance(payload, dict) else None
-        result = merge_worker(
-            manifest_path, env, manifest_data=manifest_data,
+    def handle(task: Task) -> WorkerOutput | None:
+        manifest_data = task.payload if isinstance(task.payload, dict) else None
+        manifest_path = (
+            pathlib.Path(task.relative_path)
+            if task.relative_path
+            else pathlib.Path("<inline>")
         )
+        try:
+            result = merge_worker(
+                manifest_path, env, manifest_data=manifest_data,
+            )
+        except Exception as exc:
+            attached = getattr(exc, "merge_worker_result", None)
+            message = (
+                attached.error if attached is not None and attached.error
+                else str(exc)
+            ) or "merge failed"
+            raise NonRecoverableError(message) from exc
         if result.error is None:
-            return DispatchResult.ok()
-        return DispatchResult.error(result.error)
+            return WorkerOutput()
+        raise NonRecoverableError(result.error)
 
-    return run_protocol_loop(
-        sock=sock,
-        source=args.source,
-        dispatch=dispatch,
-        log=log,
-    )
+    run(handle, args=args)
+    return 0
 
 
 if __name__ == "__main__":
