@@ -1,6 +1,9 @@
-"""Tests for the file-only SLURM run-invariant checks.
+"""Tests for the SLURM run-invariant checks.
 
-Synthetic on-disk fixtures only — never touches a real run-log tree.
+The file-only checks (1-4) use synthetic on-disk fixtures; the cluster
+checks (5-7) use a hand-rolled :class:`ClusterProbe` mock that returns
+canned :class:`PodmanRow`, :class:`ListenerRow` and :class:`ProcessRow`
+objects so the tests never touch a live cluster.
 """
 
 from __future__ import annotations
@@ -8,10 +11,17 @@ from __future__ import annotations
 import subprocess
 import sys
 import textwrap
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from compiler_suit_runner.tests.slurm.cluster_probe import (
+    ListenerRow,
+    PodmanRow,
+    ProcessRow,
+)
 from compiler_suit_runner.tests.slurm.invariants import (
     InvariantResult,
     RunArtifacts,
@@ -19,7 +29,13 @@ from compiler_suit_runner.tests.slurm.invariants import (
     check_clean_exit,
     check_manifest_count_matches,
     check_no_bind_errors,
+    check_no_leaked_containers,
+    check_no_leaked_listener_ports,
+    check_no_leaked_processes,
+    run_all_invariants,
+    run_cluster_invariants,
     run_file_invariants,
+    wait_squeue_empty,
 )
 
 
@@ -379,3 +395,634 @@ def test_cli_no_args_returns_2() -> None:
     result = _run_cli()
     assert result.returncode == 2
     assert "usage" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# RunArtifacts.from_dir
+# ---------------------------------------------------------------------------
+
+
+def test_from_dir_parses_run_id_and_started_at(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run_20260508_120300"
+    run_dir.mkdir()
+    artifacts = RunArtifacts.from_dir(run_dir)
+    assert artifacts.run_id == "run_20260508_120300"
+    assert artifacts.started_at == datetime(2026, 5, 8, 12, 3, 0)
+
+
+def test_from_dir_keeps_unparseable_name(tmp_path: Path) -> None:
+    run_dir = tmp_path / "weird_name"
+    run_dir.mkdir()
+    artifacts = RunArtifacts.from_dir(run_dir)
+    assert artifacts.run_id == "weird_name"
+    assert artifacts.started_at is None
+
+
+# ---------------------------------------------------------------------------
+# Mock ClusterProbe and helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _StubCompletedProcess:
+    """Minimal stand-in for subprocess.CompletedProcess used by the UID probe."""
+
+    returncode: int = 0
+    stdout: str = ""
+    stderr: str = ""
+
+
+@dataclass
+class _StubProbe:
+    """Hand-rolled mock matching the parts of ClusterProbe consumed by the
+    cluster invariants. Each attribute represents one method's return
+    value; the methods are implemented inline so the tests can wire any
+    combination of canned rows / failures.
+    """
+
+    reachable: bool = True
+    squeue_rows: list[object] = field(default_factory=list)
+    squeue_polls: list[list[object]] | None = None
+    podman_rows_by_worker: dict[str, list[PodmanRow]] = field(
+        default_factory=dict,
+    )
+    listener_rows_by_worker: dict[str, list[ListenerRow]] = field(
+        default_factory=dict,
+    )
+    process_rows_by_worker: dict[str, list[ProcessRow]] = field(
+        default_factory=dict,
+    )
+    gateway_uid: int | None = 1000
+    # Track squeue_me() call count so tests can poke the polling loop.
+    _squeue_calls: int = 0
+
+    def is_reachable(self, *, timeout: float = 5.0) -> bool:
+        return self.reachable
+
+    def squeue_me(self) -> list[object]:
+        if self.squeue_polls is not None:
+            idx = min(self._squeue_calls, len(self.squeue_polls) - 1)
+            self._squeue_calls += 1
+            return self.squeue_polls[idx]
+        self._squeue_calls += 1
+        return list(self.squeue_rows)
+
+    def podman_ps(self, worker: str) -> list[PodmanRow]:
+        return list(self.podman_rows_by_worker.get(worker, ()))
+
+    def port_listeners(
+        self, worker: str, ports: list[int],
+    ) -> list[ListenerRow]:
+        rows = self.listener_rows_by_worker.get(worker, ())
+        port_set = {int(p) for p in ports}
+        return [r for r in rows if r.local_port in port_set]
+
+    def processes_by_pattern(
+        self, worker: str, pattern: str,
+    ) -> list[ProcessRow]:
+        # The real probe filters by regex server-side / client-side; for
+        # the mock the caller already pre-filters via the dict.
+        return list(self.process_rows_by_worker.get(worker, ()))
+
+    def gateway_ssh(
+        self, cmd: str, *, timeout: float | None = None,
+    ) -> _StubCompletedProcess:
+        if cmd != "id -u":
+            return _StubCompletedProcess(returncode=2, stdout="", stderr="")
+        if self.gateway_uid is None:
+            return _StubCompletedProcess(returncode=1, stdout="", stderr="")
+        return _StubCompletedProcess(
+            returncode=0, stdout=f"{self.gateway_uid}\n", stderr="",
+        )
+
+
+def _artifacts_with_started_at(
+    tmp_path: Path,
+    started_at: datetime | None = None,
+    run_id: str = "run_20260508_120300",
+) -> RunArtifacts:
+    """Build an empty run_dir under ``tmp_path`` whose RunArtifacts
+    carries the given ``started_at`` / ``run_id`` values."""
+    run_dir = tmp_path / run_id
+    run_dir.mkdir(exist_ok=True)
+    if started_at is None:
+        started_at = datetime(2026, 5, 8, 12, 3, 0)
+    return RunArtifacts(
+        run_dir=run_dir, run_id=run_id, started_at=started_at,
+    )
+
+
+def _podman_row(
+    *,
+    name: str = "k8s_secondary",
+    cid: str = "abc1234567890",
+    state: str = "running",
+    started_at: str = "2026-05-08T12:04:00Z",
+    labels: dict[str, str] | None = None,
+) -> PodmanRow:
+    return PodmanRow(
+        id=cid,
+        name=name,
+        image="img",
+        state=state,
+        started_at=started_at,
+        labels=labels or {},
+        raw={},
+    )
+
+
+def _listener_row(
+    *,
+    port: int = 5050,
+    pid: int = 12345,
+    process: str | None = "peer_push",
+    uid: int | None = 1000,
+) -> ListenerRow:
+    return ListenerRow(
+        proto="tcp",
+        local_address="0.0.0.0",
+        local_port=port,
+        pid=pid,
+        process=process,
+        uid=uid,
+    )
+
+
+def _process_row(
+    *,
+    pid: int = 67094,
+    ppid: int = 1,
+    user: str = "sirati",
+    etime: str = "00:42",
+    cmd: str = "/usr/bin/harmonia-cache --listen 0.0.0.0:5000",
+) -> ProcessRow:
+    return ProcessRow(
+        pid=pid, ppid=ppid, user=user, etime=etime, cmd=cmd,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Invariant 5: leaked containers
+# ---------------------------------------------------------------------------
+
+
+def test_check_no_leaked_containers_pass_when_empty(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    probe = _StubProbe(podman_rows_by_worker={"slurm-worker1": []})
+    result = check_no_leaked_containers(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert result.passed
+    assert result.status == "pass"
+
+
+def test_check_no_leaked_containers_label_match(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    leaked = _podman_row(
+        name="rando", labels={"run_id": artifacts.run_id},
+    )
+    probe = _StubProbe(podman_rows_by_worker={"slurm-worker1": [leaked]})
+    result = check_no_leaked_containers(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert not result.passed
+    assert result.status == "fail"
+    assert "1 leaked container" in result.detail
+    assert leaked in result.rows
+
+
+def test_check_no_leaked_containers_name_substring(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    leaked = _podman_row(name=f"asm-secondary-{artifacts.run_id}-0")
+    probe = _StubProbe(podman_rows_by_worker={"slurm-worker1": [leaked]})
+    result = check_no_leaked_containers(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert not result.passed
+    assert leaked in result.rows
+
+
+def test_check_no_leaked_containers_started_at_window(tmp_path: Path) -> None:
+    # The container has neither label nor name match; the started_at
+    # falls inside the run window so it counts as a leak.
+    artifacts = _artifacts_with_started_at(
+        tmp_path, started_at=datetime(2026, 5, 8, 12, 0, 0),
+    )
+    leaked = _podman_row(
+        name="some-other-container",
+        started_at="2026-05-08T12:05:00Z",
+    )
+    probe = _StubProbe(podman_rows_by_worker={"slurm-worker1": [leaked]})
+    result = check_no_leaked_containers(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert not result.passed
+    assert leaked in result.rows
+
+
+def test_check_no_leaked_containers_started_at_before(tmp_path: Path) -> None:
+    # Container started BEFORE the run -> not a leak from this run.
+    artifacts = _artifacts_with_started_at(
+        tmp_path, started_at=datetime(2026, 5, 8, 12, 0, 0),
+    )
+    pre_existing = _podman_row(
+        name="pre-existing",
+        started_at="2026-05-08T11:55:00Z",
+    )
+    probe = _StubProbe(
+        podman_rows_by_worker={"slurm-worker1": [pre_existing]},
+    )
+    result = check_no_leaked_containers(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert result.passed
+
+
+def test_check_no_leaked_containers_unreachable(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    probe = _StubProbe(reachable=False)
+    result = check_no_leaked_containers(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert not result.passed
+    assert result.status == "skip"
+    assert "live cluster unavailable" in result.detail
+
+
+def test_check_no_leaked_containers_multi_worker(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    leaked = _podman_row(labels={"run_id": artifacts.run_id})
+    probe = _StubProbe(
+        podman_rows_by_worker={
+            "slurm-worker1": [],
+            "slurm-worker2": [leaked],
+            "slurm-worker3": [],
+        },
+    )
+    result = check_no_leaked_containers(
+        artifacts, probe, ["slurm-worker1", "slurm-worker2", "slurm-worker3"],
+    )
+    assert not result.passed
+    assert "slurm-worker2" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# Invariant 6: leaked listener ports
+# ---------------------------------------------------------------------------
+
+
+def test_check_no_leaked_listener_ports_pass(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    probe = _StubProbe(
+        listener_rows_by_worker={"slurm-worker1": []},
+        gateway_uid=1000,
+    )
+    result = check_no_leaked_listener_ports(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert result.passed
+    assert result.status == "pass"
+
+
+def test_check_no_leaked_listener_ports_uid_match(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    leaked = _listener_row(port=5050, uid=1000, process="peer_push")
+    probe = _StubProbe(
+        listener_rows_by_worker={"slurm-worker1": [leaked]},
+        gateway_uid=1000,
+    )
+    result = check_no_leaked_listener_ports(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert not result.passed
+    assert "1 leaked listener" in result.detail
+    assert "5050" in result.detail
+
+
+def test_check_no_leaked_listener_ports_other_uid_skipped(
+    tmp_path: Path,
+) -> None:
+    # A listener bound by a different UID is NOT this run's leak.
+    artifacts = _artifacts_with_started_at(tmp_path)
+    other = _listener_row(port=5050, uid=99, process="someone-else")
+    probe = _StubProbe(
+        listener_rows_by_worker={"slurm-worker1": [other]},
+        gateway_uid=1000,
+    )
+    result = check_no_leaked_listener_ports(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert result.passed
+
+
+def test_check_no_leaked_listener_ports_no_uid_skipped(
+    tmp_path: Path,
+) -> None:
+    # Kernel-style listener with no UID surfaced -> cannot attribute,
+    # skip rather than blame.
+    artifacts = _artifacts_with_started_at(tmp_path)
+    no_uid = _listener_row(port=5050, uid=None, process=None, pid=None)
+    probe = _StubProbe(
+        listener_rows_by_worker={"slurm-worker1": [no_uid]},
+        gateway_uid=1000,
+    )
+    result = check_no_leaked_listener_ports(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert result.passed
+
+
+def test_check_no_leaked_listener_ports_filters_by_port(tmp_path: Path) -> None:
+    # Only the requested ports are inspected; the mock applies the same
+    # client-side filter as the real probe.
+    artifacts = _artifacts_with_started_at(tmp_path)
+    other_port = _listener_row(port=22, uid=1000)
+    leaked = _listener_row(port=5000, uid=1000)
+    probe = _StubProbe(
+        listener_rows_by_worker={"slurm-worker1": [other_port, leaked]},
+        gateway_uid=1000,
+    )
+    result = check_no_leaked_listener_ports(
+        artifacts, probe, ["slurm-worker1"], ports=[5000, 5050],
+    )
+    assert not result.passed
+    assert "5000" in result.detail
+    assert "22" not in result.detail
+
+
+def test_check_no_leaked_listener_ports_unreachable(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    probe = _StubProbe(reachable=False)
+    result = check_no_leaked_listener_ports(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert result.status == "skip"
+    assert not result.passed
+
+
+# ---------------------------------------------------------------------------
+# Invariant 7: leaked processes
+# ---------------------------------------------------------------------------
+
+
+def test_check_no_leaked_processes_pass(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    probe = _StubProbe(process_rows_by_worker={"slurm-worker1": []})
+    result = check_no_leaked_processes(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert result.passed
+    assert result.status == "pass"
+
+
+def test_check_no_leaked_processes_orphaned_in_window(tmp_path: Path) -> None:
+    # Run started ~2 minutes ago; process etime 00:42 is inside that
+    # window AND ppid==1 -> leaked orphan.
+    artifacts = _artifacts_with_started_at(
+        tmp_path, started_at=datetime.now() - timedelta(minutes=2),
+    )
+    leaked = _process_row(
+        ppid=1, etime="00:42", cmd="harmonia-cache --listen 0.0.0.0:5000",
+    )
+    probe = _StubProbe(
+        process_rows_by_worker={"slurm-worker1": [leaked]},
+    )
+    result = check_no_leaked_processes(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert not result.passed
+    assert "1 leaked PPID=1" in result.detail
+
+
+def test_check_no_leaked_processes_ppid_not_one_skipped(
+    tmp_path: Path,
+) -> None:
+    # ppid != 1 means it has a live parent; we only flag orphans.
+    artifacts = _artifacts_with_started_at(
+        tmp_path, started_at=datetime.now() - timedelta(minutes=2),
+    )
+    not_orphan = _process_row(
+        ppid=42, etime="00:30", cmd="harmonia-cache",
+    )
+    probe = _StubProbe(
+        process_rows_by_worker={"slurm-worker1": [not_orphan]},
+    )
+    result = check_no_leaked_processes(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert result.passed
+
+
+def test_check_no_leaked_processes_outside_window_skipped(
+    tmp_path: Path,
+) -> None:
+    # Process started 1h ago but the run started 2min ago -> it's
+    # leftover from another run, not ours.
+    artifacts = _artifacts_with_started_at(
+        tmp_path, started_at=datetime.now() - timedelta(minutes=2),
+    )
+    older = _process_row(
+        ppid=1, etime="01:00:00", cmd="harmonia-cache",
+    )
+    probe = _StubProbe(
+        process_rows_by_worker={"slurm-worker1": [older]},
+    )
+    result = check_no_leaked_processes(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert result.passed
+
+
+def test_check_no_leaked_processes_d_etime_format(tmp_path: Path) -> None:
+    # Process etime in D-HH:MM:SS form is parsed correctly.
+    artifacts = _artifacts_with_started_at(
+        tmp_path, started_at=datetime.now() - timedelta(minutes=5),
+    )
+    long_runner = _process_row(
+        ppid=1, etime="2-03:04:05", cmd="harmonia-cache",
+    )
+    probe = _StubProbe(
+        process_rows_by_worker={"slurm-worker1": [long_runner]},
+    )
+    result = check_no_leaked_processes(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    # 2 days etime > 5 minutes window -> not from this run.
+    assert result.passed
+
+
+def test_check_no_leaked_processes_unparseable_etime_in_window(
+    tmp_path: Path,
+) -> None:
+    # Conservative: an unparseable etime is treated as in-window so we
+    # don't mask a real leak via parser fragility.
+    artifacts = _artifacts_with_started_at(
+        tmp_path, started_at=datetime.now() - timedelta(minutes=2),
+    )
+    weird = _process_row(
+        ppid=1, etime="???", cmd="compiler_suit_runner build",
+    )
+    probe = _StubProbe(
+        process_rows_by_worker={"slurm-worker1": [weird]},
+    )
+    result = check_no_leaked_processes(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert not result.passed
+
+
+def test_check_no_leaked_processes_missing_started_at(tmp_path: Path) -> None:
+    # No started_at -> cannot scope a window; the check soft-skips with
+    # passed=False and status="skip" so the caller knows.
+    run_dir = tmp_path / "run_no_ts"
+    run_dir.mkdir()
+    artifacts = RunArtifacts(run_dir=run_dir, run_id="run_no_ts")
+    probe = _StubProbe()
+    result = check_no_leaked_processes(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert not result.passed
+    assert result.status == "skip"
+    assert "started_at" in result.detail
+
+
+def test_check_no_leaked_processes_unreachable(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    probe = _StubProbe(reachable=False)
+    result = check_no_leaked_processes(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert result.status == "skip"
+    assert not result.passed
+
+
+# ---------------------------------------------------------------------------
+# wait_squeue_empty
+# ---------------------------------------------------------------------------
+
+
+def test_wait_squeue_empty_returns_true_when_empty() -> None:
+    probe = _StubProbe(squeue_rows=[])
+    assert wait_squeue_empty(probe, timeout_s=1.0) is True
+
+
+def test_wait_squeue_empty_returns_false_on_timeout() -> None:
+    probe = _StubProbe(squeue_rows=["job1"])  # never empties
+    assert wait_squeue_empty(
+        probe, timeout_s=0.05, poll_interval_s=0.01,
+    ) is False
+
+
+def test_wait_squeue_empty_polls_until_drained() -> None:
+    # First poll returns one job, second poll empty -> success.
+    probe = _StubProbe(squeue_polls=[["jobA"], []])
+    assert wait_squeue_empty(
+        probe, timeout_s=2.0, poll_interval_s=0.01,
+    ) is True
+    assert probe._squeue_calls == 2
+
+
+# ---------------------------------------------------------------------------
+# run_cluster_invariants composition
+# ---------------------------------------------------------------------------
+
+
+def test_run_cluster_invariants_unreachable_returns_three_skips(
+    tmp_path: Path,
+) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    probe = _StubProbe(reachable=False)
+    results = run_cluster_invariants(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert len(results) == 3
+    assert all(r.status == "skip" for r in results)
+    assert [r.name for r in results] == [
+        "no_leaked_containers",
+        "no_leaked_listener_ports",
+        "no_leaked_processes",
+    ]
+
+
+def test_run_cluster_invariants_still_running(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    probe = _StubProbe(squeue_rows=["jobX"])  # never drains
+    results = run_cluster_invariants(
+        artifacts, probe, ["slurm-worker1"], squeue_timeout_s=0.05,
+    )
+    assert len(results) == 3
+    assert all(r.status == "still-running" for r in results)
+    assert all(not r.passed for r in results)
+
+
+def test_run_cluster_invariants_full_pass(tmp_path: Path) -> None:
+    artifacts = _artifacts_with_started_at(tmp_path)
+    probe = _StubProbe(
+        squeue_rows=[],
+        podman_rows_by_worker={"slurm-worker1": []},
+        listener_rows_by_worker={"slurm-worker1": []},
+        process_rows_by_worker={"slurm-worker1": []},
+        gateway_uid=1000,
+    )
+    results = run_cluster_invariants(
+        artifacts, probe, ["slurm-worker1"],
+    )
+    assert len(results) == 3
+    assert all(r.passed for r in results), [str(r) for r in results]
+
+
+# ---------------------------------------------------------------------------
+# run_all_invariants composition
+# ---------------------------------------------------------------------------
+
+
+def test_run_all_invariants_returns_seven_results(tmp_path: Path) -> None:
+    run_dir = _make_run_dir(tmp_path, variant_count=1)
+    # Re-anchor the artifacts to use from_dir-style timestamps so check 7
+    # has a window. _make_run_dir uses ``run_2026<jobid>``; skip parsing
+    # and inject started_at directly.
+    artifacts = RunArtifacts(
+        run_dir=run_dir,
+        run_id=run_dir.name,
+        started_at=datetime(2026, 5, 8, 12, 0, 0),
+    )
+    probe = _StubProbe(
+        squeue_rows=[],
+        podman_rows_by_worker={"slurm-worker1": []},
+        listener_rows_by_worker={"slurm-worker1": []},
+        process_rows_by_worker={"slurm-worker1": []},
+        gateway_uid=1000,
+    )
+    results = run_all_invariants(
+        artifacts, probe, ["slurm-worker1"], expected_failure_count=0,
+    )
+    assert len(results) == 7
+    names = [r.name for r in results]
+    assert names == [
+        "clean_exit",
+        "no_bind_errors",
+        "manifest_count_matches",
+        "build_failures",
+        "no_leaked_containers",
+        "no_leaked_listener_ports",
+        "no_leaked_processes",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# CLI --cluster
+# ---------------------------------------------------------------------------
+
+
+def test_cli_cluster_requires_workers(tmp_path: Path) -> None:
+    run_dir = _make_run_dir(tmp_path, variant_count=1)
+    # --cluster without --workers should error out.
+    result = _run_cli(str(run_dir), "--cluster")
+    assert result.returncode == 2
+    assert "--workers" in result.stderr
+
+
+def test_cli_argparse_accepts_expected_failures_flag(tmp_path: Path) -> None:
+    run_dir = _make_run_dir(tmp_path, build_failure_count=2)
+    result = _run_cli(str(run_dir), "--expected-failures", "2")
+    assert result.returncode == 0, result.stdout + result.stderr
