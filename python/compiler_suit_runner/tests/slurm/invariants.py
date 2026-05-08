@@ -131,20 +131,33 @@ class RunArtifacts:
     run_dir: Path
     run_id: str = ""
     started_at: datetime | None = None
+    shared_fs: Path | None = None
+    """Optional ``--shared-fs`` root passed to the dispatch.
+
+    When set, :attr:`manifests_dir` resolves to ``shared_fs/manifests/``
+    (where the framework actually writes manifests). When ``None``, the
+    legacy ``run_dir/manifests/`` is used to keep older callers working.
+    """
 
     @classmethod
-    def from_dir(cls, run_dir: Path) -> RunArtifacts:
+    def from_dir(
+        cls, run_dir: Path, *, shared_fs: Path | None = None,
+    ) -> RunArtifacts:
         """Build a :class:`RunArtifacts` from a ``run_<TS>`` directory.
 
         ``run_id`` is the directory name verbatim. ``started_at`` is
         parsed from the timestamp embedded in the name, or left as
         ``None`` if the name does not match the framework's
-        ``run_YYYYMMDD_HHMMSS`` template.
+        ``run_YYYYMMDD_HHMMSS`` template. ``shared_fs`` is forwarded to
+        the dataclass so :attr:`manifests_dir` can resolve correctly.
         """
         name = run_dir.name
         m = _RUN_ID_RE.match(name)
         if m is None:
-            return cls(run_dir=run_dir, run_id=name, started_at=None)
+            return cls(
+                run_dir=run_dir, run_id=name, started_at=None,
+                shared_fs=shared_fs,
+            )
         date_s, time_s = m.group(1), m.group(2)
         try:
             ts = datetime.strptime(
@@ -152,10 +165,15 @@ class RunArtifacts:
             )
         except ValueError:
             ts = None
-        return cls(run_dir=run_dir, run_id=name, started_at=ts)
+        return cls(
+            run_dir=run_dir, run_id=name, started_at=ts,
+            shared_fs=shared_fs,
+        )
 
     @property
     def manifests_dir(self) -> Path:
+        if self.shared_fs is not None:
+            return self.shared_fs / "manifests"
         return self.run_dir / "manifests"
 
     @property
@@ -233,6 +251,25 @@ def _count_dir_entries(path: Path) -> int:
     if not path.is_dir():
         return 0
     return sum(1 for _ in path.iterdir())
+
+
+def _count_variant_manifests(path: Path) -> int:
+    """Count variant-manifest JSON files in ``path``.
+
+    Excludes the run-level ``_meta.json`` and any ``toolchain_*.json``
+    sidecars - only files representing one *built variant* count toward
+    the manifest invariant. Returns 0 if the directory is missing.
+    """
+    if not path.is_dir():
+        return 0
+    return sum(
+        1
+        for entry in path.iterdir()
+        if entry.is_file()
+        and entry.suffix == ".json"
+        and not entry.name.startswith("_")
+        and not entry.name.startswith("toolchain_")
+    )
 
 
 def _parse_etime_seconds(etime: str) -> int | None:
@@ -363,7 +400,7 @@ def check_manifest_count_matches(
 ) -> InvariantResult:
     """Invariant 3: ``len(manifests/)`` equals completed-variant count."""
     name = "manifest_count_matches"
-    manifest_count = _count_dir_entries(artifacts.manifests_dir)
+    manifest_count = _count_variant_manifests(artifacts.manifests_dir)
 
     completed = 0
     for path in artifacts.slurm_out_files():

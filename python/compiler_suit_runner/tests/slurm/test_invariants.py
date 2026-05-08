@@ -295,6 +295,37 @@ def test_manifest_count_toolchain_lines_ignored(tmp_path: Path) -> None:
     assert result.passed, result.detail
 
 
+def test_manifest_count_meta_and_toolchain_files_excluded(
+    tmp_path: Path,
+) -> None:
+    # The framework drops ``_meta.json`` and ``toolchain_<x>__<y>.json``
+    # alongside the per-variant manifests; only true variant manifests
+    # should count.
+    run_dir = _make_run_dir(tmp_path, variant_count=1)
+    manifests = run_dir / "manifests"
+    (manifests / "_meta.json").write_text("{}\n")
+    (manifests / "toolchain__aarch64__clang10.json").write_text("{}\n")
+    result = check_manifest_count_matches(RunArtifacts(run_dir=run_dir))
+    assert result.passed, result.detail
+
+
+def test_manifest_count_shared_fs_overrides_run_dir(tmp_path: Path) -> None:
+    # When ``shared_fs`` is set, manifests are read from
+    # ``shared_fs/manifests/`` rather than ``run_dir/manifests/``.
+    run_dir = _make_run_dir(tmp_path, variant_count=1)
+    # Drop the run-dir manifests/ so it can't accidentally satisfy the
+    # check; the variant manifest only lives under shared_fs.
+    for entry in (run_dir / "manifests").iterdir():
+        entry.unlink()
+    shared_fs = tmp_path / "shared"
+    (shared_fs / "manifests").mkdir(parents=True)
+    (shared_fs / "manifests" / "variant_0.json").write_text("{}\n")
+    artifacts = RunArtifacts.from_dir(run_dir, shared_fs=shared_fs)
+    assert artifacts.manifests_dir == shared_fs / "manifests"
+    result = check_manifest_count_matches(artifacts)
+    assert result.passed, result.detail
+
+
 # ---------------------------------------------------------------------------
 # Invariant 4: build-failure count
 # ---------------------------------------------------------------------------

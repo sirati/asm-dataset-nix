@@ -243,7 +243,9 @@ def test_t01_clean_tiny(
     # All seven invariants. ``run_all_invariants`` re-checks
     # ``wait_squeue_empty`` for the cluster checks; the second poll is
     # a fast no-op now that we drained above.
-    artifacts = RunArtifacts.from_dir(result.log_dir)
+    artifacts = RunArtifacts.from_dir(
+        result.log_dir, shared_fs=invocation.shared_fs,
+    )
     results = run_all_invariants(
         artifacts,
         probe,
