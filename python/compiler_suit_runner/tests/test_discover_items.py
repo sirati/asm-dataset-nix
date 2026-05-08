@@ -8,6 +8,7 @@ killing the run.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import pathlib
 import tempfile
@@ -246,3 +247,37 @@ def test_discover_items_skips_dotfiles_and_underscored(
     task = SuitTask(config)
     items = list(task.discover_items())
     assert len(items) == 1
+
+
+def test_discover_items_strips_task_depends_on_when_disabled(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``disable_task_deps=True`` zeros out ``task_depends_on`` for every item.
+
+    The variant header normally carries a tuple
+    ``(toolchain_task_id(...),)``; with the workaround flag set the
+    framework never sees those edges, and PendingPool.extend() accepts
+    the variant even when its toolchain dep is in-flight.
+    """
+    base_config = _make_config(tmp_path)
+    config = dataclasses.replace(base_config, disable_task_deps=True)
+    config.manifest_dir.mkdir(parents=True, exist_ok=True)
+
+    write_manifest(
+        config.manifest_dir,
+        make_toolchain_header("x86_64-linux", "x86_64", "gcc15"),
+    )
+    write_manifest(
+        config.manifest_dir,
+        make_variant_header(_variant("hello", "x86_64"), "x86_64-linux"),
+    )
+
+    items = list(SuitTask(config).discover_items())
+    assert items, "expected at least one item"
+    assert all(item.task_depends_on == () for item in items)
+
+    # Sanity: with the flag OFF, the variant retains its toolchain dep
+    # so this test can't pass tautologically.
+    items_with_deps = list(SuitTask(base_config).discover_items())
+    variant = next(item for item in items_with_deps if item.type_id == "variant")
+    assert variant.task_depends_on  # non-empty
