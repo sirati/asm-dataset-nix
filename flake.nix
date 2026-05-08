@@ -139,7 +139,7 @@
           # Only evaluates the requested slice, not the full matrix.
           datasetNested = lib.mapAttrs (
             pkgLabel: archAttrs:
-            lib.mapAttrs (archLabel: variantAttrs: lib.mapAttrs (_: v: v.tarball) variantAttrs) archAttrs
+            lib.mapAttrs (archLabel: variantAttrs: lib.mapAttrs (_: v: v.elfFolder) variantAttrs) archAttrs
           ) matrix.nestedMatrix;
 
           # ── Manifest generation app ────────────────────────────────────────
@@ -243,7 +243,7 @@
           _drvPaths = lib.mapAttrs (
             pkgLabel: archAttrs:
             lib.mapAttrs (
-              archLabel: variantAttrs: lib.mapAttrs (suffix: v: v.tarball.drvPath) variantAttrs
+              archLabel: variantAttrs: lib.mapAttrs (suffix: v: v.elfFolder.drvPath) variantAttrs
             ) archAttrs
           ) matrix.nestedMatrix;
 

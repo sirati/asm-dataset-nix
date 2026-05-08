@@ -42,7 +42,7 @@ let
   flagDefs = import ./flags.nix { };
   pkgDefs = import ./packages.nix { };
   mkVariant = import ./mkVariant.nix { inherit pkgs lib; };
-  mkBinaryTarball = import ./mkBinaryTarball.nix { inherit pkgs lib; };
+  mkBinaryFolder = import ./mkBinaryFolder.nix { inherit pkgs lib; };
 
   # Skip -Oz for GCC (clang-only flag)
   isValidCombo = compiler: optLevel: !(optLevel.clangOnly && compiler.family == "gcc");
@@ -215,7 +215,7 @@ let
       march = march.label;
     };
 
-  # Build one variant entry (lazy — derivation not forced until .tarball/.rawPkg is accessed)
+  # Build one variant entry (lazy — derivation not forced until .elfFolder/.rawPkg is accessed)
   mkEntry =
     pkgDef: target: combo:
     let
@@ -228,7 +228,7 @@ let
         inherit meta;
         inherit (meta) variantLabel;
         # These are lazy — only evaluated when actually accessed
-        tarball = mkBinaryTarball (mkVariant {
+        elfFolder = mkBinaryFolder (mkVariant {
           pkg = pkgDef;
           compiler = combo.compiler;
           inherit target;
