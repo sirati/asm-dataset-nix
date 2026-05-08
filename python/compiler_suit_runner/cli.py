@@ -147,6 +147,19 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--no-task-depends",
+        action="store_true",
+        default=False,
+        help=(
+            "Drop ``task_depends_on`` from TaskInfo at discovery time. "
+            "Workaround for a dynamic_runner post-promotion bug where "
+            "PendingPool.extend() rejects variants whose toolchain dep "
+            "is in-flight (validator only seeds completed task_ids). "
+            "Safe because nix's drv graph + harmonia federation order "
+            "toolchain-before-variant at the build-lock level."
+        ),
+    )
+    parser.add_argument(
         "--variant-sample",
         type=int,
         default=2,
@@ -446,6 +459,7 @@ _CSR_BOOL_FLAGS: frozenset[str] = frozenset({
     "--no-cache",
     "--no-submitter-peer",
     "--enable-ssh-debug",
+    "--no-task-depends",
 })
 _CSR_SUBCOMMANDS: frozenset[str] = frozenset({
     "submit", "secondary", "preflight", "clear-cache",
@@ -541,6 +555,7 @@ def _config_from_args(
         enable_ssh_debug=getattr(args, "enable_ssh_debug", False),
         ssh_debug_port=getattr(args, "ssh_debug_port", 22222),
         build_max_concurrent=getattr(args, "build_max_concurrent", None),
+        disable_task_deps=getattr(args, "no_task_depends", False),
     )
 
 
@@ -615,7 +630,15 @@ def _restore_manifests_from_archive(
             label=v["label"],
             drv=v["drv"],
             variant_dir=v["variant_dir"],
+            metadata_name=v["metadata_name"],
             compiler_id=v["compiler_id"],
+            compiler_family=v["compiler_family"],
+            compiler_version=v["compiler_version"],
+            optimization=v["optimization"],
+            flag_set=v["flag_set"],
+            hardening=v["hardening"],
+            sanitizer=v["sanitizer"],
+            march=v["march"],
             tier=int(v["tier"]),
             pkg=v["pkg"],
             arch=v["arch"],
@@ -628,6 +651,11 @@ def _restore_manifests_from_archive(
     common_dep_drvs = tuple(
         (entry[0], entry[1]) for entry in pre_dict.get("common_dep_drvs", [])
     )
+    tc_drvs: dict[tuple[str, str], str] = {
+        (entry[0], entry[1]): entry[2]
+        for entry in pre_dict.get("toolchain_drvs_by_pair", [])
+        if isinstance(entry, list) and len(entry) == 3
+    }
     num_workers = int(pre_dict.get("num_workers", 1))
     emit_all_manifests(
         target_dir=target_dir,
@@ -636,25 +664,40 @@ def _restore_manifests_from_archive(
         toolchain_specs=toolchain_specs,
         common_deps=common_dep_drvs,
         num_workers=num_workers,
+        toolchain_drvs=tc_drvs,
     )
 
 
 def _serialize_preflight_for_cache(
-    pre: PreflightResult, num_workers: int, target_path: pathlib.Path
+    pre: PreflightResult,
+    num_workers: int,
+    target_path: pathlib.Path,
+    *,
+    toolchain_drvs_by_pair: Optional[dict[tuple[str, str], str]] = None,
 ) -> None:
     """Write the cacheable subset of a :class:`PreflightResult` as JSON.
 
     We only persist what :func:`emit_all_manifests` needs to recreate the
     manifest tree on a future cache hit: variants, toolchain_specs,
-    common_dep_drvs, sys_name, num_workers. Storing the sparse manifest
+    common_dep_drvs, sys_name, num_workers, and the realised toolchain
+    drv paths keyed by (arch, compiler). Storing the sparse manifest
     files themselves would explode the cache (each is up to ~1.5 PiB
     apparent-size).
+
+    Without ``toolchain_drvs_by_pair`` the restored toolchain manifests
+    fall back to ``flake_ref#_crossToolchainMap.<...>``, which fails on
+    SLURM secondaries (no flake.nix in /app).
     """
+    tc_pairs = toolchain_drvs_by_pair or {}
     payload = {
         "sys_name": pre.sys_name,
         "variants": [dict(v) for v in pre.variants],
         "toolchain_specs": [list(p) for p in pre.toolchain_specs],
         "common_dep_drvs": [list(p) for p in pre.common_dep_drvs],
+        "toolchain_drvs_by_pair": [
+            [arch, compiler, drv]
+            for (arch, compiler), drv in sorted(tc_pairs.items())
+        ],
         "num_workers": num_workers,
     }
     target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -989,6 +1032,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     slurm_root=str(args.slurm_root_folder),
                     local_port=port,
                     gateway_port=port,
+                    identity_file=args.ssh_identity_file,
+                    config_file=args.ssh_config,
                     log=log,
                 )
                 submitter.start()
@@ -1085,7 +1130,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
             try:
                 staging_path = pathlib.Path(staging)
                 _serialize_preflight_for_cache(
-                    pre, num_workers, staging_path / "_preflight.json"
+                    pre,
+                    num_workers,
+                    staging_path / "_preflight.json",
+                    toolchain_drvs_by_pair=tc_drvs,
                 )
                 cache.store(
                     input_hash=input_hash,

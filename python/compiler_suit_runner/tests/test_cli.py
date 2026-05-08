@@ -472,3 +472,78 @@ def test_cmd_submit_propagates_failure(
     rc = cmd_submit(args)
     assert rc == 1
     assert stub_submit_helpers["cache_store_calls"] == []
+
+
+def test_serialize_then_restore_preflight_roundtrip(tmp_path: pathlib.Path):
+    """Cached preflight must round-trip every VariantSpec field.
+
+    Regression: previously the restore path constructed VariantSpec with
+    only 7 of its 15 TypedDict fields, so make_variant_header crashed
+    with KeyError('metadata_name') on a cache hit.
+    """
+    import tarfile
+
+    from compiler_suit_runner.cli import (
+        _restore_manifests_from_archive,
+        _serialize_preflight_for_cache,
+    )
+    from compiler_suit_runner.partition import VariantSpec
+
+    variant: VariantSpec = {
+        "label": "hello-x86_64-gcc15-O2",
+        "drv": "/nix/store/abc.drv",
+        "variant_dir": "gcc15_x86_64_O2_deadbeef",
+        "metadata_name": "gcc15_x86_64_O2_deadbeef.json",
+        "compiler_id": "gcc15",
+        "compiler_family": "gcc",
+        "compiler_version": "15.2.0",
+        "optimization": "O2",
+        "flag_set": "baseline",
+        "hardening": "default",
+        "sanitizer": "san-off",
+        "march": "march-default",
+        "tier": 1,
+        "pkg": "hello",
+        "arch": "x86_64",
+    }
+    pre = PreflightResult(
+        sys_name="x86_64-linux",
+        variants=(variant,),
+        toolchain_specs=(("x86_64", "gcc15"),),
+        common_dep_drvs=(),
+        toolchain_drvs=frozenset({"/nix/store/tc.drv"}),
+    )
+
+    preflight_path = tmp_path / "_preflight.json"
+    _serialize_preflight_for_cache(
+        pre,
+        num_workers=1,
+        target_path=preflight_path,
+        toolchain_drvs_by_pair={("x86_64", "gcc15"): "/nix/store/tc.drv"},
+    )
+
+    archive = tmp_path / "manifests.tar"
+    with tarfile.open(archive, mode="w") as tf:
+        tf.add(preflight_path, arcname="manifests/_preflight.json")
+
+    target_dir = tmp_path / "out"
+    _restore_manifests_from_archive(archive, target_dir)
+
+    # The variant header is written as <label>.json — load it and prove
+    # every VariantSpec field survived the round-trip.
+    body = json.loads((target_dir / f"{variant['label']}.json").read_text())
+    payload = body["payload"]
+    assert payload["pkg"] == "hello"
+    assert payload["arch"] == "x86_64"
+    assert payload["compiler_id"] == "gcc15"
+    assert payload["metadata_name"] == "gcc15_x86_64_O2_deadbeef.json"
+    assert payload["compiler_family"] == "gcc"
+    assert payload["optimization"] == "O2"
+
+    # The toolchain manifest must carry the realised drv path so the
+    # SLURM-side build worker doesn't fall back to flake-attr lookup
+    # (which fails — secondaries have no flake.nix in /app).
+    tc_files = list(target_dir.glob("toolchain__*.json"))
+    assert len(tc_files) == 1
+    tc = json.loads(tc_files[0].read_text())
+    assert tc["payload"].get("drv") == "/nix/store/tc.drv"

@@ -60,6 +60,12 @@ from compiler_suit_runner.peer_cache import (
     generate_signing_key,
     withdraw_self,
 )
+from compiler_suit_runner.peer_push import (
+    PeerPushServer,
+    fan_out_announce,
+    fan_out_withdraw,
+    push_port_for,
+)
 from compiler_suit_runner.workers.build_worker import (
     BuildWorkerEnv,
     build_worker,
@@ -314,6 +320,17 @@ class SuitTaskConfig:
     # compiler invocations, so unbounded concurrency × workers
     # quickly oversubscribes the underlying secondaries.
     build_max_concurrent: Optional[int] = None
+    # Workaround flag: when True, ``discover_items`` strips
+    # ``task_depends_on`` from every emitted :class:`TaskInfo`. Set this
+    # to bypass a dynamic_runner post-promotion bug where the secondary
+    # rebuilds its PendingPool from cluster_state after the primary
+    # promotes it but never seeds in-flight task_ids into the
+    # extend()-validator's ``known`` set, causing UnknownTaskDep on any
+    # variant whose toolchain dep is currently dispatched. Safe because
+    # nix's drv graph + harmonia federation handle toolchain-before-
+    # variant ordering at the daemon build-lock level — we never needed
+    # framework-level deps for correctness, they were belt-and-suspenders.
+    disable_task_deps: bool = False
     input_hash: str = ""
     toolchain_drvs: frozenset[str] = frozenset()
     common_threshold: int = 10
@@ -351,6 +368,7 @@ class SuitTask:
         self._peer_nix_conf_watcher: Optional[Any] = None
         self._cachix_uploader: Optional[CachixUploader] = None
         self._harmonia: Optional[HarmoniaProcess] = None
+        self._push_server: Optional[PeerPushServer] = None
         self._setup_done: bool = False
         self._setup_lock = threading.Lock()
 
@@ -449,6 +467,9 @@ class SuitTask:
                 "size": header.size,
                 "payload": dict(header.payload),
             }
+            task_depends_on = (
+                () if self.config.disable_task_deps else header.task_depends_on
+            )
             yield _make_task_info(
                 pathlib.Path(entry.name),
                 header.size,
@@ -457,7 +478,7 @@ class SuitTask:
                 affinity_id=affinity_id,
                 payload=header_dict,
                 task_id=header.task_id,
-                task_depends_on=header.task_depends_on,
+                task_depends_on=task_depends_on,
             )
 
     # ── Memory estimator (disabled) ───────────────────────────────────
@@ -569,32 +590,29 @@ class SuitTask:
                 )
                 self._signing_key = None
 
-            # 2. Announce self.
             public_key = (
                 self._signing_key.public_key
                 if self._signing_key is not None
                 else ""
             )
-            try:
-                announce_self(
-                    self.config.shared_fs,
-                    PeerInfo(
-                        secondary_id=self.config.secondary_id,
-                        hostname=self.config.hostname,
-                        port=self.config.harmonia_port,
-                        public_key=public_key,
-                    ),
-                )
-            except Exception:  # noqa: BLE001 — log + continue
-                self._logger.exception(
-                    "on_run_start: announce_self failed"
-                )
+            my_info = PeerInfo(
+                secondary_id=self.config.secondary_id,
+                hostname=self.config.hostname,
+                port=self.config.harmonia_port,
+                public_key=public_key,
+            )
 
-            # 3. Watcher.
+            # 2. Watcher (start FIRST so its initial _refresh populates
+            # the live peer set before we announce/push). The push tick
+            # is relaxed to 60 s once push is enabled — push collapses
+            # the typical announce → discover latency to one HTTP RTT,
+            # leaving polling as a join-race / lost-packet safety net.
+            push_enabled = bool(public_key)
             try:
                 self._peer_watcher = PeerListWatcher(
                     shared_fs=self.config.shared_fs,
                     exclude_id=self.config.secondary_id,
+                    tick_seconds=60.0 if push_enabled else 5.0,
                 )
                 self._peer_watcher.start()
             except Exception:  # noqa: BLE001 — log + continue
@@ -602,6 +620,54 @@ class SuitTask:
                     "on_run_start: PeerListWatcher failed to start"
                 )
                 self._peer_watcher = None
+
+            # 2b. Push server (listens BEFORE we announce so any peer
+            # that pushes us in response sees a ready listener). Keyed
+            # off ``public_key``: without the cluster signing key we
+            # have no auth token, so we degrade to polling-only.
+            if push_enabled and self._peer_watcher is not None:
+                try:
+                    refresh_cb = self._peer_watcher.request_refresh
+                    self._push_server = PeerPushServer(
+                        bind_host="0.0.0.0",
+                        port=push_port_for(self.config.harmonia_port),
+                        expected_pubkey=public_key,
+                        on_announce=lambda _info: refresh_cb(),
+                        on_withdraw=lambda _sid: refresh_cb(),
+                    )
+                    self._push_server.start()
+                except Exception:  # noqa: BLE001 — log + continue
+                    self._logger.exception(
+                        "on_run_start: PeerPushServer failed to start"
+                    )
+                    self._push_server = None
+
+            # 3. Announce self (writes peers/<id>.json), then push the
+            # announce to currently-known peers so they re-read without
+            # waiting for their next 60 s tick.
+            try:
+                announce_self(self.config.shared_fs, my_info)
+            except Exception:  # noqa: BLE001 — log + continue
+                self._logger.exception(
+                    "on_run_start: announce_self failed"
+                )
+            if (
+                push_enabled
+                and self._peer_watcher is not None
+                and self._push_server is not None
+            ):
+                try:
+                    sent = fan_out_announce(
+                        self._peer_watcher.peers, my_info, public_key,
+                    )
+                    self._logger.debug(
+                        "on_run_start: announce push sent to %d peer(s)",
+                        sent,
+                    )
+                except Exception:  # noqa: BLE001 — log + continue
+                    self._logger.exception(
+                        "on_run_start: fan_out_announce failed"
+                    )
 
             # 4. Cachix uploader (optional).
             if self.config.cachix_cache and self.config.cachix_token_file:
@@ -625,18 +691,36 @@ class SuitTask:
                     # Start nix-daemon FIRST. Idempotent — no-op if a
                     # daemon socket already exists. Container's
                     # nix.conf is in single-user mode so no nixbld*
-                    # group is needed.
+                    # group is needed. Log goes on the gateway-
+                    # readable mount alongside harmonia's so we can
+                    # diagnose worker connection-reset issues from
+                    # the host after the container exits and its
+                    # /tmp gets nuked.
                     from .peer_cache import start_nix_daemon
-                    start_nix_daemon()
+                    daemon_log = (
+                        pathlib.Path("/app/log-network")
+                        / f"nix-daemon-{self.config.secondary_id}.log"
+                    )
+                    start_nix_daemon(daemon_log)
                 except Exception:  # noqa: BLE001 — log + continue
                     self._logger.exception(
                         "on_run_start: nix-daemon start failed"
                         " (harmonia will likely 500 on store queries)"
                     )
                 try:
+                    # Log goes on the gateway-readable mount under a
+                    # secondary-id-scoped filename (operators read it
+                    # from the gateway; other secondaries never write
+                    # it). TOML stays container-local under the
+                    # default runtime_dir.
+                    log_path = (
+                        pathlib.Path("/app/log-network")
+                        / f"harmonia-{self.config.secondary_id}.log"
+                    )
                     self._harmonia = HarmoniaProcess(
                         bind_addr=f"0.0.0.0:{self.config.harmonia_port}",
                         signing_key_path=self._signing_key.secret_path,
+                        log_path=log_path,
                     )
                     self._harmonia.start()
                 except FileNotFoundError as exc:
@@ -712,6 +796,38 @@ class SuitTask:
                     )
                 finally:
                     self._peer_nix_conf_watcher = None
+
+            # Push withdraw BEFORE we drop the file or stop the watcher
+            # — we still have access to the live peer list and the
+            # signing public-key for the auth header.
+            if (
+                self._push_server is not None
+                and self._peer_watcher is not None
+                and self._signing_key is not None
+            ):
+                try:
+                    sent = fan_out_withdraw(
+                        self._peer_watcher.peers,
+                        self.config.secondary_id,
+                        self._signing_key.public_key,
+                    )
+                    self._logger.debug(
+                        "on_run_end: withdraw push sent to %d peer(s)", sent,
+                    )
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "on_run_end: fan_out_withdraw failed"
+                    )
+
+            if self._push_server is not None:
+                try:
+                    self._push_server.stop()
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "on_run_end: PeerPushServer stop failed"
+                    )
+                finally:
+                    self._push_server = None
 
             if self._harmonia is not None:
                 try:
