@@ -7,7 +7,7 @@ in this directory expects:
   imported lazily here so a missing module degrades to a skip rather
   than an import error at collection time),
 * the host-side log mount path,
-* a cleanup hook (filled in by sibling B2; placeholder for now),
+* a cleanup hook that runs the between-test cleanup harness on demand,
 * a ``fresh_run`` callable that wraps :func:`run_compiler_suit` with
   a pre-/post- :func:`clear_incremental_cache` so each row exercises
   the full cache-cold path.
@@ -27,6 +27,16 @@ from compiler_suit_runner.tests.slurm.run_helpers import (
     clear_incremental_cache,
     run_compiler_suit,
 )
+
+
+CleanupCallable = Callable[..., Any]
+"""Type alias for the ``cleanup_cluster`` fixture's yielded callable.
+
+Concretely returns a :class:`CleanupReport` from
+``compiler_suit_runner.tests.slurm.cluster_probe`` but typed loosely
+here so a missing ``cluster_probe`` module (during incremental
+implementation) doesn't produce import errors at collection time.
+"""
 
 
 @pytest.fixture(scope="session")
@@ -67,19 +77,56 @@ def slurm_log_root() -> pathlib.Path:
 
 
 @pytest.fixture
-def cleanup_cluster() -> Iterator[None]:
-    """Per-test cleanup hook — placeholder until B2 wires the real harness."""
-    # B2 will replace this no-op with the squeue/podman cleanup chain
-    # described in plan section "Cleanup harness". Yielding both
-    # before and after the test keeps the call shape stable so tests
-    # written against this fixture don't change when B2 lands.
-    yield
-    return
+def cleanup_cluster(
+    cluster_probe: Any,
+) -> Iterator[CleanupCallable]:
+    """Per-test cleanup hook implementing plan section "Cleanup harness".
+
+    The fixture runs cleanup at fixture START (before yielding to the
+    test), yields a callable so the test can invoke an extra cleanup
+    pass mid-test if it needs to (e.g. a failure-injection test that
+    wants to assert the cluster recovered before continuing), then
+    runs cleanup at fixture END.
+
+    The yielded callable returns a fresh
+    :class:`compiler_suit_runner.tests.slurm.cluster_probe.CleanupReport`
+    on each call so the test can assert on what got cleaned up.
+
+    The fixture is NOT autouse - tests opt in by listing it (or by
+    depending on :func:`fresh_run`, which wires it transitively). This
+    matters because the cleanup harness mutates the cluster; tests
+    that only inspect read-only state (e.g. parser unit tests) must
+    not pay for it.
+    """
+    cleanup_fn = getattr(cluster_probe, "cleanup", None)
+    if cleanup_fn is None:
+        pytest.skip(
+            "ClusterProbe.cleanup not available; B2 cleanup harness "
+            "not yet wired",
+        )
+
+    def _run_cleanup(**kwargs: Any) -> Any:
+        """Invoke the cleanup harness. ``kwargs`` flow through to
+        :meth:`ClusterProbe.cleanup` so individual tests can override
+        e.g. ``scancel_pattern`` for failure-injection workloads."""
+        return cleanup_fn(**kwargs)
+
+    # START: drain any leftover state from the previous test or run.
+    _run_cleanup()
+
+    try:
+        yield _run_cleanup
+    finally:
+        # END: leave the cluster clean regardless of test outcome.
+        # Errors here are NOT raised (they land in the
+        # CleanupReport.errors list) so a failed cleanup doesn't mask
+        # a more interesting test failure.
+        _run_cleanup()
 
 
 @pytest.fixture
 def fresh_run(
-    cleanup_cluster: None,  # noqa: ARG001 — drives ordering only
+    cleanup_cluster: CleanupCallable,  # noqa: ARG001 — drives ordering only
 ) -> Callable[..., RunResult]:
     """Run :func:`run_compiler_suit` with cache-cold guarantees.
 

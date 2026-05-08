@@ -1,8 +1,8 @@
-"""SSH-based read-only probes for the local SLURM test environment.
+"""SSH-based probes for the local SLURM test environment.
 
-The probes here are a thin wrapper over the OpenSSH client. They cover
-the read-side primitives the per-run invariant checker (and downstream
-preflight code) needs:
+Most of this module is read-only - the probes are a thin wrapper over
+the OpenSSH client and cover the primitives the per-run invariant
+checker (and downstream preflight code) needs:
 
 - gateway / worker shell execution via explicit ``-i`` key (never via
   ``ssh-agent`` or ``~/.ssh/`` per project policy);
@@ -10,14 +10,19 @@ preflight code) needs:
 - ``podman ps -a`` enumeration with full label set on each worker;
 - listener / process inspection (``ss``, ``ps``) for leak detection.
 
-Cleanup / mutating actions (``scancel``, ``podman rm``, ``pkill``) are
-deliberately **not** part of this module - the cleanup harness lives in
-a separate file owned by another batch and re-uses ``ClusterProbe`` for
-its read-side checks.
+The single mutating entry point is :meth:`ClusterProbe.cleanup`, which
+performs the between-test cleanup harness described in the slurm test
+plan: ``scancel`` filtered by job-name pattern (NEVER by user, since
+the test-env's ``kruppb`` account is shared with the asm-tokenizer
+peer), per-worker podman stop+rm, ``pkill`` for known-leaky processes,
+and a poll loop on harmonia/peer_push listener ports.
 
 All commands are dispatched through :class:`subprocess.run` with
 ``shell=False`` and an explicit argv vector so neither the gateway nor
 the workers ever see a shell-quoted string assembled from caller input.
+The few remote-shell expressions we DO assemble (the podman compound
+on each worker) only interpolate constants - never caller input - so
+they're safe under the implicit ``bash -lc`` SSH applies remotely.
 """
 
 from __future__ import annotations
@@ -26,16 +31,23 @@ import dataclasses
 import json
 import shlex
 import subprocess
-from typing import Any, Final, Iterable, Mapping
+import time
+from typing import Any, Final, Iterable, Mapping, Sequence
 
 __all__ = [
     "GatewayConfig",
     "ClusterProbe",
+    "CleanupReport",
+    "WorkerCleanupResult",
     "SqueueRow",
     "SinfoRow",
     "PodmanRow",
     "ListenerRow",
     "ProcessRow",
+    "DEFAULT_CLEANUP_WORKERS",
+    "DEFAULT_CLEANUP_PORTS",
+    "DEFAULT_CLEANUP_PKILL_PATTERN",
+    "DEFAULT_SCANCEL_PATTERN",
 ]
 
 
@@ -64,6 +76,61 @@ _BASE_SSH_OPTS: Final[tuple[str, ...]] = (
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "LogLevel=ERROR",
 )
+
+
+# ---------------------------------------------------------------------------
+# Cleanup defaults
+# ---------------------------------------------------------------------------
+
+DEFAULT_CLEANUP_WORKERS: Final[tuple[str, ...]] = (
+    "slurm-worker1",
+    "slurm-worker2",
+    "slurm-worker3",
+    "slurm-worker4",
+)
+"""Worker hostnames the cleanup harness sweeps by default.
+
+Matches the live local test-env topology (4 workers; see plan section
+"Confirmed cluster topology"). Override via the ``workers=`` kwarg on
+:meth:`ClusterProbe.cleanup` if a future test env adds/removes nodes.
+"""
+
+DEFAULT_CLEANUP_PORTS: Final[tuple[int, ...]] = (5000, 5050)
+"""Listener ports the cleanup harness polls for release.
+
+5000 is harmonia-cache, 5050 is peer_push - the two leaky listeners
+identified in the smoke16/17/18 retrospective. Per-port poll keeps a
+stale binder from breaking the next run with ``EADDRINUSE``.
+"""
+
+DEFAULT_CLEANUP_PKILL_PATTERN: Final[str] = (
+    "compiler_suit_runner|harmonia-cache|peer_push"
+)
+"""Regex passed to ``pkill -KILL -f`` on each worker.
+
+Three families catch the entire post-promotion leak surface:
+``compiler_suit_runner`` covers the secondary coordinator + every
+build_worker; ``harmonia-cache`` covers the binary-cache server;
+``peer_push`` covers the per-secondary HTTP push server.
+"""
+
+DEFAULT_SCANCEL_PATTERN: Final[str] = "asm-secondary-*"
+"""Glob passed to ``scancel --jobname=`` by default.
+
+CRITICAL (memory ``feedback_scancel_scope.md``): the test-env's
+``kruppb`` account is shared with the asm-tokenizer peer, so we must
+NEVER pass ``--user=kruppb``. Filtering by our own job-name glob is
+the only safe way to scope scancel.
+"""
+
+DEFAULT_CLEANUP_TIMEOUT: Final[float] = 90.0
+"""Default end-to-end timeout (seconds) for :meth:`ClusterProbe.cleanup`.
+
+Budget breakdown: 60s ``squeue --me`` poll + 30s ports poll, mirroring
+the pseudocode in plan section "Cleanup harness". Individual SSH calls
+keep their own short timeouts so a single hung command can't exhaust
+the budget.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +217,83 @@ class ProcessRow:
     user: str
     etime: str
     cmd: str
+
+
+@dataclasses.dataclass(slots=True)
+class WorkerCleanupResult:
+    """Per-worker accounting for one :meth:`ClusterProbe.cleanup` pass.
+
+    Containers are counted in two phases (stop, then rm) so a partial
+    failure in either phase is visible. ``processes_killed`` counts
+    PIDs the post-pkill probe could no longer find with the cleanup
+    pattern - the literal ``pkill`` exit code isn't a useful signal
+    (it returns 1 when nothing matched, which is the desired terminal
+    state).
+    """
+
+    worker: str
+    containers_stopped: int = 0
+    containers_removed: int = 0
+    processes_killed: int = 0
+    errors: list[str] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass(slots=True)
+class CleanupReport:
+    """Diagnosable record of one :meth:`ClusterProbe.cleanup` pass.
+
+    The report carries enough signal to decide whether the cluster is
+    actually clean (used by the test fixture to assert "no errors at
+    end-of-test") AND to surface what was wrong if it isn't (used by
+    a human reading the test failure).
+
+    Fields:
+
+    - ``reachable``: gateway health probe before scancel; if ``False``
+      every later step is skipped and ``errors`` carries
+      ``"cluster unreachable"``.
+    - ``jobs_canceled``: rows in ``squeue --me`` immediately before
+      scancel (so 0 means the queue was already empty).
+    - ``squeue_drained``: ``True`` iff ``squeue --me`` reached empty
+      within ``timeout_s`` after scancel.
+    - ``ports_released``: list of (worker, port) pairs whose listener
+      was confirmed gone. Pairs that never released within the timeout
+      land in ``ports_still_bound`` instead.
+    - ``per_worker``: per-worker container/process counts so a failure
+      on a single worker doesn't hide behind aggregate numbers.
+    - ``errors``: collected, never raised - the fixture decides whether
+      to assert empty.
+    """
+
+    reachable: bool = True
+    jobs_canceled: int = 0
+    squeue_drained: bool = False
+    per_worker: dict[str, WorkerCleanupResult] = dataclasses.field(
+        default_factory=dict,
+    )
+    ports_released: list[tuple[str, int]] = dataclasses.field(
+        default_factory=list,
+    )
+    ports_still_bound: list[tuple[str, int]] = dataclasses.field(
+        default_factory=list,
+    )
+    errors: list[str] = dataclasses.field(default_factory=list)
+    duration_s: float = 0.0
+
+    @property
+    def containers_stopped(self) -> int:
+        """Sum of containers stopped across all workers."""
+        return sum(w.containers_stopped for w in self.per_worker.values())
+
+    @property
+    def containers_removed(self) -> int:
+        """Sum of containers removed across all workers."""
+        return sum(w.containers_removed for w in self.per_worker.values())
+
+    @property
+    def processes_killed(self) -> int:
+        """Sum of leaky processes killed across all workers."""
+        return sum(w.processes_killed for w in self.per_worker.values())
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +532,335 @@ class ClusterProbe:
 
     # -- ps ------------------------------------------------------------
 
+    # -- cleanup harness ----------------------------------------------
+
+    def cleanup(
+        self,
+        *,
+        scancel_pattern: str = DEFAULT_SCANCEL_PATTERN,
+        workers: Sequence[str] | None = None,
+        ports: Sequence[int] = DEFAULT_CLEANUP_PORTS,
+        pkill_pattern: str = DEFAULT_CLEANUP_PKILL_PATTERN,
+        timeout_s: float = DEFAULT_CLEANUP_TIMEOUT,
+        squeue_poll_interval: float = 1.0,
+        ports_poll_interval: float = 1.0,
+        clock: Any = time.monotonic,
+        sleep: Any = time.sleep,
+    ) -> CleanupReport:
+        """Between-test cleanup of the SLURM test environment.
+
+        Performs the four steps in plan section "Cleanup harness":
+
+        1. ``scancel --jobname=<scancel_pattern> --user=$(whoami)`` on
+           the gateway. Note: ``$(whoami)`` is the SSH user (``sirati``
+           in the local test-env), NOT the production ``kruppb``
+           account. We MUST NOT pass ``--user=kruppb`` because that
+           account is shared with the asm-tokenizer peer per memory
+           ``feedback_scancel_scope.md``.
+        2. Poll ``squeue --me`` until empty (or 60s of the budget).
+        3. On each worker: stop+rm rootless podman containers and
+           ``pkill -KILL -f`` the leaky processes.
+        4. Poll the harmonia/peer_push listener ports until released
+           (or 30s of the budget).
+
+        All steps capture, never raise. Errors land in
+        :attr:`CleanupReport.errors`. The caller (the
+        ``cleanup_cluster`` pytest fixture) decides whether to assert
+        empty errors at end-of-test.
+
+        Parameters control the safety surface:
+
+        - ``scancel_pattern``: glob passed to ``--jobname=``. Default
+          scopes to ``asm-secondary-*``. Override only for tests that
+          inject a different job-name family.
+        - ``workers``: hostnames swept; defaults to the 4-node test
+          env. Pass an empty sequence to skip the per-worker pass.
+        - ``ports``: listener ports to poll for release. Defaults to
+          ``(5000, 5050)``.
+        - ``pkill_pattern``: regex passed to ``pkill -KILL -f``.
+          Defaults to the leaky-process families.
+        - ``timeout_s``: total budget. The squeue poll consumes up to
+          60s, the per-worker pass is bounded by per-call SSH
+          timeouts, and the ports poll consumes the remainder.
+        - ``clock`` / ``sleep``: injectable for test mocking.
+
+        Returns a :class:`CleanupReport`. Inspect ``errors``,
+        ``squeue_drained``, ``ports_still_bound`` to decide whether
+        the cluster is actually clean.
+        """
+        report = CleanupReport()
+        worker_list = (
+            tuple(workers) if workers is not None else DEFAULT_CLEANUP_WORKERS
+        )
+        start = clock()
+        deadline = start + max(timeout_s, 0.0)
+
+        # ---- step 0: reachability gate -------------------------------
+        if not self.is_reachable(timeout=min(self.gateway.timeout, 5.0)):
+            report.reachable = False
+            report.errors.append("cluster unreachable")
+            report.duration_s = max(0.0, clock() - start)
+            return report
+
+        # ---- step 1: scancel by job-name pattern ---------------------
+        # CRITICAL: filter by --jobname=<pattern> AND scope to
+        # ``--user=$(whoami)``. NEVER hard-code ``--user=kruppb``: the
+        # kruppb account is shared with the asm-tokenizer peer in the
+        # production cluster, and the local SSH user (``sirati``) is
+        # what $(whoami) resolves to in the test-env shell.
+        try:
+            squeue_before = self.squeue_me(
+                timeout=min(self.gateway.timeout, 10.0),
+            )
+            report.jobs_canceled = sum(
+                1 for r in squeue_before
+                if _matches_glob(r.name, scancel_pattern)
+            )
+            scancel_cmd = (
+                "scancel --jobname="
+                f"{shlex.quote(scancel_pattern)} "
+                "--user=\"$(whoami)\""
+            )
+            self.gateway_ssh(
+                scancel_cmd, timeout=min(self.gateway.timeout, 15.0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            report.errors.append(f"scancel: timeout ({exc})")
+        except OSError as exc:
+            report.errors.append(f"scancel: {exc}")
+
+        # ---- step 2: poll squeue --me until empty --------------------
+        squeue_deadline = min(clock() + 60.0, deadline)
+        report.squeue_drained = self._poll_until(
+            check=lambda: not self._squeue_has_jobs_safely(),
+            deadline=squeue_deadline,
+            interval=squeue_poll_interval,
+            clock=clock,
+            sleep=sleep,
+        )
+        if not report.squeue_drained:
+            report.errors.append(
+                "squeue --me did not drain within timeout",
+            )
+
+        # ---- step 3: per-worker container + process cleanup ---------
+        for worker in worker_list:
+            worker_result = self._cleanup_worker(
+                worker=worker,
+                pkill_pattern=pkill_pattern,
+            )
+            report.per_worker[worker] = worker_result
+            for err in worker_result.errors:
+                report.errors.append(f"{worker}: {err}")
+
+        # ---- step 4: poll listener ports until released --------------
+        ports_deadline = min(clock() + 30.0, deadline)
+        released, still_bound = self._poll_ports(
+            workers=worker_list,
+            ports=ports,
+            deadline=ports_deadline,
+            interval=ports_poll_interval,
+            clock=clock,
+            sleep=sleep,
+        )
+        report.ports_released = released
+        report.ports_still_bound = still_bound
+        if still_bound:
+            report.errors.append(
+                "ports still bound after cleanup: "
+                + ", ".join(f"{w}:{p}" for w, p in still_bound),
+            )
+
+        report.duration_s = max(0.0, clock() - start)
+        return report
+
+    def _squeue_has_jobs_safely(self) -> bool:
+        """Predicate for the squeue drain loop. Surfaces *exceptions*
+        as 'not yet drained' rather than aborting cleanup - a transient
+        SSH hiccup must not break the poll."""
+        try:
+            return bool(self.squeue_me(timeout=min(self.gateway.timeout, 5.0)))
+        except (subprocess.TimeoutExpired, OSError):
+            return True  # conservative: assume not drained
+
+    def _cleanup_worker(
+        self,
+        *,
+        worker: str,
+        pkill_pattern: str,
+    ) -> WorkerCleanupResult:
+        """Run the per-worker container+process cleanup compound.
+
+        The remote shell expression interpolates only constants and
+        the ``pkill_pattern`` argument (which we shell-quote). It runs
+        under the ssh-default remote shell - typically bash with
+        ``-c``. We deliberately use ``set +e`` semantics inside the
+        compound (no global ``set -e``) so a missing podman binary or
+        empty container list doesn't abort downstream pkill.
+        """
+        result = WorkerCleanupResult(worker=worker)
+        # Pre-quote the pkill pattern. ``pkill_pattern`` is a regex; we
+        # only need shell-quoting (the regex is interpreted by pkill
+        # itself, NOT by the shell). shlex.quote is sufficient even
+        # for adversarial input - we still own the call site, but
+        # belt-and-braces safety here costs nothing.
+        quoted_pattern = shlex.quote(pkill_pattern)
+        # Per-worker shell compound. Note: every command is
+        # whitespace-bounded; no semicolons are interpolated from
+        # caller input. ``$(id -u)`` runs on the worker as the SSH
+        # user (rootless podman storage path).
+        script = (
+            "set +e\n"
+            "ROOT_ARGS=\"--root /run/user/$(id -u)/storage "
+            "--runroot /run/user/$(id -u)/runtime\"\n"
+            "STOPPED_COUNT=0\n"
+            "REMOVED_COUNT=0\n"
+            "IDS=$(podman $ROOT_ARGS ps -aq 2>/dev/null)\n"
+            "if [ -n \"$IDS\" ]; then\n"
+            "  STOPPED_COUNT=$(printf '%s\\n' \"$IDS\" | "
+            "xargs -r podman $ROOT_ARGS stop --time=5 2>/dev/null | "
+            "wc -l)\n"
+            "fi\n"
+            "IDS=$(podman $ROOT_ARGS ps -aq 2>/dev/null)\n"
+            "if [ -n \"$IDS\" ]; then\n"
+            "  REMOVED_COUNT=$(printf '%s\\n' \"$IDS\" | "
+            "xargs -r podman $ROOT_ARGS rm -f 2>/dev/null | "
+            "wc -l)\n"
+            "fi\n"
+            f"pkill -KILL -f {quoted_pattern} 2>/dev/null\n"
+            "PKILL_RC=$?\n"
+            "echo STOPPED=$STOPPED_COUNT\n"
+            "echo REMOVED=$REMOVED_COUNT\n"
+            "echo PKILL_RC=$PKILL_RC\n"
+        )
+        try:
+            cp = self.worker_ssh(
+                worker, script, timeout=min(self.gateway.timeout, 30.0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            result.errors.append(f"cleanup compound timed out ({exc})")
+            return result
+        except OSError as exc:
+            result.errors.append(f"cleanup compound: {exc}")
+            return result
+
+        if cp.returncode != 0 and not cp.stdout.strip():
+            result.errors.append(
+                f"cleanup compound rc={cp.returncode} "
+                f"stderr={cp.stderr.strip()[:200]}",
+            )
+            return result
+
+        # Parse the trailing ``key=value`` lines. The compound emits
+        # exactly three; tolerate any extra noise (e.g. xargs warnings)
+        # by ignoring lines without the expected ``=`` shape.
+        for line in cp.stdout.splitlines():
+            line = line.strip()
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            try:
+                ivalue = int(value)
+            except ValueError:
+                continue
+            if key == "STOPPED":
+                result.containers_stopped = ivalue
+            elif key == "REMOVED":
+                result.containers_removed = ivalue
+            elif key == "PKILL_RC":
+                # pkill rc: 0 = matched (and killed), 1 = no match,
+                # 2 = syntax error, 3 = fatal. 1 is the desired
+                # terminal state. Anything else is an error worth
+                # surfacing.
+                if ivalue == 0:
+                    result.processes_killed = 1
+                elif ivalue == 1:
+                    result.processes_killed = 0
+                else:
+                    result.errors.append(
+                        f"pkill returned rc={ivalue}",
+                    )
+        return result
+
+    def _poll_ports(
+        self,
+        *,
+        workers: Sequence[str],
+        ports: Sequence[int],
+        deadline: float,
+        interval: float,
+        clock: Any,
+        sleep: Any,
+    ) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+        """Poll each ``(worker, port)`` until its listener is gone.
+
+        Returns ``(released, still_bound)``. A pair lands in
+        ``released`` as soon as a single probe shows it free; pairs
+        that never go free by ``deadline`` end up in ``still_bound``.
+        Errors during a single probe are treated as 'still bound' for
+        that iteration (conservative: don't claim release on partial
+        info).
+        """
+        if not workers or not ports:
+            return [], []
+        port_list = list(ports)
+        targets: list[tuple[str, int]] = [
+            (w, p) for w in workers for p in port_list
+        ]
+        released: list[tuple[str, int]] = []
+        pending: list[tuple[str, int]] = list(targets)
+        # Polled per-worker because port_listeners is per-worker.
+        while pending and clock() < deadline:
+            still_pending: list[tuple[str, int]] = []
+            # Group pending by worker for one ss call per worker.
+            by_worker: dict[str, list[int]] = {}
+            for w, p in pending:
+                by_worker.setdefault(w, []).append(p)
+            for worker, w_ports in by_worker.items():
+                try:
+                    rows = self.port_listeners(
+                        worker, w_ports,
+                        timeout=min(self.gateway.timeout, 5.0),
+                    )
+                except (subprocess.TimeoutExpired, OSError):
+                    # Treat probe failure as 'still bound' for now;
+                    # next iteration retries.
+                    for p in w_ports:
+                        still_pending.append((worker, p))
+                    continue
+                bound_ports = {r.local_port for r in rows}
+                for p in w_ports:
+                    if p in bound_ports:
+                        still_pending.append((worker, p))
+                    else:
+                        released.append((worker, p))
+            pending = still_pending
+            if pending and clock() < deadline:
+                sleep(interval)
+        return released, list(pending)
+
+    @staticmethod
+    def _poll_until(
+        *,
+        check: Any,
+        deadline: float,
+        interval: float,
+        clock: Any,
+        sleep: Any,
+    ) -> bool:
+        """Generic poll: call ``check()`` until truthy or ``deadline``
+        passes. Returns ``True`` iff ``check()`` returned truthy.
+        ``sleep(interval)`` is invoked between iterations (NOT before
+        the first call - the first probe should be immediate)."""
+        while True:
+            if check():
+                return True
+            if clock() >= deadline:
+                return False
+            sleep(interval)
+
+    # -- read-only probes (cont.) -------------------------------------
+
     def processes_by_pattern(
         self,
         worker: str,
@@ -428,6 +901,19 @@ class ClusterProbe:
 # ---------------------------------------------------------------------------
 # Parsers (module-private)
 # ---------------------------------------------------------------------------
+
+
+def _matches_glob(name: str, pattern: str) -> bool:
+    """Glob-match for the scancel ``--jobname=`` pattern.
+
+    Used purely for the `jobs_canceled` accounting in
+    :class:`CleanupReport`: scancel itself does the real matching on
+    the gateway. Defers to :mod:`fnmatch` so the semantics line up
+    with what SLURM passes through to its glob layer.
+    """
+    import fnmatch
+
+    return fnmatch.fnmatchcase(name, pattern)
 
 
 def _parse_podman_json(stdout: str) -> list[PodmanRow]:
