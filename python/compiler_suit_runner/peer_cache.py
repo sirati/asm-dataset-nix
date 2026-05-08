@@ -38,7 +38,7 @@ import threading
 import time
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 __all__ = [
     "PeerInfo",
@@ -1308,30 +1308,80 @@ class SubmitterPeer:
             "--command", "harmonia-cache",
         ]
         log_path = _SUBMITTER_KEY_DIR / "harmonia.log"
-        log_fh = open(log_path, "wb")
-        self._harmonia = subprocess.Popen(  # noqa: S603
-            cmd, env=env,
-            stdout=log_fh, stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True, close_fds=True,
-        )
-        probe = f"http://127.0.0.1:{self.local_port}/nix-cache-info"
-        for _ in range(40):
-            try:
-                with urllib.request.urlopen(probe, timeout=0.5):
-                    self.log.info(
-                        "submitter harmonia listening on 127.0.0.1:%d "
-                        "(framework will tunnel as 0.0.0.0:%d)",
-                        self.local_port, self.gateway_port,
-                    )
-                    break
-            except OSError:
-                time.sleep(0.25)
-        else:
-            self.log.warning(
-                "submitter harmonia did not respond on :%d within 10s",
-                self.local_port,
+        # If a previous SubmitterPeer left an orphaned harmonia
+        # squatting on local_port, our new one will fail to bind with
+        # EADDRINUSE while the probe still succeeds (the orphan answers
+        # for ``/nix-cache-info``). Detect that state, clear the
+        # squatter, and retry.
+        for attempt in range(2):
+            log_fh = open(log_path, "wb")
+            self._harmonia = subprocess.Popen(  # noqa: S603
+                cmd, env=env,
+                stdout=log_fh, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True, close_fds=True,
             )
+            probe = (
+                f"http://127.0.0.1:{self.local_port}/nix-cache-info"
+            )
+            bound_ok = False
+            bind_failed = False
+            for _ in range(40):
+                if self._harmonia.poll() is not None:
+                    # Subprocess already exited - either bind-failure
+                    # or some other startup error. Read the log to
+                    # discriminate.
+                    try:
+                        log_tail = log_path.read_bytes()[-512:].decode(
+                            "utf-8", errors="replace"
+                        )
+                    except OSError:
+                        log_tail = ""
+                    if "AddrInUse" in log_tail or (
+                        "Address already in use" in log_tail
+                    ):
+                        bind_failed = True
+                    break
+                try:
+                    with urllib.request.urlopen(probe, timeout=0.5):
+                        bound_ok = True
+                        break
+                except OSError:
+                    time.sleep(0.25)
+
+            if bound_ok:
+                self.log.info(
+                    "submitter harmonia listening on 127.0.0.1:%d "
+                    "(framework will tunnel as 0.0.0.0:%d)",
+                    self.local_port, self.gateway_port,
+                )
+                break
+
+            if bind_failed and attempt == 0:
+                # Wipe the squatter so the retry can bind. We only
+                # touch processes named harmonia-cache to avoid
+                # killing unrelated services that happened to
+                # collide on the port.
+                self.log.warning(
+                    "submitter harmonia bind to :%d failed - clearing"
+                    " orphan harmonia processes and retrying",
+                    self.local_port,
+                )
+                try:
+                    subprocess.run(  # noqa: S603,S607
+                        ["pkill", "-KILL", "-f", "harmonia-cache"],
+                        check=False, capture_output=True, timeout=5,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                time.sleep(0.5)
+                continue
+
+            self.log.warning(
+                "submitter harmonia did not respond on :%d within 10s"
+                " (bind_failed=%s)", self.local_port, bind_failed,
+            )
+            break
 
         # Snapshot existing run dirs so we don't publish into a
         # stale dispatch's dir that's still on the gateway.
@@ -1363,10 +1413,34 @@ class SubmitterPeer:
             )
             self._ssh_oneshot([f"rm -f {remote_path}"])
         if self._harmonia is not None:
+            # ``nix shell --command harmonia-cache`` runs in its own
+            # session (``start_new_session=True``), so the Popen handle
+            # points at the ``nix shell`` wrapper. ``terminate()`` would
+            # only signal the wrapper - the actual ``harmonia-cache``
+            # child survives, squats on the local port across
+            # dispatches, and the next dispatch's harmonia hits
+            # ``EADDRINUSE`` on bind. Send the signal to the whole
+            # process group instead so harmonia-cache exits too.
             try:
-                self._harmonia.terminate()
-            except OSError:
-                pass
+                pgid = os.getpgid(self._harmonia.pid)
+            except (OSError, ProcessLookupError):
+                pgid = None
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    pass
+                try:
+                    self._harmonia.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        pass
+                    try:
+                        self._harmonia.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
 
     def _poll_loop(self) -> None:
         while not self._stop_evt.is_set():
