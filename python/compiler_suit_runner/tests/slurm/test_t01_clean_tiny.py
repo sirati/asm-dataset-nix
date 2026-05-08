@@ -173,12 +173,16 @@ def test_t01_clean_tiny(
         f"sinfo missing expected nodes {missing!r}; got "
         f"{sorted(sinfo_by_node)!r}"
     )
-    not_idle = [
+    # T1 runs with jobs=1 so we only need at least one idle worker.
+    # Tolerate the rest being down/drained so a single bad worker (eg.
+    # ``slurm-worker1`` going to ``DOWN+NOT_RESPONDING`` after a
+    # forced cleanup) doesn't hide an otherwise-healthy harness.
+    idle = [
         w for w in WORKERS
-        if not sinfo_by_node[w].state.startswith("idle")
+        if sinfo_by_node[w].state.startswith("idle")
     ]
-    assert not not_idle, "sinfo nodes not idle: " + ", ".join(
-        f"{w}={sinfo_by_node[w].state!r}" for w in not_idle
+    assert idle, "no idle workers: " + ", ".join(
+        f"{w}={sinfo_by_node[w].state!r}" for w in WORKERS
     )
 
     # Compose the invocation. ``default_invocation_for_smoke(jobs=1,
