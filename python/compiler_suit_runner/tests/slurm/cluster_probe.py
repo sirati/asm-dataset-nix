@@ -75,6 +75,14 @@ _BASE_SSH_OPTS: Final[tuple[str, ...]] = (
     "-o", "BatchMode=yes",
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "LogLevel=ERROR",
+    # ControlMaster multiplexing: a burst of probe SSH calls (squeue +
+    # 4 worker ProxyJumps + listener probes) was tripping the gateway
+    # sshd's MaxStartups rate limit, surfacing as "Connection closed
+    # by ::1 port 2244" on the next call. Reusing one master connection
+    # per (host, port, user) tuple avoids that and is also faster.
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPath=/tmp/asm-cluster-probe-%C",
+    "-o", "ControlPersist=60s",
 )
 
 

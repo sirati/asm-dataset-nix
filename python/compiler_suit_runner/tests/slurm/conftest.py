@@ -41,29 +41,35 @@ implementation) doesn't produce import errors at collection time.
 
 @pytest.fixture(scope="session")
 def cluster_probe() -> Any:
-    """Session-scoped :class:`ClusterProbe` handle (A2-owned).
+    """Session-scoped :class:`ClusterProbe` handle.
 
-    Imported lazily because subagent A2 owns ``cluster_probe.py``;
-    until that module lands the slurm tests should ``skip`` rather
-    than fail at collection time, so the matrix can be implemented
-    in any order.
+    The identity-file path is read from ``ASM_CLUSTER_PROBE_KEY`` (env
+    var); when unset, falls back to the canonical
+    ``.ssh-debug/id_ed25519`` checked into this repo. The fixture
+    constructs the probe with a ``GatewayConfig`` carrying that key so
+    SSH probes authenticate against the live test-env.
     """
+    import os
+
     try:
         from compiler_suit_runner.tests.slurm import (  # type: ignore[attr-defined]
             cluster_probe as cluster_probe_mod,
         )
     except ImportError as exc:
         pytest.skip(
-            f"cluster_probe module not available yet ({exc}); "
-            "sibling subagent A2 owns it"
+            f"cluster_probe module not available yet ({exc})"
         )
     probe_cls = getattr(cluster_probe_mod, "ClusterProbe", None)
     if probe_cls is None:
-        pytest.skip(
-            "ClusterProbe not exported from cluster_probe; A2 hasn't "
-            "wired its public surface yet"
-        )
-    return probe_cls()
+        pytest.skip("ClusterProbe not exported from cluster_probe")
+
+    gateway_cfg_cls = getattr(cluster_probe_mod, "GatewayConfig", None)
+    repo_root = pathlib.Path(__file__).resolve().parents[4]
+    default_key = repo_root / ".ssh-debug" / "id_ed25519"
+    key_path = os.environ.get("ASM_CLUSTER_PROBE_KEY", str(default_key))
+    if gateway_cfg_cls is None:
+        return probe_cls()
+    return probe_cls(gateway=gateway_cfg_cls(identity_file=key_path))
 
 
 @pytest.fixture
