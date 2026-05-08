@@ -110,18 +110,28 @@ def _peers_dir(shared_fs: pathlib.Path) -> pathlib.Path:
     return d
 
 
+def _writer_id() -> str:
+    """Cluster-unique per-writer suffix for tmp filenames.
+
+    Hostname + PID names this writer uniquely across every secondary
+    sharing the NFS mount; without it, two writers racing the same
+    ``foo.tmp`` produce ``FileNotFoundError`` on the second
+    ``os.replace`` (winner consumed the tmp, loser's source is gone).
+    """
+    return f"{_socket.gethostname()}.{os.getpid()}"
+
+
 def _atomic_write_json(path: pathlib.Path, data: object) -> None:
     """Atomically write *data* as JSON to *path*.
 
-    Writes to ``path.with_suffix(path.suffix + ".tmp")``, fsyncs, then
-    renames into place. Concurrent readers see either the old contents
-    or the fully written new contents — never a torn write.
+    Per-writer ``.tmp`` filename so concurrent secondaries on the same
+    NFS mount don't race the rename; last-writer-wins on the final
+    path (callers that need single-writer semantics should use
+    :func:`_atomic_create_bytes_excl`).
     """
     path = pathlib.Path(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(path.suffix + f".{_writer_id()}.tmp")
     payload = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
-    # Open with O_CREAT|O_WRONLY|O_TRUNC; mode 0o644 (or 0o600 for keys
-    # — caller is responsible for chmoding after).
     fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
     try:
         os.write(fd, payload)
@@ -132,9 +142,12 @@ def _atomic_write_json(path: pathlib.Path, data: object) -> None:
 
 
 def _atomic_write_bytes(path: pathlib.Path, data: bytes, mode: int) -> None:
-    """Atomic write of raw bytes with explicit file mode."""
+    """Atomic write of raw bytes with explicit file mode.
+
+    Per-writer ``.tmp`` filename — see :func:`_atomic_write_json`.
+    """
     path = pathlib.Path(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(path.suffix + f".{_writer_id()}.tmp")
     fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
     try:
         os.write(fd, data)
@@ -147,9 +160,59 @@ def _atomic_write_bytes(path: pathlib.Path, data: bytes, mode: int) -> None:
     os.chmod(path, mode)
 
 
+def _atomic_create_bytes_excl(
+    path: pathlib.Path, data: bytes, mode: int
+) -> bool:
+    """Create *path* with *data* iff it does not yet exist.
+
+    Returns True if this caller wrote the file, False if another
+    writer beat us to it (file already existed). Used for shared
+    cluster artifacts (signing key) where ALL secondaries must agree
+    on identical bytes — last-writer-wins would let each secondary
+    keep an in-memory copy that differs from on-disk content.
+    """
+    path = pathlib.Path(path)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+    except FileExistsError:
+        return False
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.chmod(path, mode)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Signing key bootstrap
 # ---------------------------------------------------------------------------
+
+
+def _read_existing_signing_key(
+    secret_path: pathlib.Path,
+    public_path: pathlib.Path,
+    name: str,
+) -> Optional[SigningKey]:
+    """Reload an existing cluster keypair, or None if mismatched/unreadable."""
+    try:
+        public_key = public_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not public_key:
+        return None
+    if not (
+        public_key.startswith(name + ":")
+        or public_key.startswith("asm-suit-cluster-")
+    ):
+        return None
+    return SigningKey(
+        name=name,
+        secret_path=secret_path,
+        public_path=public_path,
+        public_key=public_key,
+    )
 
 
 def generate_signing_key(
@@ -157,16 +220,24 @@ def generate_signing_key(
 ) -> SigningKey:
     """Generate (or reload) the cluster-wide nix signing keypair.
 
-    Idempotent: if ``peers/__signing-key`` and ``peers/__public-key``
-    already exist for the same run, reload them instead of regenerating
-    so that all secondaries see the same key even if more than one
-    races to bootstrap.
+    Race-safe across N secondaries on a shared NFS mount:
+
+    * Fast path — both files exist with a matching name prefix:
+      reload from disk so every secondary returns identical bytes.
+    * Slow path — files missing: ``nix key generate-secret`` locally,
+      then ``O_CREAT|O_EXCL`` create. The first writer wins; every
+      other writer sees ``FileExistsError`` and reloads the winner's
+      key. The previous implementation used last-writer-wins via a
+      shared ``__signing-key.tmp``, which gave each secondary an
+      in-memory key that diverged from on-disk bytes — peers signed
+      with key X but advertised pub-Y in their ``<id>.json``, so
+      cross-peer signature verification failed and harmonia
+      substitution silently fell back to building from source.
 
     The secret is written with mode 0600, the public with mode 0644.
-
-    Requires the ``nix`` CLI (looked up via ``shutil.which``) only when
-    the keys do not already exist on disk. A missing ``nix`` binary
-    raises :class:`FileNotFoundError`.
+    Requires the ``nix`` CLI (looked up via ``shutil.which``) only
+    when the keys do not yet exist on disk; a missing ``nix`` binary
+    on the slow path raises :class:`FileNotFoundError`.
     """
     peers = _peers_dir(shared_fs)
     secret_path = peers / "__signing-key"
@@ -174,21 +245,9 @@ def generate_signing_key(
     name = f"asm-suit-cluster-{run_id}"
 
     if secret_path.exists() and public_path.exists():
-        try:
-            public_key = public_path.read_text(encoding="utf-8").strip()
-            # If the existing key has a matching name prefix, reuse it.
-            if public_key.startswith(name + ":") or public_key.startswith(
-                "asm-suit-cluster-"
-            ):
-                return SigningKey(
-                    name=name,
-                    secret_path=secret_path,
-                    public_path=public_path,
-                    public_key=public_key,
-                )
-        except OSError:
-            # Fall through to regenerate if we can't read.
-            pass
+        existing = _read_existing_signing_key(secret_path, public_path, name)
+        if existing is not None:
+            return existing
 
     nix = shutil.which("nix")
     if nix is None:
@@ -196,7 +255,6 @@ def generate_signing_key(
             "nix CLI not found in PATH; cannot generate signing key"
         )
 
-    # nix key generate-secret --key-name <name>  -> secret on stdout
     secret_proc = subprocess.run(
         [nix, "key", "generate-secret", "--key-name", name],
         check=True,
@@ -206,9 +264,6 @@ def generate_signing_key(
     if not secret_bytes:
         raise RuntimeError("nix key generate-secret produced empty output")
 
-    _atomic_write_bytes(secret_path, secret_bytes, mode=0o600)
-
-    # nix key convert-secret-to-public  (reads from stdin)
     public_proc = subprocess.run(
         [nix, "key", "convert-secret-to-public"],
         input=secret_bytes,
@@ -221,13 +276,35 @@ def generate_signing_key(
             "nix key convert-secret-to-public produced empty output"
         )
 
-    _atomic_write_bytes(public_path, public_bytes, mode=0o644)
+    # Secret is the synchronization point. Whoever wins ``secret_path``
+    # via ``O_CREAT|O_EXCL`` becomes the sole keypair authority and
+    # publishes the matching ``public_path``; everybody else reloads
+    # the winner's pair. Racing on each file independently would let
+    # writer A win secret while writer B wins public, leaving the
+    # cluster with a mismatched (secret-A, public-B) pair on disk.
+    if _atomic_create_bytes_excl(secret_path, secret_bytes, mode=0o600):
+        # Sole secret writer — publish OUR public, overwriting any
+        # stale leftover so the on-disk pair stays consistent.
+        _atomic_write_bytes(public_path, public_bytes, mode=0o644)
+        return SigningKey(
+            name=name,
+            secret_path=secret_path,
+            public_path=public_path,
+            public_key=public_bytes.decode("utf-8").strip(),
+        )
 
-    return SigningKey(
-        name=name,
-        secret_path=secret_path,
-        public_path=public_path,
-        public_key=public_bytes.decode("utf-8").strip(),
+    # Lost the race. Spin briefly: the secret winner may not have
+    # finished writing public yet.
+    for _ in range(40):
+        existing = _read_existing_signing_key(
+            secret_path, public_path, name
+        )
+        if existing is not None:
+            return existing
+        time.sleep(0.05)
+    raise RuntimeError(
+        "signing key race lost but reload from peer failed; "
+        "shared FS may be inconsistent"
     )
 
 
@@ -519,6 +596,10 @@ class PeerListWatcher(threading.Thread):
         self._tick_seconds = float(tick_seconds)
         self._substitute_on_destination = substitute_on_destination
         self._stop_event = threading.Event()
+        # Wake event: set on stop() OR on request_refresh(). The run
+        # loop blocks on this between ticks so a push notification can
+        # collapse the latency from one tick to ~one refresh.
+        self._wake_event = threading.Event()
         self._lock = threading.Lock()
         self._peers: list[PeerInfo] = []
         # Per-secondary file so concurrent writers from different
@@ -548,15 +629,33 @@ class PeerListWatcher(threading.Thread):
     def stop(self) -> None:
         """Request the thread to exit at its next tick."""
         self._stop_event.set()
+        self._wake_event.set()
+
+    def request_refresh(self) -> None:
+        """Wake the run loop for an out-of-band refresh.
+
+        Thread-safe; intended for the peer-push server to call when an
+        announce/withdraw POST arrives. The run loop's next iteration
+        re-reads ``peers/`` and republishes the substituters file. The
+        wake event is consumed at the start of each iteration so a
+        push that fires *during* a refresh still triggers a follow-up
+        refresh instead of being lost.
+        """
+        self._wake_event.set()
 
     def run(self) -> None:  # pragma: no cover - exercised via integration
         while not self._stop_event.is_set():
+            # Consume any prior wake before refreshing; a wake that
+            # arrives DURING ``_refresh`` re-sets the event and the
+            # post-refresh ``wait`` returns immediately.
+            self._wake_event.clear()
             try:
                 self._refresh()
             except Exception:  # noqa: BLE001 - keep the watcher alive
                 logger.exception("PeerListWatcher refresh failed")
-            # Wait either for the tick or for stop().
-            self._stop_event.wait(self._tick_seconds)
+            # Wait either for the tick, for an out-of-band refresh
+            # request, or for stop() (which also sets _wake_event).
+            self._wake_event.wait(self._tick_seconds)
 
     # --- internals ------------------------------------------------------------
 
@@ -584,6 +683,11 @@ class PeerListWatcher(threading.Thread):
 # ---------------------------------------------------------------------------
 
 
+# Default runtime dir for harmonia's per-node files (TOML config + log).
+# Container-local; never on NFS. See HarmoniaProcess docstring.
+DEFAULT_HARMONIA_RUNTIME_DIR = pathlib.Path("/tmp/harmonia")
+
+
 @dataclass
 class HarmoniaProcess:
     """Context-manager wrapper around a ``harmonia`` (or fallback) server.
@@ -593,6 +697,22 @@ class HarmoniaProcess:
     back to ``nix-serve`` (also looked up via :func:`shutil.which`).
     Missing both -> :class:`FileNotFoundError` from :meth:`start`.
 
+    ``harmonia.toml`` lives under ``runtime_dir`` — MUST be
+    CONTAINER-LOCAL, never on the shared NFS mount. Earlier versions
+    wrote it next to the signing key (``${shared_fs}/peers/``); on a
+    6-secondary run all writers raced the same TOML via
+    ``Path.write_text`` (truncate-then-write, not atomic on NFS), so
+    harmonia occasionally parsed a half-written TOML and exited
+    silently.
+
+    ``log_path`` can sit on NFS — but the filename MUST be unique
+    per node (e.g. ``/app/log-network/harmonia-<secondary_id>.log``)
+    so concurrent writers never share an inode. Default is
+    ``runtime_dir / "harmonia.log"`` (container-local) for callers
+    that don't need the log shared off-node; the suit-task secondary
+    overrides it to land alongside the other per-secondary logs on
+    the gateway-readable mount.
+
     Tests typically monkeypatch :func:`subprocess.Popen` so no real
     server is spawned.
     """
@@ -601,6 +721,11 @@ class HarmoniaProcess:
     signing_key_path: pathlib.Path
     binary: Optional[str] = None  # if None, autodetected on .start()
     extra_args: list[str] = field(default_factory=list)
+    workers: int = 2
+    runtime_dir: pathlib.Path = field(
+        default_factory=lambda: DEFAULT_HARMONIA_RUNTIME_DIR
+    )
+    log_path: Optional[pathlib.Path] = None
     _proc: Optional[subprocess.Popen] = field(default=None, init=False, repr=False)
 
     # --- context manager ------------------------------------------------------
@@ -656,6 +781,9 @@ class HarmoniaProcess:
         # multi-key support). Set both so legacy + current both work.
         env["SIGN_KEY_PATHS"] = str(self.signing_key_path)
 
+        runtime_dir = pathlib.Path(self.runtime_dir)
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+
         if "harmonia-cache" in binary_name or binary_name == "harmonia":
             # Harmonia 3.x: TOML config via CONFIG_FILE env. The wrapper
             # binary at /bin/harmonia is a multi-tool launcher; the
@@ -668,13 +796,9 @@ class HarmoniaProcess:
                 if os.path.exists(candidate):
                     cache_bin = candidate
 
-            # Write a TOML config in the same dir as the signing key
-            # (already user-private). Workers default to 2 — enough for
-            # cluster fan-in without saturating the secondary.
-            cfg_dir = self.signing_key_path.parent
-            cfg_path = cfg_dir / "harmonia.toml"
+            cfg_path = runtime_dir / "harmonia.toml"
             cfg_path.write_text(
-                f'bind = "{self.bind_addr}"\nworkers = 2\n'
+                f'bind = "{self.bind_addr}"\nworkers = {int(self.workers)}\n'
             )
             env["CONFIG_FILE"] = str(cfg_path)
             cmd = [cache_bin, *self.extra_args]
@@ -685,9 +809,14 @@ class HarmoniaProcess:
         logger.info("starting binary cache server: %s", cmd)
         # Detached + log-to-file (NOT PIPE — PIPE without a drainer
         # blocks once kernel buffer fills, killing harmonia silently
-        # under heavy load. We tee to a file alongside the signing
-        # key so operators can find the log.)
-        log_path = self.signing_key_path.parent / "harmonia.log"
+        # under heavy load.) ``log_path`` may live on NFS — caller's
+        # responsibility to make the filename unique-per-node.
+        log_path = (
+            pathlib.Path(self.log_path)
+            if self.log_path is not None
+            else runtime_dir / "harmonia.log"
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fh = open(log_path, "ab", buffering=0)
         self._proc = subprocess.Popen(  # noqa: S603
             cmd,
@@ -771,6 +900,14 @@ def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
     # function returns) see a fully-formed schema. Best-effort —
     # if nix-store is missing or the call fails we let the daemon
     # retry the init itself, preserving the existing behaviour.
+    #
+    # Strip ``NIX_REMOTE`` here too: the parent env carries
+    # ``NIX_REMOTE=daemon`` from the image, which would route
+    # ``nix-store --init`` through a daemon socket that doesn't
+    # exist yet. The init must talk to the local store directly.
+    local_store_env = {
+        k: v for k, v in os.environ.items() if k != "NIX_REMOTE"
+    }
     nix_store = shutil.which("nix-store") or "/bin/nix-store"
     if os.path.exists(nix_store):
         try:
@@ -780,6 +917,7 @@ def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
                 capture_output=True,
                 shell=False,
                 timeout=30,
+                env=local_store_env,
             )
         except (OSError, subprocess.TimeoutExpired):
             # fall through to daemon spawn; daemon will retry init
@@ -807,22 +945,71 @@ def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
     # reset by peer`` while the daemon's log keeps logging
     # ``accepted connection from pid X, user root (trusted)``
     # without ever serving a single request.
-    daemon_env = {k: v for k, v in os.environ.items() if k != "NIX_REMOTE"}
     proc = subprocess.Popen(  # noqa: S603
         [binary],
-        env=daemon_env,
+        env=local_store_env,
         stdout=log_fh,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
     )
-    # Wait up to ~5s for the socket to appear.
-    for _ in range(20):
-        if os.path.exists(NIX_DAEMON_SOCKET):
+    # Wait until the daemon is actually accepting connections, not
+    # just until its socket inode exists. ``nix-daemon`` creates the
+    # socket file early in startup (during ``listen(2)`` setup) but
+    # there's a window where ``connect(2)`` succeeds and the kernel's
+    # accept queue immediately RSTs because the daemon hasn't entered
+    # its accept loop. A worker that races into that window sees
+    # exactly the symptom we hit on smoke11:
+    # ``cannot open connection to remote store 'daemon': error: read
+    # of 32768 bytes: Connection reset by peer``. Probe via a real
+    # ``connect()`` + tiny round-trip and only return once the daemon
+    # has actually responded once.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if _nix_daemon_accepts_connections():
             return proc.pid
-        time.sleep(0.25)
+        time.sleep(0.05)
     return proc.pid
+
+
+def _nix_daemon_accepts_connections() -> bool:
+    """Return True iff a ``connect`` to the daemon socket round-trips.
+
+    Opens the socket, sends the nix-daemon worker-magic handshake
+    (the four-byte little-endian ``0x6e697863`` value the daemon
+    expects as the very first read on a new connection — see
+    ``src/libstore/daemon.cc`` ``WORKER_MAGIC_1``) and waits briefly
+    for any reply. If the daemon hasn't reached its accept loop yet
+    the kernel sends RST and we fail; once it has, the daemon writes
+    its own magic byte and we know it's alive.
+
+    We don't care what the daemon writes back — only that *something*
+    came through, which means the accept loop is live.
+    """
+    if not os.path.exists(NIX_DAEMON_SOCKET):
+        return False
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.25)
+        try:
+            sock.connect(NIX_DAEMON_SOCKET)
+        except OSError:
+            return False
+        try:
+            sock.sendall(b"\x63\x78\x69\x6e")  # WORKER_MAGIC_1, LE
+        except OSError:
+            return False
+        try:
+            data = sock.recv(4)
+        except OSError:
+            return False
+        return len(data) > 0
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1029,12 +1216,16 @@ class SubmitterPeer:
         slurm_root: str,
         local_port: int = 5005,
         gateway_port: int = 5005,
+        identity_file: str | None = None,
+        config_file: str | None = None,
         log: logging.Logger = logger,
     ) -> None:
         self.gateway_url = gateway_url
         self.slurm_root = slurm_root.rstrip("/")
         self.local_port = local_port
         self.gateway_port = gateway_port
+        self.identity_file = identity_file
+        self.config_file = config_file
         self.log = log
 
         self._gateway_host: str | None = None
@@ -1210,11 +1401,27 @@ class SubmitterPeer:
             target = self._gateway_host
         else:
             return 1, "", "no gateway host"
-        argv = [
-            "ssh", "-o", "BatchMode=yes",
+        argv = ["ssh", "-o", "BatchMode=yes"]
+        # Mirror the framework's gateway auth contract: with an explicit
+        # identity, lock ssh to it and shut the agent out. Without these
+        # the user's ~/.ssh/config (e.g. 1password agent socket via a
+        # ``Match host *`` block) leaks all agent keys into auth, blowing
+        # past sshd's MaxAuthTries on every poll-loop iteration and —
+        # under OpenSSH 9.8+ ``PerSourcePenalties`` — landing the source
+        # IP in the penalty box, which then drops the framework's own
+        # gateway-master commands as collateral.
+        if self.identity_file:
+            argv.extend([
+                "-i", self.identity_file,
+                "-o", "IdentitiesOnly=yes",
+                "-o", "IdentityAgent=none",
+            ])
+        if self.config_file:
+            argv.extend(["-F", self.config_file])
+        argv.extend([
             "-p", str(self._gateway_ssh_port),
             target, "; ".join(remote_cmds),
-        ]
+        ])
         try:
             res = subprocess.run(  # noqa: S603
                 argv, input=stdin_input, capture_output=True, timeout=15,
