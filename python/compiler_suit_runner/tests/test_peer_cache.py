@@ -70,8 +70,11 @@ def test_announce_self_writes_atomic_json(shared_fs: pathlib.Path) -> None:
         "port": 5001,
         "public_key": info.public_key,
     }
-    # No leftover .tmp file.
-    assert not (shared_fs / "peers" / "sec1.json.tmp").exists()
+    # No leftover per-writer .tmp file.
+    leftovers = [
+        p for p in (shared_fs / "peers").iterdir() if p.suffix == ".tmp"
+    ]
+    assert leftovers == []
 
 
 def test_announce_rejects_reserved_id(shared_fs: pathlib.Path) -> None:
@@ -360,6 +363,85 @@ def test_generate_signing_key_missing_nix(
         generate_signing_key(shared_fs, run_id="x")
 
 
+def test_generate_signing_key_concurrent_writers_agree(
+    shared_fs: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N concurrent secondaries must all return the SAME on-disk keypair.
+
+    Regression test for the federation bug: when multiple SLURM
+    secondaries hit a fresh shared FS at once, every caller used to
+    generate its OWN keypair and last-writer-wins clobbered the
+    others on disk while each kept its in-memory copy. Peers then
+    advertised mismatched ``public_key`` values in ``<id>.json``,
+    breaking signature verification on substitution.
+
+    We stub ``nix key`` so each "secondary" produces a unique
+    keypair and run them in parallel; the function must converge on
+    a single on-disk pair AND every returned :class:`SigningKey` must
+    match those on-disk bytes.
+    """
+    import threading
+
+    peers = shared_fs / "peers"
+
+    counter = {"n": 0}
+    lock = threading.Lock()
+
+    def fake_run(cmd, *args, **kwargs):
+        if "generate-secret" in cmd:
+            with lock:
+                counter["n"] += 1
+                tag = counter["n"]
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=f"secret-{tag}".encode(), stderr=b""
+            )
+        if "convert-secret-to-public" in cmd:
+            secret = kwargs.get("input", b"")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=f"asm-suit-cluster-rid:{secret.decode()}".encode(),
+                stderr=b"",
+            )
+        raise AssertionError(f"unexpected nix call: {cmd}")
+
+    monkeypatch.setattr(peer_cache.subprocess, "run", fake_run)
+    monkeypatch.setattr(peer_cache.shutil, "which", lambda _name: "/usr/bin/nix")
+
+    results: list[peer_cache.SigningKey] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        try:
+            barrier.wait(timeout=2.0)
+            results.append(generate_signing_key(shared_fs, run_id="rid"))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.0)
+
+    assert errors == [], errors
+    assert len(results) == 8
+    on_disk_secret = (peers / "__signing-key").read_bytes()
+    on_disk_public = (peers / "__public-key").read_text().strip()
+    # Every caller's in-memory public_key must match what landed on disk.
+    assert all(k.public_key == on_disk_public for k in results), [
+        k.public_key for k in results
+    ]
+    # And the in-memory key must correspond to the on-disk secret —
+    # i.e. public is "asm-suit-cluster-rid:<secret>" by stub construction.
+    expected_pub = f"asm-suit-cluster-rid:{on_disk_secret.decode()}"
+    assert on_disk_public == expected_pub
+    # No tmp leftovers.
+    leftovers = [p for p in peers.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []
+
+
 def test_generate_signing_key_reloads_existing_without_nix(
     shared_fs: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -456,7 +538,11 @@ def test_harmonia_start_invokes_subprocess(
 ) -> None:
     key = tmp_path / "secret"
     key.write_bytes(b"k")
-    proc = HarmoniaProcess(bind_addr="0.0.0.0:5000", signing_key_path=key)
+    proc = HarmoniaProcess(
+        bind_addr="0.0.0.0:5000",
+        signing_key_path=key,
+        runtime_dir=tmp_path / "harmonia",
+    )
     proc.start()
     assert len(stub_popen.instances) == 1
     spawned = stub_popen.instances[0]
@@ -471,6 +557,10 @@ def test_harmonia_start_invokes_subprocess(
     assert spawned.env.get("SIGN_KEY_PATHS") == str(key)
     cfg_path = pathlib.Path(spawned.env["CONFIG_FILE"])
     assert cfg_path.exists()
+    # Per-node TOML lives under runtime_dir, NOT next to the NFS
+    # signing key — see HarmoniaProcess docstring.
+    assert cfg_path.parent == tmp_path / "harmonia"
+    assert cfg_path.parent != key.parent
     assert 'bind = "0.0.0.0:5000"' in cfg_path.read_text()
     assert proc.is_running
 
@@ -487,7 +577,9 @@ def test_harmonia_double_start_is_idempotent(
     tmp_path: pathlib.Path, stub_popen
 ) -> None:
     proc = HarmoniaProcess(
-        bind_addr="0.0.0.0:5000", signing_key_path=tmp_path / "k"
+        bind_addr="0.0.0.0:5000",
+        signing_key_path=tmp_path / "k",
+        runtime_dir=tmp_path / "harmonia",
     )
     proc.start()
     proc.start()
@@ -500,6 +592,7 @@ def test_harmonia_context_manager(tmp_path: pathlib.Path, stub_popen) -> None:
         bind_addr="127.0.0.1:5000",
         signing_key_path=tmp_path / "k",
         extra_args=["--workers", "8"],
+        runtime_dir=tmp_path / "harmonia",
     ) as proc:
         assert proc.is_running
         assert "--workers" in stub_popen.instances[0].cmd
@@ -518,7 +611,9 @@ def test_harmonia_falls_back_to_nix_serve(
         lambda name: "/usr/bin/nix-serve" if name == "nix-serve" else None,
     )
     proc = HarmoniaProcess(
-        bind_addr="0.0.0.0:5000", signing_key_path=tmp_path / "k"
+        bind_addr="0.0.0.0:5000",
+        signing_key_path=tmp_path / "k",
+        runtime_dir=tmp_path / "harmonia",
     )
     proc.start()
     try:
@@ -532,7 +627,9 @@ def test_harmonia_missing_binary_raises(
 ) -> None:
     monkeypatch.setattr(peer_cache.shutil, "which", lambda _name: None)
     proc = HarmoniaProcess(
-        bind_addr="0.0.0.0:5000", signing_key_path=tmp_path / "k"
+        bind_addr="0.0.0.0:5000",
+        signing_key_path=tmp_path / "k",
+        runtime_dir=tmp_path / "harmonia",
     )
     with pytest.raises(FileNotFoundError):
         proc.start()
@@ -564,10 +661,91 @@ def test_harmonia_kill_on_timeout(
         lambda name: "/usr/bin/harmonia" if name == "harmonia" else None,
     )
     proc = HarmoniaProcess(
-        bind_addr="0.0.0.0:5000", signing_key_path=tmp_path / "k"
+        bind_addr="0.0.0.0:5000",
+        signing_key_path=tmp_path / "k",
+        runtime_dir=tmp_path / "harmonia",
     )
     proc.start()
     rc = proc.stop(timeout=0.05)
     assert rc == -9
     inst = _StubPopen.instances[0]
     assert inst.killed is True
+
+
+def test_harmonia_runtime_dir_not_under_signing_key_parent(
+    tmp_path: pathlib.Path, stub_popen
+) -> None:
+    """Regression: per-node files must NOT land next to the NFS-shared
+    signing key (causes 6 secondaries to race on the same TOML/log).
+
+    Ensures both the TOML and the log are written to ``runtime_dir``
+    by default, not to ``signing_key_path.parent``. Default
+    ``runtime_dir`` is ``/tmp/harmonia/``; we override here so the
+    test doesn't pollute the host's ``/tmp``.
+    """
+    nfs_dir = tmp_path / "nfs_peers"
+    nfs_dir.mkdir()
+    key = nfs_dir / "__signing-key"
+    key.write_bytes(b"k")
+
+    runtime = tmp_path / "container_local"
+    proc = HarmoniaProcess(
+        bind_addr="0.0.0.0:5000",
+        signing_key_path=key,
+        runtime_dir=runtime,
+    )
+    proc.start()
+    try:
+        # Neither file should appear under the NFS-shared dir.
+        assert not (nfs_dir / "harmonia.toml").exists()
+        assert not (nfs_dir / "harmonia.log").exists()
+        # Both should be under runtime_dir.
+        assert (runtime / "harmonia.toml").exists()
+        assert (runtime / "harmonia.log").exists()
+    finally:
+        proc.stop()
+
+
+def test_harmonia_explicit_log_path_lands_off_runtime_dir(
+    tmp_path: pathlib.Path, stub_popen
+) -> None:
+    """When ``log_path`` is given, the log lives there (not in
+    runtime_dir). Models the suit-task secondary writing harmonia
+    output to ``/app/log-network/harmonia-<secondary_id>.log`` so
+    operators can read it off the gateway while the TOML stays
+    container-local.
+    """
+    runtime = tmp_path / "container_local"
+    log_dir = tmp_path / "log_network"
+    explicit_log = log_dir / "harmonia-secA.log"
+    proc = HarmoniaProcess(
+        bind_addr="0.0.0.0:5000",
+        signing_key_path=tmp_path / "k",
+        runtime_dir=runtime,
+        log_path=explicit_log,
+    )
+    proc.start()
+    try:
+        assert (runtime / "harmonia.toml").exists()
+        # Log lands at the explicit path; default location stays empty.
+        assert explicit_log.exists()
+        assert not (runtime / "harmonia.log").exists()
+    finally:
+        proc.stop()
+
+
+def test_harmonia_workers_param_lands_in_toml(
+    tmp_path: pathlib.Path, stub_popen
+) -> None:
+    proc = HarmoniaProcess(
+        bind_addr="0.0.0.0:5000",
+        signing_key_path=tmp_path / "k",
+        runtime_dir=tmp_path / "harmonia",
+        workers=8,
+    )
+    proc.start()
+    try:
+        cfg_path = pathlib.Path(stub_popen.instances[0].env["CONFIG_FILE"])
+        assert "workers = 8" in cfg_path.read_text()
+    finally:
+        proc.stop()
