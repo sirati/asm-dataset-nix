@@ -786,3 +786,523 @@ def kill_local_primary_driver(
         signal=signal_name,
         notes=tuple(notes),
     )
+
+
+# ---------------------------------------------------------------------------
+# T8 — single-worker memory-cap (cgroup) injection
+# ---------------------------------------------------------------------------
+
+
+# Worker-side script that locates the secondary's rootless podman
+# container and constrains its ``memory.max`` cgroup. Three things make
+# this non-trivial:
+#
+# 1. The framework's slurm wrapper builds a per-job ``/tmp/asm-<hash>``
+#    podman ``--root`` AND ``--runroot``; there is no fixed system-wide
+#    path to query. We glob ``/tmp/asm-*/storage`` for storage roots and
+#    ``/tmp/asm-*/run`` for runtime roots; the most-recently-modified
+#    pair owns the live container.
+# 2. The container itself is unnamed (the framework doesn't pass
+#    ``--name``); we take the FIRST id from ``podman ps -q`` against the
+#    discovered storage. With one secondary per worker (the framework's
+#    invariant) this is unambiguous.
+# 3. The cgroup that bounds the container's memory has different paths
+#    on cgroup-v1 vs cgroup-v2. We probe ``/sys/fs/cgroup/cgroup.controllers``
+#    to detect v2 (presence of that file is the v2 marker). On v2 the
+#    target is ``/sys/fs/cgroup<podman_cgroup_path>/memory.max``; on v1
+#    it is ``/sys/fs/cgroup/memory<podman_cgroup_path>/memory.limit_in_bytes``.
+#    Both paths are derived from podman's ``inspect --format
+#    {{.State.CgroupPath}}``.
+#
+# The script writes a single line of ``key=value`` pairs to stdout so
+# the helper can parse the outcome without ambiguity. Every error is
+# trapped (``set +e``) and surfaced as ``ERROR=<short message>``; the
+# helper turns that into a :class:`OomResult` note rather than raising.
+#
+# Note: the script INTERPOLATES ``memory_max`` and ``storage_glob`` ONLY
+# - both shell-quoted at call-site. We do not interpolate caller input
+# elsewhere; a remote shell injection by way of an unsanitized field is
+# specifically guarded against.
+_OOM_CGROUP_SCRIPT_TMPL: str = r"""
+set +e
+MEM_MAX=__MEMORY_MAX_Q__
+STORAGE_GLOB=__STORAGE_GLOB_Q__
+
+# Discover the per-job podman storage + runtime roots.
+STORAGE_ROOT=""
+RUN_ROOT=""
+NEWEST=0
+for s in $STORAGE_GLOB; do
+  if [ -d "$s" ]; then
+    parent=$(dirname "$s")
+    r="$parent/run"
+    if [ -d "$r" ]; then
+      mtime=$(stat -c '%Y' "$s" 2>/dev/null || echo 0)
+      if [ "$mtime" -gt "$NEWEST" ]; then
+        NEWEST=$mtime
+        STORAGE_ROOT="$s"
+        RUN_ROOT="$r"
+      fi
+    fi
+  fi
+done
+if [ -z "$STORAGE_ROOT" ]; then
+  echo "ERROR=no_storage_root_found"
+  echo "STORAGE_GLOB=$STORAGE_GLOB"
+  exit 0
+fi
+echo "STORAGE_ROOT=$STORAGE_ROOT"
+echo "RUN_ROOT=$RUN_ROOT"
+
+PODMAN="podman --root $STORAGE_ROOT --runroot $RUN_ROOT"
+CID=$($PODMAN ps -q 2>/dev/null | head -n1)
+if [ -z "$CID" ]; then
+  echo "ERROR=no_running_container"
+  exit 0
+fi
+echo "CID=$CID"
+
+CGROUP_PATH=$($PODMAN inspect --format '{{.State.CgroupPath}}' "$CID" 2>/dev/null)
+if [ -z "$CGROUP_PATH" ]; then
+  # Some podman versions populate ``CgroupParent`` but not ``CgroupPath``;
+  # fall back to ``CgroupParent``/<cid>.
+  PARENT=$($PODMAN inspect --format '{{.HostConfig.CgroupParent}}' "$CID" 2>/dev/null)
+  if [ -n "$PARENT" ]; then
+    CGROUP_PATH="$PARENT/$CID"
+  fi
+fi
+if [ -z "$CGROUP_PATH" ]; then
+  echo "ERROR=no_cgroup_path"
+  exit 0
+fi
+echo "CGROUP_PATH=$CGROUP_PATH"
+
+# cgroup-v2 detection: presence of /sys/fs/cgroup/cgroup.controllers.
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  TARGET=/sys/fs/cgroup${CGROUP_PATH}/memory.max
+  echo "CGROUP_VERSION=2"
+else
+  TARGET=/sys/fs/cgroup/memory${CGROUP_PATH}/memory.limit_in_bytes
+  echo "CGROUP_VERSION=1"
+fi
+echo "TARGET=$TARGET"
+
+if [ ! -f "$TARGET" ]; then
+  echo "ERROR=target_missing"
+  exit 0
+fi
+
+if printf '%s\n' "$MEM_MAX" > "$TARGET" 2>/dev/null; then
+  echo "WROTE=$MEM_MAX"
+else
+  echo "ERROR=write_failed"
+  CURRENT=$(cat "$TARGET" 2>/dev/null)
+  echo "CURRENT=$CURRENT"
+fi
+"""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class OomResult:
+    """Outcome of an :func:`oom_one_worker_via_cgroup` call.
+
+    ``triggered``: ``True`` iff the helper SSHed into ``target_worker``
+    AND successfully wrote ``memory_max`` to the secondary's
+    ``memory.max`` (cgroup-v2) / ``memory.limit_in_bytes`` (cgroup-v1)
+    file. A ``False`` here means either the run dir / connection info
+    never appeared in time, or one of the worker-side discovery steps
+    failed (no storage root, no container, no cgroup path). The
+    ``notes`` tuple carries the short error label so the test caller
+    can decide whether to skip or fail.
+
+    ``target_worker``: the worker hostname the helper drove its SSH
+    against, even on failure. When the caller passed ``target_worker=
+    None`` and the helper resolved one from ``connection_info/
+    <secondary>.info``, that resolved hostname is what shows up here.
+
+    ``container_id``: the rootless podman container id the helper
+    constrained, or ``None`` if discovery failed. Truncated to whatever
+    ``podman ps -q`` returns (typically the 12-char short id).
+
+    ``cgroup_path``: the cgroup path string returned by ``podman
+    inspect --format {{.State.CgroupPath}}``, or ``None`` if the lookup
+    failed. Useful for triage: a non-None ``cgroup_path`` paired with
+    ``triggered=False`` means the write itself failed (likely a
+    permissions or controller-delegation issue), not container
+    discovery.
+
+    ``cgroup_version``: ``2`` for cgroup-v2, ``1`` for cgroup-v1, or
+    ``None`` if the helper could not detect either. Carried so the test
+    failure surface includes which cgroup ABI we exercised.
+
+    ``applied_at``: UTC timestamp captured immediately after the worker
+    script returned with a ``WROTE=`` line. ``None`` when the constrain
+    step never executed.
+
+    ``notes``: free-form per-call notes (errors during ssh, parse
+    failures, the worker-side ``ERROR=...`` short label, etc.). The
+    helper is intentionally fail-safe and surfaces every conceivable
+    error this way rather than raising, mirroring :class:`KillResult`
+    and :class:`DisconnectResult`.
+    """
+
+    triggered: bool
+    target_worker: str
+    container_id: str | None = None
+    cgroup_path: str | None = None
+    cgroup_version: int | None = None
+    applied_at: datetime | None = None
+    notes: tuple[str, ...] = ()
+
+
+class _WorkerRunner(Protocol):
+    """Minimal interface :func:`oom_one_worker_via_cgroup` needs.
+
+    A :class:`compiler_suit_runner.tests.slurm.cluster_probe.ClusterProbe`
+    satisfies this protocol via its ``worker_ssh`` method. The unit test
+    passes a duck-typed stub that records the argv shape without
+    actually shelling out to a worker.
+    """
+
+    def worker_ssh(  # pragma: no cover - protocol only
+        self,
+        worker: str,
+        cmd: str,
+        *,
+        timeout: float | None = None,
+        check: bool = False,
+    ) -> subprocess.CompletedProcess[str]: ...
+
+
+def _wait_for_run_dir(
+    log_root: pathlib.Path,
+    *,
+    baseline: set[str],
+    deadline: float,
+    poll_interval_s: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> Optional[pathlib.Path]:
+    """Poll ``log_root`` for a fresh ``run_<TS>`` directory.
+
+    Mirrors the same baseline-diff handshake T5/T6 use. Returns the
+    newly-created directory on success; ``None`` on timeout. ``baseline``
+    is the set of ``run_*`` names that already existed before the
+    dispatch started; we wait for any name not in that set.
+    """
+    while clock() < deadline:
+        now = {p.name for p in log_root.glob("run_*")}
+        new = sorted(now - baseline)
+        if new:
+            return log_root / new[-1]
+        sleep(poll_interval_s)
+    return None
+
+
+def _wait_for_secondary_info(
+    run_log_dir: pathlib.Path,
+    *,
+    target_secondary_id: str,
+    deadline: float,
+    poll_interval_s: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> Optional[str]:
+    """Poll ``run_log_dir/connection_info/<id>.info`` for ``hostname=``.
+
+    Returns the resolved worker hostname or ``None`` on timeout.
+    """
+    info_path = run_log_dir / "connection_info" / f"{target_secondary_id}.info"
+    while clock() < deadline:
+        host = _parse_info_hostname(info_path)
+        if host is not None:
+            return host
+        sleep(poll_interval_s)
+    return None
+
+
+def _parse_oom_script_output(stdout: str) -> dict[str, str]:
+    """Parse the worker-side OOM script's ``key=value`` line output.
+
+    Tolerates extra whitespace and any non ``=`` line (silently
+    ignored). Repeated keys are last-wins (the script does not emit
+    duplicates by design, but defensive parsing is cheap).
+    """
+    pairs: dict[str, str] = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        pairs[key.strip()] = value.strip()
+    return pairs
+
+
+def oom_one_worker_via_cgroup(
+    probe: _WorkerRunner,
+    *,
+    run_log_root: pathlib.Path,
+    target_worker: str | None = None,
+    target_secondary_id: str | None = None,
+    memory_max: str = "512M",
+    arm_after_run_dir_appears: bool = True,
+    baseline_run_dirs: set[str] | None = None,
+    storage_glob: str = "/tmp/asm-*/storage",
+    arm_timeout_s: float = 300.0,
+    info_timeout_s: float = 180.0,
+    ssh_timeout_s: float = 30.0,
+    poll_interval_s: float = 2.0,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    now_utc: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+) -> OomResult:
+    """Constrain one secondary's container to ``memory_max`` mid-run.
+
+    The helper drives a four-step path on a single target worker:
+
+    1. (optional) wait for a fresh ``run_<TS>`` directory under
+       ``run_log_root`` (the framework creates it before any secondary
+       starts; baseline diff against ``baseline_run_dirs`` selects the
+       NEW dir even if older runs are present);
+    2. (optional) resolve ``target_worker`` from ``connection_info/
+       <target_secondary_id>.info`` if the caller did not pass it
+       explicitly. Either ``target_worker`` OR ``target_secondary_id``
+       MUST be supplied; passing both lets the caller pin both.
+    3. SSH into the resolved worker and run :data:`_OOM_CGROUP_SCRIPT_TMPL`
+       to:
+       a. discover the per-job rootless podman storage+runtime roots
+          via ``/tmp/asm-*/storage`` glob;
+       b. find the secondary's container id (``podman ps -q | head``);
+       c. read its ``State.CgroupPath`` (with a ``HostConfig.CgroupParent``
+          fallback);
+       d. detect cgroup-v1 vs cgroup-v2 via the presence of
+          ``/sys/fs/cgroup/cgroup.controllers``;
+       e. write ``memory_max`` to the corresponding ``memory.max``
+          (v2) or ``memory.limit_in_bytes`` (v1) file.
+    4. Parse the script's stdout, mapping ``WROTE=...`` to ``triggered=True``
+       and any ``ERROR=...`` to a note + ``triggered=False``.
+
+    The kernel OOM-killer fires asynchronously once the container's
+    RSS exceeds ``memory_max``; the test assertion side polls the
+    secondary's slurm_*.out for the kernel's
+    ``Killed process`` / ``out of memory`` markers. THIS HELPER ONLY
+    INSTALLS THE CONSTRAINT — it does not wait for the kill to land.
+
+    Parameters:
+
+    * ``probe``: a :class:`ClusterProbe`-shaped object exposing
+      ``worker_ssh``. Loose-typed via :class:`_WorkerRunner` so the unit
+      test can pass a stub.
+    * ``run_log_root``: the host-side log mount (matches
+      :data:`run_helpers.SLURM_TEST_ENV_LOG_ROOT`).
+    * ``target_worker``: explicit worker hostname (e.g.
+      ``"slurm-worker3"``). When ``None``, the helper resolves it from
+      the secondary's connection_info file.
+    * ``target_secondary_id``: framework secondary id to resolve to a
+      hostname. Ignored when ``target_worker`` is set; required when
+      ``target_worker`` is ``None``.
+    * ``memory_max``: value written verbatim to ``memory.max``. The
+      kernel accepts ``512M``, ``536870912``, or ``max``; we shell-
+      quote the value at call-site to keep the script safe under any
+      future caller input.
+    * ``arm_after_run_dir_appears``: when ``True`` (default) the helper
+      first waits for a fresh ``run_<TS>`` directory under
+      ``run_log_root``. ``False`` is for tests that already have a
+      pinned ``run_log_dir`` (we then expect ``target_worker`` to be
+      passed directly so info-resolution is also skipped).
+    * ``baseline_run_dirs``: pre-existing ``run_*`` names; defaults to
+      a fresh snapshot taken at call entry, which is correct when the
+      caller invokes the helper BEFORE starting the dispatch. Tests
+      that need to start the dispatch first then arm later should pass
+      a snapshot taken pre-dispatch.
+    * ``storage_glob``: glob for the per-job podman storage roots. The
+      slurm-test-env's wrapper writes ``/tmp/asm-<hash>/storage`` so
+      the default matches; override only for a future framework
+      version that uses a different parent.
+    * ``arm_timeout_s``: budget for the run-dir wait + info wait
+      combined. The framework typically writes
+      ``connection_info/<secondary>.info`` within seconds of the
+      secondary onboarding; ``300`` is a generous ceiling.
+    * ``info_timeout_s``: per-step budget for the info file wait
+      (deducted from ``arm_timeout_s``). Useful when the test wants a
+      short connection_info wait but a long run-dir wait, or vice
+      versa.
+    * ``ssh_timeout_s``: per-call SSH timeout for the worker-side
+      script. The script itself runs in <1s under normal conditions;
+      30 covers slow Podman lookups on a busy worker.
+    * ``clock`` / ``sleep`` / ``now_utc``: injectable for unit tests.
+
+    Returns an :class:`OomResult`. The helper never raises; every
+    conceivable error (ssh timeout, missing storage root, missing
+    container, write-permission failure) lands in ``notes``.
+
+    CRITICAL: this helper SSHes into a worker and writes to the worker's
+    cgroup filesystem. The write only succeeds if the SSH user owns
+    the relevant cgroup hierarchy (rootless podman with systemd memory
+    delegation). On the slurm-test-env the secondary runs under the
+    same login as the gateway SSH user, so the delegation is in place;
+    a future test env with a different rootless setup may need
+    ``sudo`` or a different attack vector.
+    """
+    if not arm_after_run_dir_appears and target_worker is None:
+        return OomResult(
+            triggered=False,
+            target_worker="",
+            notes=(
+                "arm_after_run_dir_appears=False requires an explicit "
+                "target_worker; cannot resolve via connection_info "
+                "without first locating the run dir",
+            ),
+        )
+    if target_worker is None and target_secondary_id is None:
+        return OomResult(
+            triggered=False,
+            target_worker="",
+            notes=(
+                "either target_worker or target_secondary_id must be "
+                "supplied; helper cannot pick a worker on its own",
+            ),
+        )
+
+    started = clock()
+    deadline = started + max(arm_timeout_s, 0.0)
+    notes: list[str] = []
+
+    # Step 1: resolve the run dir if the caller did not pin it.
+    run_log_dir: Optional[pathlib.Path] = None
+    if arm_after_run_dir_appears:
+        baseline = (
+            set(baseline_run_dirs)
+            if baseline_run_dirs is not None
+            else {p.name for p in run_log_root.glob("run_*")}
+        )
+        run_log_dir = _wait_for_run_dir(
+            run_log_root,
+            baseline=baseline,
+            deadline=deadline,
+            poll_interval_s=poll_interval_s,
+            clock=clock,
+            sleep=sleep,
+        )
+        if run_log_dir is None:
+            notes.append(
+                "no fresh run_<TS> directory appeared under "
+                f"{run_log_root!s} within {arm_timeout_s:.0f}s"
+            )
+            return OomResult(
+                triggered=False,
+                target_worker=target_worker or "",
+                notes=tuple(notes),
+            )
+
+    # Step 2: resolve target_worker if the caller did not pin it. We
+    # cap the info-file wait at ``info_timeout_s`` (or the remaining
+    # arm budget, whichever is smaller).
+    resolved_worker = target_worker
+    if resolved_worker is None:
+        info_deadline = min(
+            clock() + max(info_timeout_s, 0.0), deadline,
+        )
+        assert run_log_dir is not None  # guarded above
+        assert target_secondary_id is not None  # guarded above
+        resolved_worker = _wait_for_secondary_info(
+            run_log_dir,
+            target_secondary_id=target_secondary_id,
+            deadline=info_deadline,
+            poll_interval_s=poll_interval_s,
+            clock=clock,
+            sleep=sleep,
+        )
+        if resolved_worker is None:
+            notes.append(
+                f"connection_info/{target_secondary_id}.info did not "
+                f"materialise within {info_timeout_s:.0f}s under "
+                f"{run_log_dir!s}; cannot resolve target worker"
+            )
+            return OomResult(
+                triggered=False,
+                target_worker="",
+                notes=tuple(notes),
+            )
+
+    # Step 3: drive the worker-side script.
+    import shlex as _shlex  # noqa: PLC0415 — local import keeps top clean
+
+    # Use literal-token substitution rather than ``.format()`` because
+    # the embedded shell script uses ``{`` / ``}`` syntax (Go-template
+    # ``{{.State.CgroupPath}}``, shell parameter expansion ``${VAR}``)
+    # that would collide with str.format's brace grammar.
+    script = (
+        _OOM_CGROUP_SCRIPT_TMPL
+        .replace("__MEMORY_MAX_Q__", _shlex.quote(memory_max))
+        .replace("__STORAGE_GLOB_Q__", _shlex.quote(storage_glob))
+    )
+
+    cgroup_path: Optional[str] = None
+    cgroup_version: Optional[int] = None
+    container_id: Optional[str] = None
+    applied_at: Optional[datetime] = None
+
+    try:
+        cp = probe.worker_ssh(
+            resolved_worker, script, timeout=ssh_timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        notes.append(f"ssh worker_ssh timed out: {exc}")
+        return OomResult(
+            triggered=False,
+            target_worker=resolved_worker,
+            notes=tuple(notes),
+        )
+    except OSError as exc:
+        notes.append(f"ssh worker_ssh OSError: {exc}")
+        return OomResult(
+            triggered=False,
+            target_worker=resolved_worker,
+            notes=tuple(notes),
+        )
+
+    pairs = _parse_oom_script_output(cp.stdout or "")
+    container_id = pairs.get("CID") or None
+    cgroup_path = pairs.get("CGROUP_PATH") or None
+    raw_version = pairs.get("CGROUP_VERSION")
+    if raw_version is not None:
+        try:
+            cgroup_version = int(raw_version)
+        except ValueError:
+            cgroup_version = None
+
+    if cp.returncode != 0:
+        notes.append(
+            f"worker_ssh rc={cp.returncode}; "
+            f"stderr={(cp.stderr or '').strip()[:200]!r}"
+        )
+
+    error_label = pairs.get("ERROR")
+    wrote_value = pairs.get("WROTE")
+    if wrote_value is not None:
+        applied_at = now_utc()
+    if error_label is not None:
+        notes.append(f"worker reported error: {error_label}")
+        # Surface auxiliary diagnostic fields if the script captured
+        # them (e.g. ``CURRENT=...`` on a write failure).
+        if "CURRENT" in pairs:
+            notes.append(f"current memory limit: {pairs['CURRENT']}")
+        if "STORAGE_GLOB" in pairs:
+            notes.append(f"storage glob: {pairs['STORAGE_GLOB']}")
+
+    return OomResult(
+        triggered=applied_at is not None and error_label is None,
+        target_worker=resolved_worker,
+        container_id=container_id,
+        cgroup_path=cgroup_path,
+        cgroup_version=cgroup_version,
+        applied_at=applied_at,
+        notes=tuple(notes),
+    )
+
+
+__all__ += [
+    "OomResult",
+    "oom_one_worker_via_cgroup",
+]
