@@ -142,6 +142,33 @@ the budget.
 
 
 # ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class WorkerProbeError(RuntimeError):
+    """Raised by leak-check probes when the worker SSH itself fails.
+
+    Treating ``rc != 0`` as "no rows" silently hides leaks when the
+    probe path itself is broken (stale known_hosts, missing pubkey,
+    network partition). The leak invariants must surface this as a
+    failure rather than declare the worker clean. Lenient callers
+    (cleanup polling, repro-helper container lookup) can catch this
+    and degrade explicitly.
+    """
+
+    def __init__(self, worker: str, command: str, rc: int, stderr: str) -> None:
+        self.worker = worker
+        self.command = command
+        self.rc = rc
+        self.stderr = stderr
+        super().__init__(
+            f"worker_ssh to {worker!r} failed: rc={rc} cmd={command!r} "
+            f"stderr={stderr.strip()!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Structured row types
 # ---------------------------------------------------------------------------
 
@@ -335,18 +362,48 @@ class ClusterProbe:
         return argv
 
     def _worker_argv(self, worker: str, remote_cmd: str) -> list[str]:
-        """Build an ``ssh -J <gateway> <worker> <remote_cmd>`` argv.
+        """Build an ``ssh ... <worker> <remote_cmd>`` argv that hops via
+        the gateway.
+
+        Use ``ProxyCommand`` rather than ``-J`` so the gateway-hop SSH
+        inherits the same hardened options (StrictHostKeyChecking=no,
+        BatchMode=yes, IdentitiesOnly=yes, …) as the outer worker SSH;
+        ``-J`` runs an inner ``ssh`` that picks up only the user's
+        default config, which on a freshly re-keyed slurm-test-env
+        surfaces as ``Host key verification failed`` for the inner hop.
 
         ``worker`` is the bare hostname; the SLURM-test-env DNS resolves
         ``slurm-worker{1..4}`` from inside the gateway namespace.
         """
+        # Build the inner (gateway-hop) ssh argv WITH Control* multiplexing
+        # so the burst of probe + cleanup SSH calls (squeue, sinfo, podman
+        # ps, port scans, cleanup pkills) reuses one master per (host, port,
+        # user) rather than racing the gateway sshd's MaxStartups limiter.
+        # Then escape every ``%`` in the inner argv to ``%%`` so the outer
+        # ssh's ProxyCommand percent-expansion (which only accepts
+        # ``%h/%p/%r/%u``) emits the literal ``%`` for the inner ssh —
+        # otherwise ``ControlPath=…%C`` fails with
+        # ``vdollar_percent_expand: unknown key %C`` before the proxy
+        # connect even starts. The ``-W %h:%p`` stream-forward token is
+        # appended AFTER escaping so the outer ssh substitutes the worker
+        # hostname/port itself.
+        inner_argv: list[str] = ["ssh"]
+        if self.gateway.identity_file is not None:
+            inner_argv += ["-i", self.gateway.identity_file]
+        inner_argv += [
+            "-p", str(self.gateway.port),
+            *list(_BASE_SSH_OPTS),
+            self.gateway.host,
+        ]
+        inner_str = " ".join(shlex.quote(a) for a in inner_argv)
+        inner_str_escaped = inner_str.replace("%", "%%")
+        proxy_cmd = f"{inner_str_escaped} -W %h:%p"
+
         argv: list[str] = ["ssh"]
         if self.gateway.identity_file is not None:
             argv += ["-i", self.gateway.identity_file]
-        # ProxyJump target carries its own port: ``user@host:port``.
-        proxy = f"{self.gateway.host}:{self.gateway.port}"
-        argv += ["-J", proxy]
         argv += list(_BASE_SSH_OPTS)
+        argv += ["-o", f"ProxyCommand={proxy_cmd}"]
         argv.append(worker)
         argv.append(remote_cmd)
         return argv
@@ -507,7 +564,7 @@ class ClusterProbe:
         cmd = f"{podman} ps -a --format=json"
         cp = self.worker_ssh(worker, cmd, timeout=timeout)
         if cp.returncode != 0:
-            return []
+            raise WorkerProbeError(worker, cmd, cp.returncode, cp.stderr)
         return _parse_podman_json(cp.stdout)
 
     # -- ss / port listeners ------------------------------------------
@@ -530,9 +587,10 @@ class ClusterProbe:
         port_set = {int(p) for p in ports}
         if not port_set:
             return []
-        cp = self.worker_ssh(worker, "ss -lntpe", timeout=timeout)
+        cmd = "ss -lntpe"
+        cp = self.worker_ssh(worker, cmd, timeout=timeout)
         if cp.returncode != 0:
-            return []
+            raise WorkerProbeError(worker, cmd, cp.returncode, cp.stderr)
         return [
             row for row in _parse_ss_lntpe(cp.stdout)
             if row.local_port in port_set
@@ -830,9 +888,11 @@ class ClusterProbe:
                         worker, w_ports,
                         timeout=min(self.gateway.timeout, 5.0),
                     )
-                except (subprocess.TimeoutExpired, OSError):
+                except (subprocess.TimeoutExpired, OSError, WorkerProbeError):
                     # Treat probe failure as 'still bound' for now;
-                    # next iteration retries.
+                    # next iteration retries. Cleanup is best-effort and
+                    # explicitly tolerates a transient probe failure
+                    # here (the strict invariants enforce it elsewhere).
                     for p in w_ports:
                         still_pending.append((worker, p))
                     continue
@@ -888,13 +948,10 @@ class ClusterProbe:
         """
         import re
 
-        cp = self.worker_ssh(
-            worker,
-            "ps -eo pid,ppid,user,etime,cmd --no-headers",
-            timeout=timeout,
-        )
+        cmd = "ps -eo pid,ppid,user,etime,cmd --no-headers"
+        cp = self.worker_ssh(worker, cmd, timeout=timeout)
         if cp.returncode != 0:
-            return []
+            raise WorkerProbeError(worker, cmd, cp.returncode, cp.stderr)
         rx = re.compile(pattern)
         rows: list[ProcessRow] = []
         for line in cp.stdout.splitlines():
