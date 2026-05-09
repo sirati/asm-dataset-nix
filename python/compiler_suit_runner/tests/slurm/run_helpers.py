@@ -48,10 +48,25 @@ SLURM_TEST_ENV_LOG_ROOT = pathlib.Path(
 # harness reads via :data:`SLURM_TEST_ENV_LOG_ROOT`.
 SLURM_TEST_ENV_GATEWAY_ROOT = pathlib.Path("/home/sirati/slurm")
 
-# Default gateway URL for the local slurm-test-env. Routes through
-# the host-published SSH gateway port (matches the test-env's
-# documented bring-up).
-SLURM_TEST_ENV_GATEWAY_URL = "ssh://sirati@localhost:2244"
+# Default gateway URL for the local slurm-test-env. The host string
+# is the alias workers DNS-resolve through the podman bridge (see
+# slurm-test-env owner peer note 26-05-09 02:56). The dispatcher's
+# SSH client redirects ``slurm-gateway`` -> ``localhost:2244`` via
+# the per-cluster ssh_config the conftest fixture writes; using
+# ``localhost`` directly here would propagate into worker wrappers
+# as ``--secondary tcp://localhost:port``, which workers would dial
+# in their own netns and never reach the dispatcher.
+SLURM_TEST_ENV_GATEWAY_URL = "ssh://sirati@slurm-gateway"
+
+# Per-cluster ssh_config path written by the ``ssh_master`` fixture.
+# Both the master pre-spawn and the framework's ``--ssh-config``
+# read from the same file, keeping SSH directives in one place.
+SLURM_TEST_ENV_SSH_CONFIG = pathlib.Path("/tmp/asm-dr-cluster.cfg")
+
+# Per-process Unix-socket path for the pre-spawned SSH master.
+# MUST stay below 108 bytes (``sockaddr_un.sun_path`` kernel limit
+# per migration doc Caveat); ``/tmp/asm-dr-master.sock`` is 26.
+SLURM_TEST_ENV_SSH_CONTROL_PATH = pathlib.Path("/tmp/asm-dr-master.sock")
 
 # Local incremental-cache root the wrapper wipes on demand. Mirrors
 # ``compiler_suit_runner.incremental_cache.DEFAULT_CACHE_ROOT`` but
@@ -316,6 +331,7 @@ def default_invocation_for_smoke(
         slurm_root_folder=SLURM_TEST_ENV_GATEWAY_ROOT,
         slurm_partition="debug",
         slurm_time_limit="0:30:00",
+        ssh_config=SLURM_TEST_ENV_SSH_CONFIG,
         variant_sample=sample,
         max_variants=max_v,
         # Tests want repeatability; a fixed seed makes the sampled
@@ -385,6 +401,8 @@ __all__ = [
     "SLURM_TEST_ENV_GATEWAY_ROOT",
     "SLURM_TEST_ENV_GATEWAY_URL",
     "SLURM_TEST_ENV_LOG_ROOT",
+    "SLURM_TEST_ENV_SSH_CONFIG",
+    "SLURM_TEST_ENV_SSH_CONTROL_PATH",
     "Workload",
     "clear_incremental_cache",
     "default_invocation_for_smoke",

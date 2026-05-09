@@ -15,13 +15,18 @@ in this directory expects:
 
 from __future__ import annotations
 
+import os
 import pathlib
+import subprocess
+import time
 from typing import Any, Callable, Iterator, Optional
 
 import pytest
 
 from compiler_suit_runner.tests.slurm.run_helpers import (
     SLURM_TEST_ENV_LOG_ROOT,
+    SLURM_TEST_ENV_SSH_CONFIG,
+    SLURM_TEST_ENV_SSH_CONTROL_PATH,
     RunInvocation,
     RunResult,
     clear_incremental_cache,
@@ -37,6 +42,145 @@ Concretely returns a :class:`CleanupReport` from
 here so a missing ``cluster_probe`` module (during incremental
 implementation) doesn't produce import errors at collection time.
 """
+
+
+def _write_cluster_ssh_config(
+    config_path: pathlib.Path,
+    *,
+    host_alias: str,
+    hostname: str,
+    port: int,
+    user: str,
+    identity_file: pathlib.Path,
+) -> None:
+    """Generate the per-cluster ssh_config consumed by the framework.
+
+    The Host alias is what worker containers DNS-resolve over the
+    podman bridge; the SSH client redirects it to ``localhost:<port>``
+    on the dispatcher's host. ``IdentityAgent=none`` keeps the
+    ephemeral test-env key out of every agent (1Password, gnome-
+    keyring, the operator agent — see project memory
+    ``feedback_ssh_debug_key.md`` and the slurm-test-env owner's
+    hard rule from 26-05-09 02:56).
+    """
+    config_path.write_text(
+        f"""Host {host_alias}
+    HostName {hostname}
+    Port {port}
+    User {user}
+    IdentityFile {identity_file}
+    IdentitiesOnly yes
+    IdentityAgent none
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    ServerAliveInterval 30
+    ConnectTimeout 10
+"""
+    )
+    config_path.chmod(0o600)
+
+
+def _wait_for_socket(path: pathlib.Path, timeout_s: float = 10.0) -> bool:
+    """Poll until the master socket appears (or timeout)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+@pytest.fixture(scope="session")
+def ssh_master() -> Iterator[pathlib.Path]:
+    """Pre-spawn an SSH master so the framework can reuse it.
+
+    The framework's own SSH master spawn dies after ~2 min when
+    driven from a tokio runtime nested inside a Python CLI process
+    (migration doc §"Known issue: SSH master under tokio"). The
+    documented escape hatch: pre-spawn the master via plain
+    ``subprocess`` (which doesn't have the issue) and export
+    ``DYNRUNNER_SSH_CONTROL_PATH``; the framework's ``connect()``
+    detects the env var and reuses the existing master via
+    ``ssh -O forward -R …`` instead of spawning its own.
+
+    Scope is session so a single master serves the whole test run;
+    teardown asks the master to exit cleanly via ``ssh -O exit``.
+    Yields the socket path so individual tests can probe it if
+    needed (most tests just rely on the env var).
+    """
+    repo_root = pathlib.Path(__file__).resolve().parents[4]
+    default_key = repo_root / ".ssh-debug" / "id_ed25519"
+    identity_file = pathlib.Path(
+        os.environ.get("ASM_CLUSTER_PROBE_KEY", str(default_key))
+    )
+    host_alias = "slurm-gateway"
+
+    _write_cluster_ssh_config(
+        SLURM_TEST_ENV_SSH_CONFIG,
+        host_alias=host_alias,
+        hostname="localhost",
+        port=2244,
+        user="sirati",
+        identity_file=identity_file,
+    )
+
+    # Best-effort cleanup of any prior socket before starting; ssh
+    # refuses to bind a ControlPath that already exists.
+    try:
+        SLURM_TEST_ENV_SSH_CONTROL_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+    spawn_cmd = [
+        "setsid", "-f", "--",
+        "ssh",
+        "-F", str(SLURM_TEST_ENV_SSH_CONFIG),
+        "-M", "-N", "-f",
+        "-o", f"ControlPath={SLURM_TEST_ENV_SSH_CONTROL_PATH}",
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=yes",
+        host_alias,
+    ]
+    subprocess.run(
+        spawn_cmd,
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if not _wait_for_socket(SLURM_TEST_ENV_SSH_CONTROL_PATH, timeout_s=10.0):
+        pytest.skip(
+            "ssh master socket did not appear at "
+            f"{SLURM_TEST_ENV_SSH_CONTROL_PATH} within 10s; check "
+            "that slurm-test-env is up and reachable",
+        )
+
+    os.environ["DYNRUNNER_SSH_CONTROL_PATH"] = str(
+        SLURM_TEST_ENV_SSH_CONTROL_PATH
+    )
+
+    try:
+        yield SLURM_TEST_ENV_SSH_CONTROL_PATH
+    finally:
+        os.environ.pop("DYNRUNNER_SSH_CONTROL_PATH", None)
+        subprocess.run(
+            [
+                "ssh",
+                "-F", str(SLURM_TEST_ENV_SSH_CONFIG),
+                "-O", "exit",
+                "-o", f"ControlPath={SLURM_TEST_ENV_SSH_CONTROL_PATH}",
+                host_alias,
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            SLURM_TEST_ENV_SSH_CONTROL_PATH.unlink()
+        except FileNotFoundError:
+            pass
 
 
 @pytest.fixture(scope="session")
@@ -133,6 +277,7 @@ def cleanup_cluster(
 @pytest.fixture
 def fresh_run(
     cleanup_cluster: CleanupCallable,  # noqa: ARG001 — drives ordering only
+    ssh_master: pathlib.Path,  # noqa: ARG001 — sets DYNRUNNER_SSH_CONTROL_PATH
 ) -> Callable[..., RunResult]:
     """Run :func:`run_compiler_suit` with cache-cold guarantees.
 
