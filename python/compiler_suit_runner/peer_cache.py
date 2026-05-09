@@ -1543,17 +1543,15 @@ class SubmitterPeer:
         assert self._run_id is not None
         assert self._public_key is not None
         assert self._gateway_host is not None
-        # c89775c+: extra_port_forwards fan out per-compute-node as
-        # `ssh -J gateway -R <gateway_port>:localhost:<local_port>
-        # compute-node`. From every compute-node's perspective, the
-        # submitter's harmonia is reachable as
-        # `http://localhost:<gateway_port>` regardless of whether the
-        # gateway has GatewayPorts=on or =off — the fan-out makes the
-        # URL shape stable. Publish localhost so peers in the
-        # container hit the per-compute-node tunnel.
+        # The framework's reverse tunnel (dynrunner-slurm preparation.rs
+        # `build_ssh_argv`) does a single `ssh -R <gw>:localhost:<lp>`
+        # to the gateway hop only — there is no per-compute-node fan-out.
+        # With GatewayPorts=clientspecified on the gateway sshd, the
+        # bound socket is `0.0.0.0:<gateway_port>` so workers reach the
+        # submitter via `http://<gateway_host>:<gateway_port>`.
         payload = {
             "secondary_id": "submitter",
-            "hostname": "localhost",
+            "hostname": self._gateway_host,
             "port": self.gateway_port,
             "public_key": self._public_key,
         }
