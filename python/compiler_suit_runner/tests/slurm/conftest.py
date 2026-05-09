@@ -150,6 +150,30 @@ def ssh_master() -> Iterator[pathlib.Path]:
     except FileNotFoundError:
         pass
 
+    # Clear gateway-side orphan sshd-session children left behind when
+    # a previous run died ungracefully (e.g. SIGKILL on pytest before
+    # ``ssh -O exit``). The framework's gateway code adds its reverse
+    # forwards via ``ssh -O forward -R 0.0.0.0:5005:localhost:5005``;
+    # the bound socket lives in a child sshd-session on the gateway.
+    # If that session leaks, the next run's `ssh -O forward` fails
+    # with "remote port forwarding failed for listen port 5005" before
+    # dispatch can even start. Use a one-shot SSH (not the master we
+    # are about to spawn) to pkill our own orphans.
+    subprocess.run(
+        [
+            "ssh", "-F", str(SLURM_TEST_ENV_SSH_CONFIG),
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
+            host_alias,
+            "pkill -KILL -u $USER -f 'sshd-session.*notty' || true",
+        ],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=15,
+    )
+
     spawn_cmd = [
         "setsid", "-f", "--",
         "ssh",
