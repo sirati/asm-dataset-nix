@@ -749,7 +749,9 @@ def test_check_no_leaked_listener_ports_pass(tmp_path: Path) -> None:
 
 def test_check_no_leaked_listener_ports_uid_match(tmp_path: Path) -> None:
     artifacts = _artifacts_with_started_at(tmp_path)
-    leaked = _listener_row(port=5050, uid=1000, process="peer_push")
+    # 6000 = peer_push at ``harmonia_port + PUSH_PORT_OFFSET``; this
+    # row models a leaked peer-push listener still bound by the runner.
+    leaked = _listener_row(port=6000, uid=1000, process="peer_push")
     probe = _StubProbe(
         listener_rows_by_worker={"slurm-worker1": [leaked]},
         gateway_uid=1000,
@@ -759,7 +761,7 @@ def test_check_no_leaked_listener_ports_uid_match(tmp_path: Path) -> None:
     )
     assert not result.passed
     assert "1 leaked listener" in result.detail
-    assert "5050" in result.detail
+    assert "6000" in result.detail
 
 
 def test_check_no_leaked_listener_ports_other_uid_skipped(

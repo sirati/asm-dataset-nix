@@ -113,10 +113,14 @@ DEFAULT_TIMEOUT_S = 300.0
 PREFERRED_TARGET_WORKER = "slurm-worker1"
 FALLBACK_TARGET_WORKER = "slurm-worker2"
 
-# Pre-bind port. Per the plan this is the harmonia/peer_push port
-# family identified in the smoke16 retrospective; the cleanup
-# harness's ``DEFAULT_CLEANUP_PORTS = (5000, 5050)`` matches.
-PORT_GRAB_PORT = 5050
+# Pre-bind port. The peer-push listener binds at
+# ``harmonia_port + PUSH_PORT_OFFSET`` (= 5000 + 1000 = 6000) per
+# :func:`compiler_suit_runner.peer_push.push_port_for`; pre-binding
+# 6000 on the worker is what triggers a real EADDRINUSE on the
+# secondary's peer-push start. (The earlier ``5050`` constant was a
+# stale carry-over from an older port layout — pre-binding it
+# silently no-op'd because no production process tried to bind 5050.)
+PORT_GRAB_PORT = 6000
 
 # Number of secondaries this row dispatches. One is the minimum and
 # matches the plan's ``--jobs 1`` recipe; T10 is N=1 by design so the

@@ -1244,7 +1244,10 @@ def test_cleanup_default_workers_is_four_node_topology() -> None:
 
 
 def test_cleanup_default_ports_are_harmonia_and_peer_push() -> None:
-    assert DEFAULT_CLEANUP_PORTS == (5000, 5050)
+    # 5000 = harmonia bind (DEFAULT_HARMONIA_PORT in suit_task config);
+    # 6000 = peer_push at ``harmonia_port + PUSH_PORT_OFFSET`` per
+    # :func:`compiler_suit_runner.peer_push.push_port_for`.
+    assert DEFAULT_CLEANUP_PORTS == (5000, 6000)
 
 
 def test_cleanup_default_pkill_pattern_includes_all_three_families() -> None:

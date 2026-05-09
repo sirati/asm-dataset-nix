@@ -103,7 +103,7 @@ Matches the live local test-env topology (4 workers; see plan section
 :meth:`ClusterProbe.cleanup` if a future test env adds/removes nodes.
 """
 
-DEFAULT_CLEANUP_PORTS: Final[tuple[int, ...]] = (5000, 5050)
+DEFAULT_CLEANUP_PORTS: Final[tuple[int, ...]] = (5000, 6000)
 """Listener ports the cleanup harness polls for release.
 
 5000 is harmonia-cache, 5050 is peer_push - the two leaky listeners

@@ -567,11 +567,12 @@ def check_no_leaked_listener_ports(
     """Invariant 6: ``ss -lntp`` shows no listener on harmonia/peer_push
     ports bound by the run's UID.
 
-    Defaults: ports 5000 (harmonia) and 5050 (peer_push) per
-    smoke16-class leak postmortem. The check fetches the test runner's
-    UID from the cluster (probe convention: same SSH user as the
-    gateway login) and flags any listener whose ``uid`` matches AND
-    whose port is in the watch-list.
+    Defaults: ports 5000 (harmonia) and 6000 (peer_push at
+    ``harmonia_port + PUSH_PORT_OFFSET``) per smoke16-class leak
+    postmortem. The check fetches the test runner's UID from the
+    cluster (probe convention: same SSH user as the gateway login)
+    and flags any listener whose ``uid`` matches AND whose port is
+    in the watch-list.
 
     Listeners with no PID/UID surfaced (``ss`` may emit such rows for
     kernel-level listeners) are NOT flagged - they cannot belong to
@@ -579,7 +580,7 @@ def check_no_leaked_listener_ports(
     """
     name = "no_leaked_listener_ports"
     if ports is None:
-        ports = [5000, 5050]
+        ports = [5000, 6000]
     if not probe.is_reachable():
         return _skip_unreachable(name)
 
