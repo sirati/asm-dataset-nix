@@ -115,6 +115,25 @@ def ssh_master() -> Iterator[pathlib.Path]:
     )
     host_alias = "slurm-gateway"
 
+    # Best-effort: clear any orphan dev-box harmonia squatting on the
+    # SubmitterPeer's port. The orphan slips past
+    # ``SubmitterPeer.start()``'s bind-failure retry when the existing
+    # harmonia answers ``/nix-cache-info`` faster than our child can
+    # exit with EADDRINUSE — the probe's 200 OK sets ``bound_ok=True``
+    # and the retry never fires, leaving the orphan in charge with
+    # mismatched signing keys. Killing here is cheap and safe (the
+    # only ``harmonia-cache`` we ever start on the dev box is our
+    # own SubmitterPeer's; cluster-side harmonia runs inside
+    # containers and isn't visible to a host pkill).
+    subprocess.run(
+        ["pkill", "-KILL", "-f", "harmonia-cache"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+
     _write_cluster_ssh_config(
         SLURM_TEST_ENV_SSH_CONFIG,
         host_alias=host_alias,
