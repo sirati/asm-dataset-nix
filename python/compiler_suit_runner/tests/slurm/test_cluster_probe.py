@@ -129,32 +129,49 @@ def test_gateway_argv_does_not_invoke_shell() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_worker_argv_uses_proxyjump_with_port() -> None:
+def test_worker_argv_uses_proxycommand_with_port() -> None:
     probe = _make_probe(identity="/tmp/k")
     argv = probe._worker_argv("slurm-worker3", "uname -a")
-    assert "-J" in argv
-    j_idx = argv.index("-J")
-    # The ProxyJump target carries user, host AND port: when no port
-    # is encoded, OpenSSH falls back to 22 and silently fails against
-    # the test gateway (which listens on 2244).
-    assert argv[j_idx + 1] == "sirati@localhost:2244"
+    # We use ``ProxyCommand`` rather than ``-J`` so the gateway-hop
+    # SSH inherits the same hardened options (StrictHostKeyChecking=no,
+    # BatchMode=yes, IdentitiesOnly=yes, …) as the outer worker SSH;
+    # the inner ``-J`` ssh would otherwise pick up only the user's
+    # default config, which on a freshly re-keyed slurm-test-env
+    # surfaces as ``Host key verification failed`` for the inner hop.
+    pc_idx = argv.index("ProxyCommand=", 0, len(argv) - 2) if False else None
+    pc_entries = [e for e in argv if e.startswith("ProxyCommand=")]
+    assert len(pc_entries) == 1
+    pc = pc_entries[0]
+    # The proxy command must encode the gateway port; OpenSSH falls
+    # back to 22 silently when no port is present.
+    assert "-p 2244" in pc
+    assert "sirati@localhost" in pc
+    # And it must end with -W %h:%p so the outer ssh forwards the
+    # final hop's stream through the gateway.
+    assert "-W %h:%p" in pc
+
     # The final hop is the bare worker hostname; the gateway resolves
     # it via internal DNS.
     assert argv[-2] == "slurm-worker3"
     assert argv[-1] == "uname -a"
-    # The identity flag is still there - OpenSSH applies it to every
-    # hop because IdentitiesOnly=yes is shared.
+    # The identity flag is still on the outer hop - OpenSSH applies
+    # it to the worker hop because IdentitiesOnly=yes is shared.
     assert argv[1] == "-i"
     assert argv[2] == "/tmp/k"
 
 
 def test_worker_argv_does_not_pass_p_for_worker() -> None:
     """``-p`` is only meaningful for the *direct* hop. The worker hop
-    uses default port 22; the gateway hop's port lives in the ``-J``
-    target string."""
+    uses default port 22; the gateway hop's port lives in the
+    ``ProxyCommand`` string."""
     probe = _make_probe()
     argv = probe._worker_argv("slurm-worker1", "true")
-    assert "-p" not in argv
+    # No ``-p`` on the outer ssh argv (the ``-p 2244`` lives inside
+    # the ``ProxyCommand=...`` string, not as an outer option).
+    outer_only = [
+        a for a in argv if not a.startswith("ProxyCommand=")
+    ]
+    assert "-p" not in outer_only
 
 
 # ---------------------------------------------------------------------------
@@ -389,9 +406,11 @@ def test_podman_ps_parses_full_set(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     rows = _make_probe().podman_ps("slurm-worker2")
-    # ProxyJump form must be present: rules out an accidental direct
+    # ProxyCommand form must be present: rules out an accidental direct
     # connect to the worker (which would not be reachable).
-    assert "-J" in captured["argv"]
+    assert any(
+        a.startswith("ProxyCommand=") for a in captured["argv"]
+    ), captured["argv"]
     assert len(rows) == 2
     first = rows[0]
     assert isinstance(first, PodmanRow)
@@ -523,16 +542,28 @@ def test_port_listeners_empty_when_no_ports_passed(
     assert called == []
 
 
-def test_port_listeners_returns_empty_on_ssh_failure(
+def test_port_listeners_raises_worker_probe_error_on_ssh_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Leak-check probes must surface ``rc != 0`` as a hard error so
+    the invariants don't silent-pass when the SSH path itself is
+    broken (stale known_hosts, missing pubkey, network partition).
+    Cleanup polling and other lenient callers catch the exception
+    explicitly.
+    """
+    from compiler_suit_runner.tests.slurm.cluster_probe import (
+        WorkerProbeError,
+    )
+
     monkeypatch.setattr(
         subprocess, "run",
         lambda *a, **kw: _completed(rc=255, stderr="boom"),
     )
-    assert _make_probe().port_listeners(
-        "slurm-worker1", ports=[5000],
-    ) == []
+    with pytest.raises(WorkerProbeError) as excinfo:
+        _make_probe().port_listeners("slurm-worker1", ports=[5000])
+    assert excinfo.value.worker == "slurm-worker1"
+    assert excinfo.value.rc == 255
+    assert "boom" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -591,17 +622,27 @@ def test_processes_by_pattern_filters(
     )
 
 
-def test_processes_by_pattern_returns_empty_on_failure(
+def test_processes_by_pattern_raises_worker_probe_error_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Same hard-fail contract as :func:`port_listeners`: a probe SSH
+    failure must surface as ``WorkerProbeError`` so the leak invariant
+    can't silent-pass when the SSH path is broken."""
+    from compiler_suit_runner.tests.slurm.cluster_probe import (
+        WorkerProbeError,
+    )
+
     monkeypatch.setattr(
         subprocess, "run",
         lambda *a, **kw: _completed(rc=1, stderr="oops"),
     )
-    rows = _make_probe().processes_by_pattern(
-        "slurm-worker1", r"compiler_suit_runner",
-    )
-    assert rows == []
+    with pytest.raises(WorkerProbeError) as excinfo:
+        _make_probe().processes_by_pattern(
+            "slurm-worker1", r"compiler_suit_runner",
+        )
+    assert excinfo.value.worker == "slurm-worker1"
+    assert excinfo.value.rc == 1
+    assert "oops" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -828,10 +869,11 @@ def test_cleanup_worker_compound_uses_rootless_podman_paths(
         "peer_push",
     ):
         assert needle in script
-    # The compound is reached via ProxyJump; the worker hop carries no
-    # ``-p`` (worker port is default 22 inside the gateway namespace).
+    # The compound is reached via ProxyCommand; the worker hop carries
+    # no ``-p`` (worker port is default 22 inside the gateway
+    # namespace).
     argv = compound_calls[0]["argv"]
-    assert "-J" in argv
+    assert any(a.startswith("ProxyCommand=") for a in argv), argv
     assert argv[-2] == "slurm-worker1"
 
 

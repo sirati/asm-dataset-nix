@@ -697,6 +697,38 @@ def test_check_no_leaked_containers_multi_worker(tmp_path: Path) -> None:
     assert "slurm-worker2" in result.detail
 
 
+def test_check_no_leaked_containers_probe_failure_surfaces_as_fail(
+    tmp_path: Path,
+) -> None:
+    """A WorkerProbeError on any worker must turn the leak check into
+    a hard failure rather than a silent pass — the user explicitly
+    asked for "after each test no slurm jobs remain, after that
+    succeeded confirm that on the slurm worker nodes no processes are
+    leaked", which is impossible to verify when the SSH probe itself
+    is broken (the prior empty-list-on-rc!=0 behaviour silently
+    declared the worker clean)."""
+    from compiler_suit_runner.tests.slurm.cluster_probe import (
+        WorkerProbeError,
+    )
+
+    class _ErrorProbe(_StubProbe):
+        def podman_ps(self, worker: str) -> list[PodmanRow]:
+            raise WorkerProbeError(
+                worker, "podman ps -a", 255, "Permission denied",
+            )
+
+    artifacts = _artifacts_with_started_at(tmp_path)
+    probe = _ErrorProbe(reachable=True)
+    result = check_no_leaked_containers(
+        artifacts, probe, ["slurm-worker1", "slurm-worker2"],
+    )
+    assert not result.passed
+    assert result.status == "fail"
+    assert "podman_ps probe failed" in result.detail
+    assert "slurm-worker1" in result.detail
+    assert "slurm-worker2" in result.detail
+
+
 # ---------------------------------------------------------------------------
 # Invariant 6: leaked listener ports
 # ---------------------------------------------------------------------------

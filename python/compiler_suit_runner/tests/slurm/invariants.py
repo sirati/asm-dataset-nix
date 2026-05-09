@@ -43,6 +43,15 @@ if TYPE_CHECKING:  # pragma: no cover - import only used for typing
         ProcessRow,
     )
 
+# Imported at module scope (not under TYPE_CHECKING) because the leak
+# checks raise/catch :class:`WorkerProbeError` at runtime. The probe
+# module is always available where the cluster invariants run; the
+# import would loop only if cluster_probe imported invariants, which
+# it does not.
+from compiler_suit_runner.tests.slurm.cluster_probe import (  # noqa: E402
+    WorkerProbeError,
+)
+
 __all__ = [
     "InvariantResult",
     "RunArtifacts",
@@ -496,11 +505,17 @@ def check_no_leaked_containers(
 
     leaked_rows: list[PodmanRow] = []
     descriptions: list[str] = []
+    probe_errors: list[str] = []
 
     started_at = artifacts.started_at
 
     for worker in workers:
-        for row in probe.podman_ps(worker):
+        try:
+            rows_iter = probe.podman_ps(worker)
+        except WorkerProbeError as exc:
+            probe_errors.append(str(exc))
+            continue
+        for row in rows_iter:
             tagged = _container_matches_run(row, artifacts.run_id)
             in_window = False
             if not tagged and started_at is not None:
@@ -523,6 +538,17 @@ def check_no_leaked_containers(
             + "; ".join(descriptions),
             status="fail",
             rows=tuple(leaked_rows),
+        )
+    if probe_errors:
+        return InvariantResult(
+            name=name,
+            passed=False,
+            detail=(
+                f"podman_ps probe failed on "
+                f"{len(probe_errors)}/{len(workers)} worker(s); cannot "
+                f"verify clean state: " + "; ".join(probe_errors)
+            ),
+            status="fail",
         )
     return InvariantResult(
         name=name,
@@ -560,9 +586,15 @@ def check_no_leaked_listener_ports(
     runner_uid = _gateway_uid(probe)
     leaked_rows: list[ListenerRow] = []
     descriptions: list[str] = []
+    probe_errors: list[str] = []
 
     for worker in workers:
-        for row in probe.port_listeners(worker, ports):
+        try:
+            rows_iter = probe.port_listeners(worker, ports)
+        except WorkerProbeError as exc:
+            probe_errors.append(str(exc))
+            continue
+        for row in rows_iter:
             if row.uid is None or runner_uid is None:
                 # Without a UID we cannot attribute the listener; skip
                 # rather than blame an unrelated process.
@@ -583,6 +615,17 @@ def check_no_leaked_listener_ports(
             + "; ".join(descriptions),
             status="fail",
             rows=tuple(leaked_rows),
+        )
+    if probe_errors:
+        return InvariantResult(
+            name=name,
+            passed=False,
+            detail=(
+                f"port_listeners probe failed on "
+                f"{len(probe_errors)}/{len(workers)} worker(s); cannot "
+                f"verify clean state: " + "; ".join(probe_errors)
+            ),
+            status="fail",
         )
     return InvariantResult(
         name=name,
@@ -634,9 +677,15 @@ def check_no_leaked_processes(
 
     leaked_rows: list[ProcessRow] = []
     descriptions: list[str] = []
+    probe_errors: list[str] = []
 
     for worker in workers:
-        for row in probe.processes_by_pattern(worker, pattern):
+        try:
+            rows_iter = probe.processes_by_pattern(worker, pattern)
+        except WorkerProbeError as exc:
+            probe_errors.append(str(exc))
+            continue
+        for row in rows_iter:
             if row.ppid != 1:
                 continue
             etime_s = _parse_etime_seconds(row.etime)
@@ -657,6 +706,17 @@ def check_no_leaked_processes(
             + "; ".join(descriptions),
             status="fail",
             rows=tuple(leaked_rows),
+        )
+    if probe_errors:
+        return InvariantResult(
+            name=name,
+            passed=False,
+            detail=(
+                f"processes_by_pattern probe failed on "
+                f"{len(probe_errors)}/{len(workers)} worker(s); cannot "
+                f"verify clean state: " + "; ".join(probe_errors)
+            ),
+            status="fail",
         )
     return InvariantResult(
         name=name,
