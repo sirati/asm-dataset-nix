@@ -56,7 +56,21 @@ SLURM_TEST_ENV_GATEWAY_ROOT = pathlib.Path("/home/sirati/slurm")
 # ``localhost`` directly here would propagate into worker wrappers
 # as ``--secondary tcp://localhost:port``, which workers would dial
 # in their own netns and never reach the dispatcher.
-SLURM_TEST_ENV_GATEWAY_URL = "ssh://sirati@slurm-gateway"
+#
+# Port ``2244`` is mandatory in the URL because
+# ``SubmitterPeer._ssh_oneshot`` reads ``ssh_port`` from
+# ``parse_gateway_url`` and passes it as ``-p`` to its own
+# (out-of-band) ssh invocations; cmdline ``-p`` overrides any
+# ``Port`` directive in the per-host block of ``ssh_config``, so
+# omitting the port silently drops the publish-peer-file SSH onto
+# port 22 (no listener at the host alias) — secondaries' substituters
+# files end up empty and toolchain builds fail with
+# "don't know how to build these paths". The framework still
+# propagates only the host part (``slurm-gateway``) into worker
+# wrappers' ``--secondary tcp://slurm-gateway:<framework-tunnel-port>``,
+# pairing it with its own chosen tunnel port; including ``:2244``
+# here does NOT redirect worker traffic to the SSH port.
+SLURM_TEST_ENV_GATEWAY_URL = "ssh://sirati@slurm-gateway:2244"
 
 # Per-cluster ssh_config path written by the ``ssh_master`` fixture.
 # Both the master pre-spawn and the framework's ``--ssh-config``
