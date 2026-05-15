@@ -63,6 +63,7 @@ from compiler_suit_runner.peer_cache import (
     generate_signing_key,
     withdraw_self,
 )
+from compiler_suit_runner import peer_paths
 from compiler_suit_runner.peer_push import (
     PeerPushServer,
     fan_out_announce,
@@ -1024,6 +1025,22 @@ class SuitTask:
                         if receiver is not None:
                             receiver.on_cancel(record)
 
+                    # Broadcast-receive placement gossip: when the
+                    # consumer accepts a ``/peer/path-broadcast-offer``
+                    # (the drv has been fetched into our local store),
+                    # publish a holder record under
+                    # ``item_class="phase0_eval_drv"`` so the
+                    # placement-map watcher on every other secondary
+                    # learns we hold it. Mirrors the K=3 receiver's
+                    # post-fetch ``record_self_has`` call but with the
+                    # phase0 item-class so phase0 drv holders are
+                    # distinguishable from toolchain / variant holders.
+                    _record_broadcast_self_has = (
+                        self._make_broadcast_record_self_has(
+                            peer_watcher, public_key,
+                        )
+                    )
+
                     self._push_server = PeerPushServer(
                         bind_host="0.0.0.0",
                         port=push_port_for(self.config.harmonia_port),
@@ -1036,6 +1053,7 @@ class SuitTask:
                         on_path_accept=_on_path_accept,
                         on_path_reject=_on_path_reject,
                         on_path_cancel=_on_path_cancel,
+                        record_broadcast_self_has=_record_broadcast_self_has,
                     )
                     self._push_server.start()
                 except Exception:  # noqa: BLE001 — log + continue
@@ -1352,6 +1370,48 @@ class SuitTask:
             completed,
             failed,
         )
+
+    # ── Broadcast-receive placement gossip ────────────────────────────
+
+    def _make_broadcast_record_self_has(
+        self,
+        peer_watcher: PeerListWatcher,
+        public_key: str,
+    ) -> Any:
+        """Return a callable suitable for ``PeerPushServer.record_broadcast_self_has``.
+
+        The returned function calls :func:`peer_paths.record_self_has`
+        with ``item_class=ITEM_CLASS_PHASE0_EVAL_DRV`` and the live
+        peer list from *peer_watcher*. Extracted as a method so the
+        callable assembly is unit-testable without spinning up the
+        full :meth:`on_run_start` lifecycle.
+
+        Exceptions raised by ``record_self_has`` are caught + logged
+        (gossip is best-effort; a failed write must not propagate into
+        the handshake response back to the originator).
+        """
+        my_sid = self.config.secondary_id
+        shared_fs = self.config.shared_fs
+        peer_watcher_ref = peer_watcher
+        bound_pubkey = str(public_key)
+
+        def _record(path: str) -> None:
+            try:
+                peer_paths.record_self_has(
+                    shared_fs,
+                    my_secondary_id=my_sid,
+                    outpath=path,
+                    drv_path=path,
+                    item_class=peer_paths.ITEM_CLASS_PHASE0_EVAL_DRV,
+                    peers=list(peer_watcher_ref.peers),
+                    our_pubkey=bound_pubkey,
+                )
+            except Exception:  # noqa: BLE001
+                self._logger.exception(
+                    "broadcast record_self_has failed for %s", path,
+                )
+
+        return _record
 
     # ── Phase 0 watcher wiring ────────────────────────────────────────
 

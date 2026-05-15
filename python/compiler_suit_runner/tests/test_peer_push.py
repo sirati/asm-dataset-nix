@@ -1117,6 +1117,161 @@ def test_broadcast_offer_callback_rejection_propagates() -> None:
         srv.stop()
 
 
+def test_broadcast_offer_records_self_has_after_accept() -> None:
+    """When ``on_broadcast_offer`` returns True, the server invokes the
+    optional ``record_broadcast_self_has`` hook with the path so the
+    consumer's placement-map gossip captures the new holder."""
+    recorded: list[str] = []
+
+    def cb(_p, _sz, _opid, _bid, _hop):
+        return True
+
+    def record(path: str) -> None:
+        recorded.append(path)
+
+    port = _free_port()
+    srv = PeerPushServer(
+        bind_host="127.0.0.1",
+        port=port,
+        expected_pubkey="test-pk",
+        on_announce=lambda _i: None,
+        on_withdraw=lambda _s: None,
+        on_broadcast_offer=cb,
+        record_broadcast_self_has=record,
+    )
+    srv.start()
+    try:
+        rc, raw = _post_with_body(
+            port, "/peer/path-broadcast-offer",
+            _broadcast_payload("bid-record"),
+            "test-pk",
+        )
+        assert rc == 200
+        body = json.loads(raw.decode("utf-8"))
+        assert body == {"dedup": False, "accepted": True}
+        assert recorded == ["/nix/store/aaa-toolchain.drv"]
+    finally:
+        srv.stop()
+
+
+def test_broadcast_offer_does_not_record_self_has_on_reject() -> None:
+    """When ``on_broadcast_offer`` returns False (consumer declined),
+    the record-hook MUST NOT fire — a rejected offer means no fetch
+    happened, so we are not a holder."""
+    recorded: list[str] = []
+
+    def cb(_p, _sz, _opid, _bid, _hop):
+        return False
+
+    def record(path: str) -> None:
+        recorded.append(path)
+
+    port = _free_port()
+    srv = PeerPushServer(
+        bind_host="127.0.0.1",
+        port=port,
+        expected_pubkey="test-pk",
+        on_announce=lambda _i: None,
+        on_withdraw=lambda _s: None,
+        on_broadcast_offer=cb,
+        record_broadcast_self_has=record,
+    )
+    srv.start()
+    try:
+        rc, raw = _post_with_body(
+            port, "/peer/path-broadcast-offer",
+            _broadcast_payload("bid-no-record"),
+            "test-pk",
+        )
+        assert rc == 200
+        body = json.loads(raw.decode("utf-8"))
+        assert body == {"dedup": False, "accepted": False}
+        assert recorded == []
+    finally:
+        srv.stop()
+
+
+def test_broadcast_offer_record_hook_dedup_silent() -> None:
+    """A duplicate ``broadcast_id`` returns ``{"dedup": True}`` without
+    invoking either the consumer callback OR the record hook — the
+    placement record was already published on the first acceptance."""
+    cb_calls: list[str] = []
+    recorded: list[str] = []
+
+    def cb(_p, _sz, _opid, bid, _hop):
+        cb_calls.append(bid)
+        return True
+
+    def record(path: str) -> None:
+        recorded.append(path)
+
+    port = _free_port()
+    srv = PeerPushServer(
+        bind_host="127.0.0.1",
+        port=port,
+        expected_pubkey="test-pk",
+        on_announce=lambda _i: None,
+        on_withdraw=lambda _s: None,
+        on_broadcast_offer=cb,
+        record_broadcast_self_has=record,
+    )
+    srv.start()
+    try:
+        rc1, _raw1 = _post_with_body(
+            port, "/peer/path-broadcast-offer",
+            _broadcast_payload("bid-dup"), "test-pk",
+        )
+        rc2, raw2 = _post_with_body(
+            port, "/peer/path-broadcast-offer",
+            _broadcast_payload("bid-dup"), "test-pk",
+        )
+        assert rc1 == 200
+        assert rc2 == 200
+        body2 = json.loads(raw2.decode("utf-8"))
+        assert body2 == {"dedup": True}
+        # Callback + hook each fire exactly once (the dedup hit goes
+        # straight back without touching either).
+        assert cb_calls == ["bid-dup"]
+        assert recorded == ["/nix/store/aaa-toolchain.drv"]
+    finally:
+        srv.stop()
+
+
+def test_broadcast_offer_record_hook_exception_does_not_break_response() -> None:
+    """If the record-hook raises, the originator still sees the regular
+    JSON response (gossip is best-effort; the handshake reply is not
+    contingent on a successful placement-map write)."""
+
+    def cb(_p, _sz, _opid, _bid, _hop):
+        return True
+
+    def record(_path: str) -> None:
+        raise RuntimeError("simulated gossip failure")
+
+    port = _free_port()
+    srv = PeerPushServer(
+        bind_host="127.0.0.1",
+        port=port,
+        expected_pubkey="test-pk",
+        on_announce=lambda _i: None,
+        on_withdraw=lambda _s: None,
+        on_broadcast_offer=cb,
+        record_broadcast_self_has=record,
+    )
+    srv.start()
+    try:
+        rc, raw = _post_with_body(
+            port, "/peer/path-broadcast-offer",
+            _broadcast_payload("bid-raise"),
+            "test-pk",
+        )
+        assert rc == 200
+        body = json.loads(raw.decode("utf-8"))
+        assert body == {"dedup": False, "accepted": True}
+    finally:
+        srv.stop()
+
+
 def test_push_path_broadcast_offer_returns_parsed_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
