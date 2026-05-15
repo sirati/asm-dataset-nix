@@ -63,15 +63,15 @@ __all__ = [
 # :class:`compiler_suit_runner.peer_cache.HarmoniaProcess`.
 DEFAULT_HARMONIA_PORT = 5000
 
-# Hostname of the submitter-published peer URL. The submitter publishes
-# ``hostname=localhost`` (see
+# Hostnames recognised as the submitter-published peer URL. The
+# submitter publishes its own peer file with ``hostname=<gateway>`` (see
 # :meth:`compiler_suit_runner.peer_cache.SubmitterPeer._publish_peer_file`)
-# so the per-compute-node SSH-R fan-out is reachable as
-# ``http://localhost:<gateway_port>``. We treat ANY entry whose URL host
-# is ``localhost`` (or ``127.0.0.1``) as the submitter, regardless of
-# port -- the submitter port is config-dependent (default 5005) and may
-# differ between dispatches.
-_SUBMITTER_HOSTS = frozenset({"localhost", "127.0.0.1"})
+# because the framework's reverse tunnel binds the gateway hop only --
+# workers reach the submitter at ``http://<gateway>:<gateway_port>``.
+# ``localhost`` and ``127.0.0.1`` remain in the set for cluster-internal
+# secondaries that ever resolve their submitter peer locally; the
+# slurm-test-env's gateway alias is ``slurm-gateway``.
+_SUBMITTER_HOSTS = frozenset({"localhost", "127.0.0.1", "slurm-gateway"})
 
 
 # ---------------------------------------------------------------------------

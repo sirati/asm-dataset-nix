@@ -45,14 +45,17 @@ from compiler_suit_runner.cachix_uploader import (
     CachixUploader,
     UploaderConfig,
 )
+from compiler_suit_runner import phase1_planner
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
+    phase0_eval_task_id,
     read_manifest,
 )
 from compiler_suit_runner.peer_cache import (
     SUBSTITUTERS_FILENAME,
     substituters_filename_for,
     HarmoniaProcess,
+    PathPlacementWatcher,
     PeerInfo,
     PeerListWatcher,
     SigningKey,
@@ -65,6 +68,13 @@ from compiler_suit_runner.peer_push import (
     fan_out_announce,
     fan_out_withdraw,
     push_port_for,
+)
+from compiler_suit_runner.peer_replication import (
+    DEFAULT_REPLICATION_K,
+    ReplicationContext,
+    ReplicationReceiver,
+    ReplicationRepairWorker,
+    ReplicationSender,
 )
 from compiler_suit_runner.workers.build_worker import (
     BuildWorkerEnv,
@@ -93,7 +103,7 @@ __all__ = [
 
 # Item classes that route through the build worker.
 _PHASE2_BUILD_CLASSES: frozenset[str] = frozenset(
-    {"phase2_toolchain", "phase2_common_dep"}
+    {"phase2_toolchain", "phase2_toolchain_validate", "phase2_common_dep"}
 )
 
 
@@ -108,6 +118,13 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
     onto the same worker for kernel page-cache reuse.
     """
     item_class = header.item_class
+    if item_class == "phase0_eval":
+        # Phase 0 distributed-eval: one task per binary. Pinned by
+        # binary so we get a stable affinity bucket per package
+        # (handy for log grepping; framework just treats it as a
+        # tag).
+        binary = header.payload.get("binary", "?")
+        return ("phase0", "eval", binary)
     if item_class == "phase1a_partition":
         return ("phase1a", "partition", None)
     if item_class == "phase1b_merge":
@@ -121,6 +138,16 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
         compiler = header.payload.get("compiler_label", "?")
         arch = header.payload.get("arch", "?")
         return ("phase_build", "toolchain", f"{compiler}-{arch}")
+    if item_class == "phase2_toolchain_validate":
+        # Validate-only items use a dedicated type_id so the
+        # build_worker can branch on it (fetch-from-peer instead of
+        # nix-build) without having to inspect the manifest payload.
+        # Affinity follows the build variant for cache reuse: the
+        # secondary that pulls a toolchain is the natural candidate
+        # to pick up the variants that depend on it.
+        compiler = header.payload.get("compiler_label", "?")
+        arch = header.payload.get("arch", "?")
+        return ("phase_build", "toolchain_validate", f"{compiler}-{arch}")
     if item_class == "phase2_common_dep":
         return ("phase_build", "common_dep", None)
     if item_class == "phase3_variant":
@@ -251,6 +278,12 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
     # lets the workload flow continuously: toolchains finish, their
     # downstream variants unblock via the nix dep graph, tarballs
     # emerge as soon as their full closure is realized.
+    # ``toolchain_validate`` is uncapped: the work is a path-info
+    # probe + at most one ``nix copy`` per item, so the build-heavy
+    # cap (which targets nix-build oversubscription) doesn't apply.
+    # Keeping it uncapped also avoids starving phase-3 variants
+    # behind the validate phase when the same cap is configured low
+    # for compile-throttling.
     return (
         PhaseSpec(
             phase_id="phase_build",
@@ -259,6 +292,10 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
                     type_id="toolchain",
                     worker_module="compiler_suit_runner.workers.build_worker",
                     **build_kwargs,
+                ),
+                TaskTypeSpec(
+                    type_id="toolchain_validate",
+                    worker_module="compiler_suit_runner.workers.build_worker",
                 ),
                 TaskTypeSpec(
                     type_id="common_dep",
@@ -273,6 +310,195 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
             ),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 quiesce watcher
+# ---------------------------------------------------------------------------
+
+
+class _Phase0QuiesceWatcher:
+    """Wait for every ``phase0_eval_<binary>`` task to complete, then plan.
+
+    The watcher is registered as a task-completion listener at
+    ``on_run_start``. Each call to :meth:`on_task_completed` either
+    ignores a non-phase-0 task_id or marks the matching phase-0 task
+    as complete. Once the completed set covers the expected set, the
+    watcher fires :func:`phase1_planner.plan_phase1` exactly once and
+    hands the resulting :class:`ManifestHeader` list to
+    ``spawn_tasks``.
+
+    The ``spawn_tasks`` callback today is a stub: it serialises the
+    header list to ``out_dir / "_phase1_graph.json"`` and emits an INFO
+    log line with the header count. When the framework's Q5
+    ``primary.spawn_tasks`` API lands the stub gets swapped out for the
+    real dispatch (see TODO inline).
+
+    The watcher is NOT a framework task — it runs entirely in-process
+    on whichever thread the framework's task-completion notification is
+    delivered on. Calls to :meth:`on_task_completed` are guarded by an
+    internal lock so concurrent completions from a worker pool are safe.
+    """
+
+    def __init__(
+        self,
+        expected_task_ids: Iterable[str],
+        out_dir: pathlib.Path,
+        toolchain_task_ids: dict[str, str],
+        *,
+        logger: Optional[logging.Logger] = None,
+        sys_name: str = "x86_64-linux",
+    ) -> None:
+        self._expected: frozenset[str] = frozenset(expected_task_ids)
+        self._completed: set[str] = set()
+        self._out_dir = pathlib.Path(out_dir)
+        self._toolchain_task_ids: dict[str, str] = dict(toolchain_task_ids)
+        self._sys_name = sys_name
+        self._fired: bool = False
+        self._lock = threading.Lock()
+        self._logger = logger or logging.getLogger(__name__)
+
+    # ── Public read-only inspection (used by tests) ────────────────────
+
+    @property
+    def expected(self) -> frozenset[str]:
+        return self._expected
+
+    @property
+    def completed(self) -> frozenset[str]:
+        return frozenset(self._completed)
+
+    @property
+    def fired(self) -> bool:
+        return self._fired
+
+    # ── Event entry point ──────────────────────────────────────────────
+
+    def on_task_completed(
+        self, task_id: str, result: Any = None
+    ) -> None:
+        """Process one task-completion notification.
+
+        ``result`` is forwarded by the framework's hook (eventual API);
+        we don't currently inspect it because the Phase 0 worker writes
+        its manifest to ``out_dir/<binary>/_phase0/manifest.json`` and
+        the planner re-reads them. The result slot is kept on the
+        signature so the framework's call site doesn't need a wrapper.
+
+        No-op when:
+
+        * ``task_id`` is not a phase-0 task_id (e.g. a toolchain task
+          completion arrives — the watcher coexists with K=3 listeners
+          on the same hook).
+        * The watcher has already fired (``self._fired``).
+        * The task_id has already been marked complete (idempotent).
+        """
+        del result  # see docstring
+        if not task_id:
+            return
+        with self._lock:
+            if self._fired:
+                return
+            if task_id not in self._expected:
+                return
+            if task_id in self._completed:
+                return
+            self._completed.add(task_id)
+            if self._completed < self._expected:
+                # Still waiting on more phase 0 tasks.
+                return
+            self._fired = True
+            should_fire = True
+        if should_fire:
+            self._fire()
+
+    # ── Plan invocation ────────────────────────────────────────────────
+
+    def _fire(self) -> None:
+        """Re-read all phase-0 manifests and call ``plan_phase1``.
+
+        Swallows planner exceptions and logs them: the framework's
+        task-completion thread should not raise out into the
+        scheduler. A planner failure leaves Phase 1 unscheduled (the
+        run will then stall on the build phase — operator-visible).
+        """
+        try:
+            phase0_manifests = phase1_planner.read_phase0_manifests(
+                self._out_dir
+            )
+        except Exception:  # noqa: BLE001 — log + degrade
+            self._logger.exception(
+                "_Phase0QuiesceWatcher: read_phase0_manifests failed"
+                " for %s; Phase 1 will not be scheduled",
+                self._out_dir,
+            )
+            return
+
+        self._logger.info(
+            "_Phase0QuiesceWatcher: all %d phase-0 tasks complete;"
+            " loaded %d manifests; calling plan_phase1",
+            len(self._expected),
+            len(phase0_manifests),
+        )
+
+        try:
+            phase1_planner.plan_phase1(
+                phase0_manifests,
+                self._toolchain_task_ids,
+                self._spawn_tasks_stub,
+                sys_name=self._sys_name,
+            )
+        except Exception:  # noqa: BLE001 — log + degrade
+            self._logger.exception(
+                "_Phase0QuiesceWatcher: plan_phase1 raised; Phase 1"
+                " not scheduled"
+            )
+
+    # ── spawn_tasks stub ───────────────────────────────────────────────
+
+    def _spawn_tasks_stub(
+        self, headers: list[ManifestHeader]
+    ) -> None:
+        """Serialise ``headers`` to ``_phase1_graph.json`` + log count.
+
+        TODO(Q5): once the framework exposes
+        ``primary.spawn_tasks(...)`` replace this stub with a thin
+        adapter that translates :class:`ManifestHeader` records into
+        the framework's ``TaskInfo`` shape and calls the API. The
+        graph dump stays useful for offline inspection / resume.
+        """
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        graph_path = self._out_dir / "_phase1_graph.json"
+        # Serialise to a JSON-safe shape — ManifestHeader is a frozen
+        # dataclass, so we round-trip via dict.
+        serialised = [
+            {
+                "item_class": h.item_class,
+                "name": h.name,
+                "size": h.size,
+                "payload": h.payload,
+                "task_id": h.task_id,
+                "task_depends_on": list(h.task_depends_on),
+            }
+            for h in headers
+        ]
+        try:
+            import json
+            graph_path.write_text(
+                json.dumps(serialised, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError:
+            self._logger.exception(
+                "_Phase0QuiesceWatcher: failed writing %s",
+                graph_path,
+            )
+        self._logger.info(
+            "_Phase0QuiesceWatcher: spawn_tasks stub received %d"
+            " header(s); wrote %s (Q5 not yet wired)",
+            len(headers),
+            graph_path,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +557,26 @@ class SuitTaskConfig:
     # variant ordering at the daemon build-lock level — we never needed
     # framework-level deps for correctness, they were belt-and-suspenders.
     disable_task_deps: bool = False
+    # Policy flag for remote toolchain builds. Default ``False`` means
+    # secondaries only VALIDATE toolchains (path-info + targeted
+    # ``nix copy --from`` against the placement map), never build them
+    # — missing toolchains have to be realised on the primary before
+    # dispatch and surfaced as a :class:`PreflightError`. Flipping to
+    # ``True`` restores the legacy behaviour (every secondary may
+    # rebuild any toolchain whose outputs aren't in its local store);
+    # use this only when the primary's local store is a stale cache
+    # and the slowdown of remote toolchain builds is acceptable.
+    allow_toolchain_build: bool = False
+    # K=3 toolchain replication knobs. ``replication_k`` is the
+    # target holder count cluster-wide; default 3. Set to 1 to
+    # disable the K=3 cascade (every toolchain held by only its
+    # initial fetcher); set to 0 to disable replication entirely
+    # (no cascade, no repair). ``allow_observer_as_holder`` controls
+    # whether a late-attaching observer counts toward K when wired
+    # (Framework Ask #3); without observer support the flag has no
+    # effect.
+    replication_k: int = 3
+    allow_observer_as_holder: bool = True
     input_hash: str = ""
     toolchain_drvs: frozenset[str] = frozenset()
     common_threshold: int = 10
@@ -366,9 +612,23 @@ class SuitTask:
         self._signing_key: Optional[SigningKey] = None
         self._peer_watcher: Optional[PeerListWatcher] = None
         self._peer_nix_conf_watcher: Optional[Any] = None
+        self._placement_watcher: Optional[PathPlacementWatcher] = None
         self._cachix_uploader: Optional[CachixUploader] = None
         self._harmonia: Optional[HarmoniaProcess] = None
         self._push_server: Optional[PeerPushServer] = None
+        # K=3 replication coordination (consumer-side; not a framework
+        # task — runs parallel-async to the worker pool).
+        self._replication_sender: Optional[ReplicationSender] = None
+        self._replication_receiver: Optional[ReplicationReceiver] = None
+        self._replication_repair: Optional[ReplicationRepairWorker] = None
+        # Phase 0 → Phase 1 quiesce watcher. Populated by on_run_start
+        # only when --distributed-eval is on (i.e. phase0_eval items
+        # are present in the manifest dir). Reference held so the
+        # listener doesn't get GC'd; framework task-completion events
+        # drive its on_task_completed method (best-effort hook
+        # registration; until the framework's task_completed surface
+        # lands the consumer drives it from its own dispatch loop).
+        self._phase0_watcher: Optional[_Phase0QuiesceWatcher] = None
         self._setup_done: bool = False
         self._setup_lock = threading.Lock()
 
@@ -538,7 +798,7 @@ class SuitTask:
                 "--common-threshold",
                 str(self.config.common_threshold),
             ]
-        if type_id in {"toolchain", "common_dep", "variant"}:
+        if type_id in {"toolchain", "toolchain_validate", "common_dep", "variant"}:
             argv = common + [
                 "--flake-ref",
                 self.config.flake_ref,
@@ -548,6 +808,20 @@ class SuitTask:
             substituters = self._substituters_file_path()
             if substituters is not None:
                 argv += ["--substituters-file", str(substituters)]
+            # Cluster placement-map plumbing. ``shared_fs`` + the
+            # secondary identity let the build worker subprocess read
+            # ``peers/_paths_*.jsonl`` directly (no in-process watcher
+            # available across the framework's fork boundary) and write
+            # back its own placement records. The signing public-key
+            # authenticates the ``path-have`` push fan-out.
+            if self.config.shared_fs is not None:
+                argv += ["--shared-fs", str(self.config.shared_fs)]
+            if self.config.secondary_id:
+                argv += ["--secondary-id", self.config.secondary_id]
+            if self._signing_key is not None:
+                argv += [
+                    "--signing-public-key", self._signing_key.public_key,
+                ]
             return argv
         return common
 
@@ -567,7 +841,7 @@ class SuitTask:
         args: Optional[Namespace] = None,
     ) -> None:
         """Bring up peer-cache state. Idempotent."""
-        del source_dir, output_dir, args  # unused
+        del source_dir, args  # unused (output_dir consumed below)
         with self._setup_lock:
             if self._setup_done:
                 return
@@ -621,6 +895,80 @@ class SuitTask:
                 )
                 self._peer_watcher = None
 
+            # 2a-bis. PathPlacementWatcher — same NFS-gossip + push-wake
+            # shape as PeerListWatcher, but aggregating per-secondary
+            # ``_paths_*.jsonl`` placement records. Workers query it
+            # before every fetch decision; the polling tick is the
+            # safety net for missed pushes.
+            try:
+                self._placement_watcher = PathPlacementWatcher(
+                    shared_fs=self.config.shared_fs,
+                    tick_seconds=60.0 if push_enabled else 5.0,
+                )
+                self._placement_watcher.start()
+            except Exception:  # noqa: BLE001 — log + continue
+                self._logger.exception(
+                    "on_run_start: PathPlacementWatcher failed to start"
+                )
+                self._placement_watcher = None
+
+            # 2b-pre. K=3 replication coordination plane.
+            #
+            # NOT a framework task — runs parallel-async to task/worker
+            # management. The receiver's handler callbacks need to be
+            # bound at PeerPushServer construction time (the server
+            # snapshots its callbacks into a generated handler class),
+            # so the replication classes have to be ready BEFORE the
+            # push server is constructed.
+            #
+            # Repair-on-death has two signal sources:
+            #
+            #   1. (primary, when shipped) Framework peer-removed hook —
+            #      sub-tick latency, see plan: Framework Ask #4.
+            #      Wired via ``ReplicationRepairWorker.on_peer_removed``.
+            #   2. (fallback) PathPlacementWatcher diff callback —
+            #      tick-bounded, kicks in if the framework hook is not
+            #      yet present in this dynrunner version.
+            if (
+                push_enabled
+                and self._peer_watcher is not None
+                and self._placement_watcher is not None
+                and self._signing_key is not None
+            ):
+                try:
+                    peer_watcher = self._peer_watcher
+                    placement_watcher = self._placement_watcher
+                    repl_ctx = ReplicationContext(
+                        my_secondary_id=self.config.secondary_id,
+                        our_pubkey=public_key,
+                        shared_fs=self.config.shared_fs,
+                        get_peers=lambda: list(peer_watcher.peers),
+                        get_placements=lambda: placement_watcher.snapshot(),
+                        replication_k=getattr(
+                            self.config, "replication_k",
+                            DEFAULT_REPLICATION_K,
+                        ),
+                    )
+                    self._replication_sender = ReplicationSender(repl_ctx)
+                    self._replication_receiver = ReplicationReceiver(
+                        repl_ctx, self._replication_sender,
+                    )
+                    self._replication_repair = ReplicationRepairWorker(
+                        repl_ctx, self._replication_sender,
+                    )
+                    # Fallback wiring: placement-diff drives repair.
+                    placement_watcher.register_diff_callback(
+                        self._replication_repair.on_diff,
+                    )
+                except Exception:  # noqa: BLE001 — log + continue
+                    self._logger.exception(
+                        "on_run_start: ReplicationSender/Receiver/Repair "
+                        "init failed; K=3 coordination disabled"
+                    )
+                    self._replication_sender = None
+                    self._replication_receiver = None
+                    self._replication_repair = None
+
             # 2b. Push server (listens BEFORE we announce so any peer
             # that pushes us in response sees a ready listener). Keyed
             # off ``public_key``: without the cluster signing key we
@@ -628,12 +976,66 @@ class SuitTask:
             if push_enabled and self._peer_watcher is not None:
                 try:
                     refresh_cb = self._peer_watcher.request_refresh
+                    placement_watcher = self._placement_watcher
+                    placement_refresh = (
+                        placement_watcher.request_refresh
+                        if placement_watcher is not None
+                        else (lambda: None)
+                    )
+                    receiver = self._replication_receiver
+                    sender = self._replication_sender
+
+                    def _on_path_have(record: dict) -> None:
+                        placement_refresh()
+                        # Notify the sender so any of OUR in-flight
+                        # offers to this peer settle and convergence
+                        # detection (path-cancel fan-out) can fire.
+                        if sender is not None:
+                            holder = record.get("secondary_id", "")
+                            outpath = record.get("outpath", "")
+                            if holder and outpath:
+                                try:
+                                    sender.on_path_have(holder, outpath)
+                                except Exception:  # noqa: BLE001
+                                    self._logger.exception(
+                                        "ReplicationSender.on_path_have raised"
+                                    )
+
+                    def _on_path_offer(record: dict) -> None:
+                        if receiver is not None:
+                            receiver.on_offer(record)
+
+                    def _on_path_accept(record: dict) -> None:
+                        if sender is not None:
+                            sender.on_accept(
+                                record.get("from_secondary_id", ""),
+                                record.get("outpath", ""),
+                            )
+
+                    def _on_path_reject(record: dict) -> None:
+                        if sender is not None:
+                            sender.on_reject(
+                                record.get("from_secondary_id", ""),
+                                record.get("outpath", ""),
+                                record.get("reason", ""),
+                            )
+
+                    def _on_path_cancel(record: dict) -> None:
+                        if receiver is not None:
+                            receiver.on_cancel(record)
+
                     self._push_server = PeerPushServer(
                         bind_host="0.0.0.0",
                         port=push_port_for(self.config.harmonia_port),
                         expected_pubkey=public_key,
                         on_announce=lambda _info: refresh_cb(),
                         on_withdraw=lambda _sid: refresh_cb(),
+                        on_path_have=_on_path_have,
+                        on_path_gone=lambda _rec: placement_refresh(),
+                        on_path_offer=_on_path_offer,
+                        on_path_accept=_on_path_accept,
+                        on_path_reject=_on_path_reject,
+                        on_path_cancel=_on_path_cancel,
                     )
                     self._push_server.start()
                 except Exception:  # noqa: BLE001 — log + continue
@@ -755,6 +1157,33 @@ class SuitTask:
                         "on_run_start: PeerNixConfWatcher start failed"
                     )
 
+            # 6b. Phase 0 → Phase 1 quiesce watcher.
+            #
+            # Scan the manifest dir for phase0_eval items. If any exist,
+            # spin up a _Phase0QuiesceWatcher whose on_task_completed
+            # method is the framework's task-completion hook target. The
+            # watcher fires phase1_planner.plan_phase1 once all phase 0
+            # tasks have completed and dumps the resulting graph to
+            # ``output_dir / "_phase1_graph.json"`` (Q5 stub).
+            #
+            # We register the watcher best-effort against whatever
+            # task-completion surface the framework currently exposes
+            # (none in 2552f7c — the consumer drives it directly until
+            # Q5 lands). The reference is held on ``self`` so it is
+            # not garbage-collected mid-run.
+            try:
+                self._phase0_watcher = self._build_phase0_watcher(
+                    output_dir=output_dir,
+                )
+                if self._phase0_watcher is not None:
+                    self._register_phase0_watcher(self._phase0_watcher)
+            except Exception:  # noqa: BLE001 — log + continue
+                self._logger.exception(
+                    "on_run_start: _Phase0QuiesceWatcher setup failed;"
+                    " Phase 1 planner will not auto-fire"
+                )
+                self._phase0_watcher = None
+
             # 7. ssh_debug (opt-in) — spawn sshd as a detached session
             # leader on ``config.ssh_debug_port`` and drop a ready
             # marker on the gateway-readable mount. Survives this
@@ -819,6 +1248,29 @@ class SuitTask:
                         "on_run_end: fan_out_withdraw failed"
                     )
 
+            # Stop the replication coordination plane before the push
+            # server: cancels any pending offer timers cleanly so they
+            # don't try to push through a torn-down server.
+            if self._replication_sender is not None:
+                try:
+                    self._replication_sender.stop()
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "on_run_end: ReplicationSender stop failed"
+                    )
+                finally:
+                    self._replication_sender = None
+            if self._replication_receiver is not None:
+                try:
+                    self._replication_receiver.stop()
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "on_run_end: ReplicationReceiver stop failed"
+                    )
+                finally:
+                    self._replication_receiver = None
+            self._replication_repair = None
+
             if self._push_server is not None:
                 try:
                     self._push_server.stop()
@@ -859,7 +1311,19 @@ class SuitTask:
                 finally:
                     self._peer_watcher = None
 
+            if self._placement_watcher is not None:
+                try:
+                    self._placement_watcher.stop()
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "on_run_end: PathPlacementWatcher stop failed"
+                    )
+                finally:
+                    self._placement_watcher = None
+
             try:
+                # Also unlinks ``peers/_paths_<sid>.jsonl`` so peers'
+                # placement watchers drop our entries on next tick.
                 withdraw_self(
                     self.config.shared_fs, self.config.secondary_id
                 )
@@ -868,6 +1332,11 @@ class SuitTask:
                     "on_run_end: withdraw_self failed"
                 )
 
+            # Drop the phase 0 watcher reference; if it never fired
+            # (e.g. run aborted mid-Phase-0) it just gets GC'd. No
+            # cleanup work — the watcher owns no threads, files, or
+            # sockets of its own.
+            self._phase0_watcher = None
             self._signing_key = None
             self._setup_done = False
 
@@ -882,6 +1351,135 @@ class SuitTask:
             phase_id,
             completed,
             failed,
+        )
+
+    # ── Phase 0 watcher wiring ────────────────────────────────────────
+
+    def _build_phase0_watcher(
+        self,
+        *,
+        output_dir: Optional[pathlib.Path],
+    ) -> Optional[_Phase0QuiesceWatcher]:
+        """Scan the manifest dir and return a watcher if Phase 0 is active.
+
+        Returns ``None`` (no watcher) when no ``phase0_eval`` manifest is
+        present — that's the legacy-eval path (``--distributed-eval``
+        off) and there's nothing to wait for.
+
+        ``output_dir`` is the framework-supplied per-run output
+        directory; the planner reads ``out/<binary>/_phase0/
+        manifest.json`` under it and dumps ``_phase1_graph.json`` into
+        it. When the framework doesn't pass one we fall back to
+        ``config.shared_fs / 'out'`` so the layout stays consistent
+        with what the workers write.
+        """
+        manifest_dir = self.config.manifest_dir
+        try:
+            entries = sorted(manifest_dir.iterdir())
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+
+        expected_ids: set[str] = set()
+        toolchain_task_ids: dict[str, str] = {}
+
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            if entry.name.startswith((".", "_")):
+                continue
+            if entry.suffix != ".json":
+                continue
+            try:
+                header = read_manifest(entry)
+            except Exception:  # noqa: BLE001 — corrupt manifest
+                continue
+            if header.item_class == "phase0_eval":
+                binary = header.payload.get("binary", "")
+                if isinstance(binary, str) and binary:
+                    expected_ids.add(
+                        header.task_id or phase0_eval_task_id(binary)
+                    )
+                continue
+            if header.item_class in (
+                "phase2_toolchain",
+                "phase2_toolchain_validate",
+            ):
+                if not header.task_id:
+                    continue
+                # The planner keys toolchain_task_ids by drv path —
+                # the same identifier a variant's ``inputDrvs`` set
+                # will reference. Preflight stamps that drv on the
+                # toolchain header's payload under ``drv``; fall back
+                # to the legacy ``outpath`` only when ``drv`` is
+                # missing (older manifests).
+                drv = header.payload.get("drv") or header.payload.get(
+                    "drv_path"
+                )
+                if isinstance(drv, str) and drv:
+                    toolchain_task_ids[drv] = header.task_id
+
+        if not expected_ids:
+            return None
+
+        resolved_out_dir = (
+            pathlib.Path(output_dir)
+            if output_dir is not None
+            else self.config.shared_fs / "out"
+        )
+
+        return _Phase0QuiesceWatcher(
+            expected_task_ids=expected_ids,
+            out_dir=resolved_out_dir,
+            toolchain_task_ids=toolchain_task_ids,
+            logger=self._logger,
+            sys_name=self.config.sys_name,
+        )
+
+    def _register_phase0_watcher(
+        self, watcher: _Phase0QuiesceWatcher
+    ) -> None:
+        """Best-effort wire the watcher onto the framework's hook surface.
+
+        The framework's task-completion event seam is still in flight
+        (see Q4 / pending PRs). Try a few duck-typed registration
+        surfaces in priority order; if none exist the watcher remains
+        callable from the consumer's own dispatch loop (legacy single-
+        process CLI drives it directly). Either way we hold the
+        reference on ``self`` so it isn't GC'd.
+        """
+        # Candidate surfaces, in order of preference. Each is a tuple
+        # of (object_attr, method_name, arity-tag) — duck-checked.
+        # ``arity-tag`` documents what we'd pass; not used in code.
+        try:
+            from dynamic_runner import run as dynrunner_run  # type: ignore[import-not-found]
+        except Exception:  # noqa: BLE001 — framework absent
+            self._logger.debug(
+                "_register_phase0_watcher: dynamic_runner.run not"
+                " importable; watcher attached to SuitTask only"
+            )
+            return
+
+        for attr in ("register_task_completed_listener",
+                     "add_task_completed_listener",
+                     "on_task_completed"):
+            hook = getattr(dynrunner_run, attr, None)
+            if callable(hook):
+                try:
+                    hook(watcher.on_task_completed)
+                    self._logger.info(
+                        "_register_phase0_watcher: wired via"
+                        " dynamic_runner.run.%s",
+                        attr,
+                    )
+                    return
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "_register_phase0_watcher: %s raised", attr,
+                    )
+        self._logger.info(
+            "_register_phase0_watcher: framework task_completed hook"
+            " not found; watcher reachable via"
+            " SuitTask._phase0_watcher.on_task_completed"
         )
 
     # ==================================================================
@@ -969,6 +1567,15 @@ class SuitTask:
                 flake_ref=self.config.flake_ref,
                 dataset_output_dir=self.config.dataset_dir,
                 substituters_file=self._substituters_file_path(),
+                shared_fs=self.config.shared_fs,
+                secondary_id=self.config.secondary_id,
+                placement_watcher=self._placement_watcher,
+                peer_watcher=self._peer_watcher,
+                signing_public_key=(
+                    self._signing_key.public_key
+                    if self._signing_key is not None
+                    else ""
+                ),
             )
             self._build_worker(path, env)
             return
