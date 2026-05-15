@@ -253,6 +253,13 @@ let
     # the feature on per-dispatch without rebuilding the image.
     # See compiler_suit_runner.ssh_debug for the runtime side.
     pkgs.openssh
+    # Required by ``cmd_secondary``'s opt-in
+    # ``ASM_TRACE_KILLS=1`` kill-tracing instrumentation. Always
+    # shipped (cost ~3MB) so the gated strace path can attach
+    # without an image rebuild when an operator turns the env var
+    # on. See ``compiler_suit_runner.cli.cmd_secondary`` for the
+    # runtime side.
+    pkgs.strace
   ];
 
   imageContents =

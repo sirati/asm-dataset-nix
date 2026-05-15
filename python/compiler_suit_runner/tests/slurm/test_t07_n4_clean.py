@@ -274,10 +274,17 @@ def test_t07_n4_clean(
     #   each expose 2 CPUs; the framework's default sbatch request is
     #   14, which sbatch rejects with "CPU count per node can not be
     #   satisfied". 2 is the maximum that fits on a single worker.
+    # ``archs=("x86_64",)`` narrows the variant matrix to native x86_64
+    # only. The cross-toolchain variants drag in heavy cross-LLVM builds
+    # per arch that fork-storm past the per-container 3.5 GiB worker cap
+    # on the slurm-test-env. T7's peer-mesh assertions (URL count, shape,
+    # reachability) are orthogonal to compiler family, so narrowing keeps
+    # the mesh contract intact while staying inside the memory envelope.
     invocation = dataclasses.replace(
         default_invocation_for_smoke(jobs=n_secondaries, workload="medium"),
         ssh_identity_file=pathlib.Path(LIVE_KEY_PATH),
         slurm_cpus_per_task=2,
+        archs=("x86_64",),
     )
 
     timeout_s = _resolve_timeout()
