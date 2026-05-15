@@ -108,6 +108,13 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
     onto the same worker for kernel page-cache reuse.
     """
     item_class = header.item_class
+    if item_class == "phase0_eval":
+        # Phase 0 distributed-eval: one task per binary. Pinned by
+        # binary so we get a stable affinity bucket per package
+        # (handy for log grepping; framework just treats it as a
+        # tag).
+        binary = header.payload.get("binary", "?")
+        return ("phase0", "eval", binary)
     if item_class == "phase1a_partition":
         return ("phase1a", "partition", None)
     if item_class == "phase1b_merge":
