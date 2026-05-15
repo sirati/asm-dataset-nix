@@ -37,6 +37,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -1931,3 +1932,99 @@ class SubmitterPeer:
             "ProxyJump-side -R)",
             self.gateway_port, self._run_id,
         )
+
+    # ------------------------------------------------------------------
+    # Phase -1 bootstrap — toolchain drv broadcast seeding
+    # ------------------------------------------------------------------
+
+    # The submitter participates in the cluster peer mesh with this
+    # stable id (matches the secondary_id written by
+    # :meth:`_publish_peer_file`). Broadcast receivers use it as the
+    # ``origin_peer_id`` dedup tie-breaker; logs surface it as the
+    # broadcast originator.
+    SUBMITTER_PEER_ID = "submitter"
+
+    @property
+    def peer_id(self) -> str:
+        """Submitter's stable peer id within the cluster federation."""
+        return self.SUBMITTER_PEER_ID
+
+    def seed_toolchain_drvs(
+        self,
+        drv_set: set[str],
+        first_secondary_url: str,
+    ) -> dict:
+        """Seed the cluster's toolchain drv flood-fill (Phase -1).
+
+        For every drv path in *drv_set*, POSTs a
+        ``/peer/path-broadcast-offer`` to a single secondary's push
+        listener (``first_secondary_url`` — the bare base URL, e.g.
+        ``http://node1:6000``). The receiver's broadcast handler
+        cascades each drv to ALL OTHER peers via ``fan_out_broadcast_drv``,
+        so the submitter only needs to talk to one secondary.
+
+        Returns ``{"sent": int, "failed": int, "failed_drvs":
+        list[str]}``. An empty *drv_set* short-circuits to all-zeros
+        without any network activity. Per drv we resolve the on-disk
+        size (``Path(drv).stat().st_size``), mint a fresh UUID-hex
+        ``broadcast_id``, set ``hop_count=0`` (this submitter is the
+        originator), and call
+        :func:`peer_push.push_path_broadcast_offer`. Failures (None
+        return from the helper, missing on-disk file, etc.) accumulate
+        in ``failed_drvs`` rather than aborting the loop — the broadcast
+        is best-effort; the cluster keeps working with a partially
+        seeded drv set, at the cost of secondaries having to re-fetch
+        the missing drv files via harmonia substitution.
+        """
+        if not drv_set:
+            return {"sent": 0, "failed": 0, "failed_drvs": []}
+
+        # Import lazily so this method does not pull peer_push into
+        # peer_cache's import graph (peer_push already depends on
+        # peer_cache for PeerInfo — see peer_push.py's top imports).
+        from compiler_suit_runner import peer_push
+
+        our_pubkey = self._public_key or ""
+        sent = 0
+        failed = 0
+        failed_drvs: list[str] = []
+        for drv in sorted(drv_set):
+            try:
+                size = pathlib.Path(drv).stat().st_size
+            except OSError as exc:
+                self.log.warning(
+                    "seed_toolchain_drvs: cannot stat %s: %s", drv, exc,
+                )
+                failed += 1
+                failed_drvs.append(drv)
+                continue
+            broadcast_id = uuid.uuid4().hex
+            self.log.info(
+                "seed_toolchain_drvs: broadcasting %s "
+                "(size=%d, broadcast_id=%s) -> %s",
+                drv, size, broadcast_id, first_secondary_url,
+            )
+            response = peer_push.push_path_broadcast_offer(
+                target_url=first_secondary_url,
+                path=drv,
+                size=size,
+                origin_peer_id=self.peer_id,
+                broadcast_id=broadcast_id,
+                hop_count=0,
+                our_pubkey=our_pubkey,
+            )
+            if response is None:
+                self.log.warning(
+                    "seed_toolchain_drvs: broadcast for %s failed "
+                    "(target=%s)",
+                    drv, first_secondary_url,
+                )
+                failed += 1
+                failed_drvs.append(drv)
+            else:
+                sent += 1
+        return {
+            "sent": sent,
+            "failed": failed,
+            "failed_drvs": failed_drvs,
+        }
