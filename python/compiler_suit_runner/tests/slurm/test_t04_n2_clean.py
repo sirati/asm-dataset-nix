@@ -19,9 +19,15 @@ scope of T7 (`test_t07_n4_clean.py`) which will introduce
 * Each substituters file lists at least one peer URL (the primary's
   harmonia is normally also listed; T7 will pin the exact URL count and
   format).
-* ``peers/secondary-0.json`` and ``peers/secondary-1.json`` are both
-  present, demonstrating that both secondaries successfully announced
-  themselves to the shared peer dir.
+
+The per-secondary ``peers/secondary-<N>.json`` registration files are
+intentionally NOT asserted: the framework's
+:func:`compiler_suit_runner.peer_cache.withdraw_self` removes them in
+:meth:`SuitTask.on_run_end`, so they MUST be absent on a clean
+post-run inspection. Their transient existence is what populates the
+substituters URLs; once each secondary exits cleanly the registration
+is taken down. The substituters file contents are the persisted signal
+that the mesh formed.
 
 A dedicated ``ClusterProbe`` instance is constructed locally (rather
 than using the conftest fixture) for the same reason as T1: the
@@ -133,8 +139,6 @@ def _assert_basic_peer_mesh(
     Asserts the minimal "mesh formed" signal expected for any
     multi-secondary clean run:
 
-    * Each secondary registered a ``peers/secondary-<N>.json`` file
-      (so its peers were discoverable by the others).
     * Each secondary's ``peers/_substituters.secondary-<N>.txt`` file
       exists, is non-empty, and carries the canonical 4-line shape
       emitted by ``compiler_suit_runner.peer_cache._write_substituters_file``
@@ -146,6 +150,15 @@ def _assert_basic_peer_mesh(
       precise count + URL-format checks via a dedicated
       ``peer_mesh_assertions`` module.
 
+    The per-secondary ``peers/secondary-<N>.json`` registration files
+    are intentionally NOT asserted: the framework's
+    :func:`compiler_suit_runner.peer_cache.withdraw_self` removes them
+    in :meth:`SuitTask.on_run_end`, so on a clean post-run inspection
+    they MUST be absent. Their transient existence is what allowed the
+    substituters URLs to be populated; once a secondary exits cleanly
+    the registration is taken down. We verify the substituters file
+    contents instead — those persist after the run.
+
     On any failure the assertion message lists the run-dir-relative
     paths so a CI run yields enough context to triage without
     re-reading the logs by hand.
@@ -154,16 +167,6 @@ def _assert_basic_peer_mesh(
     assert peers_dir.is_dir(), (
         f"peers/ dir missing under {run_dir!s}; "
         "peer mesh did not initialise"
-    )
-
-    # Per-secondary peer-registration JSON files.
-    expected_jsons = [
-        peers_dir / f"secondary-{i}.json" for i in range(n_secondaries)
-    ]
-    missing_jsons = [p for p in expected_jsons if not p.is_file()]
-    assert not missing_jsons, (
-        "missing per-secondary peer registration file(s): "
-        + ", ".join(str(p.relative_to(run_dir)) for p in missing_jsons)
     )
 
     # Per-secondary substituters files.

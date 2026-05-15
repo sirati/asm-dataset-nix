@@ -32,6 +32,26 @@ let
   archLib = import ./architectures.nix { };
   oldGccCross = import ./old-gcc-cross.nix { inherit pkgs lib; };
 
+  # Normalize ``meta.priority`` to an integer. Old nixpkgs (15.09, 18.03)
+  # set the gcc4_x wrapper's ``meta.priority = "10";`` as a STRING.
+  # That makes ``nix build .#flake-attr^*`` reject the attr with
+  # ``error: 'meta.priority' is not an integer`` — even though every
+  # other code path treats the wrapper fine. Coerce to int when we see
+  # a string; pass through unchanged otherwise.
+  #
+  # Wired into ``oldPkgs.${attr}`` lookups below so every downstream
+  # consumer (variant stdenvs, crossToolchainMap, manifest emission)
+  # sees the clean drv.
+  fixMetaPriority =
+    drv:
+    if (drv ? meta) && (drv.meta ? priority)
+       && (builtins.typeOf drv.meta.priority == "string") then
+      drv // {
+        meta = drv.meta // { priority = lib.toInt drv.meta.priority; };
+      }
+    else
+      drv;
+
   # Extract version string from a Clang package across different nixpkgs eras.
   # Modern: .clang.version exists
   # Old (3.7+): .clang.cc.name is "clang-X.Y.Z", extract version from name
@@ -132,6 +152,14 @@ let
 
   # Determine which hardening flags an old clang doesn't support.
   # These flags are injected by the modern cc-wrapper but old clangs reject them.
+  #
+  # IMPORTANT: this list must be exhaustive. Modern cc-wrapper's
+  # default hardening set grows over time — every new hardening
+  # flag that clang grew support for in version N means clang < N
+  # rejects it and autoconf's compile test fails (silent
+  # "C compiler cannot create executables" error). Cross-reference
+  # against ``docs/clang-flag-support-matrix.md`` when bumping
+  # nixpkgs to catch any new flags.
   getClangUnsupportedHardeningFlags =
     version:
     let
@@ -144,7 +172,15 @@ let
     # -fstack-clash-protection: added in clang 11
     ++ lib.optional (major < 11) "stackclashprotection"
     # -fzero-call-used-regs: added in clang 16
-    ++ lib.optional (major < 16) "zerocallusedregs";
+    ++ lib.optional (major < 16) "zerocallusedregs"
+    # -fstrict-flex-arrays={1,3}: added in clang 16. Without
+    # stripping, nix's default hardening set passes
+    # -fstrict-flex-arrays=1 to the compiler; clang < 16 errors
+    # with ``unknown argument`` before autoconf's first compile-test
+    # can even reach the linker. The wrapper's add-hardening.sh
+    # supports stripping these by name when listed here.
+    ++ lib.optional (major < 16) "strictflexarrays1"
+    ++ lib.optional (major < 16) "strictflexarrays3";
 
   # Whether an old clang needs -fmacro-prefix-map stripped from the wrapper.
   # -fmacro-prefix-map was added in clang 10.
@@ -166,6 +202,42 @@ let
     done
     sed -i '/-fmacro-prefix-map/d' $out/nix-support/setup-hook
   '';
+
+  # Parse the clang major version once for reuse.
+  clangMajor =
+    version:
+    let parts = builtins.match "([0-9]+)\\..*" version;
+    in if parts != null then lib.toInt (builtins.head parts) else 0;
+
+  # Per-(arch, old-clang-version) ABI overrides. The hybrid wrapper splices
+  # modern binutils + libgcc against an old clang binary; for archs whose
+  # ABI defaults shifted between the old-clang era and modern nixpkgs, the
+  # linker rejects the combo with "file in wrong format" or "soft-float vs
+  # double-float". The flags below pin codegen to the ABI the modern libgcc
+  # is built for, recovering link compatibility. Per-combo because some
+  # old-clang backends don't honour the flag and fall through to wrong
+  # ABI silently (e.g. clang3.4's ppc64 backend still wants ELFv1 even
+  # under -mabi=elfv2, which we can't paper over here).
+  abiFlagsFor =
+    arch: version:
+    let major = clangMajor version; in
+    # mips64el-gnuabin32: modern libgcc is built for N32 ABI. clang's
+    # default for the gnuabin32 triple is sometimes N64; pin to n32.
+    # Confirmed-working from clang3.4 through clang7 in repro tests.
+    if arch == "mips64el" && major <= 7 then [ "-mabi=n32" ]
+    # riscv64-gnu: modern glibc/libgcc is double-float (lp64d); clang9
+    # may default to soft-float (lp64). Force lp64d and rv64gc march.
+    else if arch == "riscv64" && major == 9 then [ "-mabi=lp64d" "-march=rv64gc" ]
+    else [ ];
+
+  # Format an abi-flag list as a postFixup-shell snippet appended to
+  # cc-cflags. The leading space matters — cc-wrapper concatenates
+  # the file's contents into the final argv without re-adding separators.
+  abiPostFixup =
+    flags:
+    lib.optionalString (flags != [ ]) ''
+      echo " ${lib.concatStringsSep " " flags}" >> $out/nix-support/cc-cflags
+    '';
 
   # Get cross-compiler from old nixpkgs for a given target.
   # For pre-pkgsCross nixpkgs, re-imports with crossSystem to get
@@ -224,6 +296,9 @@ let
     let
       oldPkgs = nixpkgsInfo.oldPkgs;
       tried = builtins.tryEval (oldPkgs.${attr}.cc.version or oldPkgs.${attr}.version);
+      # Normalised reference to the old gcc wrapper — meta.priority
+      # coerced to int so flake-attr ``^*`` builds work.
+      cleanGcc = fixMetaPriority oldPkgs.${attr};
     in
     if !tried.success then
       null
@@ -237,7 +312,7 @@ let
           targetPkgs: target:
           if target.crossAttr == null && !(target ? crossSystem) then
             # Native: just use the old compiler directly
-            targetPkgs.overrideCC targetPkgs.stdenv oldPkgs.${attr}
+            targetPkgs.overrideCC targetPkgs.stdenv cleanGcc
           else if oldPkgs ? pkgsCross then
             # pkgsCross available (22.11+): use buildPackages with depsBuildBuild bootstrap
             let
@@ -323,7 +398,22 @@ let
             if oldCrossPkgs == null then
               builtins.throw "${attr}: cross target ${target.label} not available in this nixpkgs"
             else
-              targetPkgs.overrideCC targetPkgs.stdenv oldCrossPkgs.buildPackages.${attr}.clang
+              let
+                rawCrossClang = oldCrossPkgs.buildPackages.${attr}.clang;
+                abiFlags = abiFlagsFor target.label version;
+                # Override the wrapper's postFixup to append ABI flags to
+                # cc-cflags. The wrapper is already built; appending via
+                # overrideAttrs reruns its installation phase with the
+                # extra commands tacked on.
+                crossClang =
+                  if abiFlags == [ ] then
+                    rawCrossClang
+                  else
+                    rawCrossClang.overrideAttrs (old: {
+                      postFixup = (old.postFixup or "") + abiPostFixup abiFlags;
+                    });
+              in
+              targetPkgs.overrideCC targetPkgs.stdenv crossClang
           else
             # Pre-pkgsCross (18.03, 15.09): hybrid wrapper approach.
             # The old nixpkgs' cross infrastructure has broken C++ stdlib
@@ -335,6 +425,7 @@ let
               unwrappedClang = extractUnwrappedClang oldPkgs.${attr};
               unsupportedFlags = getClangUnsupportedHardeningFlags version;
               needsStripMacroMap = clangNeedsMacroPrefixMapStripped version;
+              abiFlags = abiFlagsFor target.label version;
 
               # Use the modern cross clang wrapper as a template
               modernCrossClang = targetPkgs.buildPackages.llvmPackages.clang;
@@ -343,7 +434,9 @@ let
                   hardeningUnsupportedFlags = unsupportedFlags;
                 };
                 propagateDoc = false;
-                extraBuildCommands = if needsStripMacroMap then stripMacroPrefixMapCommands else "";
+                extraBuildCommands =
+                  (if needsStripMacroMap then stripMacroPrefixMapCommands else "")
+                  + abiPostFixup abiFlags;
               };
             in
             targetPkgs.overrideCC targetPkgs.stdenv hybridClang;

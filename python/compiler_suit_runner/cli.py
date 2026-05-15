@@ -28,6 +28,7 @@ import logging
 import os
 import pathlib
 import socket
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -49,9 +50,13 @@ from compiler_suit_runner.manifest_gen import emit_all_manifests
 from compiler_suit_runner.partition_local import (
     PartitionResult,
     compute_partition_locally,
+    eval_drv_outpaths,
 )
 from compiler_suit_runner.preflight import (
+    PreflightError,
     PreflightResult,
+    build_toolchains_locally,
+    check_toolchains_locally,
     eval_toolchain_drvs,
     filter_existing_variants,
     preflight as run_preflight,
@@ -146,6 +151,40 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "small clusters."
         ),
     )
+    # Forwarded to dynamic_runner's own argparse (deliberately NOT in
+    # _CSR_FLAGS_WITH_VALUE, so the value stays in sys.argv after our
+    # strip-pass and the framework re-reads it). Without forwarding,
+    # the secondary's ``dynrunner_manager_local::pool`` auto-detects
+    # cores via ``available_parallelism``, which inside a podman
+    # container returns the HOST's full CPU count (cgroup CPU quota
+    # isn't reflected in /proc/cpuinfo). On a 32-core host with a
+    # 2-CPU cgroup that's 32 workers spawned per secondary, immediately
+    # fork-storming the per-job cgroup before any work starts.
+    parser.add_argument(
+        "--cores",
+        type=str,
+        default=None,
+        metavar="N",
+        help=(
+            "Forwarded to dynamic_runner --cores: int / +int / -int "
+            "controlling workers-per-secondary. Defaults to the "
+            "framework's own default (all detected cores). Set "
+            "explicitly to match the cgroup CPU envelope."
+        ),
+    )
+    parser.add_argument(
+        "--max-memory",
+        type=str,
+        default=None,
+        metavar="SPEC",
+        help=(
+            "Forwarded to dynamic_runner --max-memory: e.g. '3G', "
+            "'8192M', '+1G', '-2G'. Defaults to the framework's own "
+            "default (autodetected from /proc/meminfo). Set "
+            "explicitly to match the cgroup memory envelope; "
+            "autodetect doesn't see cgroup limits inside containers."
+        ),
+    )
     parser.add_argument(
         "--no-task-depends",
         action="store_true",
@@ -157,6 +196,48 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "is in-flight (validator only seeds completed task_ids). "
             "Safe because nix's drv graph + harmonia federation order "
             "toolchain-before-variant at the build-lock level."
+        ),
+    )
+    parser.add_argument(
+        "--allow-toolchain-build",
+        action="store_true",
+        default=False,
+        help=(
+            "Permit secondaries to build cross-toolchains from source. "
+            "Default OFF: missing toolchains are surfaced as a "
+            "PreflightError at submit time; the operator runs them "
+            "locally first (or runs with this flag). With it ON the "
+            "primary builds any missing toolchain locally before "
+            "dispatch, and the existing phase2_toolchain item class "
+            "is emitted instead of phase2_toolchain_validate."
+        ),
+    )
+    parser.add_argument(
+        "--replication-k",
+        type=int,
+        default=3,
+        metavar="K",
+        help=(
+            "K=3 toolchain-outpath replication target: number of "
+            "distinct secondaries that should hold each toolchain "
+            "outpath. On first receive, a secondary push-attempts to "
+            "K-1 more peers; if a holder dies and the count drops "
+            "below K, remaining holders repair. Default: 3. Set to "
+            "1 to disable cascade/repair (every toolchain held by "
+            "only its initial fetcher); 0 disables replication "
+            "entirely. See plan: K=3 toolchain replication."
+        ),
+    )
+    parser.add_argument(
+        "--no-observer-as-holder",
+        dest="allow_observer_as_holder",
+        action="store_false",
+        default=True,
+        help=(
+            "Don't count a late-attaching observer toward the K=3 "
+            "holder set. Default: observers count (when Framework "
+            "Ask #3 is shipped). Has no effect without observer "
+            "support in the running dynrunner version."
         ),
     )
     parser.add_argument(
@@ -447,6 +528,7 @@ _CSR_FLAGS_WITH_VALUE: frozenset[str] = frozenset({
     "--variant-seed",
     "--max-variants",
     "--hash",
+    "--replication-k",
     # nargs="+" — may be followed by multiple values
     "--packages",
     "--archs",
@@ -460,6 +542,8 @@ _CSR_BOOL_FLAGS: frozenset[str] = frozenset({
     "--no-submitter-peer",
     "--enable-ssh-debug",
     "--no-task-depends",
+    "--allow-toolchain-build",
+    "--no-observer-as-holder",
 })
 _CSR_SUBCOMMANDS: frozenset[str] = frozenset({
     "submit", "secondary", "preflight", "clear-cache",
@@ -556,6 +640,11 @@ def _config_from_args(
         ssh_debug_port=getattr(args, "ssh_debug_port", 22222),
         build_max_concurrent=getattr(args, "build_max_concurrent", None),
         disable_task_deps=getattr(args, "no_task_depends", False),
+        allow_toolchain_build=getattr(args, "allow_toolchain_build", False),
+        replication_k=getattr(args, "replication_k", 3),
+        allow_observer_as_holder=getattr(
+            args, "allow_observer_as_holder", True,
+        ),
     )
 
 
@@ -566,8 +655,19 @@ def _emit_manifests_from_preflight(
     pre: PreflightResult,
     num_workers: int,
     toolchain_drvs: Optional[dict[tuple[str, str], str]] = None,
+    allow_toolchain_build: bool = False,
+    per_variant_inputs: Optional[dict[str, frozenset[str]]] = None,
+    drv_outpaths: Optional[dict[str, str]] = None,
 ):
-    """Bridge :mod:`preflight` output into ``emit_all_manifests``."""
+    """Bridge :mod:`preflight` output into ``emit_all_manifests``.
+
+    ``per_variant_inputs`` / ``drv_outpaths`` carry the transitive
+    input-drv set + output-path mapping for each variant so the
+    secondary's build_worker can pre-fetch input deps from the
+    placement map before invoking ``nix build``. Both are optional
+    — when absent, variants fall back to nix's native substituter
+    resolution (i.e. the legacy harmonia-federation path).
+    """
     return emit_all_manifests(
         target_dir=target_dir,
         sys_name=sys_name,
@@ -576,13 +676,23 @@ def _emit_manifests_from_preflight(
         common_deps=pre.common_dep_drvs,
         num_workers=num_workers,
         toolchain_drvs=toolchain_drvs,
+        allow_toolchain_build=allow_toolchain_build,
+        per_variant_inputs=per_variant_inputs,
+        drv_outpaths=drv_outpaths,
     )
 
 
 def _restore_manifests_from_archive(
     archive: pathlib.Path, target_dir: pathlib.Path
-) -> None:
+) -> dict[tuple[str, str], str]:
     """Extract a cache-stored ``manifests.tar`` into ``target_dir``.
+
+    Returns the restored ``{(arch, compiler): drv_path}`` mapping so the
+    caller can use it for the submitter placement broadcast on a
+    cache hit (without it, the placement map has no submitter entry
+    for toolchain outpaths, and the validate-only worker path fails
+    with "no peer in the placement map could serve it" even though
+    the toolchain manifests were restored correctly).
 
     The archive's root entry is ``manifests/`` (see
     :class:`IncrementalCache`); we strip that prefix so files land
@@ -657,6 +767,7 @@ def _restore_manifests_from_archive(
         if isinstance(entry, list) and len(entry) == 3
     }
     num_workers = int(pre_dict.get("num_workers", 1))
+    allow_toolchain_build = bool(pre_dict.get("allow_toolchain_build", False))
     emit_all_manifests(
         target_dir=target_dir,
         sys_name=sys_name,
@@ -665,7 +776,9 @@ def _restore_manifests_from_archive(
         common_deps=common_dep_drvs,
         num_workers=num_workers,
         toolchain_drvs=tc_drvs,
+        allow_toolchain_build=allow_toolchain_build,
     )
+    return tc_drvs
 
 
 def _serialize_preflight_for_cache(
@@ -674,6 +787,7 @@ def _serialize_preflight_for_cache(
     target_path: pathlib.Path,
     *,
     toolchain_drvs_by_pair: Optional[dict[tuple[str, str], str]] = None,
+    allow_toolchain_build: bool = False,
 ) -> None:
     """Write the cacheable subset of a :class:`PreflightResult` as JSON.
 
@@ -699,6 +813,7 @@ def _serialize_preflight_for_cache(
             for (arch, compiler), drv in sorted(tc_pairs.items())
         ],
         "num_workers": num_workers,
+        "allow_toolchain_build": bool(allow_toolchain_build),
     }
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(json.dumps(payload, sort_keys=True, indent=2))
@@ -836,16 +951,42 @@ def cmd_submit(args: argparse.Namespace) -> int:
         cache_hit = cache.lookup(input_hash)
 
     pre: Optional[PreflightResult] = None
+    # Default-init these so the cache-hit path (which skips preflight,
+    # partition, eval_toolchain_drvs) doesn't hit UnboundLocalError when
+    # downstream code references them: submitter placement broadcast,
+    # cache.store payload, etc. Cache restore re-emits manifests with
+    # the persisted ``allow_toolchain_build`` flag, so the placement-
+    # map plumbing isn't needed there (workers find peers via gossip).
+    tc_drvs: dict[tuple[str, str], str] = {}
+    partition_drv_outpaths: Optional[dict[str, str]] = None
+    partition_per_variant_inputs: Optional[dict[str, frozenset[str]]] = None
 
     if cache_hit is not None:
         log.info("cache hit: %s", input_hash)
         try:
-            _restore_manifests_from_archive(
+            tc_drvs = _restore_manifests_from_archive(
                 cache_hit.manifests_archive, manifest_dir
             )
+            # Re-resolve toolchain outpaths from the local store so the
+            # submitter placement block populates the gossip file even
+            # on cache hit. ``eval_drv_outpaths`` is cheap (single
+            # batched ``nix derivation show``) and idempotent.
+            if tc_drvs:
+                try:
+                    tc_outpaths = eval_drv_outpaths(
+                        [d for d in tc_drvs.values() if d]
+                    )
+                    if tc_outpaths:
+                        partition_drv_outpaths = dict(tc_outpaths)
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "cache-hit toolchain outpath eval failed;"
+                        " submitter placement may be incomplete"
+                    )
         except Exception:  # noqa: BLE001
             log.exception("failed to restore manifests from cache; will pre-flight")
             cache_hit = None
+            tc_drvs = {}
 
     if cache_hit is None:
         log.info("running pre-flight")
@@ -917,6 +1058,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # ``emit_all_manifests`` iterates ``(drv, label)`` (matching
         # ``make_common_dep_header``'s signature). Swap the pair on the
         # boundary.
+        # (declared at function scope above so the cache-hit path
+        # doesn't need its own defaults; here we just (re-)initialize.)
+        partition_per_variant_inputs = None
+        partition_drv_outpaths = None
         try:
             partition = compute_partition_locally(
                 pre.variants,
@@ -930,6 +1075,15 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 len(pre.variants), len(common_dep_drvs),
             )
             pre = dataclasses.replace(pre, common_dep_drvs=common_dep_drvs)
+            partition_per_variant_inputs = dict(partition.per_variant_inputs)
+            # ``drv_outpaths`` carries every drv's realised store path
+            # so build_worker can pre-fetch input deps via the
+            # placement map without re-walking the graph on the
+            # secondary. Optional attribute — older PartitionResult
+            # revisions without it fall back to no-pre-fetch.
+            partition_drv_outpaths = dict(
+                getattr(partition, "drv_outpaths", {}) or {}
+            )
         except Exception:  # noqa: BLE001 — partition is best-effort
             log.exception(
                 "partition computation failed; proceeding without"
@@ -967,6 +1121,78 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
             tc_drvs = {}
 
+        # Resolve toolchain outpaths and merge them into
+        # ``partition_drv_outpaths``. Toolchains live in a disjoint
+        # subgraph from variants (reached via _crossToolchainMap, not
+        # the variant DAG), so compute_partition_locally's walk does
+        # not see them — without this merge, the phase-2 validate
+        # manifests have no ``payload.outpath`` and the worker can't
+        # do the path-info probe + targeted ``nix copy --from`` that
+        # the validate-only path requires.
+        if tc_drvs and partition_drv_outpaths is not None:
+            try:
+                tc_outpaths = eval_drv_outpaths(
+                    [d for d in tc_drvs.values() if d]
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "toolchain outpath eval failed; validate manifests"
+                    " will be missing payload.outpath"
+                )
+                tc_outpaths = {}
+            partition_drv_outpaths.update(tc_outpaths)
+            log.info(
+                "toolchain outpath eval: %d/%d resolved",
+                len(tc_outpaths), len(tc_drvs),
+            )
+
+        # Primary-side toolchain availability check. The phase-2
+        # validate-only item class fetches toolchains from a peer
+        # (primary first) instead of building them; that contract
+        # only holds if the primary actually has the toolchain
+        # outputs in its local store. Check up-front and either
+        # fail-fast (default) or build locally (opt-in).
+        allow_tc_build = getattr(args, "allow_toolchain_build", False)
+        tc_drv_set = frozenset(d for d in tc_drvs.values() if d)
+        if tc_drv_set:
+            try:
+                missing_tcs = check_toolchains_locally(tc_drv_set)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "toolchain local-validity check failed; assuming"
+                    " all toolchains are missing"
+                )
+                missing_tcs = tc_drv_set
+            if missing_tcs:
+                if not allow_tc_build:
+                    log.error(
+                        "%d/%d toolchains missing locally and"
+                        " --allow-toolchain-build is off:",
+                        len(missing_tcs), len(tc_drv_set),
+                    )
+                    for drv in sorted(missing_tcs):
+                        log.error("  %s", drv)
+                    log.error(
+                        "Re-run with --allow-toolchain-build to build"
+                        " them locally before dispatch, or run"
+                        " `nix build <drv>^*` for each missing drv"
+                        " by hand."
+                    )
+                    return 1
+                log.warning(
+                    "building %d missing toolchains locally"
+                    " (--allow-toolchain-build is on)",
+                    len(missing_tcs),
+                )
+                try:
+                    build_toolchains_locally(missing_tcs)
+                except PreflightError as exc:
+                    log.error("local toolchain build aborted: %s", exc)
+                    return 1
+                except Exception:  # noqa: BLE001
+                    log.exception("local toolchain build failed")
+                    return 1
+
         try:
             _emit_manifests_from_preflight(
                 target_dir=manifest_dir,
@@ -974,6 +1200,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 pre=pre,
                 num_workers=num_workers,
                 toolchain_drvs=tc_drvs,
+                allow_toolchain_build=allow_tc_build,
+                per_variant_inputs=partition_per_variant_inputs,
+                drv_outpaths=partition_drv_outpaths,
             )
         except Exception:  # noqa: BLE001
             log.exception("manifest emission failed")
@@ -1010,6 +1239,41 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
             return 1
 
+        # Opt-in override for clusters where the framework's gateway-port
+        # probe is necessary-but-not-sufficient: brasilianit (LMU CIP)
+        # binds the SSH reverse-forward on 0.0.0.0 — so the framework's
+        # auto-detect sets ``gateway_ports_enabled=True`` and selects
+        # gateway-direct outbound mode — but the kraterNN compute nodes
+        # are on a different segment and can't actually reach the gateway
+        # port. Setting ``DYNRUNNER_FORCE_REVERSE_CONNECTION=1`` coerces
+        # ``gateway_ports_enabled=True → False`` so the framework picks
+        # the ProxyJump-into-secondaries path. Remove once the framework
+        # grows a reachability probe or a config-level override.
+        if os.environ.get("DYNRUNNER_FORCE_REVERSE_CONNECTION") == "1":
+            try:
+                from dynamic_runner.packaging.gateway import (  # type: ignore[import-not-found]
+                    ssh_gateway as _dr_ssh_gateway,
+                )
+                _gw_cls = _dr_ssh_gateway.SSHGateway
+                _orig_setattr = _gw_cls.__setattr__
+
+                def _coerce_gpe(self, name, value, _o=_orig_setattr):  # noqa: ANN001
+                    if name == "gateway_ports_enabled" and value is True:
+                        value = False
+                    return _o(self, name, value)
+
+                _gw_cls.__setattr__ = _coerce_gpe
+                log.info(
+                    "DYNRUNNER_FORCE_REVERSE_CONNECTION=1: coercing "
+                    "gateway_ports_enabled=True→False to force ProxyJump"
+                )
+            except Exception:  # noqa: BLE001 — opt-in workaround; never fatal
+                log.exception(
+                    "DYNRUNNER_FORCE_REVERSE_CONNECTION=1 set but "
+                    "SSHGateway patch failed; dispatch continues with "
+                    "the framework's native decision"
+                )
+
         # Submitter-peer: makes the dispatching machine's local nix
         # store reachable from compute-node containers as a federated
         # peer cache. The framework's TaskDeploymentSpec.extra_port_forwards
@@ -1036,6 +1300,24 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     config_file=args.ssh_config,
                     log=log,
                 )
+                # Advertise the primary's toolchain outpaths in the
+                # cluster placement gossip so secondaries on the
+                # validate-only path find ``submitter`` as a fetch
+                # candidate. The primary's harmonia (already SSH-R'd
+                # into each compute node's localhost via the framework)
+                # serves the NARs; this placement file is what tells
+                # the worker WHICH peer to dial.
+                placements: list[tuple[str, str, str]] = []
+                if tc_drvs and partition_drv_outpaths:
+                    for drv in tc_drvs.values():
+                        if not drv:
+                            continue
+                        outpath = partition_drv_outpaths.get(drv)
+                        if not outpath:
+                            continue
+                        placements.append((outpath, drv, "toolchain"))
+                if placements:
+                    submitter.set_placements(placements)
                 submitter.start()
                 extra_pf = submitter.deployment_extra_port_forwards
             except Exception:  # noqa: BLE001 — never block dispatch
@@ -1096,6 +1378,50 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     f"CSR_SSH_DEBUG_PORT="
                     f"{getattr(args, 'ssh_debug_port', 22222)}",
                 ]
+            # Opt-in kill-chasing instrumentation. Enabled by setting
+            # ``ASM_TRACE_KILLS=1`` in the submitter env; no-op
+            # otherwise. Adds SYS_PTRACE capability + propagates the
+            # env var into the secondary container so cmd_secondary's
+            # gated strace spawn can attach. Used during the
+            # 2026-05-12 bilateral-SIGTERM diagnostic; kept as future-
+            # use diagnostic since signal-attribution problems in
+            # nested-podman are easy to hit again.
+            if os.environ.get("ASM_TRACE_KILLS") == "1":
+                run_args += ["--cap-add=SYS_PTRACE", "-e", "ASM_TRACE_KILLS=1"]
+            # Cap concurrent nix builds inside each secondary's container.
+            # Without this the inner nix-daemon will honor every worker's
+            # parallel-build request — 14 dynrunner workers × heavy cross-
+            # LLVM toolchain builds can sum to >120 GiB peak and OOM the
+            # container before any toolchain finishes (observed on LMU
+            # Krater 2026-05-13: 4 secondaries killed at 28-29 min with
+            # ExitCode 9:0). max-jobs serializes the heavy ones; warm-
+            # cached variants flow at no risk after toolchains. dynrunner-
+            # owner confirmed this is operator territory; ResourceStealing-
+            # Scheduler intentionally doesn't gate at the daemon layer.
+            # Tunable via ASM_NIX_MAX_JOBS (default 2).
+            # Started at 4, but on the 2026-05-13 LMU Krater run that
+            # still hit the same OOM wall ~15 minutes later (jobs
+            # SIGKILL'd at 44m instead of 29m). Dropping to 2 per
+            # dynrunner-owner's curve estimate.
+            # Also injects ``connect-timeout = 1`` and
+            # ``download-attempts = 1``: when a secondary dies, its
+            # harmonia URL stays in the substituter list (peer-mesh
+            # liveness is a framework primitive but consumer-side
+            # policy), so every variant fetch tries the dead peer
+            # first. Default nix waits 30s × 5 attempts = 150s per
+            # narfile per dead peer before falling through to the
+            # next substituter. Capping at 1s × 1 attempt = 1s.
+            # dynrunner-owner endorsed this approach 2026-05-13
+            # 08:31; the long-term fix is content-addressable peer
+            # caching with redundancy but that's a major design
+            # effort.
+            _nix_max_jobs = os.environ.get("ASM_NIX_MAX_JOBS", "2")
+            _nix_config = (
+                f"max-jobs = {_nix_max_jobs}\n"
+                "connect-timeout = 1\n"
+                "download-attempts = 1"
+            )
+            run_args += ["-e", f"NIX_CONFIG={_nix_config}"]
             deployment = TaskDeploymentSpec(
                 secondary_module="compiler_suit_runner",
                 image_name="asm-dataset-nix-runner",
@@ -1147,6 +1473,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     num_workers,
                     staging_path / "_preflight.json",
                     toolchain_drvs_by_pair=tc_drvs,
+                    allow_toolchain_build=getattr(
+                        config, "allow_toolchain_build", False
+                    ),
                 )
                 cache.store(
                     input_hash=input_hash,
@@ -1222,6 +1551,42 @@ def cmd_secondary(args: argparse.Namespace) -> int:
 
     # Same argv-strip as cmd_submit: framework re-parses sys.argv.
     sys.argv = [sys.argv[0]] + _strip_csr_argv_for_framework(sys.argv[1:])
+
+    # Opt-in kill-chasing instrumentation, paired with the
+    # SYS_PTRACE / env-propagation block in cmd_submit. Enabled by
+    # setting ``ASM_TRACE_KILLS=1`` (submitter forwards it via
+    # ``-e`` on ``podman run``); no-op otherwise. Spawns strace
+    # attached to this secondary's PID 1 with ``-f`` so all
+    # subprocess workers + nix-daemon + harmonia are followed. The
+    # trace filter includes clone/fork/vfork/clone3/execve so the
+    # PTRACE_O_TRACECLONE events fire correctly (without them
+    # ``-f`` doesn't attach to fresh children). Output lands in
+    # ``/app/log-network/secondary-strace.log`` (volume-mounted, so
+    # it survives container teardown). The ``start_new_session=True``
+    # keeps strace in its own session so it isn't reaped by any
+    # pgrp-scoped signal to the secondary; container-wide signals
+    # (e.g. user@.service slice teardown) still kill it.
+    _strace_proc = None
+    if os.environ.get("ASM_TRACE_KILLS") == "1":
+        try:
+            _strace_log = pathlib.Path("/app/log-network/secondary-strace.log")
+            _strace_log.parent.mkdir(parents=True, exist_ok=True)
+            _strace_proc = subprocess.Popen(
+                [
+                    "strace", "-f", "-tt", "-p", str(os.getpid()),
+                    "-e", "trace=kill,tgkill,tkill,clone,fork,vfork,clone3,execve",
+                    "-o", str(_strace_log),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            time.sleep(0.5)
+            log.warning("ASM_TRACE_KILLS=1: strace attached to pid=%d, log=%s", os.getpid(), _strace_log)
+        except Exception:  # noqa: BLE001
+            log.exception("ASM_TRACE_KILLS=1: strace spawn failed; continuing without trace")
+
     rc = 0
     try:
         deployment = TaskDeploymentSpec(
