@@ -147,6 +147,59 @@ def test_record_self_has_rejects_empty_secondary_id(shared_fs):
         )
 
 
+def test_record_self_has_phase0_eval_drv_item_class(shared_fs):
+    """Verify ``item_class="phase0_eval_drv"`` lands in the gossip file
+    as a first-class holder record — what T21's placement-map assertion
+    scopes on to count holders of phase 0 drvs.
+
+    Mirrors the toolchain test; the only difference is the class string
+    set by the broadcast-receive path in :mod:`peer_push`. Same record
+    shape so :class:`peer_cache.PathPlacementWatcher` reads it as just
+    another holder."""
+    peer_paths.record_self_has(
+        shared_fs,
+        my_secondary_id="sec-broadcast",
+        outpath="/nix/store/aaa-phase0.drv",
+        drv_path="/nix/store/aaa-phase0.drv",
+        item_class=peer_paths.ITEM_CLASS_PHASE0_EVAL_DRV,
+    )
+    target = peer_paths.paths_file_for(shared_fs, "sec-broadcast")
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["secondary_id"] == "sec-broadcast"
+    assert record["outpath"] == "/nix/store/aaa-phase0.drv"
+    assert record["item_class"] == "phase0_eval_drv"
+    # Constant matches the literal used by workers.eval_worker and
+    # the T21 integration test (keep this string stable -- the
+    # cluster gossip wire-format depends on it).
+    assert peer_paths.ITEM_CLASS_PHASE0_EVAL_DRV == "phase0_eval_drv"
+
+
+def test_record_self_has_phase0_idempotent_safe_on_repeat(shared_fs):
+    """Calling ``record_self_has`` twice for the same path appends two
+    JSONL lines (the gossip file is append-only). The placement-map
+    reader collapses duplicates via the (secondary_id, outpath) key,
+    so repeated receives are safe; this test pins that the append
+    contract is unchanged for the phase0 class."""
+    path = "/nix/store/dup-phase0.drv"
+    for _ in range(2):
+        peer_paths.record_self_has(
+            shared_fs,
+            my_secondary_id="sec-dup",
+            outpath=path,
+            drv_path=path,
+            item_class=peer_paths.ITEM_CLASS_PHASE0_EVAL_DRV,
+        )
+    target = peer_paths.paths_file_for(shared_fs, "sec-dup")
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    for line in lines:
+        rec = json.loads(line)
+        assert rec["outpath"] == path
+        assert rec["item_class"] == "phase0_eval_drv"
+
+
 def test_record_self_has_skips_push_when_peers_missing(shared_fs, monkeypatch):
     """Without ``peers`` or ``our_pubkey`` the push fan-out must not run."""
     sentinel = {"called": False}

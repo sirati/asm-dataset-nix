@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from io import BytesIO
@@ -1117,6 +1118,161 @@ def test_broadcast_offer_callback_rejection_propagates() -> None:
         srv.stop()
 
 
+def test_broadcast_offer_records_self_has_after_accept() -> None:
+    """When ``on_broadcast_offer`` returns True, the server invokes the
+    optional ``record_broadcast_self_has`` hook with the path so the
+    consumer's placement-map gossip captures the new holder."""
+    recorded: list[str] = []
+
+    def cb(_p, _sz, _opid, _bid, _hop):
+        return True
+
+    def record(path: str) -> None:
+        recorded.append(path)
+
+    port = _free_port()
+    srv = PeerPushServer(
+        bind_host="127.0.0.1",
+        port=port,
+        expected_pubkey="test-pk",
+        on_announce=lambda _i: None,
+        on_withdraw=lambda _s: None,
+        on_broadcast_offer=cb,
+        record_broadcast_self_has=record,
+    )
+    srv.start()
+    try:
+        rc, raw = _post_with_body(
+            port, "/peer/path-broadcast-offer",
+            _broadcast_payload("bid-record"),
+            "test-pk",
+        )
+        assert rc == 200
+        body = json.loads(raw.decode("utf-8"))
+        assert body == {"dedup": False, "accepted": True}
+        assert recorded == ["/nix/store/aaa-toolchain.drv"]
+    finally:
+        srv.stop()
+
+
+def test_broadcast_offer_does_not_record_self_has_on_reject() -> None:
+    """When ``on_broadcast_offer`` returns False (consumer declined),
+    the record-hook MUST NOT fire — a rejected offer means no fetch
+    happened, so we are not a holder."""
+    recorded: list[str] = []
+
+    def cb(_p, _sz, _opid, _bid, _hop):
+        return False
+
+    def record(path: str) -> None:
+        recorded.append(path)
+
+    port = _free_port()
+    srv = PeerPushServer(
+        bind_host="127.0.0.1",
+        port=port,
+        expected_pubkey="test-pk",
+        on_announce=lambda _i: None,
+        on_withdraw=lambda _s: None,
+        on_broadcast_offer=cb,
+        record_broadcast_self_has=record,
+    )
+    srv.start()
+    try:
+        rc, raw = _post_with_body(
+            port, "/peer/path-broadcast-offer",
+            _broadcast_payload("bid-no-record"),
+            "test-pk",
+        )
+        assert rc == 200
+        body = json.loads(raw.decode("utf-8"))
+        assert body == {"dedup": False, "accepted": False}
+        assert recorded == []
+    finally:
+        srv.stop()
+
+
+def test_broadcast_offer_record_hook_dedup_silent() -> None:
+    """A duplicate ``broadcast_id`` returns ``{"dedup": True}`` without
+    invoking either the consumer callback OR the record hook — the
+    placement record was already published on the first acceptance."""
+    cb_calls: list[str] = []
+    recorded: list[str] = []
+
+    def cb(_p, _sz, _opid, bid, _hop):
+        cb_calls.append(bid)
+        return True
+
+    def record(path: str) -> None:
+        recorded.append(path)
+
+    port = _free_port()
+    srv = PeerPushServer(
+        bind_host="127.0.0.1",
+        port=port,
+        expected_pubkey="test-pk",
+        on_announce=lambda _i: None,
+        on_withdraw=lambda _s: None,
+        on_broadcast_offer=cb,
+        record_broadcast_self_has=record,
+    )
+    srv.start()
+    try:
+        rc1, _raw1 = _post_with_body(
+            port, "/peer/path-broadcast-offer",
+            _broadcast_payload("bid-dup"), "test-pk",
+        )
+        rc2, raw2 = _post_with_body(
+            port, "/peer/path-broadcast-offer",
+            _broadcast_payload("bid-dup"), "test-pk",
+        )
+        assert rc1 == 200
+        assert rc2 == 200
+        body2 = json.loads(raw2.decode("utf-8"))
+        assert body2 == {"dedup": True}
+        # Callback + hook each fire exactly once (the dedup hit goes
+        # straight back without touching either).
+        assert cb_calls == ["bid-dup"]
+        assert recorded == ["/nix/store/aaa-toolchain.drv"]
+    finally:
+        srv.stop()
+
+
+def test_broadcast_offer_record_hook_exception_does_not_break_response() -> None:
+    """If the record-hook raises, the originator still sees the regular
+    JSON response (gossip is best-effort; the handshake reply is not
+    contingent on a successful placement-map write)."""
+
+    def cb(_p, _sz, _opid, _bid, _hop):
+        return True
+
+    def record(_path: str) -> None:
+        raise RuntimeError("simulated gossip failure")
+
+    port = _free_port()
+    srv = PeerPushServer(
+        bind_host="127.0.0.1",
+        port=port,
+        expected_pubkey="test-pk",
+        on_announce=lambda _i: None,
+        on_withdraw=lambda _s: None,
+        on_broadcast_offer=cb,
+        record_broadcast_self_has=record,
+    )
+    srv.start()
+    try:
+        rc, raw = _post_with_body(
+            port, "/peer/path-broadcast-offer",
+            _broadcast_payload("bid-raise"),
+            "test-pk",
+        )
+        assert rc == 200
+        body = json.loads(raw.decode("utf-8"))
+        assert body == {"dedup": False, "accepted": True}
+    finally:
+        srv.stop()
+
+
 def test_push_path_broadcast_offer_returns_parsed_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1465,4 +1621,87 @@ def test_request_refresh_wakes_watcher(
             timer.cancel()
     finally:
         watcher.stop()
-        watcher.join(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# BroadcastReceiver wired into PeerPushServer (end-to-end consumer)
+# ---------------------------------------------------------------------------
+
+
+def test_path_broadcast_offer_with_broadcast_receiver_wired_e2e(
+    tmp_path,
+) -> None:
+    """End-to-end: POST /peer/path-broadcast-offer hits the wired
+    BroadcastReceiver, which calls fetch + cascade fan-out, and the
+    HTTP response carries ``{"dedup": False, "accepted": True}``."""
+    from unittest import mock as _mock
+    from compiler_suit_runner.peer_replication import BroadcastReceiver
+
+    fetch_calls: list[tuple[str, str]] = []
+
+    def _fetch(path: str, origin_url: str) -> bool:
+        fetch_calls.append((path, origin_url))
+        return True
+
+    fan_out_mock = _mock.MagicMock(return_value=(1, 0, []))
+
+    receiver = BroadcastReceiver(
+        self_peer_id="me",
+        peer_url_provider=lambda: {
+            "me": "http://me:6000",
+            "origin": "http://origin-host:6000",
+            "peer1": "http://peer1:6000",
+        },
+        is_path_locally_valid=lambda _p: False,
+        fetch_path_from_peer=_fetch,
+        our_pubkey="me:PK",
+        shared_fs=tmp_path,
+        record_self_has=lambda *_a, **_kw: None,
+        fan_out=fan_out_mock,
+        timeout=0.5,
+    )
+
+    port = _free_port()
+    srv = PeerPushServer(
+        bind_host="127.0.0.1",
+        port=port,
+        expected_pubkey="cluster-pk",
+        on_announce=lambda _i: None,
+        on_withdraw=lambda _s: None,
+        on_broadcast_offer=receiver.on_broadcast_offer,
+    )
+    srv.start()
+    try:
+        rc, raw = _post_with_body(
+            port, "/peer/path-broadcast-offer",
+            {
+                "path": "/nix/store/e2e.drv",
+                "size": 256,
+                "origin_peer_id": "origin",
+                "broadcast_id": "bid-e2e",
+                "hop_count": 0,
+            },
+            "cluster-pk",
+        )
+        assert rc == 200
+        body = json.loads(raw.decode("utf-8"))
+        assert body == {"dedup": False, "accepted": True}
+        # Fetch was made against the origin's URL.
+        assert fetch_calls == [
+            ("/nix/store/e2e.drv", "http://origin-host:6000"),
+        ]
+        # Wait for fan-out to land on the worker thread.
+        deadline = time.time() + 2.0
+        while time.time() < deadline and fan_out_mock.call_count == 0:
+            threading.Event().wait(0.02)
+        assert fan_out_mock.call_count == 1
+        _, kw = fan_out_mock.call_args
+        # peer1 is the only non-self, non-origin target.
+        assert kw["peer_urls"] == ["http://peer1:6000"]
+        assert kw["hop_count"] == 1
+        assert kw["origin_peer_id"] == "me"
+    finally:
+        try:
+            srv.stop()
+        finally:
+            receiver.stop()

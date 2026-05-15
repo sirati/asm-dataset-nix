@@ -63,7 +63,9 @@ from compiler_suit_runner.peer_cache import (
     generate_signing_key,
     withdraw_self,
 )
+from compiler_suit_runner import peer_paths
 from compiler_suit_runner.peer_push import (
+    PUSH_PORT_OFFSET,
     PeerPushServer,
     fan_out_announce,
     fan_out_withdraw,
@@ -71,11 +73,13 @@ from compiler_suit_runner.peer_push import (
 )
 from compiler_suit_runner.peer_replication import (
     DEFAULT_REPLICATION_K,
+    BroadcastReceiver,
     ReplicationContext,
     ReplicationReceiver,
     ReplicationRepairWorker,
     ReplicationSender,
 )
+from compiler_suit_runner import peer_paths_fetch
 from compiler_suit_runner.workers.build_worker import (
     BuildWorkerEnv,
     build_worker,
@@ -99,6 +103,39 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+
+def _push_url_to_substituter_url(push_url: str) -> Optional[str]:
+    """Translate ``http://host:<push_port>`` → ``http://host:<harmonia_port>``.
+
+    The broadcast protocol gossips push URLs (port = harmonia_port +
+    PUSH_PORT_OFFSET) because that's the port the receiver listens on
+    for the ``/peer/path-broadcast-offer`` POST. The fetch side, in
+    contrast, needs the harmonia substituter URL. Both run on the
+    same host, so we just subtract PUSH_PORT_OFFSET from the port.
+
+    Returns ``None`` if the URL doesn't parse as ``http://host:port``
+    or the port-arithmetic produces a non-positive number; callers
+    fall back to using the raw URL (which ``nix copy --from`` will
+    reject, returning False — the safe default).
+    """
+    if not push_url or not push_url.startswith(("http://", "https://")):
+        return None
+    try:
+        scheme, _, rest = push_url.partition("://")
+        # rest looks like ``host:port[/...]``; we don't preserve any
+        # path suffix because nix copy --from is base-URL only.
+        host_port, _, _ = rest.partition("/")
+        host, _, port_s = host_port.rpartition(":")
+        if not host or not port_s:
+            return None
+        push_port = int(port_s)
+    except (TypeError, ValueError):
+        return None
+    harmonia_port = push_port - PUSH_PORT_OFFSET
+    if harmonia_port <= 0:
+        return None
+    return f"{scheme}://{host}:{harmonia_port}"
 
 
 # Item classes that route through the build worker.
@@ -621,6 +658,12 @@ class SuitTask:
         self._replication_sender: Optional[ReplicationSender] = None
         self._replication_receiver: Optional[ReplicationReceiver] = None
         self._replication_repair: Optional[ReplicationRepairWorker] = None
+        # Phase 0 drv broadcast consumer (mirrors ReplicationReceiver but
+        # for the all-peers flood-fill protocol). Without this the
+        # ``/peer/path-broadcast-offer`` endpoint sees deduped offers
+        # land on a no-op callback that returns False, so the cluster
+        # never actually fetches the broadcast drvs.
+        self._broadcast_receiver: Optional[BroadcastReceiver] = None
         # Phase 0 → Phase 1 quiesce watcher. Populated by on_run_start
         # only when --distributed-eval is on (i.e. phase0_eval items
         # are present in the manifest dir). Reference held so the
@@ -969,6 +1012,66 @@ class SuitTask:
                     self._replication_receiver = None
                     self._replication_repair = None
 
+                # Phase 0 broadcast consumer (path-broadcast-offer).
+                # Parallel to the K=3 receiver above but for the
+                # all-peers flood-fill protocol: every secondary that
+                # accepts a broadcast both fetches the drv from the
+                # originator and re-fans the offer to the rest of
+                # the cluster (minus self + origin). Constructed here
+                # so its ``on_broadcast_offer`` method can be passed
+                # to the PeerPushServer below.
+                try:
+                    self_sid = self.config.secondary_id
+
+                    def _broadcast_peer_url_map() -> dict[str, str]:
+                        # Snapshot: peer_id -> push URL for every
+                        # currently-known peer, including self (the
+                        # receiver subtracts self + origin at fan-out
+                        # time, per the broadcast contract).
+                        return {
+                            p.secondary_id: (
+                                f"http://{p.hostname}:"
+                                f"{push_port_for(p.port)}"
+                            )
+                            for p in peer_watcher.peers
+                        }
+
+                    def _broadcast_fetch(
+                        path: str, origin_push_url: str,
+                    ) -> bool:
+                        # The provider hands us push URLs; nix copy
+                        # needs the harmonia substituter URL. Same
+                        # host, port - PUSH_PORT_OFFSET. Falling back
+                        # to the raw URL on a parse failure is safe:
+                        # nix copy will just error and we return
+                        # False.
+                        substituter_url = (
+                            _push_url_to_substituter_url(
+                                origin_push_url,
+                            )
+                            or origin_push_url
+                        )
+                        return peer_paths_fetch.nix_copy_from_url(
+                            path, substituter_url,
+                        )
+
+                    self._broadcast_receiver = BroadcastReceiver(
+                        self_peer_id=self_sid,
+                        peer_url_provider=_broadcast_peer_url_map,
+                        is_path_locally_valid=(
+                            peer_paths_fetch.is_path_locally_valid
+                        ),
+                        fetch_path_from_peer=_broadcast_fetch,
+                        our_pubkey=public_key,
+                        shared_fs=self.config.shared_fs,
+                    )
+                except Exception:  # noqa: BLE001 — log + continue
+                    self._logger.exception(
+                        "on_run_start: BroadcastReceiver init failed;"
+                        " phase 0 drv flood-fill consumer disabled"
+                    )
+                    self._broadcast_receiver = None
+
             # 2b. Push server (listens BEFORE we announce so any peer
             # that pushes us in response sees a ready listener). Keyed
             # off ``public_key``: without the cluster signing key we
@@ -984,6 +1087,7 @@ class SuitTask:
                     )
                     receiver = self._replication_receiver
                     sender = self._replication_sender
+                    broadcast_receiver = self._broadcast_receiver
 
                     def _on_path_have(record: dict) -> None:
                         placement_refresh()
@@ -1024,6 +1128,39 @@ class SuitTask:
                         if receiver is not None:
                             receiver.on_cancel(record)
 
+                    # Broadcast-receive placement gossip: when the
+                    # consumer accepts a ``/peer/path-broadcast-offer``
+                    # (the drv has been fetched into our local store),
+                    # publish a holder record under
+                    # ``item_class="phase0_eval_drv"`` so the
+                    # placement-map watcher on every other secondary
+                    # learns we hold it. Mirrors the K=3 receiver's
+                    # post-fetch ``record_self_has`` call but with the
+                    # phase0 item-class so phase0 drv holders are
+                    # distinguishable from toolchain / variant holders.
+                    _record_broadcast_self_has = (
+                        self._make_broadcast_record_self_has(
+                            peer_watcher, public_key,
+                        )
+                    )
+
+                    def _on_broadcast_offer(
+                        path: str,
+                        size: int,
+                        origin_peer_id: str,
+                        broadcast_id: str,
+                        hop_count: int,
+                    ) -> bool:
+                        # Without a wired BroadcastReceiver we cannot
+                        # actually fetch the drv; reject so the
+                        # originator's placement accounting is honest.
+                        if broadcast_receiver is None:
+                            return False
+                        return broadcast_receiver.on_broadcast_offer(
+                            path, size, origin_peer_id,
+                            broadcast_id, hop_count,
+                        )
+
                     self._push_server = PeerPushServer(
                         bind_host="0.0.0.0",
                         port=push_port_for(self.config.harmonia_port),
@@ -1036,6 +1173,8 @@ class SuitTask:
                         on_path_accept=_on_path_accept,
                         on_path_reject=_on_path_reject,
                         on_path_cancel=_on_path_cancel,
+                        record_broadcast_self_has=_record_broadcast_self_has,
+                        on_broadcast_offer=_on_broadcast_offer,
                     )
                     self._push_server.start()
                 except Exception:  # noqa: BLE001 — log + continue
@@ -1270,6 +1409,15 @@ class SuitTask:
                 finally:
                     self._replication_receiver = None
             self._replication_repair = None
+            if self._broadcast_receiver is not None:
+                try:
+                    self._broadcast_receiver.stop()
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "on_run_end: BroadcastReceiver stop failed"
+                    )
+                finally:
+                    self._broadcast_receiver = None
 
             if self._push_server is not None:
                 try:
@@ -1352,6 +1500,48 @@ class SuitTask:
             completed,
             failed,
         )
+
+    # ── Broadcast-receive placement gossip ────────────────────────────
+
+    def _make_broadcast_record_self_has(
+        self,
+        peer_watcher: PeerListWatcher,
+        public_key: str,
+    ) -> Any:
+        """Return a callable suitable for ``PeerPushServer.record_broadcast_self_has``.
+
+        The returned function calls :func:`peer_paths.record_self_has`
+        with ``item_class=ITEM_CLASS_PHASE0_EVAL_DRV`` and the live
+        peer list from *peer_watcher*. Extracted as a method so the
+        callable assembly is unit-testable without spinning up the
+        full :meth:`on_run_start` lifecycle.
+
+        Exceptions raised by ``record_self_has`` are caught + logged
+        (gossip is best-effort; a failed write must not propagate into
+        the handshake response back to the originator).
+        """
+        my_sid = self.config.secondary_id
+        shared_fs = self.config.shared_fs
+        peer_watcher_ref = peer_watcher
+        bound_pubkey = str(public_key)
+
+        def _record(path: str) -> None:
+            try:
+                peer_paths.record_self_has(
+                    shared_fs,
+                    my_secondary_id=my_sid,
+                    outpath=path,
+                    drv_path=path,
+                    item_class=peer_paths.ITEM_CLASS_PHASE0_EVAL_DRV,
+                    peers=list(peer_watcher_ref.peers),
+                    our_pubkey=bound_pubkey,
+                )
+            except Exception:  # noqa: BLE001
+                self._logger.exception(
+                    "broadcast record_self_has failed for %s", path,
+                )
+
+        return _record
 
     # ── Phase 0 watcher wiring ────────────────────────────────────────
 
