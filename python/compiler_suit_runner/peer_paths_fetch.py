@@ -46,6 +46,7 @@ __all__ = [
     "PRIMARY_CANDIDATE_ID",
     "fetch_from_peer",
     "is_path_locally_valid",
+    "nix_copy_from_url",
 ]
 
 logger = logging.getLogger(__name__)
@@ -237,6 +238,53 @@ def fetch_from_peer(
         # path; the rc + stderr are the diagnostic value we want.
         del stdout
     return None
+
+
+def nix_copy_from_url(
+    outpath: str,
+    source_url: str,
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> bool:
+    """Run ``nix copy --from <source_url> --no-check-sigs <outpath>``.
+
+    Returns True iff the subprocess exited with code 0. Unlike
+    :func:`fetch_from_peer`, this helper does not consult the
+    placement map nor a candidate list — it pulls from a single
+    explicit URL. Used by :class:`peer_replication.BroadcastReceiver`
+    where the origin peer is dictated by the broadcast offer's
+    ``origin_peer_id`` field, not chosen heuristically.
+
+    ``source_url`` should be the peer's harmonia substituter URL
+    (``http://<host>:<harmonia_port>``); ``nix copy --from`` reads
+    only from that URL and ignores ``extra-substituters`` in
+    ``nix.conf``. ``--no-check-sigs`` matches
+    :func:`fetch_from_peer`'s rationale: the cluster's auth boundary
+    is the X-Cluster-PubKey header on the push side, not the
+    in-store signature.
+    """
+    if not outpath or not source_url:
+        return False
+    runner = run_subprocess or _default_run_subprocess
+    cmd = [
+        *_NIX_BASE_CMD,
+        "copy",
+        "--from", source_url,
+        "--no-check-sigs",
+        outpath,
+    ]
+    _stdout, stderr, rc = runner(cmd)
+    if rc == 0:
+        logger.info(
+            "nix_copy_from_url: %s <- %s", outpath, source_url,
+        )
+        return True
+    logger.debug(
+        "nix_copy_from_url: %s from %s failed rc=%d stderr=%r",
+        outpath, source_url, rc,
+        stderr.decode("utf-8", errors="replace")[-400:],
+    )
+    return False
 
 
 def has_nix_cli() -> bool:

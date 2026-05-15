@@ -60,8 +60,11 @@ from compiler_suit_runner import peer_paths, peer_paths_fetch, peer_push
 from compiler_suit_runner.peer_cache import PeerInfo, PlacementDiff
 
 __all__ = [
+    "DEFAULT_BROADCAST_MAX_HOP",
     "DEFAULT_OFFER_TIMEOUT_SECONDS",
     "DEFAULT_REPLICATION_K",
+    "BROADCAST_ITEM_CLASS",
+    "BroadcastReceiver",
     "BroadcastResult",
     "BroadcastSender",
     "ReplicationContext",
@@ -74,6 +77,22 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REPLICATION_K = 3
 DEFAULT_OFFER_TIMEOUT_SECONDS = 1.0
+
+# Loop-prevention cap for the broadcast gossip protocol. Even with
+# broadcast_id-based dedup at the receiver, a hop cap is the cheap
+# belt-and-suspenders defense against pathological topologies; an
+# eight-hop fan-out is comfortably larger than any reasonable cluster
+# diameter (≤ ten secondaries → ceil(log2(10)) = 4 hops). A receiver
+# that sees hop_count ≥ DEFAULT_BROADCAST_MAX_HOP still records the
+# path as locally-held when applicable but skips the fan-out.
+DEFAULT_BROADCAST_MAX_HOP = 8
+
+# Item class stamped on placement records written after a successful
+# broadcast receive. Matches the value the originator
+# (:mod:`workers.eval_worker`) writes via
+# :func:`peer_paths.record_self_has` so the cluster-wide placement map
+# is uniform across origin + flood-fill recipients.
+BROADCAST_ITEM_CLASS = "phase0_eval_drv"
 
 
 # ---------------------------------------------------------------------------
@@ -1008,3 +1027,384 @@ class BroadcastSender:
             event = self._events.get(broadcast_id)
         if event is not None:
             event.set()
+
+
+# ---------------------------------------------------------------------------
+# Broadcast receiver — Phase 0 drv flood-fill consumer
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _BroadcastFanoutJob:
+    """One enqueued fan-out hop awaiting dispatch on the worker thread."""
+
+    path: str
+    size: int
+    broadcast_id: str
+    origin_peer_id: str
+    hop_count: int
+
+
+class BroadcastReceiver:
+    """Consumer for ``/peer/path-broadcast-offer`` notifications.
+
+    The :class:`peer_push.PeerPushServer` calls
+    :meth:`on_broadcast_offer` from its HTTP handler thread when a
+    distinct ``broadcast_id`` arrives (the server itself dedups by id,
+    so this class only ever sees first-time broadcasts). The return
+    value tells the push server whether the recipient now holds the
+    path: the JSON response body carries that bool, and the originator
+    side uses it for placement-map accounting.
+
+    Logic per receive:
+
+    1. Short-circuit when ``is_path_locally_valid(path)`` is True —
+       record a placement entry (so peers learn we have it) and
+       return True. No fetch, no fan-out.
+    2. Otherwise look up the origin peer's URL via the
+       ``peer_url_provider`` mapping. Unknown origin → return False
+       and skip fetch (we have no source to pull from).
+    3. Call ``fetch_path_from_peer(path, origin_peer_url)``. On
+       success, record the placement and enqueue a fan-out hop to
+       every OTHER peer (minus self, minus origin). Return True.
+    4. On fetch failure: log warn, return False. Do NOT fan-out and
+       do NOT record — we don't actually have the path.
+
+    The fan-out itself runs on a single daemon worker thread fed by an
+    internal queue (mirrors :class:`BroadcastSender`). The HTTP
+    handler thread is therefore never blocked on N peer POSTs; it
+    only enqueues a job and returns.
+
+    Hop-count protection: if the inbound ``hop_count >=
+    DEFAULT_BROADCAST_MAX_HOP`` we still fetch/record but never
+    fan out, even on a fresh ``broadcast_id``. The broadcast_id
+    dedup at the server is the primary loop guard; the hop cap is the
+    cheap belt-and-suspenders defense for pathological topologies.
+    """
+
+    def __init__(
+        self,
+        self_peer_id: str,
+        peer_url_provider: Callable[[], dict[str, str]],
+        is_path_locally_valid: Callable[[str], bool],
+        fetch_path_from_peer: Callable[[str, str], bool],
+        our_pubkey: str = "",
+        *,
+        shared_fs: Optional[pathlib.Path] = None,
+        record_self_has: Optional[Callable[..., None]] = None,
+        fan_out: Callable[..., tuple[int, int, list[str]]] = (
+            peer_push.fan_out_broadcast_drv
+        ),
+        max_hop: int = DEFAULT_BROADCAST_MAX_HOP,
+        timeout: float = peer_push.DEFAULT_PUSH_TIMEOUT,
+    ) -> None:
+        """Construct a receiver.
+
+        Parameters
+        ----------
+        self_peer_id :
+            This secondary's id. Used both to subtract self from the
+            fan-out target list and as the ``my_secondary_id`` written
+            into placement records.
+        peer_url_provider :
+            Zero-arg callable returning ``{peer_id: push_url}`` for
+            every currently-known peer (INCLUDING self — subtraction
+            happens at fan-out time, per the broadcast contract). Push
+            URLs are the bare base (e.g. ``http://node3:6000``); the
+            ``/peer/path-broadcast-offer`` suffix is appended by the
+            fan-out helper.
+        is_path_locally_valid :
+            ``Callable[[path], bool]`` — typically
+            :func:`peer_paths_fetch.is_path_locally_valid`.
+        fetch_path_from_peer :
+            ``Callable[[path, origin_peer_url], bool]`` returning True
+            on a successful pull. The receiver is intentionally agnostic
+            to which URL scheme the fetcher needs (push port vs
+            harmonia port); the caller wires that translation.
+        our_pubkey :
+            Cluster shared pubkey for the ``X-Cluster-PubKey`` header
+            on fan-out posts.
+        shared_fs, record_self_has :
+            Together feed the post-receive placement record. When
+            ``shared_fs`` is None or ``record_self_has`` is None,
+            placement-record writes are skipped (handy for tests and
+            for the degraded-mode path where the placement gossip
+            file is not yet bootstrapped). Default ``record_self_has``
+            is :func:`peer_paths.record_self_has`.
+        fan_out :
+            Injection seam for tests; defaults to
+            :func:`peer_push.fan_out_broadcast_drv`.
+        max_hop :
+            Loop guard; see module-level
+            ``DEFAULT_BROADCAST_MAX_HOP``.
+        timeout :
+            Per-target HTTP timeout for fan-out POSTs.
+        """
+        self._self_peer_id = str(self_peer_id)
+        self._peer_url_provider = peer_url_provider
+        self._is_path_locally_valid = is_path_locally_valid
+        self._fetch_path_from_peer = fetch_path_from_peer
+        self._our_pubkey = str(our_pubkey)
+        self._fan_out = fan_out
+        self._max_hop = int(max_hop)
+        self._timeout = float(timeout)
+        self._shared_fs = shared_fs
+        self._record_self_has = (
+            record_self_has if record_self_has is not None
+            else peer_paths.record_self_has
+        )
+        # Fan-out worker queue; unbounded for the same reason as
+        # BroadcastSender (broadcasts are small, the cluster is small,
+        # back-pressure on the HTTP handler thread would just block
+        # the push server).
+        self._queue: queue.Queue[Optional[_BroadcastFanoutJob]] = queue.Queue()
+        self._lock = threading.Lock()
+        self._stopped = False
+        self._thread: Optional[threading.Thread] = None
+
+    # --- public API ---------------------------------------------------------
+
+    def start(self) -> None:
+        """Spawn the fan-out worker thread if not already running.
+
+        Idempotent. Most callers do not need to call this explicitly;
+        :meth:`on_broadcast_offer` calls it lazily.
+        """
+        with self._lock:
+            if self._stopped:
+                raise RuntimeError(
+                    "BroadcastReceiver: cannot start after stop()"
+                )
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(
+                target=self._run,
+                name="BroadcastReceiver",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the worker thread to exit and join it briefly.
+
+        Idempotent. Subsequent :meth:`on_broadcast_offer` calls reject
+        (return False) so a torn-down receiver cannot accidentally
+        accept new flood-fill traffic.
+        """
+        with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            thread = self._thread
+        # Sentinel wakes the worker even when the queue is empty.
+        self._queue.put(None)
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    def on_broadcast_offer(
+        self,
+        path: str,
+        size: int,
+        origin_peer_id: str,
+        broadcast_id: str,
+        hop_count: int,
+    ) -> bool:
+        """Handle one path-broadcast-offer event.
+
+        Wire-shape matches the callable contract
+        :class:`peer_push.PeerPushServer` invokes. Returns True iff
+        the recipient now holds the path (either already had it or
+        successfully fetched it); False otherwise. The originator side
+        consults that bool for placement-map accounting.
+
+        See class docstring for the four-branch decision tree.
+        """
+        with self._lock:
+            if self._stopped:
+                return False
+        if not path:
+            return False
+
+        # ── Branch 1: already-have short-circuit ─────────────────────
+        try:
+            already_have = bool(self._is_path_locally_valid(path))
+        except Exception:  # noqa: BLE001 — defensive; treat as miss
+            logger.exception(
+                "BroadcastReceiver: is_path_locally_valid raised for %s",
+                path,
+            )
+            already_have = False
+        if already_have:
+            # Record so peers learn we hold it; no fetch, no fan-out.
+            self._maybe_record(path)
+            logger.debug(
+                "BroadcastReceiver: %s already local, accepting %s",
+                path, broadcast_id,
+            )
+            return True
+
+        # ── Branch 2: resolve origin URL ─────────────────────────────
+        url_map = self._safe_url_map()
+        origin_url = url_map.get(origin_peer_id)
+        if not origin_url:
+            logger.warning(
+                "BroadcastReceiver: unknown origin peer %s for "
+                "broadcast %s (path=%s); rejecting",
+                origin_peer_id, broadcast_id, path,
+            )
+            return False
+
+        # ── Branch 3: fetch from origin ──────────────────────────────
+        try:
+            fetched = bool(self._fetch_path_from_peer(path, origin_url))
+        except Exception:  # noqa: BLE001 — defensive
+            logger.exception(
+                "BroadcastReceiver: fetch_path_from_peer raised for %s",
+                path,
+            )
+            fetched = False
+        if not fetched:
+            logger.warning(
+                "BroadcastReceiver: fetch failed for %s from %s "
+                "(broadcast %s); not fanning out",
+                path, origin_url, broadcast_id,
+            )
+            return False
+
+        # Record placement so peers learn we now hold it.
+        self._maybe_record(path)
+
+        # ── Branch 4: cascade fan-out to other peers ────────────────
+        if hop_count >= self._max_hop:
+            logger.info(
+                "BroadcastReceiver: hop_count %d ≥ max_hop %d for "
+                "broadcast %s; skipping cascade",
+                hop_count, self._max_hop, broadcast_id,
+            )
+            return True
+
+        self._enqueue_fanout(
+            _BroadcastFanoutJob(
+                path=path,
+                size=int(size),
+                broadcast_id=broadcast_id,
+                origin_peer_id=origin_peer_id,
+                hop_count=int(hop_count) + 1,
+            )
+        )
+        return True
+
+    # --- internals ----------------------------------------------------------
+
+    def _maybe_record(self, path: str) -> None:
+        """Record placement when shared_fs + record callable are present.
+
+        The placement record carries
+        ``item_class == BROADCAST_ITEM_CLASS`` so it lines up with what
+        the originator (eval_worker) writes; the cluster-wide
+        placement aggregate then shows uniform records for both
+        origin + flood-fill recipients of the same drv.
+        """
+        if self._shared_fs is None or self._record_self_has is None:
+            return
+        if not self._self_peer_id:
+            return
+        try:
+            self._record_self_has(
+                self._shared_fs,
+                my_secondary_id=self._self_peer_id,
+                outpath=path,
+                drv_path=path,
+                item_class=BROADCAST_ITEM_CLASS,
+            )
+        except Exception:  # noqa: BLE001 — placement is best-effort
+            logger.exception(
+                "BroadcastReceiver: record_self_has raised for %s",
+                path,
+            )
+
+    def _safe_url_map(self) -> dict[str, str]:
+        try:
+            url_map = self._peer_url_provider() or {}
+        except Exception:  # noqa: BLE001 — defensive
+            logger.exception(
+                "BroadcastReceiver: peer_url_provider raised"
+            )
+            return {}
+        # Normalize to a dict[str, str]; tolerate the (rare) case
+        # where a provider hands back ``items()``-style iterables.
+        try:
+            return dict(url_map)
+        except (TypeError, ValueError):
+            logger.exception(
+                "BroadcastReceiver: peer_url_provider yielded a "
+                "non-mappable %r", type(url_map).__name__,
+            )
+            return {}
+
+    def _enqueue_fanout(self, job: _BroadcastFanoutJob) -> None:
+        """Push a fan-out hop onto the worker queue (lazy start)."""
+        try:
+            self.start()
+        except RuntimeError:
+            # start-after-stop; the receiver is winding down, drop the
+            # cascade hop on the floor (best-effort gossip).
+            return
+        self._queue.put(job)
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:
+                with self._lock:
+                    if self._stopped:
+                        return
+                continue
+            self._dispatch(job)
+
+    def _dispatch(self, job: _BroadcastFanoutJob) -> None:
+        url_map = self._safe_url_map()
+        # Subtract self + origin at fan-out time (the contract is
+        # "provider returns full set"); also dedup URLs in case the
+        # provider repeats them.
+        targets: list[str] = []
+        seen: set[str] = set()
+        for pid, url in url_map.items():
+            if not url or pid == self._self_peer_id:
+                continue
+            if pid == job.origin_peer_id:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            targets.append(url)
+        if not targets:
+            logger.debug(
+                "BroadcastReceiver: no fan-out targets for broadcast "
+                "%s after subtracting self+origin",
+                job.broadcast_id,
+            )
+            return
+        try:
+            success, fail, failed = self._fan_out(
+                peer_urls=targets,
+                path=job.path,
+                size=job.size,
+                broadcast_id=job.broadcast_id,
+                origin_peer_id=self._self_peer_id,
+                hop_count=job.hop_count,
+                our_pubkey=self._our_pubkey,
+                timeout=self._timeout,
+            )
+        except Exception:  # noqa: BLE001 — worker stays alive
+            logger.exception(
+                "BroadcastReceiver: fan_out raised for broadcast %s",
+                job.broadcast_id,
+            )
+            return
+        logger.debug(
+            "BroadcastReceiver: cascade for %s → %d ok, %d fail "
+            "(targets=%d, hop=%d, failed=%s)",
+            job.broadcast_id, success, fail, len(targets),
+            job.hop_count, failed,
+        )
