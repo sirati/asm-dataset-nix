@@ -43,6 +43,15 @@ if TYPE_CHECKING:  # pragma: no cover - import only used for typing
         ProcessRow,
     )
 
+# Imported at module scope (not under TYPE_CHECKING) because the leak
+# checks raise/catch :class:`WorkerProbeError` at runtime. The probe
+# module is always available where the cluster invariants run; the
+# import would loop only if cluster_probe imported invariants, which
+# it does not.
+from compiler_suit_runner.tests.slurm.cluster_probe import (  # noqa: E402
+    WorkerProbeError,
+)
+
 __all__ = [
     "InvariantResult",
     "RunArtifacts",
@@ -81,13 +90,20 @@ _BIND_ERROR_RE: re.Pattern[str] = re.compile(
     r"Address already in use|EADDRINUSE"
 )
 
-# Match `task completed ... task_type=Some("variant") ... success=true`.
-# The structured logger emits keys as `task_type=Some("variant")` (Rust
-# `Option<&str>`); we accept the bare `task_type=variant` form too in case
-# a future framework version drops the `Some(...)` wrapper.
-_VARIANT_COMPLETED_RE: re.Pattern[str] = re.compile(
-    r"task completed.*?task_type=(?:Some\(\"variant\"\)|variant)"
-    r".*?success=true"
+# The framework emits assignment + completion on SEPARATE log lines,
+# linked by ``task_hash``:
+#
+#   primary assigned task ... task_type=variant   task_hash=XXXX
+#   task done            ... task_hash=Some("XXXX") success=true
+#
+# To count completed variants we have to cross-reference. The two
+# regexes below extract the hash from each line shape.
+_TASK_ASSIGNED_RE: re.Pattern[str] = re.compile(
+    r"primary assigned task.*?task_type=(?:Some\(\"(?P<vt1>variant)\"\)|(?P<vt2>variant))"
+    r".*?task_hash=(?P<hash>[0-9a-f]+)"
+)
+_TASK_DONE_OK_RE: re.Pattern[str] = re.compile(
+    r"task done.*?task_hash=Some\(\"(?P<hash>[0-9a-f]+)\"\).*?success=true"
 )
 
 # ``run_<YYYYMMDD>_<HHMMSS>`` (framework emits underscores, see
@@ -402,10 +418,15 @@ def check_manifest_count_matches(
     name = "manifest_count_matches"
     manifest_count = _count_variant_manifests(artifacts.manifests_dir)
 
-    completed = 0
+    variant_hashes: set[str] = set()
+    done_hashes: set[str] = set()
     for path in artifacts.slurm_out_files():
         text = _read_text(path)
-        completed += len(_VARIANT_COMPLETED_RE.findall(text))
+        for m in _TASK_ASSIGNED_RE.finditer(text):
+            variant_hashes.add(m.group("hash"))
+        for m in _TASK_DONE_OK_RE.finditer(text):
+            done_hashes.add(m.group("hash"))
+    completed = len(variant_hashes & done_hashes)
 
     if manifest_count != completed:
         return InvariantResult(
@@ -496,11 +517,17 @@ def check_no_leaked_containers(
 
     leaked_rows: list[PodmanRow] = []
     descriptions: list[str] = []
+    probe_errors: list[str] = []
 
     started_at = artifacts.started_at
 
     for worker in workers:
-        for row in probe.podman_ps(worker):
+        try:
+            rows_iter = probe.podman_ps(worker)
+        except WorkerProbeError as exc:
+            probe_errors.append(str(exc))
+            continue
+        for row in rows_iter:
             tagged = _container_matches_run(row, artifacts.run_id)
             in_window = False
             if not tagged and started_at is not None:
@@ -524,6 +551,17 @@ def check_no_leaked_containers(
             status="fail",
             rows=tuple(leaked_rows),
         )
+    if probe_errors:
+        return InvariantResult(
+            name=name,
+            passed=False,
+            detail=(
+                f"podman_ps probe failed on "
+                f"{len(probe_errors)}/{len(workers)} worker(s); cannot "
+                f"verify clean state: " + "; ".join(probe_errors)
+            ),
+            status="fail",
+        )
     return InvariantResult(
         name=name,
         passed=True,
@@ -541,11 +579,12 @@ def check_no_leaked_listener_ports(
     """Invariant 6: ``ss -lntp`` shows no listener on harmonia/peer_push
     ports bound by the run's UID.
 
-    Defaults: ports 5000 (harmonia) and 5050 (peer_push) per
-    smoke16-class leak postmortem. The check fetches the test runner's
-    UID from the cluster (probe convention: same SSH user as the
-    gateway login) and flags any listener whose ``uid`` matches AND
-    whose port is in the watch-list.
+    Defaults: ports 5000 (harmonia) and 6000 (peer_push at
+    ``harmonia_port + PUSH_PORT_OFFSET``) per smoke16-class leak
+    postmortem. The check fetches the test runner's UID from the
+    cluster (probe convention: same SSH user as the gateway login)
+    and flags any listener whose ``uid`` matches AND whose port is
+    in the watch-list.
 
     Listeners with no PID/UID surfaced (``ss`` may emit such rows for
     kernel-level listeners) are NOT flagged - they cannot belong to
@@ -553,16 +592,22 @@ def check_no_leaked_listener_ports(
     """
     name = "no_leaked_listener_ports"
     if ports is None:
-        ports = [5000, 5050]
+        ports = [5000, 6000]
     if not probe.is_reachable():
         return _skip_unreachable(name)
 
     runner_uid = _gateway_uid(probe)
     leaked_rows: list[ListenerRow] = []
     descriptions: list[str] = []
+    probe_errors: list[str] = []
 
     for worker in workers:
-        for row in probe.port_listeners(worker, ports):
+        try:
+            rows_iter = probe.port_listeners(worker, ports)
+        except WorkerProbeError as exc:
+            probe_errors.append(str(exc))
+            continue
+        for row in rows_iter:
             if row.uid is None or runner_uid is None:
                 # Without a UID we cannot attribute the listener; skip
                 # rather than blame an unrelated process.
@@ -583,6 +628,17 @@ def check_no_leaked_listener_ports(
             + "; ".join(descriptions),
             status="fail",
             rows=tuple(leaked_rows),
+        )
+    if probe_errors:
+        return InvariantResult(
+            name=name,
+            passed=False,
+            detail=(
+                f"port_listeners probe failed on "
+                f"{len(probe_errors)}/{len(workers)} worker(s); cannot "
+                f"verify clean state: " + "; ".join(probe_errors)
+            ),
+            status="fail",
         )
     return InvariantResult(
         name=name,
@@ -634,9 +690,15 @@ def check_no_leaked_processes(
 
     leaked_rows: list[ProcessRow] = []
     descriptions: list[str] = []
+    probe_errors: list[str] = []
 
     for worker in workers:
-        for row in probe.processes_by_pattern(worker, pattern):
+        try:
+            rows_iter = probe.processes_by_pattern(worker, pattern)
+        except WorkerProbeError as exc:
+            probe_errors.append(str(exc))
+            continue
+        for row in rows_iter:
             if row.ppid != 1:
                 continue
             etime_s = _parse_etime_seconds(row.etime)
@@ -657,6 +719,17 @@ def check_no_leaked_processes(
             + "; ".join(descriptions),
             status="fail",
             rows=tuple(leaked_rows),
+        )
+    if probe_errors:
+        return InvariantResult(
+            name=name,
+            passed=False,
+            detail=(
+                f"processes_by_pattern probe failed on "
+                f"{len(probe_errors)}/{len(workers)} worker(s); cannot "
+                f"verify clean state: " + "; ".join(probe_errors)
+            ),
+            status="fail",
         )
     return InvariantResult(
         name=name,

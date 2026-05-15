@@ -20,8 +20,13 @@ import pytest
 from compiler_suit_runner import peer_cache
 from compiler_suit_runner.peer_cache import (
     HarmoniaProcess,
+    PATHS_FILE_PREFIX,
+    PathPlacementWatcher,
     PeerInfo,
     PeerListWatcher,
+    PlacementDiff,
+    _compute_placement_diff,
+    _read_all_placement_files,
     announce_self,
     assemble_substituter_env,
     build_nix_extra_args,
@@ -140,6 +145,29 @@ def test_withdraw_self_removes_file(shared_fs: pathlib.Path) -> None:
 def test_withdraw_self_missing_is_ok(shared_fs: pathlib.Path) -> None:
     # No file present — must not raise.
     withdraw_self(shared_fs, "ghost")
+
+
+def test_withdraw_self_also_unlinks_paths_file(
+    shared_fs: pathlib.Path,
+) -> None:
+    """Other peers' :class:`PathPlacementWatcher` reads
+    ``_paths_<sid>.jsonl`` per tick and unions the records into the
+    aggregate map. A dead secondary's stale records would point
+    fetchers at an offline harmonia — withdraw_self must delete the
+    file so the next tick prunes our entries cluster-wide."""
+    announce_self(shared_fs, _mk_peer(1))
+    paths_file = (
+        shared_fs / "peers" / f"{PATHS_FILE_PREFIX}sec1.jsonl"
+    )
+    paths_file.write_text(
+        '{"secondary_id":"sec1","outpath":"/nix/store/x"}\n'
+    )
+    assert paths_file.exists()
+
+    withdraw_self(shared_fs, "sec1")
+
+    assert not (shared_fs / "peers" / "sec1.json").exists()
+    assert not paths_file.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -749,3 +777,486 @@ def test_harmonia_workers_param_lands_in_toml(
         assert "workers = 8" in cfg_path.read_text()
     finally:
         proc.stop()
+
+
+# ---------------------------------------------------------------------------
+# PathPlacementWatcher + _read_all_placement_files
+# ---------------------------------------------------------------------------
+
+
+def _write_paths_file(
+    shared_fs: pathlib.Path, sid: str, records: list[dict]
+) -> pathlib.Path:
+    target = shared_fs / "peers" / f"{PATHS_FILE_PREFIX}{sid}.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n",
+        encoding="utf-8",
+    )
+    return target
+
+
+def test_read_all_placement_files_aggregates_across_peers(
+    shared_fs: pathlib.Path,
+) -> None:
+    _write_paths_file(shared_fs, "sec1", [
+        {"secondary_id": "sec1", "outpath": "/nix/store/a"},
+        {"secondary_id": "sec1", "outpath": "/nix/store/b"},
+    ])
+    _write_paths_file(shared_fs, "sec2", [
+        {"secondary_id": "sec2", "outpath": "/nix/store/b"},
+        {"secondary_id": "sec2", "outpath": "/nix/store/c"},
+    ])
+    agg = _read_all_placement_files(shared_fs)
+    assert agg["/nix/store/a"] == {"sec1"}
+    assert agg["/nix/store/b"] == {"sec1", "sec2"}
+    assert agg["/nix/store/c"] == {"sec2"}
+
+
+def test_read_all_placement_files_ignores_non_paths_files(
+    shared_fs: pathlib.Path,
+) -> None:
+    """Only ``_paths_*.jsonl`` files contribute; regular peer files
+    (``<sid>.json``) and other junk in ``peers/`` are ignored."""
+    announce_self(shared_fs, _mk_peer(1))  # writes peers/sec1.json
+    (shared_fs / "peers" / "stray.txt").write_text(
+        '{"secondary_id":"x","outpath":"/nix/store/x"}\n'
+    )
+    _write_paths_file(shared_fs, "sec1", [
+        {"secondary_id": "sec1", "outpath": "/nix/store/a"},
+    ])
+    agg = _read_all_placement_files(shared_fs)
+    assert agg == {"/nix/store/a": {"sec1"}}
+
+
+def test_read_all_placement_files_missing_dir_returns_empty(
+    tmp_path: pathlib.Path,
+) -> None:
+    assert _read_all_placement_files(tmp_path / "nope") == {}
+
+
+def test_path_placement_watcher_initial_snapshot_primed(
+    shared_fs: pathlib.Path,
+) -> None:
+    """Constructor primes the snapshot once synchronously so a caller
+    reading right after ``__init__`` (before ``start()``) sees the
+    on-disk state — no race window where a stale empty map is
+    returned."""
+    _write_paths_file(shared_fs, "sec1", [
+        {"secondary_id": "sec1", "outpath": "/nix/store/a"},
+    ])
+    watcher = PathPlacementWatcher(shared_fs, tick_seconds=30.0)
+    try:
+        snap = watcher.snapshot()
+        assert snap == {"/nix/store/a": {"sec1"}}
+    finally:
+        watcher.stop()
+
+
+def test_path_placement_watcher_snapshot_is_a_copy(
+    shared_fs: pathlib.Path,
+) -> None:
+    _write_paths_file(shared_fs, "sec1", [
+        {"secondary_id": "sec1", "outpath": "/nix/store/a"},
+    ])
+    watcher = PathPlacementWatcher(shared_fs, tick_seconds=30.0)
+    try:
+        snap = watcher.snapshot()
+        # Mutating the snapshot does not mutate the watcher state.
+        snap["/nix/store/a"].add("intruder")
+        snap["/nix/store/new"] = {"x"}
+        assert watcher.snapshot() == {"/nix/store/a": {"sec1"}}
+    finally:
+        watcher.stop()
+
+
+def test_path_placement_watcher_request_refresh_wakes_loop(
+    shared_fs: pathlib.Path,
+) -> None:
+    """Push-side ``request_refresh`` must wake the watcher between
+    ticks so a new placement record is visible without waiting a
+    full poll cycle."""
+    watcher = PathPlacementWatcher(shared_fs, tick_seconds=30.0)
+    watcher.start()
+    try:
+        assert watcher.snapshot() == {}
+        _write_paths_file(shared_fs, "sec1", [
+            {"secondary_id": "sec1", "outpath": "/nix/store/a"},
+        ])
+        watcher.request_refresh()
+        assert _wait_until(
+            lambda: watcher.snapshot()
+            == {"/nix/store/a": {"sec1"}},
+            timeout=2.0,
+        ), watcher.snapshot()
+    finally:
+        watcher.stop()
+        watcher.join(timeout=2.0)
+
+
+def test_path_placement_watcher_handles_malformed_lines(
+    shared_fs: pathlib.Path,
+) -> None:
+    """One bad line must not lose every record in the file (lossy
+    parse, not lossy file)."""
+    target = shared_fs / "peers" / f"{PATHS_FILE_PREFIX}sec1.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        "\n".join([
+            "{not valid json",
+            json.dumps({"secondary_id": "sec1", "outpath": "/nix/store/a"}),
+            "[1,2,3]",  # not an object
+            json.dumps({"outpath": "/nix/store/b"}),  # missing sid
+            json.dumps({"secondary_id": "sec1", "outpath": "/nix/store/c"}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    agg = _read_all_placement_files(shared_fs)
+    # Only the two well-formed records survive.
+    assert agg == {
+        "/nix/store/a": {"sec1"},
+        "/nix/store/c": {"sec1"},
+    }
+
+
+def test_path_placement_watcher_stops_cleanly(
+    shared_fs: pathlib.Path,
+) -> None:
+    watcher = PathPlacementWatcher(shared_fs, tick_seconds=0.05)
+    watcher.start()
+    time.sleep(0.15)  # let it run a couple of ticks
+    watcher.stop()
+    watcher.join(timeout=2.0)
+    assert not watcher.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# PlacementDiff + diff callbacks (fallback K=3 repair signal)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_placement_diff_pure_addition() -> None:
+    diff = _compute_placement_diff(
+        {"A": {"s1"}},
+        {"A": {"s1", "s2"}, "B": {"s3"}},
+    )
+    assert diff.added == {"A": {"s2"}, "B": {"s3"}}
+    assert diff.removed == {}
+    assert not diff.is_empty()
+
+
+def test_compute_placement_diff_pure_removal() -> None:
+    diff = _compute_placement_diff(
+        {"A": {"s1", "s2"}, "B": {"s3"}},
+        {"A": {"s1"}},
+    )
+    assert diff.removed == {"A": {"s2"}, "B": {"s3"}}
+    assert diff.added == {}
+    assert not diff.is_empty()
+
+
+def test_compute_placement_diff_no_change() -> None:
+    same = {"A": {"s1", "s2"}, "B": {"s3"}}
+    diff = _compute_placement_diff(same, dict(same))
+    assert diff.is_empty()
+    assert diff.added == {}
+    assert diff.removed == {}
+
+
+def test_compute_placement_diff_mixed() -> None:
+    """Symmetric movement: one secondary appears, one disappears for
+    the same outpath. Both events surface in their respective maps."""
+    diff = _compute_placement_diff(
+        {"A": {"s1", "s2"}},
+        {"A": {"s1", "s3"}},
+    )
+    assert diff.added == {"A": {"s3"}}
+    assert diff.removed == {"A": {"s2"}}
+
+
+def test_register_diff_callback_fires_on_addition(
+    shared_fs: pathlib.Path,
+) -> None:
+    """A newly-arrived placement record (path-have) drives a non-empty
+    diff containing the holder in ``added``."""
+    received: list[PlacementDiff] = []
+    watcher = PathPlacementWatcher(shared_fs, tick_seconds=30.0)
+    watcher.register_diff_callback(received.append)
+    watcher.start()
+    try:
+        assert watcher.snapshot() == {}
+        _write_paths_file(shared_fs, "sec1", [
+            {"secondary_id": "sec1", "outpath": "/nix/store/a"},
+        ])
+        watcher.request_refresh()
+        assert _wait_until(lambda: bool(received), timeout=2.0), received
+        assert received[0].added == {"/nix/store/a": {"sec1"}}
+        assert received[0].removed == {}
+    finally:
+        watcher.stop()
+        watcher.join(timeout=2.0)
+
+
+def test_register_diff_callback_fires_on_removal(
+    shared_fs: pathlib.Path,
+) -> None:
+    """When a holder's ``_paths_<sid>.jsonl`` disappears (the
+    withdraw_self path), the diff carries that holder under
+    ``removed`` — the fallback signal for repair-on-death."""
+    _write_paths_file(shared_fs, "sec1", [
+        {"secondary_id": "sec1", "outpath": "/nix/store/a"},
+    ])
+    received: list[PlacementDiff] = []
+    watcher = PathPlacementWatcher(shared_fs, tick_seconds=30.0)
+    watcher.register_diff_callback(received.append)
+    watcher.start()
+    try:
+        # Initial prime saw sec1; now drop the file.
+        assert watcher.snapshot() == {"/nix/store/a": {"sec1"}}
+        (shared_fs / "peers" / f"{PATHS_FILE_PREFIX}sec1.jsonl").unlink()
+        watcher.request_refresh()
+        assert _wait_until(lambda: bool(received), timeout=2.0), received
+        assert received[0].removed == {"/nix/store/a": {"sec1"}}
+        assert received[0].added == {}
+    finally:
+        watcher.stop()
+        watcher.join(timeout=2.0)
+
+
+def test_register_diff_callback_silent_when_no_change(
+    shared_fs: pathlib.Path,
+) -> None:
+    """Identity-refresh (placements unchanged) does NOT fire the
+    callback — empty diffs are filtered upstream."""
+    _write_paths_file(shared_fs, "sec1", [
+        {"secondary_id": "sec1", "outpath": "/nix/store/a"},
+    ])
+    received: list[PlacementDiff] = []
+    watcher = PathPlacementWatcher(shared_fs, tick_seconds=30.0)
+    watcher.register_diff_callback(received.append)
+    watcher.start()
+    try:
+        # Several wakes with no file changes.
+        for _ in range(3):
+            watcher.request_refresh()
+            time.sleep(0.05)
+        assert received == [], received
+    finally:
+        watcher.stop()
+        watcher.join(timeout=2.0)
+
+
+def test_register_diff_callback_isolates_exceptions(
+    shared_fs: pathlib.Path,
+) -> None:
+    """A buggy callback must not take the watcher down OR prevent
+    later callbacks from firing in the same refresh."""
+    seen_second: list[PlacementDiff] = []
+
+    def boom(_diff: PlacementDiff) -> None:
+        raise RuntimeError("buggy callback")
+
+    watcher = PathPlacementWatcher(shared_fs, tick_seconds=30.0)
+    watcher.register_diff_callback(boom)
+    watcher.register_diff_callback(seen_second.append)
+    watcher.start()
+    try:
+        _write_paths_file(shared_fs, "sec1", [
+            {"secondary_id": "sec1", "outpath": "/nix/store/a"},
+        ])
+        watcher.request_refresh()
+        assert _wait_until(lambda: bool(seen_second), timeout=2.0), seen_second
+        assert seen_second[0].added == {"/nix/store/a": {"sec1"}}
+        # Watcher still alive.
+        assert watcher.is_alive()
+    finally:
+        watcher.stop()
+        watcher.join(timeout=2.0)
+
+
+def test_initial_prime_does_not_fire_diff_callback(
+    shared_fs: pathlib.Path,
+) -> None:
+    """Callbacks registered AFTER construction never see a synthetic
+    diff for the prime refresh (no previous state to diff against)."""
+    _write_paths_file(shared_fs, "sec1", [
+        {"secondary_id": "sec1", "outpath": "/nix/store/a"},
+    ])
+    received: list[PlacementDiff] = []
+    watcher = PathPlacementWatcher(shared_fs, tick_seconds=30.0)
+    # Register BEFORE start: still no prime-diff (the prime ran in
+    # __init__ before the callback registry was used).
+    watcher.register_diff_callback(received.append)
+    # No wake yet: nothing should arrive.
+    time.sleep(0.05)
+    assert received == []
+    watcher.stop()
+
+
+# ---------------------------------------------------------------------------
+# SubmitterPeer.seed_toolchain_drvs (Phase -1 toolchain drv flood-fill)
+# ---------------------------------------------------------------------------
+
+
+def _make_submitter_for_seed(
+    public_key: str = "submitter-pub:AAAA",
+) -> "peer_cache.SubmitterPeer":
+    """Construct a SubmitterPeer skipping ``start()`` and stub its key.
+
+    ``seed_toolchain_drvs`` only reads ``self._public_key`` and
+    ``self.peer_id`` / ``self.log``; no harmonia, no SSH, no polling
+    thread needed for these unit tests.
+    """
+    peer = peer_cache.SubmitterPeer(
+        gateway_url="ssh://user@gateway.example",
+        slurm_root="/srv/slurm",
+        local_port=5005,
+        gateway_port=5005,
+    )
+    peer._public_key = public_key  # type: ignore[attr-defined]
+    return peer
+
+
+def _write_drv(path: pathlib.Path, payload: bytes) -> str:
+    """Write *payload* to *path* and return the path as str."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return str(path)
+
+
+def test_seed_toolchain_drvs_empty_set_returns_zero_summary() -> None:
+    """An empty drv_set short-circuits without any peer_push call."""
+    peer = _make_submitter_for_seed()
+    result = peer.seed_toolchain_drvs(set(), "http://node1:6000")
+    assert result == {"sent": 0, "failed": 0, "failed_drvs": []}
+
+
+def test_seed_toolchain_drvs_happy_path_one_call_per_drv(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each drv triggers exactly one ``push_path_broadcast_offer`` call
+    with size from disk, fresh broadcast_id, origin=submitter, hop=0."""
+    drv_a = _write_drv(tmp_path / "a.drv", b"alpha" * 7)
+    drv_b = _write_drv(tmp_path / "b.drv", b"beta" * 11)
+    drv_c = _write_drv(tmp_path / "c.drv", b"gamma" * 13)
+    expected_sizes = {
+        drv_a: pathlib.Path(drv_a).stat().st_size,
+        drv_b: pathlib.Path(drv_b).stat().st_size,
+        drv_c: pathlib.Path(drv_c).stat().st_size,
+    }
+
+    calls: list[dict] = []
+
+    def fake_push(**kwargs):
+        calls.append(kwargs)
+        return {"dedup": False, "accepted": True}
+
+    from compiler_suit_runner import peer_push
+    monkeypatch.setattr(peer_push, "push_path_broadcast_offer", fake_push)
+
+    peer = _make_submitter_for_seed(public_key="submitter-pub:KEY")
+    target = "http://node1:6000"
+    result = peer.seed_toolchain_drvs({drv_a, drv_b, drv_c}, target)
+
+    assert result == {"sent": 3, "failed": 0, "failed_drvs": []}
+    assert len(calls) == 3
+    seen_drvs: set[str] = set()
+    seen_bids: set[str] = set()
+    for kw in calls:
+        assert kw["target_url"] == target
+        assert kw["origin_peer_id"] == peer.peer_id == "submitter"
+        assert kw["hop_count"] == 0
+        assert kw["our_pubkey"] == "submitter-pub:KEY"
+        assert kw["size"] == expected_sizes[kw["path"]]
+        # Fresh UUID-hex broadcast_id per call (32 hex chars).
+        assert isinstance(kw["broadcast_id"], str)
+        assert len(kw["broadcast_id"]) == 32
+        int(kw["broadcast_id"], 16)  # all-hex
+        seen_drvs.add(kw["path"])
+        seen_bids.add(kw["broadcast_id"])
+    assert seen_drvs == {drv_a, drv_b, drv_c}
+    assert len(seen_bids) == 3  # all distinct
+
+
+def test_seed_toolchain_drvs_partial_failure_records_failed_drvs(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A None response from push_path_broadcast_offer for one drv lands
+    it in ``failed_drvs`` while the rest of the set still succeeds."""
+    drv_ok1 = _write_drv(tmp_path / "ok1.drv", b"x" * 16)
+    drv_bad = _write_drv(tmp_path / "bad.drv", b"y" * 32)
+    drv_ok2 = _write_drv(tmp_path / "ok2.drv", b"z" * 48)
+
+    def fake_push(**kwargs):
+        if kwargs["path"] == drv_bad:
+            return None
+        return {"dedup": False, "accepted": True}
+
+    from compiler_suit_runner import peer_push
+    monkeypatch.setattr(peer_push, "push_path_broadcast_offer", fake_push)
+
+    peer = _make_submitter_for_seed()
+    result = peer.seed_toolchain_drvs(
+        {drv_ok1, drv_bad, drv_ok2}, "http://node1:6000",
+    )
+
+    assert result["sent"] == 2
+    assert result["failed"] == 1
+    assert result["failed_drvs"] == [drv_bad]
+
+
+def test_seed_toolchain_drvs_all_failure(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If every push returns None, sent=0 and failed_drvs lists all."""
+    drvs = {
+        _write_drv(tmp_path / f"drv{i}.drv", bytes([i]) * (8 + i))
+        for i in range(4)
+    }
+
+    from compiler_suit_runner import peer_push
+    monkeypatch.setattr(
+        peer_push, "push_path_broadcast_offer",
+        lambda **_kwargs: None,
+    )
+
+    peer = _make_submitter_for_seed()
+    result = peer.seed_toolchain_drvs(drvs, "http://node1:6000")
+
+    assert result["sent"] == 0
+    assert result["failed"] == 4
+    assert set(result["failed_drvs"]) == drvs
+
+
+def test_seed_toolchain_drvs_missing_file_lands_in_failed_drvs(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drv whose on-disk file is missing (stat raises OSError) is
+    recorded as a failure WITHOUT a peer_push call for that path."""
+    drv_ok = _write_drv(tmp_path / "ok.drv", b"present")
+    drv_missing = str(tmp_path / "nope.drv")  # never created
+
+    calls: list[dict] = []
+
+    def fake_push(**kwargs):
+        calls.append(kwargs)
+        return {"dedup": False, "accepted": True}
+
+    from compiler_suit_runner import peer_push
+    monkeypatch.setattr(peer_push, "push_path_broadcast_offer", fake_push)
+
+    peer = _make_submitter_for_seed()
+    result = peer.seed_toolchain_drvs(
+        {drv_ok, drv_missing}, "http://node1:6000",
+    )
+
+    assert result["sent"] == 1
+    assert result["failed"] == 1
+    assert result["failed_drvs"] == [drv_missing]
+    # Only the present drv was actually broadcast.
+    assert len(calls) == 1
+    assert calls[0]["path"] == drv_ok
