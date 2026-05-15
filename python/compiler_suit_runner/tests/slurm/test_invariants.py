@@ -44,9 +44,15 @@ from compiler_suit_runner.tests.slurm.invariants import (
 # ---------------------------------------------------------------------------
 
 
-# A minimal slurm_<jobid>.out tail mirroring the real format (ANSI
-# escapes, ``task completed ... task_type=Some("variant") ...
-# success=true``, success markers near the end).
+# A minimal slurm_<jobid>.out tail mirroring the real framework log
+# shape. The framework emits assignment + completion as SEPARATE
+# lines, linked by ``task_hash``:
+#
+#   primary assigned task ... task_type=variant   task_hash=XXXX
+#   task done            ... task_hash=Some("XXXX") success=true
+#
+# The invariant cross-references the two to identify completed
+# variants vs. completed toolchains.
 _OUT_HEAD = textwrap.dedent(
     """\
     \x1b[2m2026-05-08T09:07:50Z\x1b[0m INFO _native::cli: starting secondary
@@ -54,23 +60,37 @@ _OUT_HEAD = textwrap.dedent(
     """
 )
 
-_VARIANT_LINE = (
+_VARIANT_ASSIGN = (
+    '\x1b[2m2026-05-08T09:08:42Z\x1b[0m INFO '
+    '\x1b[2mdynrunner_manager_distributed::secondary::primary\x1b[0m: '
+    'primary assigned task secondary=secondary-0 worker_id=0 '
+    'task_id=Some("variant__x86_64-linux__hello-x86_64-clang10-O0") '
+    'phase=phase_build task_type=variant '
+    'task_hash=a83ece0a80571a68 remaining=1\n'
+)
+_VARIANT_DONE = (
     '\x1b[2m2026-05-08T09:08:42Z\x1b[0m INFO '
     '\x1b[2mdynrunner_manager_distributed::secondary::processing\x1b[0m: '
-    'task completed secondary=secondary-0 worker_id=0 '
-    'task_id=Some("variant__x86_64-linux__hello-x86_64-clang10-O0") '
-    'phase=Some("phase_build") task_type=Some("variant") '
+    'task done worker_id=0 '
     'task_hash=Some("a83ece0a80571a68") success=true\n'
 )
+_VARIANT_LINE = _VARIANT_ASSIGN + _VARIANT_DONE
 
-_TOOLCHAIN_LINE = (
+_TOOLCHAIN_ASSIGN = (
+    '\x1b[2m2026-05-08T09:08:15Z\x1b[0m INFO '
+    '\x1b[2mdynrunner_manager_distributed::secondary::primary\x1b[0m: '
+    'primary assigned task secondary=secondary-0 worker_id=0 '
+    'task_id=Some("toolchain__x86_64-linux__x86_64__clang10") '
+    'phase=phase_build task_type=toolchain '
+    'task_hash=34cc7b97b9033a15 remaining=2\n'
+)
+_TOOLCHAIN_DONE = (
     '\x1b[2m2026-05-08T09:08:15Z\x1b[0m INFO '
     '\x1b[2mdynrunner_manager_distributed::secondary::processing\x1b[0m: '
-    'task completed secondary=secondary-0 worker_id=0 '
-    'task_id=Some("toolchain__x86_64-linux__x86_64__clang10") '
-    'phase=Some("phase_build") task_type=Some("toolchain") '
+    'task done worker_id=0 '
     'task_hash=Some("34cc7b97b9033a15") success=true\n'
 )
+_TOOLCHAIN_LINE = _TOOLCHAIN_ASSIGN + _TOOLCHAIN_DONE
 
 _OUT_TAIL = textwrap.dedent(
     """\
@@ -86,9 +106,29 @@ _OUT_TAIL = textwrap.dedent(
 )
 
 
+def _variant_line(idx: int) -> str:
+    """Emit one assignment + completion pair with a unique task_hash."""
+    h = f"a83ece0a8057{idx:04x}"
+    assign = (
+        '\x1b[2m2026-05-08T09:08:42Z\x1b[0m INFO '
+        '\x1b[2mdynrunner_manager_distributed::secondary::primary\x1b[0m: '
+        'primary assigned task secondary=secondary-0 worker_id=0 '
+        f'task_id=Some("variant__x86_64-linux__hello-x86_64-clang10-O0-{idx}") '
+        'phase=phase_build task_type=variant '
+        f'task_hash={h} remaining=1\n'
+    )
+    done = (
+        '\x1b[2m2026-05-08T09:08:42Z\x1b[0m INFO '
+        '\x1b[2mdynrunner_manager_distributed::secondary::processing\x1b[0m: '
+        'task done worker_id=0 '
+        f'task_hash=Some("{h}") success=true\n'
+    )
+    return assign + done
+
+
 def _write_out(path: Path, *, variant_count: int) -> None:
     parts = [_OUT_HEAD, _TOOLCHAIN_LINE]
-    parts.extend(_VARIANT_LINE for _ in range(variant_count))
+    parts.extend(_variant_line(i) for i in range(variant_count))
     parts.append(_OUT_TAIL)
     path.write_text("".join(parts), encoding="utf-8")
 

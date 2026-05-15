@@ -90,13 +90,20 @@ _BIND_ERROR_RE: re.Pattern[str] = re.compile(
     r"Address already in use|EADDRINUSE"
 )
 
-# Match `task completed ... task_type=Some("variant") ... success=true`.
-# The structured logger emits keys as `task_type=Some("variant")` (Rust
-# `Option<&str>`); we accept the bare `task_type=variant` form too in case
-# a future framework version drops the `Some(...)` wrapper.
-_VARIANT_COMPLETED_RE: re.Pattern[str] = re.compile(
-    r"task completed.*?task_type=(?:Some\(\"variant\"\)|variant)"
-    r".*?success=true"
+# The framework emits assignment + completion on SEPARATE log lines,
+# linked by ``task_hash``:
+#
+#   primary assigned task ... task_type=variant   task_hash=XXXX
+#   task done            ... task_hash=Some("XXXX") success=true
+#
+# To count completed variants we have to cross-reference. The two
+# regexes below extract the hash from each line shape.
+_TASK_ASSIGNED_RE: re.Pattern[str] = re.compile(
+    r"primary assigned task.*?task_type=(?:Some\(\"(?P<vt1>variant)\"\)|(?P<vt2>variant))"
+    r".*?task_hash=(?P<hash>[0-9a-f]+)"
+)
+_TASK_DONE_OK_RE: re.Pattern[str] = re.compile(
+    r"task done.*?task_hash=Some\(\"(?P<hash>[0-9a-f]+)\"\).*?success=true"
 )
 
 # ``run_<YYYYMMDD>_<HHMMSS>`` (framework emits underscores, see
@@ -411,10 +418,15 @@ def check_manifest_count_matches(
     name = "manifest_count_matches"
     manifest_count = _count_variant_manifests(artifacts.manifests_dir)
 
-    completed = 0
+    variant_hashes: set[str] = set()
+    done_hashes: set[str] = set()
     for path in artifacts.slurm_out_files():
         text = _read_text(path)
-        completed += len(_VARIANT_COMPLETED_RE.findall(text))
+        for m in _TASK_ASSIGNED_RE.finditer(text):
+            variant_hashes.add(m.group("hash"))
+        for m in _TASK_DONE_OK_RE.finditer(text):
+            done_hashes.add(m.group("hash"))
+    completed = len(variant_hashes & done_hashes)
 
     if manifest_count != completed:
         return InvariantResult(
