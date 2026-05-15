@@ -124,6 +124,25 @@ class RunInvocation:
     slurm_partition: Optional[str] = None
     slurm_time_limit: Optional[str] = None
     slurm_cpus_per_task: Optional[int] = None
+    # Framework's ``--cores N`` knob (post-9ca9124 per-machine plumbing).
+    # Controls how many ``dynrunner_manager_local::pool`` workers each
+    # secondary spawns. ``None`` leaves the framework default ("-0" =
+    # all detected host cores). The slurm-test-env workers expose 2
+    # CPUs each, but ``available_parallelism`` inside the container
+    # sees the HOST's 32 cores (cgroup CPU quota isn't reflected in
+    # /proc/cpuinfo), so without explicit ``cores`` each secondary
+    # auto-spawns 32 workers — fork-storming past the per-job cgroup's
+    # nproc limit before the workload even starts. Set this explicitly
+    # to match ``slurm_cpus_per_task``.
+    cores: Optional[int] = None
+    # Framework's ``--max-memory`` knob (post-57d7ee8 SLURM plumbing,
+    # symmetric to ``--cores``). Without it, the secondary's argparse
+    # default ``-2G`` resolves locally against its OWN /proc/meminfo,
+    # which inside a podman container reads the HOST's full RAM
+    # (~96 GiB on the dev box) rather than the 4 GiB cgroup cap.
+    # Set explicitly to the cgroup envelope (e.g. ``"3G"``) until the
+    # framework's cgroup-aware autodetect lands (#31).
+    max_memory: Optional[str] = None
     ssh_identity_file: Optional[pathlib.Path] = None
     ssh_config: Optional[pathlib.Path] = None
     variant_sample: Optional[int] = None
@@ -164,6 +183,10 @@ class RunInvocation:
             argv += ["--slurm-time-limit", self.slurm_time_limit]
         if self.slurm_cpus_per_task is not None:
             argv += ["--slurm-cpus-per-task", str(self.slurm_cpus_per_task)]
+        if self.cores is not None:
+            argv += ["--cores", str(self.cores)]
+        if self.max_memory is not None:
+            argv += ["--max-memory", self.max_memory]
         if self.ssh_identity_file is not None:
             argv += ["--ssh-identity-file", str(self.ssh_identity_file)]
         if self.ssh_config is not None:
@@ -338,9 +361,42 @@ def default_invocation_for_smoke(
     return RunInvocation(
         shared_fs=shared_fs if shared_fs is not None else _default_shared_fs(),
         packages=("hello",),
+        # Narrow to native x86_64 only. The slurm-test-env contract is a
+        # 3.5 GiB / worker memory envelope (intentional, not a
+        # misconfiguration — surfaces memory-greedy workloads in CI).
+        # Cross-toolchain variants (e.g. clang10-aarch64) drag in heavy
+        # cross-LLVM builds that fork-storm past that envelope: even
+        # after dynrunner's #20 (`--ulimit nproc=32768` on the podman
+        # wrapper) and the per-machine `--cores` plumbing, the inner
+        # nix-build sandbox hits `fork: Resource temporarily
+        # unavailable` on configure's recursive fan-out. Tests of the
+        # SLURM dispatch path are orthogonal to compiler family, so we
+        # narrow to native here and keep all rows inside the envelope.
+        archs=("x86_64",),
         multi_computer="slurm",
         packaging="podman",
         jobs=jobs,
+        # Pin to 2 workers per secondary, matching the slurm-test-env's
+        # WORKER_CPUS=2 and our slurm_cpus_per_task=2. Without this the
+        # framework's --cores defaults to "-0" (all available) and
+        # available_parallelism returns 32 inside the container,
+        # immediately fork-storming the new per-job cgroup.
+        cores=2,
+        # Tight nominal memory budget to absorb the
+        # ``ResourceStealingScheduler``'s descending per-worker
+        # ``budget_mb`` over-allocation. The scheduler's design
+        # **intentionally** sums per-worker budgets above the total
+        # (worker 0 = max, worker 1 = max/2, ...) so worker 0 can
+        # take a large task when worker 1 is idle — confirmed
+        # by dynrunner-owner as design intent for resource-stealing
+        # workloads. With the autodetect (#31) seeing the 4 GiB
+        # worker cgroup cap and the default ``-2G`` math yielding
+        # 2 GiB nominal, the per-worker sum was still 4096+2198=
+        # 6.2 GiB and concurrent variant builds OOM-killed the whole
+        # cgroup. Pinning to ``"2G"`` gives worker 0 max=2G + worker 1
+        # max=1G + framework overhead ≈ 3 GiB declared, fitting
+        # comfortably under 4 GiB even under concurrent peak.
+        max_memory="2G",
         gateway=SLURM_TEST_ENV_GATEWAY_URL,
         slurm_root_folder=SLURM_TEST_ENV_GATEWAY_ROOT,
         slurm_partition="debug",

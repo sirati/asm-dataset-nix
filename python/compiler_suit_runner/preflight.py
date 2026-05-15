@@ -27,7 +27,7 @@ import random
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Optional
 
 from compiler_suit_runner.partition import VariantSpec
@@ -377,6 +377,12 @@ def _parse_compiler_major(version: str) -> Optional[int]:
     return int(m.group(1)) if m is not None else None
 
 
+def _parse_compiler_minor(version: str) -> int:
+    """Best-effort parse of the minor version (0 if absent)."""
+    m = re.match(r"^\d+\.(\d+)", version)
+    return int(m.group(1)) if m is not None else 0
+
+
 # --- Primitives ----------------------------------------------------------
 #
 # Every rule below is one of three shapes:
@@ -531,6 +537,28 @@ def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
             f"{family} {major} sourced from legacy nixpkgs cannot link "
             f"{march}: missing {_LEGACY_BROKEN_MARCH[march]}"
         )
+
+    # Per-(arch, compiler-version) broken combos — the wrapper builds,
+    # ABI flags are right, hardening is stripped, but the variant
+    # build still fails for compiler-internal reasons (no
+    # integrated-as for that target+version, autoconf-vs-direct
+    # divergence, etc.). Lib/architectures.nix's brokenClangVersions
+    # is the source of truth on the Nix side; Python mirrors it
+    # via compiler_suit_runner.compiler_flag_support so the runner
+    # never enumerates these even if the Nix matrix gate is
+    # accidentally bypassed.
+    arch = meta_entry.get("arch", "")
+    minor = _parse_compiler_minor(meta_entry.get("compilerVersion", ""))
+    if family in ("gcc", "clang") and arch and major:
+        try:
+            from compiler_suit_runner.compiler_flag_support import is_known_broken
+            reason = is_known_broken(arch, family, major, minor)
+            if reason is not None:
+                return (
+                    f"{family} {major}.{minor} on {arch}: known-broken — {reason}"
+                )
+        except Exception:  # noqa: BLE001 — module-import safety
+            pass
 
     return None
 
@@ -1093,3 +1121,113 @@ def filter_existing_variants(
         else:
             remaining.append(variant)
     return tuple(remaining), skipped
+
+
+# ---------------------------------------------------------------------------
+# Local toolchain validation + realisation
+# ---------------------------------------------------------------------------
+
+
+class PreflightError(RuntimeError):
+    """Raised when preflight detects a state the dispatch cannot recover
+    from on its own — e.g. missing toolchains while remote-build is off.
+
+    Subclass of :class:`RuntimeError` so callers that already catch the
+    broader exception keep working; the dedicated type lets the CLI
+    surface a clean ``error:`` line without a traceback for known
+    failure modes.
+    """
+
+
+def check_toolchains_locally(
+    toolchain_drvs: frozenset[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> frozenset[str]:
+    """Return the subset of toolchain drvs not yet realised locally.
+
+    For each drv path in ``toolchain_drvs``, runs
+    ``nix path-info <drv>^*`` (one invocation per drv) and treats a
+    non-zero exit as "outputs are missing". ``^*`` expands to every
+    output of the drv, so a partially-realised toolchain (e.g. ``lib``
+    present but ``out`` missing) is correctly flagged as missing.
+
+    Returns a :class:`frozenset` so the caller can compare cheaply
+    against the full toolchain set without re-allocating.
+    """
+    runner = run_subprocess or _default_run_subprocess
+    missing: set[str] = set()
+    for drv in toolchain_drvs:
+        if not drv:
+            continue
+        cmd = [
+            "nix",
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "path-info",
+            f"{drv}^*",
+        ]
+        _stdout, _stderr, rc = runner(cmd)
+        if rc != 0:
+            missing.add(drv)
+    return frozenset(missing)
+
+
+def query_initial_toolchain_placement(
+    toolchain_outpaths: Iterable[str],
+) -> dict[str, list[str]]:
+    """Return the K=3 placement map for *toolchain_outpaths* at submit.
+
+    On the primary at submit time the placement map is typically
+    empty: no secondary has fetched the toolchains yet, and the
+    primary itself does NOT count toward K (per plan: primary may
+    disconnect; K is about secondary redundancy). The map converges
+    via cascade as soon as secondaries start fetching.
+
+    Returns ``{outpath: []}`` for every outpath so callers can iterate
+    keys without ``KeyError`` checks; empty lists mean "no preference"
+    when read by :func:`manifest_gen.emit_all_manifests`.
+
+    Function exists so the plumbing exists; in a future revision we
+    may pre-seed placement based on a "submitter-as-peer" observation,
+    but for now this is intentionally trivial.
+    """
+    return {op: [] for op in toolchain_outpaths if op}
+
+
+def build_toolchains_locally(
+    toolchain_drvs: frozenset[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> None:
+    """Realise every toolchain drv in the local nix store.
+
+    Calls ``nix build <drv>^* --no-link`` per drv (sequentially —
+    nix handles internal parallelism). On the first non-zero exit,
+    raises :class:`PreflightError` with the stderr snippet so the
+    operator can see why the build aborted.
+
+    ``--no-link`` avoids polluting the cwd with ``result`` symlinks;
+    the build artefacts land in the store regardless and the
+    placement gossip will be written from the first secondary that
+    pulls them.
+    """
+    runner = run_subprocess or _default_run_subprocess
+    for drv in sorted(toolchain_drvs):
+        if not drv:
+            continue
+        cmd = [
+            "nix",
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "build",
+            f"{drv}^*",
+            "--no-link",
+        ]
+        _stdout, stderr, rc = runner(cmd)
+        if rc != 0:
+            decoded = stderr.decode("utf-8", errors="replace").strip()
+            raise PreflightError(
+                f"local toolchain build failed for {drv} (rc={rc}): "
+                f"{decoded[-1000:]}"
+            )

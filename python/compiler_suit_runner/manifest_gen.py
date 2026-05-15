@@ -43,6 +43,7 @@ ItemClass = Literal[
     "phase1a_partition",
     "phase1b_merge",
     "phase2_toolchain",
+    "phase2_toolchain_validate",
     "phase2_common_dep",
     "phase3_variant",
 ]
@@ -55,6 +56,7 @@ _ALL_ITEM_CLASSES: tuple[ItemClass, ...] = (
     "phase1a_partition",
     "phase1b_merge",
     "phase2_toolchain",
+    "phase2_toolchain_validate",
     "phase2_common_dep",
     "phase3_variant",
 )
@@ -197,6 +199,51 @@ def make_toolchain_header(
     )
 
 
+def make_toolchain_validate_header(
+    sys_name: str,
+    arch: str,
+    compiler_label: str,
+    drv: str,
+    outpath: str | None = None,
+) -> ManifestHeader:
+    """Build a phase-2 toolchain *validate-only* manifest.
+
+    Emitted instead of :func:`make_toolchain_header` when the dispatch
+    runs with ``--allow-toolchain-build`` off (the default). The
+    build_worker handler for this class fetches the toolchain from a
+    peer (primary first per the placement map) instead of building
+    from source; the primary is responsible for having every
+    toolchain output already realised before dispatch.
+
+    Payload mirrors :func:`make_toolchain_header` so dispatch code
+    paths that key off the ``drv`` / ``attr`` / ``compiler_label``
+    fields keep working; the differentiator is the ``item_class``
+    string + the ``validate_only`` flag (set as a belt-and-braces
+    marker for forward compatibility if we want to thread per-item
+    behaviour through the validate path later). ``outpath`` is the
+    realised store path of the drv's ``out`` output; when present
+    the worker can skip ``nix derivation show`` and go straight to
+    a path-info check.
+    """
+    payload: dict = {
+        "sys": sys_name,
+        "arch": arch,
+        "compiler_label": compiler_label,
+        "attr": f"_crossToolchainMap.{sys_name}.{arch}.{compiler_label}",
+        "drv": drv,
+        "validate_only": True,
+    }
+    if outpath is not None:
+        payload["outpath"] = outpath
+    return ManifestHeader(
+        item_class="phase2_toolchain_validate",
+        name=f"toolchain_validate__{arch}__{compiler_label}",
+        size=0,
+        payload=payload,
+        task_id=toolchain_task_id(sys_name, arch, compiler_label),
+    )
+
+
 def make_common_dep_header(drv: str, label: str) -> ManifestHeader:
     """Build a phase-2 common host-dep manifest.
 
@@ -229,7 +276,12 @@ def _label_to_attr_suffix(label: str) -> str:
 
 
 def make_variant_header(
-    variant: VariantSpec, sys_name: str
+    variant: VariantSpec,
+    sys_name: str,
+    *,
+    input_drvs: Optional[frozenset[str]] = None,
+    drv_outpaths: Optional[dict[str, str]] = None,
+    preferred_secondaries: Optional[list[str]] = None,
 ) -> ManifestHeader:
     """Build a phase-3 variant manifest.
 
@@ -239,6 +291,23 @@ def make_variant_header(
     toolchain has been built/substituted, eliminating the worker-slot
     waste of variants spinning on nix-daemon's build-lock waiting for
     their toolchain to come online.
+
+    ``input_drvs`` (when provided) carries the variant's transitive
+    ``inputDrvs`` set — every drv path the variant build can read
+    from the local store. ``drv_outpaths`` maps each drv to its
+    realised ``outputs.out.path``. The pair is embedded in the
+    variant payload so the secondary's build_worker can pre-fetch
+    input deps from the cluster placement map before the actual
+    ``nix build``. When either is absent, no pre-fetch list is
+    emitted and the variant falls back to nix's native substituter
+    resolution (cache.nixos.org + the peer federation).
+
+    ``preferred_secondaries`` carries the K=3 scheduling-affinity
+    hint: the list of secondary-ids known (at manifest-emission time)
+    to hold this variant's toolchain. The framework scheduler reads
+    it and prefers a candidate from the list when a free worker is
+    available there (see plan: Framework Ask #2 — requires upstream
+    support to take effect). Empty / ``None`` = no preference.
     """
     pkg = variant["pkg"]
     arch = variant["arch"]
@@ -264,6 +333,21 @@ def make_variant_header(
         "tier": variant["tier"],
         "attr": f"dataset.{sys_name}.{pkg}.{arch}.{suffix}",
     }
+    if input_drvs and drv_outpaths:
+        # Only ship the inputs that we actually have an outpath
+        # mapping for; the rest stay implicit (worker falls back to
+        # native substituter resolution). Sorted for deterministic
+        # JSON output so manifest diffs stay readable across runs.
+        kept_inputs = sorted(d for d in input_drvs if d in drv_outpaths)
+        if kept_inputs:
+            payload["input_drvs"] = kept_inputs
+            payload["input_outpaths"] = {
+                d: drv_outpaths[d] for d in kept_inputs
+            }
+    if preferred_secondaries:
+        # Deterministic order so manifest diffs are stable; the
+        # scheduler treats this as an unordered preference set anyway.
+        payload["preferred_secondaries"] = sorted(preferred_secondaries)
     return ManifestHeader(
         item_class="phase3_variant",
         name=label,
@@ -419,6 +503,10 @@ def emit_all_manifests(
     common_deps: Iterable[tuple[str, str]],
     num_workers: int = 1,
     toolchain_drvs: Optional[dict[tuple[str, str], str]] = None,
+    allow_toolchain_build: bool = False,
+    per_variant_inputs: Optional[dict[str, frozenset[str]]] = None,
+    drv_outpaths: Optional[dict[str, str]] = None,
+    toolchain_outpath_placements: Optional[dict[str, list[str]]] = None,
 ) -> ManifestSet:
     """Produce one ManifestHeader per queue item; write each to disk.
 
@@ -427,6 +515,18 @@ def emit_all_manifests(
     (toolchains then common_deps), phase3 variants. Phase ordering is
     enforced by the framework's :class:`PhaseSpec.depends_on` graph;
     no explicit barrier sentinels are emitted.
+
+    ``allow_toolchain_build`` flips phase-2 toolchain emission between
+    the legacy build-from-source ``phase2_toolchain`` class (True) and
+    the new validate-only ``phase2_toolchain_validate`` class (False,
+    the default for production dispatches).
+
+    ``per_variant_inputs`` + ``drv_outpaths`` (both optional) carry
+    the per-variant transitive ``inputDrvs`` sets and the global
+    drv→outpath mapping. When both are present, each variant
+    manifest's payload gets ``input_drvs`` + ``input_outpaths``
+    fields so the secondary's build_worker can pre-fetch deps from
+    the cluster placement map before the build.
 
     ``num_workers`` is accepted for API compatibility with older
     callers; it is no longer used (the framework sizes its worker pool
@@ -469,17 +569,55 @@ def emit_all_manifests(
     # substitute) instead of ``nix build <flake>#<attr>`` (which
     # would need flake.nix shipped to the secondary).
     tc_drvs = toolchain_drvs or {}
+    outpaths_map = drv_outpaths or {}
     for arch, compiler_label in toolchain_specs:
         drv = tc_drvs.get((arch, compiler_label))
-        headers.append(
-            make_toolchain_header(sys_name, arch, compiler_label, drv=drv)
-        )
+        if allow_toolchain_build or not drv:
+            # Fall back to the build header when either:
+            #  - the operator opted in via --allow-toolchain-build, or
+            #  - we don't have a resolved drv path (validate-only
+            #    can't fetch by-outpath without the drv → outpath
+            #    mapping). The latter typically means
+            #    eval_toolchain_drvs failed on the primary; logging
+            #    here would be noisy because emit_all_manifests is
+            #    also called from cached-preflight restoration. The
+            #    CLI's primary-side toolchain check is the loud
+            #    "no drv resolved" signal.
+            headers.append(
+                make_toolchain_header(sys_name, arch, compiler_label, drv=drv)
+            )
+        else:
+            headers.append(
+                make_toolchain_validate_header(
+                    sys_name, arch, compiler_label, drv,
+                    outpath=outpaths_map.get(drv),
+                )
+            )
     for drv, label in common_deps:
         headers.append(make_common_dep_header(drv, label))
 
-    # Phase 3 — variants.
+    # Phase 3 — variants. Inputs map keys by ``variant['label']``
+    # (matches compute_partition_locally's per_variant dict).
+    inputs_by_label = per_variant_inputs or {}
+    placements_by_outpath = toolchain_outpath_placements or {}
     for variant in variants_tuple:
-        headers.append(make_variant_header(variant, sys_name))
+        # K=3 scheduling affinity: look up the variant's toolchain
+        # drv → outpath → placement holders. Empty list when the
+        # toolchain hasn't been placed yet (typical at submit time).
+        tc_drv = tc_drvs.get((variant["arch"], variant["compiler_id"]))
+        preferred: Optional[list[str]] = None
+        if tc_drv:
+            tc_outpath = outpaths_map.get(tc_drv)
+            if tc_outpath:
+                preferred = placements_by_outpath.get(tc_outpath) or None
+        headers.append(
+            make_variant_header(
+                variant, sys_name,
+                input_drvs=inputs_by_label.get(variant["label"]),
+                drv_outpaths=outpaths_map if outpaths_map else None,
+                preferred_secondaries=preferred,
+            )
+        )
 
     for header in headers:
         write_manifest(target_dir, header)

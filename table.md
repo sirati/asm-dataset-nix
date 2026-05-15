@@ -1,5 +1,5 @@
-- **Passed**: 256
-- **Failed**: 41
+- **Passed**: 269
+- **Failed**: 28
 - **Skipped** (after first failure): 0
 - **Unsupported** (below minimum compiler version): 63
 
@@ -34,14 +34,50 @@
 | clang12    | OK        | OK        | OK        | n/a       | OK        | OK        | FAIL      | OK        | OK        |
 | clang11    | OK        | OK        | OK        | n/a       | OK        | OK        | FAIL      | OK        | OK        |
 | clang10    | OK        | OK        | OK        | n/a       | OK        | OK        | FAIL      | OK        | OK        |
-| clang9     | OK        | OK        | OK        | n/a       | OK        | OK        | FAIL      | OK        | FAIL      |
+| clang9     | OK        | OK        | OK        | n/a       | OK        | OK        | FAIL      | OK        | OK        |
 | clang8     | OK        | OK        | OK        | n/a       | OK        | OK        | FAIL      | OK        | n/a       |
-| clang7     | OK        | OK        | OK        | n/a       | OK        | FAIL      | FAIL      | FAIL      | n/a       |
-| clang6     | OK        | OK        | OK        | n/a       | OK        | FAIL      | FAIL      | FAIL      | n/a       |
-| clang5     | OK        | OK        | OK        | n/a       | OK        | FAIL      | FAIL      | FAIL      | n/a       |
-| clang4     | OK        | OK        | OK        | n/a       | OK        | FAIL      | OK        | OK        | n/a       |
-| clang3_9   | OK        | OK        | OK        | n/a       | OK        | FAIL      | OK        | OK        | n/a       |
-| clang3_8   | OK        | OK        | OK        | n/a       | OK        | FAIL      | OK        | OK        | n/a       |
-| clang3_7   | OK        | OK        | OK        | n/a       | OK        | FAIL      | OK        | OK        | n/a       |
-| clang3_5   | OK        | FAIL      | OK        | n/a       | OK        | FAIL      | OK        | FAIL      | n/a       |
-| clang3_4   | OK        | OK        | OK        | n/a       | OK        | FAIL      | OK        | FAIL      | n/a       |
+| clang7     | OK        | OK        | OK        | n/a       | OK        | OK        | FAIL      | OK        | n/a       |
+| clang6     | OK        | OK        | OK        | n/a       | OK        | OK        | FAIL      | OK        | n/a       |
+| clang5     | OK        | OK        | OK        | n/a       | OK        | OK        | FAIL      | OK        | n/a       |
+| clang4     | OK        | OK        | OK        | n/a       | OK        | OK        | OK        | OK        | n/a       |
+| clang3_9   | OK        | OK        | OK        | n/a       | OK        | OK        | OK        | OK        | n/a       |
+| clang3_8   | OK        | OK        | OK        | n/a       | OK        | OK        | OK        | OK        | n/a       |
+| clang3_7   | OK        | OK        | OK        | n/a       | OK        | OK        | OK        | OK        | n/a       |
+| clang3_5   | OK        | FAIL      | OK        | n/a       | OK        | OK        | OK        | FAIL      | n/a       |
+| clang3_4   | OK        | OK        | OK        | n/a       | OK        | OK        | OK        | FAIL      | n/a       |
+
+## Recovered combinations (this run)
+
+The following 13 (arch, compiler) entries were FAIL in the previous
+revision of this table but PASS now after three patches in
+`lib/old-compilers.nix`:
+
+| arch     | compiler                   | fix                                              |
+|----------|----------------------------|--------------------------------------------------|
+| mips64el | clang3_4 .. clang7 (9)     | `-mabi=n32` injected via abiFlagsFor             |
+| ppc64    | clang5, clang6, clang7 (3) | (stale table entries; verified PASS as-is)       |
+| riscv64  | clang9 (1)                 | `-mabi=lp64d -march=rv64gc` via abiFlagsFor      |
+
+Plus the `meta.priority = "10"` (string→int) coercion in
+`fixMetaPriority` that recovered native `x86_64 + gcc4_4/4_5/4_6`
+from flake-attr resolution (those toolchains were always FAIL — now
+they build).
+
+Plus the `strictflexarrays1`/`strictflexarrays3` additions in
+`getClangUnsupportedHardeningFlags` for clang < 16; this stopped
+`-fstrict-flex-arrays=1` from leaking into clang3.4-15's argv via
+modern nix-default hardening, which had been silently breaking all
+clang < 16 variant builds at autoconf's first compile test.
+
+## Remaining permanent FAILures (3)
+
+| arch     | compiler | reason                                                   |
+|----------|----------|----------------------------------------------------------|
+| ppc64    | clang3_4 | clang 3.x has no integrated-as for ppc64 + no external `as` on PATH |
+| ppc64    | clang3_5 | (same)                                                   |
+| aarch64  | clang3_5 | manual compile works, variant build fails (autoconf-vs-direct divergence) |
+
+Plus the 25 matrix-level "FAIL"s (these are dropped at evaluation
+time by `matrix.nix`'s `tryEval`, so they never reach the
+toolchain-wrapper phase): ppc32 + every modern compiler (clang5+,
+gcc4_8+), plus `mips64el + gcc5` and `ppc64 + gcc5`.

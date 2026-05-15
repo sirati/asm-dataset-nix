@@ -50,16 +50,33 @@ ANSI strip or they miss the tokens. Mirrors the same constant in
 """
 
 
-# Match a ``task completed ... task_type=variant`` line. We accept BOTH
-# the ``task_type=Some("variant")`` form (current Rust ``Option<&str>``
-# rendering) and the bare ``task_type=variant`` form so a future
-# framework version that drops the ``Some(...)`` wrapper still matches.
-# We additionally insist on ``success=true`` so a failed-variant log
-# line does not falsely trigger the kill (the post-promotion-with-failure
-# class of bugs has its own dedicated reproducer in
+# Match a ``task completed ... task_type=(toolchain|variant)`` line. The
+# post-2f30920 framework only emits this line at INFO from the
+# secondary that actually executed the task locally, AND the
+# distributed manager assigns the toolchain (heavyweight, ~75 s) to one
+# secondary and the variant fan-out (cache-warm) to the other; the
+# variant-completion logs land on whichever secondary ran the variants,
+# which is non-deterministic AND in some runs the primary-promoted
+# secondary doesn't log per-variant completions at INFO at all (see
+# attempt-7 run dir notes in the T6 findings — secondary reports
+# completed=9 but emits zero ``task completed`` lines for them).
+#
+# Treat a successful TOOLCHAIN completion as a valid trigger as well:
+# it's emitted by the toolchain-builder secondary, marks the end of
+# the heavyweight first build, and is the earliest reliable signal
+# that the cluster is past worker bring-up. SIGKILL'ing right after
+# is equally good for testing the post-promotion drain (the test's
+# plan-level KEY assertion is "no leak after a mid-flight SIGKILL").
+#
+# We accept both the ``task_type=Some("…")`` form (current Rust
+# ``Option<&str>`` rendering) and the bare ``task_type=…`` form so a
+# future framework version that drops the ``Some(...)`` wrapper still
+# matches. ``success=true`` filters out failed-task lines (the
+# post-promotion-with-failure class has its own reproducer in
 # ``broken_toolchain.py``).
 _VARIANT_COMPLETED_RE: re.Pattern[str] = re.compile(
-    r"task completed.*?task_type=(?:Some\(\"variant\"\)|variant)"
+    r"task completed.*?"
+    r"task_type=(?:Some\(\"(?:variant|toolchain)\"\)|variant|toolchain)"
     r".*?success=true"
 )
 
@@ -192,12 +209,30 @@ def _resolve_secondary_out(
     if not candidates:
         return None
 
+    # Primary lookup path: match on the slurm wrapper's
+    # ``Secondary ID: <id>`` header line. This is the most direct
+    # signal — it's written by the wrapper script BEFORE the
+    # framework's tracing output starts, and survives across refactors
+    # that touch the framework's own logging without touching the
+    # wrapper template. We try this BEFORE the connection_info /
+    # hostname dance because the post-2f30920 refactor stopped
+    # writing ``connection_info/<id>.info``, leaving the legacy
+    # hostname-match path with nothing to consume.
+    secondary_id_marker = f"Secondary ID: {target_secondary_id}"
+    for path in candidates:
+        text = _read_text_safely(path)
+        if not text:
+            continue
+        if secondary_id_marker in text:
+            return path
+
     if target_host is None:
-        # Fallback: a run with a single secondary has exactly one
-        # slurm_*.out, so we accept it unconditionally. With multiple
-        # secondaries the absence of an info file means the secondary
-        # has not announced itself yet — return None and let the watch
-        # loop retry.
+        # Legacy fallback: a run with a single secondary has exactly
+        # one slurm_*.out, so we accept it unconditionally. With
+        # multiple secondaries the absence of both the Secondary-ID
+        # marker (above) and a connection_info file means the
+        # secondary has not announced itself yet — return None and
+        # let the watch loop retry.
         if len(candidates) == 1:
             return candidates[0]
         return None
@@ -206,8 +241,9 @@ def _resolve_secondary_out(
         text = _read_text_safely(path)
         if not text:
             continue
-        # The slurm wrapper writes ``Node: <hostname>`` very early —
-        # before any podman pull — so we can match on hostname.
+        # Legacy hostname-match path. The slurm wrapper writes
+        # ``Node: <hostname>`` very early — before any podman pull —
+        # so we can match on hostname.
         if f"Node: {target_host}" in text:
             return path
     return None
@@ -327,16 +363,35 @@ def kill_secondary_when_first_variant_completes(
     deadline = started + max(timeout_s, 0.0)
     notes: list[str] = []
 
+    # ``target_secondary_id == "auto"`` means: kill whichever secondary
+    # FIRST reports a variant completion. The framework's distributed
+    # manager assigns the toolchain (heavyweight, single-task) to one
+    # secondary and the variant fan-out (cache-warm) to the other; that
+    # polarity is non-deterministic across runs in the post-2f30920
+    # framework, so a hardcoded id mismatches roughly half the time.
+    # Auto-discovery reads ALL ``slurm_*.out`` per poll and matches the
+    # first that carries a successful-variant ``task completed`` line.
+    auto_select = target_secondary_id == "auto"
+
     resolved_path: Optional[pathlib.Path] = None
     while clock() < deadline:
-        candidate = _resolve_secondary_out(
-            run_log_dir, target_secondary_id,
-        )
-        if candidate is not None:
-            text = _read_text_safely(candidate)
-            if text and _saw_variant_completion(text):
-                resolved_path = candidate
+        if auto_select:
+            for candidate in sorted(run_log_dir.glob("slurm_*.out")):
+                text = _read_text_safely(candidate)
+                if text and _saw_variant_completion(text):
+                    resolved_path = candidate
+                    break
+            if resolved_path is not None:
                 break
+        else:
+            candidate = _resolve_secondary_out(
+                run_log_dir, target_secondary_id,
+            )
+            if candidate is not None:
+                text = _read_text_safely(candidate)
+                if text and _saw_variant_completion(text):
+                    resolved_path = candidate
+                    break
         sleep(poll_interval_s)
 
     if resolved_path is None:
@@ -1008,12 +1063,37 @@ def _wait_for_secondary_info(
     clock: Callable[[], float],
     sleep: Callable[[float], None],
 ) -> Optional[str]:
-    """Poll ``run_log_dir/connection_info/<id>.info`` for ``hostname=``.
+    """Resolve the worker hostname for ``target_secondary_id``.
+
+    Tries the slurm wrapper's ``Secondary ID: <id>`` + ``Node: <host>``
+    header lines in ``slurm_*.out`` first (post-2f30920 framework no
+    longer writes ``connection_info/<id>.info`` in
+    :class:`ConnectionMode::Standard`), and falls back to the legacy
+    ``connection_info`` file for the Reverse-mode case.
 
     Returns the resolved worker hostname or ``None`` on timeout.
     """
     info_path = run_log_dir / "connection_info" / f"{target_secondary_id}.info"
+    secondary_id_marker = f"Secondary ID: {target_secondary_id}"
     while clock() < deadline:
+        # Primary path — Secondary-ID marker in the slurm wrapper
+        # output. Read each candidate slurm_*.out and pull out the
+        # ``Node: <host>`` line when the Secondary-ID matches.
+        for path in run_log_dir.glob("slurm_*.out"):
+            text = _read_text_safely(path)
+            if not text or secondary_id_marker not in text:
+                continue
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("Node:"):
+                    host = stripped.split(":", 1)[1].strip()
+                    if host:
+                        return host
+            # Found the marker but no Node: line yet (very early in
+            # wrapper bring-up); keep polling.
+            break
+        # Legacy fallback for Reverse-mode dispatches that DO write
+        # connection_info/<id>.info.
         host = _parse_info_hostname(info_path)
         if host is not None:
             return host

@@ -37,8 +37,9 @@ import subprocess
 import threading
 import time
 import urllib.request
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 __all__ = [
     "PeerInfo",
@@ -52,6 +53,8 @@ __all__ = [
     "build_nix_extra_args",
     "PeerListWatcher",
     "PeerNixConfWatcher",
+    "PathPlacementWatcher",
+    "PATHS_FILE_PREFIX",
     "prune_stale",
     "HarmoniaProcess",
     "start_nix_daemon",
@@ -336,11 +339,26 @@ def announce_self(shared_fs: pathlib.Path, info: PeerInfo) -> pathlib.Path:
 
 
 def withdraw_self(shared_fs: pathlib.Path, secondary_id: str) -> None:
-    """Remove ``peers/<secondary_id>.json`` (no error if absent)."""
+    """Remove ``peers/<secondary_id>.json`` (no error if absent).
+
+    Also unlinks the path-placement gossip file
+    ``peers/_paths_<secondary_id>.jsonl`` so other peers' watchers
+    drop our placement records on the next tick. Stale placement
+    records pointing at a no-longer-running secondary would cause
+    workers to issue a ``nix copy --from http://<host>:<port>`` that
+    times out, then fall through to the next candidate — correctness
+    is preserved but latency is paid; removing the file up front
+    avoids the dead-peer probe altogether.
+    """
     peers = _peers_dir(shared_fs)
     target = peers / f"{secondary_id}.json"
     try:
         target.unlink()
+    except FileNotFoundError:
+        pass
+    paths_file = peers / f"{PATHS_FILE_PREFIX}{secondary_id}.jsonl"
+    try:
+        paths_file.unlink()
     except FileNotFoundError:
         return
 
@@ -721,7 +739,7 @@ class HarmoniaProcess:
     signing_key_path: pathlib.Path
     binary: Optional[str] = None  # if None, autodetected on .start()
     extra_args: list[str] = field(default_factory=list)
-    workers: int = 2
+    workers: int = 16
     runtime_dir: pathlib.Path = field(
         default_factory=lambda: DEFAULT_HARMONIA_RUNTIME_DIR
     )
@@ -1013,6 +1031,243 @@ def _nix_daemon_accepts_connections() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Path-placement watcher
+# ---------------------------------------------------------------------------
+
+
+# Per-secondary placement gossip file: ``peers/_paths_<id>.jsonl``.
+# Underscore-prefixed so :func:`list_peers` (which only scans ``*.json``)
+# ignores them, but distinct from the existing ``__signing-key`` /
+# ``__public-key`` reserved files so the path-placement reader can
+# still find them by prefix match.
+PATHS_FILE_PREFIX = "_paths_"
+
+
+@dataclass(frozen=True)
+class PlacementDiff:
+    """Delta between two consecutive :class:`PathPlacementWatcher`
+    snapshots.
+
+    ``added[outpath]`` is the set of secondary-ids that became holders
+    of *outpath* in this refresh; ``removed[outpath]`` is the set that
+    stopped holding it. Outpaths with neither addition nor removal are
+    omitted from both maps. An empty diff (``added`` and ``removed``
+    both empty) means the refresh saw no change.
+
+    Used by :meth:`PathPlacementWatcher.register_diff_callback` as the
+    **fallback** signal for K=3 repair when the framework's
+    peer-removed hook isn't yet available. Primary signal for
+    peer-death is the framework hook (see plan: Framework Ask #4).
+    """
+
+    added: dict[str, set[str]]
+    removed: dict[str, set[str]]
+
+    def is_empty(self) -> bool:
+        return not self.added and not self.removed
+
+
+class PathPlacementWatcher(threading.Thread):
+    """Background thread that aggregates per-secondary placement gossip.
+
+    On every tick the watcher reads every ``peers/_paths_*.jsonl``
+    file and rebuilds an in-memory aggregate
+    ``dict[outpath, set[secondary_id]]``. Workers query the aggregate
+    via :meth:`snapshot` to decide which peer to fetch a given store
+    path from.
+
+    Push-driven wake-ups (via :meth:`request_refresh`) collapse the
+    update latency from one tick to a single re-read; the polling
+    tick is the safety net for missed pushes.
+
+    The watcher is a daemon thread; ``stop()`` requests exit at the
+    next tick or wake.
+
+    Diff callbacks (:meth:`register_diff_callback`) fire on every
+    refresh that produces a non-empty :class:`PlacementDiff`. They are
+    a fallback signal for K=3 replication repair-on-death when the
+    framework's peer-removed hook isn't available; the framework hook
+    is the primary signal.
+    """
+
+    def __init__(
+        self,
+        shared_fs: pathlib.Path,
+        tick_seconds: float = DEFAULT_TICK_SECONDS,
+    ) -> None:
+        super().__init__(name="PathPlacementWatcher", daemon=True)
+        self._shared_fs = pathlib.Path(shared_fs)
+        self._tick_seconds = float(tick_seconds)
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._lock = threading.Lock()
+        # outpath -> { secondary_id, ... }
+        self._placements: dict[str, set[str]] = {}
+        # Diff-callback registry. Append-only after start(); each entry
+        # is invoked synchronously per refresh that produces a
+        # non-empty diff, OUTSIDE the lock so callbacks can call
+        # snapshot() without deadlocking. Exceptions are isolated per
+        # callback so one buggy callback doesn't take the watcher down.
+        self._diff_callbacks: list[Callable[[PlacementDiff], None]] = []
+        # Prime once synchronously so callers reading right after
+        # ``start()`` see a meaningful initial snapshot. The prime
+        # refresh intentionally does NOT fire diff callbacks: there is
+        # no "previous" state to diff against and callbacks haven't
+        # been registered yet anyway.
+        self._refresh(fire_callbacks=False)
+
+    # --- public read-side API ----------------------------------------------
+
+    def snapshot(self) -> dict[str, set[str]]:
+        """Return a fresh copy of the current placement aggregate.
+
+        Each entry's value is a copy of the secondary-id set so
+        callers can mutate without disturbing the watcher's state.
+        """
+        with self._lock:
+            return {outpath: set(sids) for outpath, sids in self._placements.items()}
+
+    def register_diff_callback(
+        self, fn: Callable[[PlacementDiff], None],
+    ) -> None:
+        """Register *fn* to be called on every refresh that observes a
+        non-empty :class:`PlacementDiff`.
+
+        Callbacks are invoked synchronously on the watcher thread,
+        OUTSIDE the placement lock (so they may call :meth:`snapshot`
+        freely). Exceptions raised by a callback are logged and
+        suppressed; one buggy callback never takes the watcher down.
+
+        **Fallback path only.** This is the secondary signal for K=3
+        replication repair-on-death; the framework's peer-removed hook
+        (see plan: Framework Ask #4) is the primary signal with sub-
+        tick latency. When the framework hook is wired, this callback
+        becomes a redundant backstop for cases where the dying peer
+        managed to run ``withdraw_self`` cleanly.
+        """
+        self._diff_callbacks.append(fn)
+
+    # --- lifecycle ---------------------------------------------------------
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+
+    def request_refresh(self) -> None:
+        """Wake the run loop for an out-of-band refresh.
+
+        Intended for :class:`PeerPushServer` to call on every
+        ``path-have`` / ``path-gone`` push so a peer's newly-realised
+        store paths are visible within ~one refresh instead of waiting
+        a full tick.
+        """
+        self._wake_event.set()
+
+    def run(self) -> None:  # pragma: no cover - integration-tested
+        while not self._stop_event.is_set():
+            self._wake_event.clear()
+            try:
+                self._refresh()
+            except Exception:  # noqa: BLE001 - keep watcher alive
+                logger.exception("PathPlacementWatcher refresh failed")
+            self._wake_event.wait(self._tick_seconds)
+
+    # --- internals ---------------------------------------------------------
+
+    def _refresh(self, *, fire_callbacks: bool = True) -> None:
+        new_placements = _read_all_placement_files(self._shared_fs)
+        with self._lock:
+            old_placements = self._placements
+            self._placements = new_placements
+        if not fire_callbacks or not self._diff_callbacks:
+            return
+        diff = _compute_placement_diff(old_placements, new_placements)
+        if diff.is_empty():
+            return
+        for fn in self._diff_callbacks:
+            try:
+                fn(diff)
+            except Exception:  # noqa: BLE001 - isolate buggy callback
+                logger.exception(
+                    "PathPlacementWatcher: diff callback raised"
+                )
+
+
+def _compute_placement_diff(
+    old: dict[str, set[str]],
+    new: dict[str, set[str]],
+) -> PlacementDiff:
+    """Symmetric-difference per outpath between two placement maps."""
+    added: dict[str, set[str]] = {}
+    removed: dict[str, set[str]] = {}
+    all_outpaths = set(old) | set(new)
+    for outpath in all_outpaths:
+        old_sids = old.get(outpath, set())
+        new_sids = new.get(outpath, set())
+        gained = new_sids - old_sids
+        lost = old_sids - new_sids
+        if gained:
+            added[outpath] = gained
+        if lost:
+            removed[outpath] = lost
+    return PlacementDiff(added=added, removed=removed)
+
+
+def _read_all_placement_files(
+    shared_fs: pathlib.Path,
+) -> dict[str, set[str]]:
+    """Read every ``peers/_paths_*.jsonl`` and aggregate by outpath.
+
+    Each record is one JSON object per line with at least
+    ``{secondary_id, outpath}``. Malformed lines are skipped at debug
+    level so one bad writer doesn't take the watcher down. Missing
+    ``peers/`` returns an empty aggregate.
+    """
+    peers_dir = _peers_dir(shared_fs)
+    aggregate: dict[str, set[str]] = {}
+    try:
+        entries = list(peers_dir.iterdir())
+    except FileNotFoundError:
+        return aggregate
+    for entry in entries:
+        if not entry.is_file():
+            continue
+        if not entry.name.startswith(PATHS_FILE_PREFIX):
+            continue
+        if entry.suffix != ".jsonl":
+            continue
+        try:
+            raw = entry.read_text(encoding="utf-8")
+        except OSError as exc:
+            logger.debug(
+                "PathPlacementWatcher: skipping unreadable %s: %s", entry, exc
+            )
+            continue
+        for line_num, line in enumerate(raw.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as exc:
+                logger.debug(
+                    "PathPlacementWatcher: bad line %s:%d: %s",
+                    entry, line_num, exc,
+                )
+                continue
+            if not isinstance(rec, dict):
+                continue
+            outpath = rec.get("outpath")
+            sid = rec.get("secondary_id")
+            if not isinstance(outpath, str) or not isinstance(sid, str):
+                continue
+            if not outpath or not sid:
+                continue
+            aggregate.setdefault(outpath, set()).add(sid)
+    return aggregate
+
+
+# ---------------------------------------------------------------------------
 # /etc/nix/peer.conf live-rewriter
 # ---------------------------------------------------------------------------
 
@@ -1239,12 +1494,31 @@ class SubmitterPeer:
         self._poll_thread: threading.Thread | None = None
         self._run_id: str | None = None
         self._peer_published = False
+        self._placements_published = False
+        # ``(outpath, drv_path, item_class)`` triples to advertise once
+        # the run_id is known. Caller fills this before ``start()`` or
+        # at any point during dispatch; the poll loop flushes on each
+        # tick after the peer file is published.
+        self._pending_placements: list[tuple[str, str, str]] = []
         # Captured at start(); _discover_run_id only accepts dirs we
         # didn't see at submitter init. Without this, polling races
         # the framework's run-dir creation and publishes the peer
         # file into a stale dispatch's run dir (which the current
         # dispatch's compute-nodes never read).
         self._initial_run_ids: set[str] = set()
+
+    def set_placements(
+        self, outpaths: Iterable[tuple[str, str, str]],
+    ) -> None:
+        """Buffer placement records for the next ``_poll_loop`` tick.
+
+        Each tuple is ``(outpath, drv_path, item_class)``. The poll
+        loop flushes via :meth:`publish_placements` once ``run_id``
+        is discovered + the peer file is published (so workers'
+        substituters list AND placement map agree on the submitter's
+        identity before they're told what paths it serves)."""
+        self._pending_placements = list(outpaths)
+        self._placements_published = False
 
     def __enter__(self) -> "SubmitterPeer":
         self.start()
@@ -1295,7 +1569,7 @@ class SubmitterPeer:
         # 2. harmonia-cache via nix shell nixpkgs#harmonia.
         config_path = _SUBMITTER_KEY_DIR / "harmonia.toml"
         config_path.write_text(
-            f'bind = "127.0.0.1:{self.local_port}"\nworkers = 2\n'
+            f'bind = "127.0.0.1:{self.local_port}"\nworkers = 16\n'
         )
         env = dict(os.environ)
         env["CONFIG_FILE"] = str(config_path)
@@ -1453,6 +1727,21 @@ class SubmitterPeer:
                 ):
                     self._publish_peer_file()
                     self._peer_published = True
+                if (
+                    self._run_id is not None
+                    and self._peer_published
+                    and not self._placements_published
+                    and self._pending_placements
+                ):
+                    if self.publish_placements(self._pending_placements):
+                        self._placements_published = True
+                if (
+                    self._peer_published
+                    and (
+                        self._placements_published
+                        or not self._pending_placements
+                    )
+                ):
                     return
             except Exception:  # noqa: BLE001
                 self.log.exception(
@@ -1539,19 +1828,82 @@ class SubmitterPeer:
         )
         return candidate
 
+    def publish_placements(
+        self, outpaths: Iterable[tuple[str, str, str]],
+    ) -> bool:
+        """Write ``peers/_paths_submitter.jsonl`` to the remote run dir.
+
+        ``outpaths`` is an iterable of ``(outpath, drv_path, item_class)``
+        tuples — one record per store path the primary already has in
+        its local nix store. Workers' :class:`PathPlacementWatcher`
+        reads this file on every tick + on every ``path-have`` push and
+        treats ``submitter`` as a fetch candidate for those paths.
+
+        Without this file the placement map has no entry for the
+        primary's toolchains, and the validate-only worker path fails
+        with "no peer in the placement map could serve it" even though
+        the primary's harmonia is reachable through the SSH-R fan-out.
+
+        Returns True on success, False on any failure (network /
+        permission). Best-effort: caller should not abort dispatch
+        on failure.
+        """
+        if self._run_id is None or self._gateway_host is None:
+            self.log.warning(
+                "publish_placements called before run_id discovered;"
+                " skipping"
+            )
+            return False
+        records: list[str] = []
+        for outpath, drv_path, item_class in outpaths:
+            if not isinstance(outpath, str) or not outpath:
+                continue
+            rec = {
+                "secondary_id": "submitter",
+                "outpath": outpath,
+                "drv_path": drv_path or "",
+                "item_class": item_class or "",
+                "ts": time.time(),
+            }
+            records.append(json.dumps(rec, sort_keys=True))
+        if not records:
+            return True
+        body = "\n".join(records) + "\n"
+        remote_dir = f"{self.slurm_root}/log/{self._run_id}/peers"
+        remote_path = f"{remote_dir}/_paths_submitter.jsonl"
+
+        import base64
+        b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
+        rc, _out, err = self._ssh_oneshot([
+            f"mkdir -p {remote_dir}",
+            f"echo {b64} | base64 -d > {remote_path}",
+        ])
+        if rc != 0:
+            self.log.warning(
+                "publish_placements failed: rc=%d err=%s", rc, err
+            )
+            return False
+        self.log.info(
+            "submitter placements published: %d outpath(s) (run %s)",
+            len(records), self._run_id,
+        )
+        return True
+
     def _publish_peer_file(self) -> None:
         assert self._run_id is not None
         assert self._public_key is not None
         assert self._gateway_host is not None
-        # The framework's reverse tunnel (dynrunner-slurm preparation.rs
-        # `build_ssh_argv`) does a single `ssh -R <gw>:localhost:<lp>`
-        # to the gateway hop only — there is no per-compute-node fan-out.
-        # With GatewayPorts=clientspecified on the gateway sshd, the
-        # bound socket is `0.0.0.0:<gateway_port>` so workers reach the
-        # submitter via `http://<gateway_host>:<gateway_port>`.
+        # The framework fan-outs ``extra_port_forwards`` per-secondary
+        # over the primary→secondary ProxyJump SSH session (since
+        # dynamic-runner c89775c), so each compute node sees the
+        # submitter on its OWN loopback. Workers reach the submitter
+        # at ``http://localhost:<gateway_port>`` regardless of the
+        # gateway's sshd ``GatewayPorts`` setting. See
+        # ``TaskDeploymentSpec.extra_port_forwards`` in the framework
+        # docstring for the contract.
         payload = {
             "secondary_id": "submitter",
-            "hostname": self._gateway_host,
+            "hostname": "localhost",
             "port": self.gateway_port,
             "public_key": self._public_key,
         }
@@ -1574,6 +1926,8 @@ class SubmitterPeer:
             )
             return
         self.log.info(
-            "submitter peer published: %s:%d (run %s)",
-            self._gateway_host, self.gateway_port, self._run_id,
+            "submitter peer published: localhost:%d (run %s, "
+            "fan-out terminates on each compute node via "
+            "ProxyJump-side -R)",
+            self.gateway_port, self._run_id,
         )

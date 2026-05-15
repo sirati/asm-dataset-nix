@@ -15,7 +15,10 @@ from typing import Optional
 import pytest
 
 from compiler_suit_runner.preflight import (
+    PreflightError,
     PreflightResult,
+    build_toolchains_locally,
+    check_toolchains_locally,
     enumerate_toolchains,
     enumerate_variants,
     filter_existing_variants,
@@ -639,5 +642,110 @@ def test_filter_existing_handles_legacy_flat_layout(
     kept, skipped = filter_existing_variants(variants, dataset_dir=dataset)
     assert skipped == 1
     assert [v["label"] for v in kept] == ["b"]
+
+
+# ---------------------------------------------------------------------------
+# check_toolchains_locally / build_toolchains_locally
+# ---------------------------------------------------------------------------
+
+
+def test_check_toolchains_locally_returns_only_missing():
+    """``nix path-info <drv>^*`` returns 0 for realised, non-zero for
+    missing. The helper aggregates and returns the failing subset."""
+    realised = "/nix/store/aaa.drv"
+    missing = "/nix/store/bbb.drv"
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        drv_arg = argv[-1]
+        # ``<drv>^*`` expands to every output; the helper feeds the
+        # full ``^*`` suffix.
+        assert drv_arg.endswith("^*"), drv_arg
+        if drv_arg.startswith(realised):
+            return b"valid\n", b"", 0
+        return b"", b"path is not valid\n", 1
+
+    out = check_toolchains_locally(
+        frozenset({realised, missing}), run_subprocess=runner,
+    )
+    assert out == frozenset({missing})
+    # One probe per drv, regardless of order.
+    assert len(calls) == 2
+    for argv in calls:
+        assert argv[0] == "nix"
+        assert "path-info" in argv
+
+
+def test_check_toolchains_locally_handles_empty_set():
+    def runner(_argv):
+        raise AssertionError("runner must not be called for empty input")
+
+    assert check_toolchains_locally(frozenset(), run_subprocess=runner) == frozenset()
+
+
+def test_check_toolchains_locally_skips_falsy_entries():
+    """A drv path that is the empty string is a no-op (defensive: the
+    primary's eval may produce ``""`` for an unresolvable attr; we
+    don't want to count those as missing toolchains)."""
+
+    def runner(_argv):
+        return b"", b"", 0
+
+    # An empty string is silently dropped; no probe issued for it.
+    out = check_toolchains_locally(
+        frozenset({""}), run_subprocess=runner,
+    )
+    assert out == frozenset()
+
+
+def test_build_toolchains_locally_runs_nix_build_per_drv():
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        return b"", b"", 0
+
+    build_toolchains_locally(
+        frozenset({"/nix/store/aaa.drv", "/nix/store/bbb.drv"}),
+        run_subprocess=runner,
+    )
+    assert len(calls) == 2
+    for argv in calls:
+        assert argv[0] == "nix"
+        assert "build" in argv
+        assert "--no-link" in argv
+        # ``<drv>^*`` realises every output.
+        assert argv[-2].endswith("^*")
+
+
+def test_build_toolchains_locally_raises_preflight_error_on_failure():
+    def runner(_argv):
+        return b"", b"compilation failed: missing /lib/foo\n", 1
+
+    with pytest.raises(PreflightError, match="rc=1"):
+        build_toolchains_locally(
+            frozenset({"/nix/store/aaa.drv"}), run_subprocess=runner,
+        )
+
+
+def test_build_toolchains_locally_stops_at_first_failure():
+    """Once one build fails, the helper raises immediately — the
+    rest of the queue is implicitly abandoned because the operator
+    needs to investigate the first failure before continuing."""
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        # First drv fails; second would succeed if we got there.
+        if calls and len(calls) == 1:
+            return b"", b"boom\n", 1
+        return b"", b"", 0
+
+    # ``sorted`` order matters: the helper iterates sorted(drv_set).
+    drvs = frozenset({"/nix/store/aaa.drv", "/nix/store/bbb.drv"})
+    with pytest.raises(PreflightError):
+        build_toolchains_locally(drvs, run_subprocess=runner)
+    assert len(calls) == 1
 
 

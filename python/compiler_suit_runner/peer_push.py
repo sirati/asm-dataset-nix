@@ -16,6 +16,34 @@ codes):
         body: PeerInfo as ``{secondary_id, hostname, port, public_key}``
     POST /peer/withdraw
         body: ``{secondary_id}``
+    POST /peer/path-have
+        body: ``{secondary_id, outpath, drv_path, item_class}``
+        Issued when a secondary has just realised a new store path
+        (toolchain/common-dep/variant) and wants peers to learn it
+        before the next placement-watcher tick.
+    POST /peer/path-gone
+        body: ``{secondary_id, outpath}``
+        Per-path retraction; rarely needed (withdraw_self deletes the
+        whole _paths_<sid>.jsonl file in one shot).
+
+    POST /peer/path-offer
+        body: ``{from_secondary_id, outpath, drv_path, item_class}``
+        K=3 replication handshake — sender offers to push *outpath* to
+        the recipient. Recipient replies via /peer/path-accept or
+        /peer/path-reject; sender's 1 s timer treats no reply as
+        rejection.
+    POST /peer/path-accept
+        body: ``{from_secondary_id, outpath}``
+        Recipient confirms the offer; will fetch *outpath* from
+        from_secondary_id next.
+    POST /peer/path-reject
+        body: ``{from_secondary_id, outpath, reason}``
+        Recipient declines; reason in {already-have, already-targeted,
+        disk-full, ...}.
+    POST /peer/path-cancel
+        body: ``{from_secondary_id, outpath}``
+        Sender aborts an outstanding offer (e.g. K satisfied by another
+        path or the placement converged elsewhere).
 
 Auth is intra-cluster only: every request carries
 ``X-Cluster-PubKey: <our public key>``; the server rejects requests
@@ -47,7 +75,13 @@ __all__ = [
     "PUSH_PORT_OFFSET",
     "PeerPushServer",
     "fan_out_announce",
+    "fan_out_path_gone",
+    "fan_out_path_have",
     "fan_out_withdraw",
+    "push_path_accept",
+    "push_path_cancel",
+    "push_path_offer",
+    "push_path_reject",
     "push_port_for",
     "push_to_peer",
 ]
@@ -89,6 +123,12 @@ class _PushHandler(http.server.BaseHTTPRequestHandler):
     expected_pubkey: str = ""
     on_announce: Callable[[PeerInfo], None] = staticmethod(lambda info: None)
     on_withdraw: Callable[[str], None] = staticmethod(lambda sid: None)
+    on_path_have: Callable[[dict], None] = staticmethod(lambda rec: None)
+    on_path_gone: Callable[[dict], None] = staticmethod(lambda rec: None)
+    on_path_offer: Callable[[dict], None] = staticmethod(lambda rec: None)
+    on_path_accept: Callable[[dict], None] = staticmethod(lambda rec: None)
+    on_path_reject: Callable[[dict], None] = staticmethod(lambda rec: None)
+    on_path_cancel: Callable[[dict], None] = staticmethod(lambda rec: None)
 
     # Quiet the default access log; the framework's own logging is
     # the system of record.
@@ -137,6 +177,47 @@ class _PushHandler(http.server.BaseHTTPRequestHandler):
                 self.on_announce(info)
             elif self.path == "/peer/withdraw":
                 self.on_withdraw(str(data["secondary_id"]))
+            elif self.path == "/peer/path-have":
+                record = {
+                    "secondary_id": str(data["secondary_id"]),
+                    "outpath": str(data["outpath"]),
+                    "drv_path": str(data.get("drv_path", "")),
+                    "item_class": str(data.get("item_class", "")),
+                }
+                self.on_path_have(record)
+            elif self.path == "/peer/path-gone":
+                record = {
+                    "secondary_id": str(data["secondary_id"]),
+                    "outpath": str(data["outpath"]),
+                }
+                self.on_path_gone(record)
+            elif self.path == "/peer/path-offer":
+                record = {
+                    "from_secondary_id": str(data["from_secondary_id"]),
+                    "outpath": str(data["outpath"]),
+                    "drv_path": str(data.get("drv_path", "")),
+                    "item_class": str(data.get("item_class", "")),
+                }
+                self.on_path_offer(record)
+            elif self.path == "/peer/path-accept":
+                record = {
+                    "from_secondary_id": str(data["from_secondary_id"]),
+                    "outpath": str(data["outpath"]),
+                }
+                self.on_path_accept(record)
+            elif self.path == "/peer/path-reject":
+                record = {
+                    "from_secondary_id": str(data["from_secondary_id"]),
+                    "outpath": str(data["outpath"]),
+                    "reason": str(data.get("reason", "")),
+                }
+                self.on_path_reject(record)
+            elif self.path == "/peer/path-cancel":
+                record = {
+                    "from_secondary_id": str(data["from_secondary_id"]),
+                    "outpath": str(data["outpath"]),
+                }
+                self.on_path_cancel(record)
             else:
                 self._respond(404)
                 return
@@ -187,6 +268,12 @@ class PeerPushServer(threading.Thread):
         expected_pubkey: str,
         on_announce: Callable[[PeerInfo], None],
         on_withdraw: Callable[[str], None],
+        on_path_have: Optional[Callable[[dict], None]] = None,
+        on_path_gone: Optional[Callable[[dict], None]] = None,
+        on_path_offer: Optional[Callable[[dict], None]] = None,
+        on_path_accept: Optional[Callable[[dict], None]] = None,
+        on_path_reject: Optional[Callable[[dict], None]] = None,
+        on_path_cancel: Optional[Callable[[dict], None]] = None,
     ) -> None:
         super().__init__(name="PeerPushServer", daemon=True)
         self._bind_host = str(bind_host)
@@ -196,12 +283,24 @@ class PeerPushServer(threading.Thread):
         # HTTPServer with no extra args).
         bound_announce = on_announce
         bound_withdraw = on_withdraw
+        bound_path_have = on_path_have or (lambda _rec: None)
+        bound_path_gone = on_path_gone or (lambda _rec: None)
+        bound_path_offer = on_path_offer or (lambda _rec: None)
+        bound_path_accept = on_path_accept or (lambda _rec: None)
+        bound_path_reject = on_path_reject or (lambda _rec: None)
+        bound_path_cancel = on_path_cancel or (lambda _rec: None)
         bound_pubkey = str(expected_pubkey)
 
         class _BoundHandler(_PushHandler):
             expected_pubkey = bound_pubkey
             on_announce = staticmethod(bound_announce)
             on_withdraw = staticmethod(bound_withdraw)
+            on_path_have = staticmethod(bound_path_have)
+            on_path_gone = staticmethod(bound_path_gone)
+            on_path_offer = staticmethod(bound_path_offer)
+            on_path_accept = staticmethod(bound_path_accept)
+            on_path_reject = staticmethod(bound_path_reject)
+            on_path_cancel = staticmethod(bound_path_cancel)
 
         self._handler_cls = _BoundHandler
         self._server: Optional[_ThreadingHTTPServer] = None
@@ -268,7 +367,16 @@ def push_to_peer(
     are silent at WARN level so a single missing peer does not fill
     the log on every announce.
     """
-    if event not in ("announce", "withdraw"):
+    if event not in (
+        "announce",
+        "withdraw",
+        "path-have",
+        "path-gone",
+        "path-offer",
+        "path-accept",
+        "path-reject",
+        "path-cancel",
+    ):
         raise ValueError(f"unsupported push event: {event!r}")
     if not peer.hostname:
         return False
@@ -351,3 +459,146 @@ def fan_out_withdraw(
         if push_to_peer(peer, "withdraw", payload, our_pubkey, timeout=timeout):
             sent += 1
     return sent
+
+
+def fan_out_path_have(
+    peers: list[PeerInfo],
+    my_secondary_id: str,
+    outpath: str,
+    drv_path: str,
+    item_class: str,
+    our_pubkey: str,
+    timeout: float = DEFAULT_PUSH_TIMEOUT,
+) -> int:
+    """Push a ``path-have`` event to every peer in *peers*.
+
+    Best-effort, mirrors :func:`fan_out_announce`. The path-placement
+    watcher on each peer will wake on receipt and re-read the
+    placement gossip files; the polling tick is the safety net.
+    """
+    payload = {
+        "secondary_id": my_secondary_id,
+        "outpath": outpath,
+        "drv_path": drv_path,
+        "item_class": item_class,
+    }
+    sent = 0
+    for peer in peers:
+        if peer.secondary_id == my_secondary_id:
+            continue  # self
+        if push_to_peer(peer, "path-have", payload, our_pubkey, timeout=timeout):
+            sent += 1
+    return sent
+
+
+def fan_out_path_gone(
+    peers: list[PeerInfo],
+    my_secondary_id: str,
+    outpath: str,
+    our_pubkey: str,
+    timeout: float = DEFAULT_PUSH_TIMEOUT,
+) -> int:
+    """Push a ``path-gone`` event to every peer in *peers*.
+
+    Rare; used when a placement record needs explicit retraction (a
+    GC pass removed the path before withdraw, say). Day-to-day,
+    withdraw_self deletes the whole _paths_<sid>.jsonl file in one
+    shot and per-record retraction is unnecessary.
+    """
+    payload = {
+        "secondary_id": my_secondary_id,
+        "outpath": outpath,
+    }
+    sent = 0
+    for peer in peers:
+        if peer.secondary_id == my_secondary_id:
+            continue  # self
+        if push_to_peer(peer, "path-gone", payload, our_pubkey, timeout=timeout):
+            sent += 1
+    return sent
+
+
+# ---------------------------------------------------------------------------
+# K=3 replication handshake — point-to-point single-peer helpers
+# ---------------------------------------------------------------------------
+#
+# Unlike fan_out_*, these target ONE peer per call. They are the
+# building blocks the ReplicationSender / ReplicationReceiver in
+# peer_replication.py use to negotiate "I'll push this outpath to you"
+# before doing the actual transfer.
+
+
+def push_path_offer(
+    peer: PeerInfo,
+    from_secondary_id: str,
+    outpath: str,
+    drv_path: str,
+    item_class: str,
+    our_pubkey: str,
+    timeout: float = DEFAULT_PUSH_TIMEOUT,
+) -> bool:
+    """Offer *outpath* to *peer*. Returns True if the POST succeeded
+    (transport-level), not whether the recipient accepted — that
+    arrives asynchronously via a separate path-accept / path-reject
+    POST in the opposite direction."""
+    payload = {
+        "from_secondary_id": from_secondary_id,
+        "outpath": outpath,
+        "drv_path": drv_path,
+        "item_class": item_class,
+    }
+    return push_to_peer(peer, "path-offer", payload, our_pubkey, timeout=timeout)
+
+
+def push_path_accept(
+    peer: PeerInfo,
+    from_secondary_id: str,
+    outpath: str,
+    our_pubkey: str,
+    timeout: float = DEFAULT_PUSH_TIMEOUT,
+) -> bool:
+    """Reply to an offer from *peer*: accept it. ``from_secondary_id``
+    is OUR id (the recipient/accepter); the offerer correlates by
+    (outpath, from_secondary_id) tuple."""
+    payload = {
+        "from_secondary_id": from_secondary_id,
+        "outpath": outpath,
+    }
+    return push_to_peer(peer, "path-accept", payload, our_pubkey, timeout=timeout)
+
+
+def push_path_reject(
+    peer: PeerInfo,
+    from_secondary_id: str,
+    outpath: str,
+    reason: str,
+    our_pubkey: str,
+    timeout: float = DEFAULT_PUSH_TIMEOUT,
+) -> bool:
+    """Reply to an offer from *peer*: reject it with *reason* (one of
+    ``already-have``, ``already-targeted``, ``disk-full``, ...).
+    ``from_secondary_id`` is OUR id."""
+    payload = {
+        "from_secondary_id": from_secondary_id,
+        "outpath": outpath,
+        "reason": reason,
+    }
+    return push_to_peer(peer, "path-reject", payload, our_pubkey, timeout=timeout)
+
+
+def push_path_cancel(
+    peer: PeerInfo,
+    from_secondary_id: str,
+    outpath: str,
+    our_pubkey: str,
+    timeout: float = DEFAULT_PUSH_TIMEOUT,
+) -> bool:
+    """Cancel an outstanding offer to *peer*. ``from_secondary_id`` is
+    OUR id (the offerer). Used when K converges before the recipient
+    has fetched, so a still-pending offer should not result in a
+    redundant fetch."""
+    payload = {
+        "from_secondary_id": from_secondary_id,
+        "outpath": outpath,
+    }
+    return push_to_peer(peer, "path-cancel", payload, our_pubkey, timeout=timeout)

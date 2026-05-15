@@ -16,6 +16,7 @@ from compiler_suit_runner.manifest_gen import (
     make_merge_header,
     make_partition_shard_header,
     make_toolchain_header,
+    make_toolchain_validate_header,
     make_variant_header,
     read_manifest,
     write_manifest,
@@ -144,6 +145,83 @@ def test_variant_header_payload():
     assert h.payload["attr"] == (
         f"dataset.x86_64-linux.hello.x86_64.{v['label']}"
     )
+    # No K=3 affinity hint by default.
+    assert "preferred_secondaries" not in h.payload
+
+
+def test_variant_header_preferred_secondaries_emitted_sorted():
+    """When ``preferred_secondaries`` is non-empty, it is emitted in
+    the payload sorted (deterministic manifest diffs)."""
+    v = _variant("hello", "x86_64", "O2")
+    h = make_variant_header(
+        v, "x86_64-linux",
+        preferred_secondaries=["sec-b", "sec-a", "sec-c"],
+    )
+    assert h.payload["preferred_secondaries"] == ["sec-a", "sec-b", "sec-c"]
+
+
+def test_variant_header_preferred_secondaries_omitted_when_empty():
+    """Empty / None preferred_secondaries -> no payload key (keeps
+    legacy manifests byte-identical)."""
+    v = _variant("hello", "x86_64", "O2")
+    for empty in (None, []):
+        h = make_variant_header(
+            v, "x86_64-linux", preferred_secondaries=empty,
+        )
+        assert "preferred_secondaries" not in h.payload
+
+
+def test_emit_all_manifests_threads_toolchain_placements_to_variants(
+    tmp_path: pathlib.Path,
+):
+    """When ``toolchain_outpath_placements`` is provided to
+    ``emit_all_manifests``, the per-variant header's
+    ``preferred_secondaries`` is looked up via:
+        variant.arch + variant.compiler_id
+            -> toolchain_drvs[(arch, compiler_id)]
+            -> drv_outpaths[drv]
+            -> toolchain_outpath_placements[outpath]
+    """
+    v = _variant("hello", "x86_64", "O2", compiler_id="gcc15")
+    tc_drv = "/nix/store/abc-toolchain-x86_64-gcc15.drv"
+    tc_outpath = "/nix/store/abc-toolchain-x86_64-gcc15"
+    result = emit_all_manifests(
+        target_dir=tmp_path,
+        sys_name="x86_64-linux",
+        variants=[v],
+        toolchain_specs=[("x86_64", "gcc15")],
+        common_deps=[],
+        toolchain_drvs={("x86_64", "gcc15"): tc_drv},
+        drv_outpaths={tc_drv: tc_outpath},
+        toolchain_outpath_placements={tc_outpath: ["sec-1", "sec-2"]},
+    )
+    variant_headers = [
+        h for h in result.headers if h.item_class == "phase3_variant"
+    ]
+    assert len(variant_headers) == 1
+    assert variant_headers[0].payload["preferred_secondaries"] == [
+        "sec-1", "sec-2",
+    ]
+
+
+def test_emit_all_manifests_omits_preferred_secondaries_when_no_placement(
+    tmp_path: pathlib.Path,
+):
+    """Default (no placement map provided) -> no preferred_secondaries
+    field. Backward compat for legacy callers."""
+    v = _variant("hello", "x86_64", "O2")
+    result = emit_all_manifests(
+        target_dir=tmp_path,
+        sys_name="x86_64-linux",
+        variants=[v],
+        toolchain_specs=[("x86_64", "gcc15")],
+        common_deps=[],
+    )
+    variant_headers = [
+        h for h in result.headers if h.item_class == "phase3_variant"
+    ]
+    assert len(variant_headers) == 1
+    assert "preferred_secondaries" not in variant_headers[0].payload
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +443,7 @@ def test_manifest_set_by_class_includes_all_known_classes(
         "phase1a_partition",
         "phase1b_merge",
         "phase2_toolchain",
+        "phase2_toolchain_validate",
         "phase2_common_dep",
         "phase3_variant",
     }
@@ -384,3 +463,139 @@ def test_emit_all_manifests_target_dir_created(tmp_path: pathlib.Path):
         common_deps=[],
     )
     assert target.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Validate-vs-build switch (``--allow-toolchain-build`` plumbing)
+# ---------------------------------------------------------------------------
+
+
+def test_toolchain_validate_header_payload():
+    h = make_toolchain_validate_header(
+        "x86_64-linux", "aarch64", "gcc14",
+        drv="/nix/store/tc.drv",
+        outpath="/nix/store/tc-out",
+    )
+    assert h.item_class == "phase2_toolchain_validate"
+    assert h.name == "toolchain_validate__aarch64__gcc14"
+    assert h.payload["drv"] == "/nix/store/tc.drv"
+    assert h.payload["outpath"] == "/nix/store/tc-out"
+    # The validate_only flag is what discriminates this from the
+    # build header — workers branch on item_class but the flag keeps
+    # a marker available in the on-wire payload for diagnostics.
+    assert h.payload["validate_only"] is True
+
+
+def test_toolchain_validate_header_omits_outpath_when_unknown():
+    h = make_toolchain_validate_header(
+        "x86_64-linux", "armv7l", "gcc11", drv="/nix/store/tc.drv",
+    )
+    assert "outpath" not in h.payload
+
+
+def test_emit_all_manifests_default_emits_validate_class(
+    tmp_path: pathlib.Path,
+):
+    """With ``allow_toolchain_build`` off (default) and a resolved drv
+    + outpath available, the toolchain slot must emit
+    ``phase2_toolchain_validate`` — that's the no-build-on-secondaries
+    contract."""
+    toolchain_specs = [("x86_64", "gcc15")]
+    tc_drv = "/nix/store/tc15.drv"
+    result = emit_all_manifests(
+        target_dir=tmp_path,
+        sys_name="x86_64-linux",
+        variants=[],
+        toolchain_specs=toolchain_specs,
+        common_deps=[],
+        toolchain_drvs={("x86_64", "gcc15"): tc_drv},
+        drv_outpaths={tc_drv: "/nix/store/tc15-out"},
+    )
+    grouped = result.by_class
+    assert len(grouped["phase2_toolchain"]) == 0
+    assert len(grouped["phase2_toolchain_validate"]) == 1
+    header = grouped["phase2_toolchain_validate"][0]
+    assert header.payload["drv"] == tc_drv
+    assert header.payload["outpath"] == "/nix/store/tc15-out"
+    assert (tmp_path / f"{header.name}.json").exists()
+
+
+def test_emit_all_manifests_opt_in_emits_build_class(
+    tmp_path: pathlib.Path,
+):
+    """With ``allow_toolchain_build=True`` the operator has explicitly
+    opted into secondaries building toolchains locally — emit the
+    legacy ``phase2_toolchain`` class so the build worker dispatches
+    the nix-build path."""
+    result = emit_all_manifests(
+        target_dir=tmp_path,
+        sys_name="x86_64-linux",
+        variants=[],
+        toolchain_specs=[("x86_64", "gcc15")],
+        common_deps=[],
+        toolchain_drvs={("x86_64", "gcc15"): "/nix/store/tc.drv"},
+        allow_toolchain_build=True,
+    )
+    grouped = result.by_class
+    assert len(grouped["phase2_toolchain"]) == 1
+    assert len(grouped["phase2_toolchain_validate"]) == 0
+
+
+def test_emit_all_manifests_falls_back_to_build_when_drv_missing(
+    tmp_path: pathlib.Path,
+):
+    """If ``allow_toolchain_build`` is off but the primary couldn't
+    resolve a drv (eval failed), the validate-only path is unsafe
+    (no outpath → no fetch target) and we fall back to the build
+    header. The CLI's pre-dispatch check is the loud signal — this
+    is the on-wire safety net."""
+    result = emit_all_manifests(
+        target_dir=tmp_path,
+        sys_name="x86_64-linux",
+        variants=[],
+        toolchain_specs=[("x86_64", "gcc15")],
+        common_deps=[],
+        # No toolchain_drvs at all → drv lookup returns None.
+    )
+    grouped = result.by_class
+    assert len(grouped["phase2_toolchain"]) == 1
+    assert len(grouped["phase2_toolchain_validate"]) == 0
+
+
+def test_variant_header_embeds_input_drvs_and_outpaths():
+    """``make_variant_header`` carries the placement-map plumbing for
+    the secondary's pre-fetch loop: input_drvs (sorted) +
+    input_outpaths (per-drv mapping)."""
+    v = _variant("hello", "x86_64", "O2")
+    h = make_variant_header(
+        v, "x86_64-linux",
+        input_drvs=frozenset({
+            "/nix/store/d1.drv",
+            "/nix/store/d2.drv",
+            "/nix/store/d3.drv",
+        }),
+        drv_outpaths={
+            "/nix/store/d1.drv": "/nix/store/d1-out",
+            "/nix/store/d2.drv": "/nix/store/d2-out",
+            # d3 deliberately absent — must be filtered out.
+        },
+    )
+    # The list is sorted (deterministic dispatch ordering).
+    assert h.payload["input_drvs"] == [
+        "/nix/store/d1.drv",
+        "/nix/store/d2.drv",
+    ]
+    assert h.payload["input_outpaths"] == {
+        "/nix/store/d1.drv": "/nix/store/d1-out",
+        "/nix/store/d2.drv": "/nix/store/d2-out",
+    }
+
+
+def test_variant_header_without_placement_kwargs_omits_fields():
+    """When no input_drvs / drv_outpaths are passed (single-process
+    flows, cached-preflight restore), the variant payload stays at
+    the legacy shape so older workers still parse it cleanly."""
+    v = _variant("hello", "x86_64", "O2")
+    h = make_variant_header(v, "x86_64-linux")
+    assert "input_drvs" not in h.payload
+    assert "input_outpaths" not in h.payload
