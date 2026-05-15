@@ -43,6 +43,16 @@ in
         minor = 8;
       }; # ARM64 added in GCC 4.8
       minClangVersion = noMin; # clang3_4 passes (lower than matrix's 3.5)
+      # clang 3.5 evaluates + wrapper installs, but variant-build
+      # fails an autoconf check that the same toolchain passes
+      # manually (autoconf-vs-direct divergence not yet narrowed
+      # down). Singleton — clang3.4 and clang3.7+ all work.
+      brokenClangVersions = [
+        {
+          major = 3;
+          minor = 5;
+        }
+      ];
     };
     armv7l-hf = {
       label = "armv7l-hf";
@@ -127,6 +137,21 @@ in
         minor = 8;
       }; # gnuabielfv2 triple unknown to gcc <= 4.6 (15.09 old-expression path)
       minClangVersion = noMin;
+      # clang 3.x's ppc64 backend lacks an integrated assembler
+      # and falls back to an external ``as`` that isn't on the
+      # wrapper's PATH for this triple → ``Executable "as" doesn't
+      # exist`` at assembly stage. clang 4+ has integrated-as for
+      # ppc64.
+      brokenClangVersions = [
+        {
+          major = 3;
+          minor = 4;
+        }
+        {
+          major = 3;
+          minor = 5;
+        }
+      ];
     };
     riscv64 = {
       label = "riscv64";

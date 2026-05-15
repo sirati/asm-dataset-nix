@@ -43,7 +43,7 @@ import dataclasses
 import json
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, Optional
 
 from compiler_suit_runner.partition import VariantSpec
@@ -89,10 +89,18 @@ class PartitionResult:
     used to compute the refcount; it is preserved on the result for
     debugging, sanity checks, and future per-variant features (e.g.
     "which variants need this common dep?").
+
+    ``drv_outpaths`` maps each drv path encountered during the walk
+    (variant roots and their transitive ``inputDrvs``) to its
+    realised ``outputs.out.path``. Consumed downstream by
+    ``manifest_gen.emit_all_manifests`` so phase-3 variant payloads
+    can ship their inputs' outpaths to the build_worker pre-fetch
+    loop without the worker needing to re-walk the graph.
     """
 
     common_dep_drvs: tuple[tuple[str, str], ...]
     per_variant_inputs: dict[str, frozenset[str]]
+    drv_outpaths: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +116,14 @@ _NIX_BASE_CMD: tuple[str, ...] = (
     "--recursive",
 )
 
+_NIX_SHOW_FLAT_CMD: tuple[str, ...] = (
+    "nix",
+    "--extra-experimental-features",
+    "nix-command flakes",
+    "derivation",
+    "show",
+)
+
 
 def _show_drv_recursive(
     drv: str, runner: RunSubprocess
@@ -118,6 +134,100 @@ def _show_drv_recursive(
     parametrised on ``runner`` directly rather than a ``WorkerEnv``.
     """
     return _show_drvs_recursive_batch([drv], runner)
+
+
+_NIX_STORE_PREFIX = "/nix/store/"
+
+
+def _normalize_show_output(parsed: Any) -> dict[str, Any]:
+    """Normalize ``nix derivation show`` JSON to flat ``{full_drv: node}``.
+
+    Modern nix (``version=4``) wraps the output as
+    ``{"derivations": {...}, "version": 4}`` and strips the
+    ``/nix/store/`` prefix from drv keys AND from each output's
+    ``path`` field. Older nix returned a flat ``{full_drv: node}``
+    dict with the prefix intact.
+
+    This helper:
+    * unwraps ``{"derivations": ...}`` if present;
+    * re-adds the ``/nix/store/`` prefix to every drv key;
+    * re-adds the ``/nix/store/`` prefix to every output's ``path``
+      so downstream callers can string-compare against the worker's
+      ``nix path-info`` output without further normalization.
+    """
+    if not isinstance(parsed, dict):
+        return {}
+    if "derivations" in parsed and isinstance(parsed["derivations"], dict):
+        flat = parsed["derivations"]
+    else:
+        flat = parsed
+    normalized: dict[str, Any] = {}
+    for key, node in flat.items():
+        if not isinstance(key, str) or not isinstance(node, dict):
+            continue
+        full_drv = key if key.startswith(_NIX_STORE_PREFIX) else _NIX_STORE_PREFIX + key
+        outputs = node.get("outputs")
+        if isinstance(outputs, dict):
+            for out_name, entry in outputs.items():
+                if not isinstance(entry, dict):
+                    continue
+                path = entry.get("path")
+                if isinstance(path, str) and not path.startswith(_NIX_STORE_PREFIX):
+                    entry["path"] = _NIX_STORE_PREFIX + path
+        normalized[full_drv] = node
+    return normalized
+
+
+def eval_drv_outpaths(
+    drvs: Iterable[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> dict[str, str]:
+    """Resolve each drv's primary output path (``outputs.out.path``).
+
+    Used to enrich the cluster placement map with toolchain drvs that
+    aren't in the variant-graph walk (toolchains live in a disjoint
+    subgraph reached via the ``_crossToolchainMap`` flake attribute,
+    not via variant dependencies — see compute_partition_locally).
+    Wire: ``nix derivation show <drv1> <drv2> ...`` (non-recursive),
+    single subprocess, returns each drv's outputs verbatim. Drvs that
+    fail to resolve are omitted from the returned dict.
+    """
+    drv_list = [d for d in drvs if d and d.endswith(".drv")]
+    if not drv_list:
+        return {}
+    runner = run_subprocess or _default_run_subprocess
+    cmd = [*_NIX_SHOW_FLAT_CMD, *drv_list]
+    stdout, _stderr, rc = runner(cmd)
+    if rc != 0:
+        return {}
+    try:
+        parsed = json.loads(stdout.decode("utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    normalized = _normalize_show_output(parsed)
+    out: dict[str, str] = {}
+    for drv_path, node in normalized.items():
+        if not isinstance(node, dict):
+            continue
+        outputs = node.get("outputs")
+        if not isinstance(outputs, dict):
+            continue
+        chosen = None
+        if "out" in outputs and isinstance(outputs["out"], dict):
+            chosen = outputs["out"]
+        else:
+            for key in sorted(outputs.keys()):
+                entry = outputs[key]
+                if isinstance(entry, dict):
+                    chosen = entry
+                    break
+        if chosen is None:
+            continue
+        path = chosen.get("path")
+        if isinstance(path, str) and path.startswith("/nix/store/"):
+            out[drv_path] = path
+    return out
 
 
 def _show_drvs_recursive_batch(
@@ -154,7 +264,7 @@ def _show_drvs_recursive_batch(
             f"nix derivation show --recursive (batch of {len(drvs)} drvs)"
             " did not return a JSON object"
         )
-    return parsed
+    return _normalize_show_output(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +442,40 @@ def compute_partition_locally(
     # of dict iteration order.
     common.sort()
 
+    # Collect each drv's realised output path from the graph cache.
+    # Both the new + array-form inputDrvs schemas put the outpath on
+    # the node itself under ``outputs.<output-name>.path`` (most
+    # commonly ``outputs.out.path``). Variant roots, common deps,
+    # and the toolchain leaves all live in ``graph_cache`` after
+    # the ``nix derivation show --recursive`` calls above.
+    drv_outpaths: dict[str, str] = {}
+    for drv_path, node in graph_cache.items():
+        if not isinstance(node, dict):
+            continue
+        outputs = node.get("outputs")
+        if not isinstance(outputs, dict):
+            continue
+        # Prefer ``out`` when present; otherwise pick the first
+        # output deterministically (sorted key order). drvs with
+        # multiple outputs (e.g. -bin / -dev / -lib splits) still
+        # surface their primary output for fetch-by-outpath.
+        chosen = None
+        if "out" in outputs and isinstance(outputs["out"], dict):
+            chosen = outputs["out"]
+        else:
+            for key in sorted(outputs.keys()):
+                entry = outputs[key]
+                if isinstance(entry, dict):
+                    chosen = entry
+                    break
+        if chosen is None:
+            continue
+        path = chosen.get("path")
+        if isinstance(path, str) and path.startswith("/nix/store/"):
+            drv_outpaths[drv_path] = path
+
     return PartitionResult(
         common_dep_drvs=tuple(common),
         per_variant_inputs=per_variant,
+        drv_outpaths=drv_outpaths,
     )

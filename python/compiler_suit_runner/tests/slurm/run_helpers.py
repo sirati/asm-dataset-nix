@@ -48,10 +48,39 @@ SLURM_TEST_ENV_LOG_ROOT = pathlib.Path(
 # harness reads via :data:`SLURM_TEST_ENV_LOG_ROOT`.
 SLURM_TEST_ENV_GATEWAY_ROOT = pathlib.Path("/home/sirati/slurm")
 
-# Default gateway URL for the local slurm-test-env. Routes through
-# the host-published SSH gateway port (matches the test-env's
-# documented bring-up).
-SLURM_TEST_ENV_GATEWAY_URL = "ssh://sirati@localhost:2244"
+# Default gateway URL for the local slurm-test-env. The host string
+# is the alias workers DNS-resolve through the podman bridge (see
+# slurm-test-env owner peer note 26-05-09 02:56). The dispatcher's
+# SSH client redirects ``slurm-gateway`` -> ``localhost:2244`` via
+# the per-cluster ssh_config the conftest fixture writes; using
+# ``localhost`` directly here would propagate into worker wrappers
+# as ``--secondary tcp://localhost:port``, which workers would dial
+# in their own netns and never reach the dispatcher.
+#
+# Port ``2244`` is mandatory in the URL because
+# ``SubmitterPeer._ssh_oneshot`` reads ``ssh_port`` from
+# ``parse_gateway_url`` and passes it as ``-p`` to its own
+# (out-of-band) ssh invocations; cmdline ``-p`` overrides any
+# ``Port`` directive in the per-host block of ``ssh_config``, so
+# omitting the port silently drops the publish-peer-file SSH onto
+# port 22 (no listener at the host alias) — secondaries' substituters
+# files end up empty and toolchain builds fail with
+# "don't know how to build these paths". The framework still
+# propagates only the host part (``slurm-gateway``) into worker
+# wrappers' ``--secondary tcp://slurm-gateway:<framework-tunnel-port>``,
+# pairing it with its own chosen tunnel port; including ``:2244``
+# here does NOT redirect worker traffic to the SSH port.
+SLURM_TEST_ENV_GATEWAY_URL = "ssh://sirati@slurm-gateway:2244"
+
+# Per-cluster ssh_config path written by the ``ssh_master`` fixture.
+# Both the master pre-spawn and the framework's ``--ssh-config``
+# read from the same file, keeping SSH directives in one place.
+SLURM_TEST_ENV_SSH_CONFIG = pathlib.Path("/tmp/asm-dr-cluster.cfg")
+
+# Per-process Unix-socket path for the pre-spawned SSH master.
+# MUST stay below 108 bytes (``sockaddr_un.sun_path`` kernel limit
+# per migration doc Caveat); ``/tmp/asm-dr-master.sock`` is 26.
+SLURM_TEST_ENV_SSH_CONTROL_PATH = pathlib.Path("/tmp/asm-dr-master.sock")
 
 # Local incremental-cache root the wrapper wipes on demand. Mirrors
 # ``compiler_suit_runner.incremental_cache.DEFAULT_CACHE_ROOT`` but
@@ -95,6 +124,25 @@ class RunInvocation:
     slurm_partition: Optional[str] = None
     slurm_time_limit: Optional[str] = None
     slurm_cpus_per_task: Optional[int] = None
+    # Framework's ``--cores N`` knob (post-9ca9124 per-machine plumbing).
+    # Controls how many ``dynrunner_manager_local::pool`` workers each
+    # secondary spawns. ``None`` leaves the framework default ("-0" =
+    # all detected host cores). The slurm-test-env workers expose 2
+    # CPUs each, but ``available_parallelism`` inside the container
+    # sees the HOST's 32 cores (cgroup CPU quota isn't reflected in
+    # /proc/cpuinfo), so without explicit ``cores`` each secondary
+    # auto-spawns 32 workers — fork-storming past the per-job cgroup's
+    # nproc limit before the workload even starts. Set this explicitly
+    # to match ``slurm_cpus_per_task``.
+    cores: Optional[int] = None
+    # Framework's ``--max-memory`` knob (post-57d7ee8 SLURM plumbing,
+    # symmetric to ``--cores``). Without it, the secondary's argparse
+    # default ``-2G`` resolves locally against its OWN /proc/meminfo,
+    # which inside a podman container reads the HOST's full RAM
+    # (~96 GiB on the dev box) rather than the 4 GiB cgroup cap.
+    # Set explicitly to the cgroup envelope (e.g. ``"3G"``) until the
+    # framework's cgroup-aware autodetect lands (#31).
+    max_memory: Optional[str] = None
     ssh_identity_file: Optional[pathlib.Path] = None
     ssh_config: Optional[pathlib.Path] = None
     variant_sample: Optional[int] = None
@@ -135,6 +183,10 @@ class RunInvocation:
             argv += ["--slurm-time-limit", self.slurm_time_limit]
         if self.slurm_cpus_per_task is not None:
             argv += ["--slurm-cpus-per-task", str(self.slurm_cpus_per_task)]
+        if self.cores is not None:
+            argv += ["--cores", str(self.cores)]
+        if self.max_memory is not None:
+            argv += ["--max-memory", self.max_memory]
         if self.ssh_identity_file is not None:
             argv += ["--ssh-identity-file", str(self.ssh_identity_file)]
         if self.ssh_config is not None:
@@ -309,13 +361,47 @@ def default_invocation_for_smoke(
     return RunInvocation(
         shared_fs=shared_fs if shared_fs is not None else _default_shared_fs(),
         packages=("hello",),
+        # Narrow to native x86_64 only. The slurm-test-env contract is a
+        # 3.5 GiB / worker memory envelope (intentional, not a
+        # misconfiguration — surfaces memory-greedy workloads in CI).
+        # Cross-toolchain variants (e.g. clang10-aarch64) drag in heavy
+        # cross-LLVM builds that fork-storm past that envelope: even
+        # after dynrunner's #20 (`--ulimit nproc=32768` on the podman
+        # wrapper) and the per-machine `--cores` plumbing, the inner
+        # nix-build sandbox hits `fork: Resource temporarily
+        # unavailable` on configure's recursive fan-out. Tests of the
+        # SLURM dispatch path are orthogonal to compiler family, so we
+        # narrow to native here and keep all rows inside the envelope.
+        archs=("x86_64",),
         multi_computer="slurm",
         packaging="podman",
         jobs=jobs,
+        # Pin to 2 workers per secondary, matching the slurm-test-env's
+        # WORKER_CPUS=2 and our slurm_cpus_per_task=2. Without this the
+        # framework's --cores defaults to "-0" (all available) and
+        # available_parallelism returns 32 inside the container,
+        # immediately fork-storming the new per-job cgroup.
+        cores=2,
+        # Tight nominal memory budget to absorb the
+        # ``ResourceStealingScheduler``'s descending per-worker
+        # ``budget_mb`` over-allocation. The scheduler's design
+        # **intentionally** sums per-worker budgets above the total
+        # (worker 0 = max, worker 1 = max/2, ...) so worker 0 can
+        # take a large task when worker 1 is idle — confirmed
+        # by dynrunner-owner as design intent for resource-stealing
+        # workloads. With the autodetect (#31) seeing the 4 GiB
+        # worker cgroup cap and the default ``-2G`` math yielding
+        # 2 GiB nominal, the per-worker sum was still 4096+2198=
+        # 6.2 GiB and concurrent variant builds OOM-killed the whole
+        # cgroup. Pinning to ``"2G"`` gives worker 0 max=2G + worker 1
+        # max=1G + framework overhead ≈ 3 GiB declared, fitting
+        # comfortably under 4 GiB even under concurrent peak.
+        max_memory="2G",
         gateway=SLURM_TEST_ENV_GATEWAY_URL,
         slurm_root_folder=SLURM_TEST_ENV_GATEWAY_ROOT,
         slurm_partition="debug",
         slurm_time_limit="0:30:00",
+        ssh_config=SLURM_TEST_ENV_SSH_CONFIG,
         variant_sample=sample,
         max_variants=max_v,
         # Tests want repeatability; a fixed seed makes the sampled
@@ -385,6 +471,8 @@ __all__ = [
     "SLURM_TEST_ENV_GATEWAY_ROOT",
     "SLURM_TEST_ENV_GATEWAY_URL",
     "SLURM_TEST_ENV_LOG_ROOT",
+    "SLURM_TEST_ENV_SSH_CONFIG",
+    "SLURM_TEST_ENV_SSH_CONTROL_PATH",
     "Workload",
     "clear_incremental_cache",
     "default_invocation_for_smoke",
