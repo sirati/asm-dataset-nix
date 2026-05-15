@@ -48,8 +48,10 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import queue
 import random
 import threading
+import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Optional
@@ -60,6 +62,8 @@ from compiler_suit_runner.peer_cache import PeerInfo, PlacementDiff
 __all__ = [
     "DEFAULT_OFFER_TIMEOUT_SECONDS",
     "DEFAULT_REPLICATION_K",
+    "BroadcastResult",
+    "BroadcastSender",
     "ReplicationContext",
     "ReplicationReceiver",
     "ReplicationRepairWorker",
@@ -752,3 +756,255 @@ class ReplicationRepairWorker:
                     "ReplicationRepairWorker: push_attempt raised for %s",
                     outpath,
                 )
+
+
+# ---------------------------------------------------------------------------
+# Broadcast sender — Phase 0 drv flood-fill
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BroadcastResult:
+    """Outcome of a single broadcast fan-out.
+
+    Mirrors the tuple returned by
+    :func:`peer_push.fan_out_broadcast_drv`: a count of successful
+    peers (any non-``None`` response, including ``{"dedup": true}``),
+    a count of failed peers (transport-level failures), and the list
+    of failed peer URLs so callers can re-try or log.
+    """
+
+    broadcast_id: str
+    success_count: int
+    fail_count: int
+    failed_peers: tuple[str, ...]
+
+
+@dataclass
+class _BroadcastJob:
+    """One enqueued broadcast awaiting dispatch."""
+
+    broadcast_id: str
+    path: str
+    size: int
+    item_class: Optional[str]
+
+
+class BroadcastSender:
+    """Originator-side fan-out for ``path-broadcast-offer`` (drv flood).
+
+    Unlike :class:`ReplicationSender`, the broadcast protocol carries
+    no K accounting, no preferred-secondary selection, and no
+    "already-targeted" reject coordination: every broadcast goes to
+    every peer at ``hop_count=0`` and each receiver dedupes via
+    ``broadcast_id`` and forwards once. The sender's job is therefore
+    simply:
+
+    * Mint a fresh UUID4 ``broadcast_id`` per :meth:`enqueue_broadcast`
+      call and return it to the caller without blocking.
+    * Dispatch the fan-out on a single worker thread (consumer of an
+      internal queue) so the caller never waits on HTTP.
+    * Record per-broadcast results so callers can
+      :meth:`wait_for_completion` and inspect ``(success, fail,
+      failed_peers)``.
+
+    Lifecycle mirrors the rest of the module: construct → no explicit
+    ``start()`` needed (the worker thread is spawned on first use) →
+    :meth:`stop` for clean shutdown. The worker thread is a daemon so
+    a forgotten ``stop()`` cannot block process exit.
+
+    Failure handling: an exception raised by ``fan_out_broadcast_drv``
+    is caught in the worker (the job is marked as full-fail with an
+    empty failed-peers list), so a single bad broadcast cannot crash
+    the worker thread.
+    """
+
+    def __init__(
+        self,
+        self_peer_id: str,
+        peer_url_provider: Callable[[], list[str]],
+        our_pubkey: str = "",
+        fan_out: Callable[..., tuple[int, int, list[str]]] = (
+            peer_push.fan_out_broadcast_drv
+        ),
+        timeout: float = peer_push.DEFAULT_PUSH_TIMEOUT,
+    ) -> None:
+        self._self_peer_id = str(self_peer_id)
+        self._peer_url_provider = peer_url_provider
+        self._our_pubkey = str(our_pubkey)
+        self._fan_out = fan_out
+        self._timeout = float(timeout)
+        # Unbounded — broadcasts are small (10–50 KB drv files), the
+        # cluster is small (≤ tens of peers), and back-pressure here
+        # would block the eval-worker thread anyway.
+        self._queue: queue.Queue[Optional[_BroadcastJob]] = queue.Queue()
+        self._results: dict[str, BroadcastResult] = {}
+        # Per-broadcast events so multiple waiters can ``wait_for_completion``
+        # on different ids concurrently without polling.
+        self._events: dict[str, threading.Event] = {}
+        self._lock = threading.Lock()
+        self._stopped = False
+        self._thread: Optional[threading.Thread] = None
+
+    # --- public API ---------------------------------------------------------
+
+    def start(self) -> None:
+        """Spawn the worker thread if not already running.
+
+        Idempotent. Most callers do not need to call this explicitly;
+        :meth:`enqueue_broadcast` calls it lazily.
+        """
+        with self._lock:
+            if self._stopped:
+                raise RuntimeError(
+                    "BroadcastSender: cannot start after stop()"
+                )
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(
+                target=self._run,
+                name="BroadcastSender",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def enqueue_broadcast(
+        self,
+        path: str,
+        size: int,
+        item_class: Optional[str] = None,
+    ) -> str:
+        """Enqueue a fan-out and return the broadcast_id immediately.
+
+        Non-blocking. The worker thread picks the job up and calls
+        :func:`peer_push.fan_out_broadcast_drv` with the current peer
+        URL list and ``hop_count=0`` (originator).
+        """
+        broadcast_id = uuid.uuid4().hex
+        job = _BroadcastJob(
+            broadcast_id=broadcast_id,
+            path=str(path),
+            size=int(size),
+            item_class=item_class,
+        )
+        with self._lock:
+            if self._stopped:
+                raise RuntimeError(
+                    "BroadcastSender: enqueue after stop()"
+                )
+            self._events[broadcast_id] = threading.Event()
+        self.start()
+        self._queue.put(job)
+        return broadcast_id
+
+    def wait_for_completion(
+        self,
+        broadcast_id: str,
+        timeout: Optional[float] = None,
+    ) -> Optional[BroadcastResult]:
+        """Block until the named broadcast finishes (or *timeout*).
+
+        Returns the :class:`BroadcastResult` recorded by the worker,
+        or ``None`` if the wait timed out before the fan-out
+        completed. Unknown ``broadcast_id`` also returns ``None``.
+        """
+        with self._lock:
+            event = self._events.get(broadcast_id)
+        if event is None:
+            return None
+        if not event.wait(timeout=timeout):
+            return None
+        with self._lock:
+            return self._results.get(broadcast_id)
+
+    def stop(self) -> None:
+        """Signal the worker thread to exit and join it briefly.
+
+        Idempotent. Any waiters blocked on :meth:`wait_for_completion`
+        for unresolved broadcasts are NOT released — they will time
+        out per their own timeout argument. (In practice ``stop()`` is
+        called during teardown after all eval work has completed.)
+        """
+        with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            thread = self._thread
+        # Sentinel wakes the worker even when the queue is empty.
+        self._queue.put(None)
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    # --- internals ----------------------------------------------------------
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:
+                # Sentinel; either stop() was called or a spurious None
+                # slipped through. Re-check the stopped flag.
+                with self._lock:
+                    if self._stopped:
+                        return
+                continue
+            self._dispatch(job)
+
+    def _dispatch(self, job: _BroadcastJob) -> None:
+        try:
+            peer_urls = list(self._peer_url_provider())
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "BroadcastSender: peer_url_provider raised for %s",
+                job.broadcast_id,
+            )
+            peer_urls = []
+        # Empty peer list is a legitimate state (single-secondary
+        # cluster, all peers down) — ack as a 0/0 success.
+        if not peer_urls:
+            self._record_result(job.broadcast_id, 0, 0, [])
+            return
+        try:
+            success, fail, failed = self._fan_out(
+                peer_urls=peer_urls,
+                path=job.path,
+                size=job.size,
+                broadcast_id=job.broadcast_id,
+                origin_peer_id=self._self_peer_id,
+                hop_count=0,
+                our_pubkey=self._our_pubkey,
+                timeout=self._timeout,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "BroadcastSender: fan_out raised for %s (path=%s)",
+                job.broadcast_id, job.path,
+            )
+            # Treat as full failure but DO record + signal so waiters
+            # don't hang forever. failed_peers is empty because we
+            # don't know which target(s) actually raised.
+            self._record_result(
+                job.broadcast_id, 0, len(peer_urls), peer_urls,
+            )
+            return
+        self._record_result(
+            job.broadcast_id, int(success), int(fail), list(failed),
+        )
+
+    def _record_result(
+        self,
+        broadcast_id: str,
+        success: int,
+        fail: int,
+        failed_peers: list[str],
+    ) -> None:
+        result = BroadcastResult(
+            broadcast_id=broadcast_id,
+            success_count=int(success),
+            fail_count=int(fail),
+            failed_peers=tuple(failed_peers),
+        )
+        with self._lock:
+            self._results[broadcast_id] = result
+            event = self._events.get(broadcast_id)
+        if event is not None:
+            event.set()
