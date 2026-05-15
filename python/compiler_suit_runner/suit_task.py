@@ -45,8 +45,10 @@ from compiler_suit_runner.cachix_uploader import (
     CachixUploader,
     UploaderConfig,
 )
+from compiler_suit_runner import phase1_planner
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
+    phase0_eval_task_id,
     read_manifest,
 )
 from compiler_suit_runner.peer_cache import (
@@ -311,6 +313,195 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
 
 
 # ---------------------------------------------------------------------------
+# Phase 0 quiesce watcher
+# ---------------------------------------------------------------------------
+
+
+class _Phase0QuiesceWatcher:
+    """Wait for every ``phase0_eval_<binary>`` task to complete, then plan.
+
+    The watcher is registered as a task-completion listener at
+    ``on_run_start``. Each call to :meth:`on_task_completed` either
+    ignores a non-phase-0 task_id or marks the matching phase-0 task
+    as complete. Once the completed set covers the expected set, the
+    watcher fires :func:`phase1_planner.plan_phase1` exactly once and
+    hands the resulting :class:`ManifestHeader` list to
+    ``spawn_tasks``.
+
+    The ``spawn_tasks`` callback today is a stub: it serialises the
+    header list to ``out_dir / "_phase1_graph.json"`` and emits an INFO
+    log line with the header count. When the framework's Q5
+    ``primary.spawn_tasks`` API lands the stub gets swapped out for the
+    real dispatch (see TODO inline).
+
+    The watcher is NOT a framework task — it runs entirely in-process
+    on whichever thread the framework's task-completion notification is
+    delivered on. Calls to :meth:`on_task_completed` are guarded by an
+    internal lock so concurrent completions from a worker pool are safe.
+    """
+
+    def __init__(
+        self,
+        expected_task_ids: Iterable[str],
+        out_dir: pathlib.Path,
+        toolchain_task_ids: dict[str, str],
+        *,
+        logger: Optional[logging.Logger] = None,
+        sys_name: str = "x86_64-linux",
+    ) -> None:
+        self._expected: frozenset[str] = frozenset(expected_task_ids)
+        self._completed: set[str] = set()
+        self._out_dir = pathlib.Path(out_dir)
+        self._toolchain_task_ids: dict[str, str] = dict(toolchain_task_ids)
+        self._sys_name = sys_name
+        self._fired: bool = False
+        self._lock = threading.Lock()
+        self._logger = logger or logging.getLogger(__name__)
+
+    # ── Public read-only inspection (used by tests) ────────────────────
+
+    @property
+    def expected(self) -> frozenset[str]:
+        return self._expected
+
+    @property
+    def completed(self) -> frozenset[str]:
+        return frozenset(self._completed)
+
+    @property
+    def fired(self) -> bool:
+        return self._fired
+
+    # ── Event entry point ──────────────────────────────────────────────
+
+    def on_task_completed(
+        self, task_id: str, result: Any = None
+    ) -> None:
+        """Process one task-completion notification.
+
+        ``result`` is forwarded by the framework's hook (eventual API);
+        we don't currently inspect it because the Phase 0 worker writes
+        its manifest to ``out_dir/<binary>/_phase0/manifest.json`` and
+        the planner re-reads them. The result slot is kept on the
+        signature so the framework's call site doesn't need a wrapper.
+
+        No-op when:
+
+        * ``task_id`` is not a phase-0 task_id (e.g. a toolchain task
+          completion arrives — the watcher coexists with K=3 listeners
+          on the same hook).
+        * The watcher has already fired (``self._fired``).
+        * The task_id has already been marked complete (idempotent).
+        """
+        del result  # see docstring
+        if not task_id:
+            return
+        with self._lock:
+            if self._fired:
+                return
+            if task_id not in self._expected:
+                return
+            if task_id in self._completed:
+                return
+            self._completed.add(task_id)
+            if self._completed < self._expected:
+                # Still waiting on more phase 0 tasks.
+                return
+            self._fired = True
+            should_fire = True
+        if should_fire:
+            self._fire()
+
+    # ── Plan invocation ────────────────────────────────────────────────
+
+    def _fire(self) -> None:
+        """Re-read all phase-0 manifests and call ``plan_phase1``.
+
+        Swallows planner exceptions and logs them: the framework's
+        task-completion thread should not raise out into the
+        scheduler. A planner failure leaves Phase 1 unscheduled (the
+        run will then stall on the build phase — operator-visible).
+        """
+        try:
+            phase0_manifests = phase1_planner.read_phase0_manifests(
+                self._out_dir
+            )
+        except Exception:  # noqa: BLE001 — log + degrade
+            self._logger.exception(
+                "_Phase0QuiesceWatcher: read_phase0_manifests failed"
+                " for %s; Phase 1 will not be scheduled",
+                self._out_dir,
+            )
+            return
+
+        self._logger.info(
+            "_Phase0QuiesceWatcher: all %d phase-0 tasks complete;"
+            " loaded %d manifests; calling plan_phase1",
+            len(self._expected),
+            len(phase0_manifests),
+        )
+
+        try:
+            phase1_planner.plan_phase1(
+                phase0_manifests,
+                self._toolchain_task_ids,
+                self._spawn_tasks_stub,
+                sys_name=self._sys_name,
+            )
+        except Exception:  # noqa: BLE001 — log + degrade
+            self._logger.exception(
+                "_Phase0QuiesceWatcher: plan_phase1 raised; Phase 1"
+                " not scheduled"
+            )
+
+    # ── spawn_tasks stub ───────────────────────────────────────────────
+
+    def _spawn_tasks_stub(
+        self, headers: list[ManifestHeader]
+    ) -> None:
+        """Serialise ``headers`` to ``_phase1_graph.json`` + log count.
+
+        TODO(Q5): once the framework exposes
+        ``primary.spawn_tasks(...)`` replace this stub with a thin
+        adapter that translates :class:`ManifestHeader` records into
+        the framework's ``TaskInfo`` shape and calls the API. The
+        graph dump stays useful for offline inspection / resume.
+        """
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        graph_path = self._out_dir / "_phase1_graph.json"
+        # Serialise to a JSON-safe shape — ManifestHeader is a frozen
+        # dataclass, so we round-trip via dict.
+        serialised = [
+            {
+                "item_class": h.item_class,
+                "name": h.name,
+                "size": h.size,
+                "payload": h.payload,
+                "task_id": h.task_id,
+                "task_depends_on": list(h.task_depends_on),
+            }
+            for h in headers
+        ]
+        try:
+            import json
+            graph_path.write_text(
+                json.dumps(serialised, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError:
+            self._logger.exception(
+                "_Phase0QuiesceWatcher: failed writing %s",
+                graph_path,
+            )
+        self._logger.info(
+            "_Phase0QuiesceWatcher: spawn_tasks stub received %d"
+            " header(s); wrote %s (Q5 not yet wired)",
+            len(headers),
+            graph_path,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Public dataclass
 # ---------------------------------------------------------------------------
 
@@ -430,6 +621,14 @@ class SuitTask:
         self._replication_sender: Optional[ReplicationSender] = None
         self._replication_receiver: Optional[ReplicationReceiver] = None
         self._replication_repair: Optional[ReplicationRepairWorker] = None
+        # Phase 0 → Phase 1 quiesce watcher. Populated by on_run_start
+        # only when --distributed-eval is on (i.e. phase0_eval items
+        # are present in the manifest dir). Reference held so the
+        # listener doesn't get GC'd; framework task-completion events
+        # drive its on_task_completed method (best-effort hook
+        # registration; until the framework's task_completed surface
+        # lands the consumer drives it from its own dispatch loop).
+        self._phase0_watcher: Optional[_Phase0QuiesceWatcher] = None
         self._setup_done: bool = False
         self._setup_lock = threading.Lock()
 
@@ -642,7 +841,7 @@ class SuitTask:
         args: Optional[Namespace] = None,
     ) -> None:
         """Bring up peer-cache state. Idempotent."""
-        del source_dir, output_dir, args  # unused
+        del source_dir, args  # unused (output_dir consumed below)
         with self._setup_lock:
             if self._setup_done:
                 return
@@ -958,6 +1157,33 @@ class SuitTask:
                         "on_run_start: PeerNixConfWatcher start failed"
                     )
 
+            # 6b. Phase 0 → Phase 1 quiesce watcher.
+            #
+            # Scan the manifest dir for phase0_eval items. If any exist,
+            # spin up a _Phase0QuiesceWatcher whose on_task_completed
+            # method is the framework's task-completion hook target. The
+            # watcher fires phase1_planner.plan_phase1 once all phase 0
+            # tasks have completed and dumps the resulting graph to
+            # ``output_dir / "_phase1_graph.json"`` (Q5 stub).
+            #
+            # We register the watcher best-effort against whatever
+            # task-completion surface the framework currently exposes
+            # (none in 2552f7c — the consumer drives it directly until
+            # Q5 lands). The reference is held on ``self`` so it is
+            # not garbage-collected mid-run.
+            try:
+                self._phase0_watcher = self._build_phase0_watcher(
+                    output_dir=output_dir,
+                )
+                if self._phase0_watcher is not None:
+                    self._register_phase0_watcher(self._phase0_watcher)
+            except Exception:  # noqa: BLE001 — log + continue
+                self._logger.exception(
+                    "on_run_start: _Phase0QuiesceWatcher setup failed;"
+                    " Phase 1 planner will not auto-fire"
+                )
+                self._phase0_watcher = None
+
             # 7. ssh_debug (opt-in) — spawn sshd as a detached session
             # leader on ``config.ssh_debug_port`` and drop a ready
             # marker on the gateway-readable mount. Survives this
@@ -1106,6 +1332,11 @@ class SuitTask:
                     "on_run_end: withdraw_self failed"
                 )
 
+            # Drop the phase 0 watcher reference; if it never fired
+            # (e.g. run aborted mid-Phase-0) it just gets GC'd. No
+            # cleanup work — the watcher owns no threads, files, or
+            # sockets of its own.
+            self._phase0_watcher = None
             self._signing_key = None
             self._setup_done = False
 
@@ -1120,6 +1351,135 @@ class SuitTask:
             phase_id,
             completed,
             failed,
+        )
+
+    # ── Phase 0 watcher wiring ────────────────────────────────────────
+
+    def _build_phase0_watcher(
+        self,
+        *,
+        output_dir: Optional[pathlib.Path],
+    ) -> Optional[_Phase0QuiesceWatcher]:
+        """Scan the manifest dir and return a watcher if Phase 0 is active.
+
+        Returns ``None`` (no watcher) when no ``phase0_eval`` manifest is
+        present — that's the legacy-eval path (``--distributed-eval``
+        off) and there's nothing to wait for.
+
+        ``output_dir`` is the framework-supplied per-run output
+        directory; the planner reads ``out/<binary>/_phase0/
+        manifest.json`` under it and dumps ``_phase1_graph.json`` into
+        it. When the framework doesn't pass one we fall back to
+        ``config.shared_fs / 'out'`` so the layout stays consistent
+        with what the workers write.
+        """
+        manifest_dir = self.config.manifest_dir
+        try:
+            entries = sorted(manifest_dir.iterdir())
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+
+        expected_ids: set[str] = set()
+        toolchain_task_ids: dict[str, str] = {}
+
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            if entry.name.startswith((".", "_")):
+                continue
+            if entry.suffix != ".json":
+                continue
+            try:
+                header = read_manifest(entry)
+            except Exception:  # noqa: BLE001 — corrupt manifest
+                continue
+            if header.item_class == "phase0_eval":
+                binary = header.payload.get("binary", "")
+                if isinstance(binary, str) and binary:
+                    expected_ids.add(
+                        header.task_id or phase0_eval_task_id(binary)
+                    )
+                continue
+            if header.item_class in (
+                "phase2_toolchain",
+                "phase2_toolchain_validate",
+            ):
+                if not header.task_id:
+                    continue
+                # The planner keys toolchain_task_ids by drv path —
+                # the same identifier a variant's ``inputDrvs`` set
+                # will reference. Preflight stamps that drv on the
+                # toolchain header's payload under ``drv``; fall back
+                # to the legacy ``outpath`` only when ``drv`` is
+                # missing (older manifests).
+                drv = header.payload.get("drv") or header.payload.get(
+                    "drv_path"
+                )
+                if isinstance(drv, str) and drv:
+                    toolchain_task_ids[drv] = header.task_id
+
+        if not expected_ids:
+            return None
+
+        resolved_out_dir = (
+            pathlib.Path(output_dir)
+            if output_dir is not None
+            else self.config.shared_fs / "out"
+        )
+
+        return _Phase0QuiesceWatcher(
+            expected_task_ids=expected_ids,
+            out_dir=resolved_out_dir,
+            toolchain_task_ids=toolchain_task_ids,
+            logger=self._logger,
+            sys_name=self.config.sys_name,
+        )
+
+    def _register_phase0_watcher(
+        self, watcher: _Phase0QuiesceWatcher
+    ) -> None:
+        """Best-effort wire the watcher onto the framework's hook surface.
+
+        The framework's task-completion event seam is still in flight
+        (see Q4 / pending PRs). Try a few duck-typed registration
+        surfaces in priority order; if none exist the watcher remains
+        callable from the consumer's own dispatch loop (legacy single-
+        process CLI drives it directly). Either way we hold the
+        reference on ``self`` so it isn't GC'd.
+        """
+        # Candidate surfaces, in order of preference. Each is a tuple
+        # of (object_attr, method_name, arity-tag) — duck-checked.
+        # ``arity-tag`` documents what we'd pass; not used in code.
+        try:
+            from dynamic_runner import run as dynrunner_run  # type: ignore[import-not-found]
+        except Exception:  # noqa: BLE001 — framework absent
+            self._logger.debug(
+                "_register_phase0_watcher: dynamic_runner.run not"
+                " importable; watcher attached to SuitTask only"
+            )
+            return
+
+        for attr in ("register_task_completed_listener",
+                     "add_task_completed_listener",
+                     "on_task_completed"):
+            hook = getattr(dynrunner_run, attr, None)
+            if callable(hook):
+                try:
+                    hook(watcher.on_task_completed)
+                    self._logger.info(
+                        "_register_phase0_watcher: wired via"
+                        " dynamic_runner.run.%s",
+                        attr,
+                    )
+                    return
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "_register_phase0_watcher: %s raised", attr,
+                    )
+        self._logger.info(
+            "_register_phase0_watcher: framework task_completed hook"
+            " not found; watcher reachable via"
+            " SuitTask._phase0_watcher.on_task_completed"
         )
 
     # ==================================================================
