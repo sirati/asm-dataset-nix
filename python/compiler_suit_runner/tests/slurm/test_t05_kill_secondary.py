@@ -113,7 +113,17 @@ DEFAULT_TIMEOUT_S = 1200.0
 # one we expect to promote; reversing this would also be valid but
 # splitting the responsibility across the two id slots makes the test
 # message line up with the plan's prose.
-TARGET_SECONDARY_ID = "secondary-1"
+# Which secondary to SIGKILL mid-build. With N=2 the framework's
+# distributed manager assigns the toolchain (one heavyweight build)
+# to one secondary and the variant fan-out (cache-warm builds) to the
+# other, but the polarity between secondary-0 / secondary-1 is
+# non-deterministic across runs in the post-2f30920 framework. We use
+# the watchdog's ``"auto"`` mode which scans both secondaries' slurm
+# logs and fires on whichever one FIRST reports a successful variant
+# completion — that is the secondary running variants, and SIGKILL'ing
+# it mid-build is what triggers the post-promotion drain we want to
+# exercise.
+TARGET_SECONDARY_ID = "auto"
 
 # Number of secondaries this row dispatches. Two is the minimum for
 # the post-promotion drain we exercise.
@@ -124,8 +134,21 @@ N_SECONDARIES = 2
 # dispatch (only one secondary ever receives work). For T5 we go further:
 # we need ENOUGH variants that secondary-1 has work in flight when the
 # kill fires AND that secondary-0 has more work to do after the
-# promotion. ``2 * N_SECONDARIES`` is the same heuristic T4 uses.
-VARIANT_BUDGET = 2 * N_SECONDARIES
+# promotion. The watchdog fires on the FIRST variant completion (~one
+# cache-cold build wall on the live cluster, ~75 s); the scancel
+# round-trip is a few seconds; so the secondary needs strictly more
+# than (1 + scancel-latency / per-variant-wall) variants per secondary
+# in flight to still be running cache-warm follow-ups when SIGKILL
+# lands.
+#
+# Upper bound: the preflight passes the variant suffix set as a
+# ``--select`` expression to ``nix-eval-jobs``. Above ~12 total variants
+# the combined argv + env crosses the kernel's ARG_MAX and the
+# subprocess fails with ``OSError: [Errno 7] Argument list too long``.
+# ``4 * N_SECONDARIES`` (= 8 with N=2) sits comfortably below that
+# ceiling and still keeps secondary-1 busy with 3 cache-warm variants
+# past the kill on the live cluster wall numbers.
+VARIANT_BUDGET = 4 * N_SECONDARIES
 
 # In-flight cap for the failure heuristic. The framework dispatches
 # one variant per worker at a time; secondary-1 has at most this many

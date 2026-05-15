@@ -40,6 +40,11 @@ from compiler_suit_runner.tests.slurm.invariants import (
     run_all_invariants,
     wait_squeue_empty,
 )
+from compiler_suit_runner.tests.slurm.placement_assertions import (
+    assert_placement_files_present_and_nonempty as _assert_placement_files_present_and_nonempty,
+    assert_targeted_nix_copy_in_secondary_logs as _assert_targeted_nix_copy_in_secondary_logs,
+    assert_validate_manifests_emitted as _assert_validate_manifests_emitted,
+)
 from compiler_suit_runner.tests.slurm.run_helpers import (
     RunResult,
     default_invocation_for_smoke,
@@ -207,6 +212,15 @@ def test_t03_clean_medium(
 
     timeout_s = _resolve_timeout()
     result = fresh_run(invocation, timeout_s=timeout_s)
+    # Dump full dispatcher stdout/stderr to a file for offline triage.
+    # This is a temporary diagnostic for the
+    # primary-exit-reason mystery (Path A/B/C); remove once root-cause is
+    # identified.
+    import pathlib as _pl
+    _dump = _pl.Path("/tmp/t03-disp-full.log")
+    _dump.write_text(
+        "=== STDOUT ===\n" + result.stdout + "\n=== STDERR ===\n" + result.stderr
+    )
 
     # Surface the dispatch wall-time + exit code in the assertion
     # message so a clean-but-failing run is easy to triage.
@@ -263,3 +277,18 @@ def test_t03_clean_medium(
     assert not failed, (
         f"invariant(s) failed for {detail}:\n{_format_results(results)}"
     )
+
+    # ------------------------------------------------------------------
+    # Placement-map plumbing (cluster-wide ``dict[outpath, set[sid]]``).
+    # These assertions exercise the targeted-fetch refactor:
+    #   * manifests should be ``phase2_toolchain_validate`` (no build-on-
+    #     secondaries) — only path-info + nix-copy from a peer.
+    #   * the on-disk gossip ``peers/_paths_<sid>.jsonl`` files should
+    #     exist post-run and reference the toolchain outpaths.
+    #   * secondary logs should show ``nix copy --from http://...
+    #     --no-check-sigs`` invocations (point-to-point, no fanout).
+    # All four are file-only inspections of state the run left behind;
+    # nothing needs a live cluster connection at this stage.
+    _assert_validate_manifests_emitted(artifacts)
+    _assert_placement_files_present_and_nonempty(artifacts)
+    _assert_targeted_nix_copy_in_secondary_logs(artifacts)

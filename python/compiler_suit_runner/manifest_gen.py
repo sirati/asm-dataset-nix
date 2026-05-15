@@ -11,9 +11,10 @@ constant, so the framework's resource scheduler treats all items as
 zero-cost and packs purely by ``--jobs N`` worker count. Phase / type
 ordering is owned by :class:`PhaseSpec.depends_on` declared on the task.
 
-This module produces manifests for all five item classes in the plan's
+This module produces manifests for all known item classes in the plan's
 phase sequence:
 
+* ``phase0_eval``       — one per binary, distributed-eval Phase 0 task
 * ``phase1a_partition`` — one per (pkg, arch) shard
 * ``phase1b_merge``     — exactly one merge item
 * ``phase2_toolchain``  — one per (arch, compiler_label) cross-toolchain
@@ -22,6 +23,15 @@ phase sequence:
 
 Iteration order in the returned :class:`ManifestSet` follows the phase
 sequence.
+
+Stage taxonomy (see :func:`emit_all_manifests` ``stages`` kwarg) groups
+item classes by submission lifecycle:
+
+* ``"phase_minus1"`` — toolchain bootstrap tasks (``phase2_toolchain``)
+* ``"phase0"``       — distributed eval tasks (``phase0_eval``)
+* ``"phase1"``       — partition + merge + common-dep + variant build
+  tasks (everything else; emitted by the primary at runtime via Q5
+  ``primary.spawn_tasks`` once the distributed-eval path is wired)
 """
 
 from __future__ import annotations
@@ -40,9 +50,11 @@ from compiler_suit_runner.partition import Shard, VariantSpec, split_into_shards
 # Types
 
 ItemClass = Literal[
+    "phase0_eval",
     "phase1a_partition",
     "phase1b_merge",
     "phase2_toolchain",
+    "phase2_toolchain_validate",
     "phase2_common_dep",
     "phase3_variant",
 ]
@@ -52,12 +64,36 @@ ItemClass = Literal[
 # ``ManifestSet.by_class`` can return an empty tuple for absent classes
 # rather than raising ``KeyError``.
 _ALL_ITEM_CLASSES: tuple[ItemClass, ...] = (
+    "phase0_eval",
     "phase1a_partition",
     "phase1b_merge",
     "phase2_toolchain",
+    "phase2_toolchain_validate",
     "phase2_common_dep",
     "phase3_variant",
 )
+
+
+# Stage taxonomy — maps each lifecycle stage to the set of item classes
+# it covers. Used by :func:`emit_all_manifests` to selectively emit
+# only a subset of manifests when the submitter is only producing the
+# Phase -1 + Phase 0 slice (Phase 1+ comes later via Q5 spawn_tasks).
+Stage = Literal["phase_minus1", "phase0", "phase1"]
+
+_STAGE_TO_CLASSES: dict[Stage, frozenset[ItemClass]] = {
+    "phase_minus1": frozenset({
+        "phase2_toolchain", "phase2_toolchain_validate",
+    }),
+    "phase0": frozenset({"phase0_eval"}),
+    "phase1": frozenset({
+        "phase1a_partition",
+        "phase1b_merge",
+        "phase2_common_dep",
+        "phase3_variant",
+    }),
+}
+
+_ALL_STAGES: tuple[Stage, ...] = ("phase_minus1", "phase0", "phase1")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -127,8 +163,67 @@ def partition_task_id(shard: Shard) -> str:
 MERGE_TASK_ID = "merge__singleton"
 
 
+def phase0_eval_task_id(binary: str) -> str:
+    """Stable id for a phase 0 distributed-eval task. One task per
+    binary (NOT per (binary, arch)) — see plan Part B.
+
+    The eval worker, given the binary, walks every requested arch
+    locally inside the single task and broadcasts every produced drv
+    to its peers.
+    """
+    return f"phase0_eval__{binary}"
+
+
 # ---------------------------------------------------------------------------
 # Header constructors
+
+
+def make_phase0_eval_header(
+    binary: str,
+    sys_name: str,
+    archs: Iterable[str],
+    suffixes: Iterable[str],
+    *,
+    variant_sample: Optional[int] = None,
+    variant_seed: Optional[str] = None,
+) -> ManifestHeader:
+    """Build a phase 0 distributed-eval manifest.
+
+    One task per binary. The eval worker (``workers/eval_worker.py``)
+    runs ``nix-eval-jobs --flake .#dataset.<sys>.<binary>.<arch>`` for
+    every arch in ``archs``, sampled per ``(variant_sample,
+    variant_seed)``, collects the produced ``.drv`` paths, and
+    broadcasts each drv to all peers via the
+    ``/peer/path-broadcast-offer`` primitive.
+
+    ``task_depends_on`` is left empty for now — once Phase -1
+    toolchain bootstrap is wired, the phase 0 task should depend on
+    every toolchain task whose outputs it needs in order to walk the
+    flake's dataset attrs. TODO: reference Phase -1 toolchain task
+    hashes once those tasks exist (see plan Part B step 3 of Phase
+    -1).
+    """
+    archs_list = list(archs)
+    suffixes_list = list(suffixes)
+    payload: dict = {
+        "binary": binary,
+        "sys": sys_name,
+        "archs": archs_list,
+        "suffixes": suffixes_list,
+        "attr": f"dataset.{sys_name}.{binary}",
+    }
+    if variant_sample is not None:
+        payload["variant_sample"] = variant_sample
+    if variant_seed is not None:
+        payload["variant_seed"] = variant_seed
+    return ManifestHeader(
+        item_class="phase0_eval",
+        name=f"phase0_eval__{binary}",
+        size=0,
+        payload=payload,
+        task_id=phase0_eval_task_id(binary),
+        task_depends_on=(),
+    )
 
 
 def make_partition_shard_header(shard: Shard) -> ManifestHeader:
@@ -197,6 +292,51 @@ def make_toolchain_header(
     )
 
 
+def make_toolchain_validate_header(
+    sys_name: str,
+    arch: str,
+    compiler_label: str,
+    drv: str,
+    outpath: str | None = None,
+) -> ManifestHeader:
+    """Build a phase-2 toolchain *validate-only* manifest.
+
+    Emitted instead of :func:`make_toolchain_header` when the dispatch
+    runs with ``--allow-toolchain-build`` off (the default). The
+    build_worker handler for this class fetches the toolchain from a
+    peer (primary first per the placement map) instead of building
+    from source; the primary is responsible for having every
+    toolchain output already realised before dispatch.
+
+    Payload mirrors :func:`make_toolchain_header` so dispatch code
+    paths that key off the ``drv`` / ``attr`` / ``compiler_label``
+    fields keep working; the differentiator is the ``item_class``
+    string + the ``validate_only`` flag (set as a belt-and-braces
+    marker for forward compatibility if we want to thread per-item
+    behaviour through the validate path later). ``outpath`` is the
+    realised store path of the drv's ``out`` output; when present
+    the worker can skip ``nix derivation show`` and go straight to
+    a path-info check.
+    """
+    payload: dict = {
+        "sys": sys_name,
+        "arch": arch,
+        "compiler_label": compiler_label,
+        "attr": f"_crossToolchainMap.{sys_name}.{arch}.{compiler_label}",
+        "drv": drv,
+        "validate_only": True,
+    }
+    if outpath is not None:
+        payload["outpath"] = outpath
+    return ManifestHeader(
+        item_class="phase2_toolchain_validate",
+        name=f"toolchain_validate__{arch}__{compiler_label}",
+        size=0,
+        payload=payload,
+        task_id=toolchain_task_id(sys_name, arch, compiler_label),
+    )
+
+
 def make_common_dep_header(drv: str, label: str) -> ManifestHeader:
     """Build a phase-2 common host-dep manifest.
 
@@ -229,7 +369,12 @@ def _label_to_attr_suffix(label: str) -> str:
 
 
 def make_variant_header(
-    variant: VariantSpec, sys_name: str
+    variant: VariantSpec,
+    sys_name: str,
+    *,
+    input_drvs: Optional[frozenset[str]] = None,
+    drv_outpaths: Optional[dict[str, str]] = None,
+    preferred_secondaries: Optional[list[str]] = None,
 ) -> ManifestHeader:
     """Build a phase-3 variant manifest.
 
@@ -239,6 +384,23 @@ def make_variant_header(
     toolchain has been built/substituted, eliminating the worker-slot
     waste of variants spinning on nix-daemon's build-lock waiting for
     their toolchain to come online.
+
+    ``input_drvs`` (when provided) carries the variant's transitive
+    ``inputDrvs`` set — every drv path the variant build can read
+    from the local store. ``drv_outpaths`` maps each drv to its
+    realised ``outputs.out.path``. The pair is embedded in the
+    variant payload so the secondary's build_worker can pre-fetch
+    input deps from the cluster placement map before the actual
+    ``nix build``. When either is absent, no pre-fetch list is
+    emitted and the variant falls back to nix's native substituter
+    resolution (cache.nixos.org + the peer federation).
+
+    ``preferred_secondaries`` carries the K=3 scheduling-affinity
+    hint: the list of secondary-ids known (at manifest-emission time)
+    to hold this variant's toolchain. The framework scheduler reads
+    it and prefers a candidate from the list when a free worker is
+    available there (see plan: Framework Ask #2 — requires upstream
+    support to take effect). Empty / ``None`` = no preference.
     """
     pkg = variant["pkg"]
     arch = variant["arch"]
@@ -264,6 +426,21 @@ def make_variant_header(
         "tier": variant["tier"],
         "attr": f"dataset.{sys_name}.{pkg}.{arch}.{suffix}",
     }
+    if input_drvs and drv_outpaths:
+        # Only ship the inputs that we actually have an outpath
+        # mapping for; the rest stay implicit (worker falls back to
+        # native substituter resolution). Sorted for deterministic
+        # JSON output so manifest diffs stay readable across runs.
+        kept_inputs = sorted(d for d in input_drvs if d in drv_outpaths)
+        if kept_inputs:
+            payload["input_drvs"] = kept_inputs
+            payload["input_outpaths"] = {
+                d: drv_outpaths[d] for d in kept_inputs
+            }
+    if preferred_secondaries:
+        # Deterministic order so manifest diffs are stable; the
+        # scheduler treats this as an unordered preference set anyway.
+        payload["preferred_secondaries"] = sorted(preferred_secondaries)
     return ManifestHeader(
         item_class="phase3_variant",
         name=label,
@@ -410,6 +587,60 @@ class ManifestSet:
         return {cls: tuple(items) for cls, items in groups.items()}
 
 
+def emit_phase0_eval_manifests(
+    per_binary_metadata: dict[str, dict],
+    *,
+    sys_name: str,
+) -> list[ManifestHeader]:
+    """Build one phase 0 distributed-eval manifest header per binary.
+
+    ``per_binary_metadata`` maps a binary name to a metadata dict of
+    shape::
+
+        {
+            "archs": ["x86_64", "aarch64", ...],
+            "suffixes": ["O0", "O2", ...],
+            "variant_sample": 64,    # optional
+            "variant_seed": "...",   # optional
+        }
+
+    This shape is what :func:`compiler_suit_runner.preflight
+    .enumerate_variants` returns when invoked in
+    ``defer_to_phase0=True`` mode (see plan Part B, ``preflight.py``
+    split).
+
+    Each emitted header has ``task_depends_on=()`` for now. Once
+    Phase -1 toolchain bootstrap tasks exist, this should reference
+    the relevant toolchain task ids — see TODO inline in
+    :func:`make_phase0_eval_header`.
+
+    The function returns the list of headers; the caller is
+    responsible for writing them to disk (typically via
+    :func:`emit_all_manifests(stages=["phase_minus1", "phase0"])`,
+    which delegates here).
+    """
+    headers: list[ManifestHeader] = []
+    # Sort binaries for deterministic iteration order so test
+    # assertions and operator log lines are stable across runs.
+    for binary in sorted(per_binary_metadata.keys()):
+        meta = per_binary_metadata[binary]
+        archs = meta.get("archs", ())
+        suffixes = meta.get("suffixes", ())
+        variant_sample = meta.get("variant_sample")
+        variant_seed = meta.get("variant_seed")
+        headers.append(
+            make_phase0_eval_header(
+                binary=binary,
+                sys_name=sys_name,
+                archs=archs,
+                suffixes=suffixes,
+                variant_sample=variant_sample,
+                variant_seed=variant_seed,
+            )
+        )
+    return headers
+
+
 def emit_all_manifests(
     *,
     target_dir: pathlib.Path,
@@ -419,18 +650,53 @@ def emit_all_manifests(
     common_deps: Iterable[tuple[str, str]],
     num_workers: int = 1,
     toolchain_drvs: Optional[dict[tuple[str, str], str]] = None,
+    allow_toolchain_build: bool = False,
+    per_variant_inputs: Optional[dict[str, frozenset[str]]] = None,
+    drv_outpaths: Optional[dict[str, str]] = None,
+    toolchain_outpath_placements: Optional[dict[str, list[str]]] = None,
+    per_binary_metadata: Optional[dict[str, dict]] = None,
+    stages: Optional[list[str]] = None,
 ) -> ManifestSet:
     """Produce one ManifestHeader per queue item; write each to disk.
 
     Ordering of the returned ``headers`` tuple is deterministic and
-    follows the phase sequence: phase1a, phase1b_merge, phase2
-    (toolchains then common_deps), phase3 variants. Phase ordering is
-    enforced by the framework's :class:`PhaseSpec.depends_on` graph;
-    no explicit barrier sentinels are emitted.
+    follows the phase sequence: phase0_eval, phase1a, phase1b_merge,
+    phase2 (toolchains then common_deps), phase3 variants. Phase
+    ordering is enforced by the framework's
+    :class:`PhaseSpec.depends_on` graph; no explicit barrier sentinels
+    are emitted.
+
+    ``allow_toolchain_build`` flips phase-2 toolchain emission between
+    the legacy build-from-source ``phase2_toolchain`` class (True) and
+    the new validate-only ``phase2_toolchain_validate`` class (False,
+    the default for production dispatches).
+
+    ``per_variant_inputs`` + ``drv_outpaths`` (both optional) carry
+    the per-variant transitive ``inputDrvs`` sets and the global
+    drv→outpath mapping. When both are present, each variant
+    manifest's payload gets ``input_drvs`` + ``input_outpaths``
+    fields so the secondary's build_worker can pre-fetch deps from
+    the cluster placement map before the build.
 
     ``num_workers`` is accepted for API compatibility with older
     callers; it is no longer used (the framework sizes its worker pool
     independently).
+
+    ``per_binary_metadata`` carries the per-binary input for the
+    Phase 0 distributed-eval tasks (see
+    :func:`emit_phase0_eval_manifests` for the shape). When None, no
+    phase0_eval manifests are emitted regardless of ``stages``.
+
+    ``stages`` selects which lifecycle stages to emit:
+
+    * ``None`` (default, legacy): emit every class — used by callers
+      that still run the monolithic submitter flow.
+    * a list of values from ``{"phase_minus1", "phase0", "phase1"}``:
+      emit only the classes whose stage is in the list. The new
+      submit-time path (distributed-eval) passes
+      ``stages=["phase_minus1", "phase0"]`` so that Phase 1+ tasks
+      can be spawned at runtime by the primary via Q5
+      ``primary.spawn_tasks`` instead.
     """
     del num_workers  # accepted for compatibility; no longer used
 
@@ -451,9 +717,34 @@ def emit_all_manifests(
             continue
         stale.unlink()
 
+    # Resolve which item classes are in-scope for this emission.
+    if stages is None:
+        active_classes: frozenset[ItemClass] = frozenset(_ALL_ITEM_CLASSES)
+    else:
+        unknown = [s for s in stages if s not in _STAGE_TO_CLASSES]
+        if unknown:
+            raise ValueError(
+                f"emit_all_manifests: unknown stage(s) {unknown!r}; "
+                f"valid stages are {list(_STAGE_TO_CLASSES.keys())}"
+            )
+        merged: set[ItemClass] = set()
+        for stage in stages:
+            merged.update(_STAGE_TO_CLASSES[stage])  # type: ignore[index]
+        active_classes = frozenset(merged)
+
     variants_tuple = tuple(variants)
 
     headers: list[ManifestHeader] = []
+
+    # Phase 0 — distributed-eval tasks (one per binary). Emitted
+    # only when ``per_binary_metadata`` is provided AND the phase0
+    # stage is active; legacy callers don't pass either.
+    if "phase0_eval" in active_classes and per_binary_metadata:
+        headers.extend(
+            emit_phase0_eval_manifests(
+                per_binary_metadata, sys_name=sys_name
+            )
+        )
 
     # Phase 1a + Phase 1b are computed inline on the primary (job-list
     # creation belongs there — secondaries have empty /nix/stores and
@@ -469,17 +760,59 @@ def emit_all_manifests(
     # substitute) instead of ``nix build <flake>#<attr>`` (which
     # would need flake.nix shipped to the secondary).
     tc_drvs = toolchain_drvs or {}
+    outpaths_map = drv_outpaths or {}
     for arch, compiler_label in toolchain_specs:
         drv = tc_drvs.get((arch, compiler_label))
-        headers.append(
-            make_toolchain_header(sys_name, arch, compiler_label, drv=drv)
-        )
-    for drv, label in common_deps:
-        headers.append(make_common_dep_header(drv, label))
+        if allow_toolchain_build or not drv:
+            # Fall back to the build header when either:
+            #  - the operator opted in via --allow-toolchain-build, or
+            #  - we don't have a resolved drv path (validate-only
+            #    can't fetch by-outpath without the drv → outpath
+            #    mapping). The latter typically means
+            #    eval_toolchain_drvs failed on the primary; logging
+            #    here would be noisy because emit_all_manifests is
+            #    also called from cached-preflight restoration. The
+            #    CLI's primary-side toolchain check is the loud
+            #    "no drv resolved" signal.
+            if "phase2_toolchain" in active_classes:
+                headers.append(
+                    make_toolchain_header(sys_name, arch, compiler_label, drv=drv)
+                )
+        else:
+            if "phase2_toolchain_validate" in active_classes:
+                headers.append(
+                    make_toolchain_validate_header(
+                        sys_name, arch, compiler_label, drv,
+                        outpath=outpaths_map.get(drv),
+                    )
+                )
+    if "phase2_common_dep" in active_classes:
+        for drv, label in common_deps:
+            headers.append(make_common_dep_header(drv, label))
 
-    # Phase 3 — variants.
-    for variant in variants_tuple:
-        headers.append(make_variant_header(variant, sys_name))
+    # Phase 3 — variants. Inputs map keys by ``variant['label']``
+    # (matches compute_partition_locally's per_variant dict).
+    if "phase3_variant" in active_classes:
+        inputs_by_label = per_variant_inputs or {}
+        placements_by_outpath = toolchain_outpath_placements or {}
+        for variant in variants_tuple:
+            # K=3 scheduling affinity: look up the variant's toolchain
+            # drv → outpath → placement holders. Empty list when the
+            # toolchain hasn't been placed yet (typical at submit time).
+            tc_drv = tc_drvs.get((variant["arch"], variant["compiler_id"]))
+            preferred: Optional[list[str]] = None
+            if tc_drv:
+                tc_outpath = outpaths_map.get(tc_drv)
+                if tc_outpath:
+                    preferred = placements_by_outpath.get(tc_outpath) or None
+            headers.append(
+                make_variant_header(
+                    variant, sys_name,
+                    input_drvs=inputs_by_label.get(variant["label"]),
+                    drv_outpaths=outpaths_map if outpaths_map else None,
+                    preferred_secondaries=preferred,
+                )
+            )
 
     for header in headers:
         write_manifest(target_dir, header)

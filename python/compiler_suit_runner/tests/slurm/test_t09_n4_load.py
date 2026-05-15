@@ -251,10 +251,19 @@ def test_t09_n4_load(
     #   each expose 2 CPUs; the framework's default sbatch request is
     #   14, which sbatch rejects with "CPU count per node can not be
     #   satisfied". 2 is the maximum that fits on a single worker.
+    # * ``archs`` -- narrow to native x86_64 only. The cross-toolchain
+    #   variants (aarch64-clang10, ...) drag in a heavy cross-LLVM
+    #   build per arch that fork-storms past the worker's per-container
+    #   process/memory budget on the 3.5 GiB slurm-test-env cap. T9's
+    #   contention contract is "N=4 secondaries dispatching the same
+    #   workload concurrently" — that's orthogonal to compiler family,
+    #   so narrowing keeps the row contention-meaningful and inside the
+    #   memory envelope.
     invocation = dataclasses.replace(
         default_invocation_for_smoke(jobs=n_secondaries, workload="large"),
         ssh_identity_file=pathlib.Path(LIVE_KEY_PATH),
         slurm_cpus_per_task=2,
+        archs=("x86_64",),
     )
 
     timeout_s = _resolve_timeout()

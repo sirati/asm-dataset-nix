@@ -53,6 +53,7 @@ from compiler_suit_runner.peer_cache import (
     SUBSTITUTERS_FILENAME,
     substituters_filename_for,
     HarmoniaProcess,
+    PathPlacementWatcher,
     PeerInfo,
     PeerListWatcher,
     SigningKey,
@@ -65,6 +66,13 @@ from compiler_suit_runner.peer_push import (
     fan_out_announce,
     fan_out_withdraw,
     push_port_for,
+)
+from compiler_suit_runner.peer_replication import (
+    DEFAULT_REPLICATION_K,
+    ReplicationContext,
+    ReplicationReceiver,
+    ReplicationRepairWorker,
+    ReplicationSender,
 )
 from compiler_suit_runner.workers.build_worker import (
     BuildWorkerEnv,
@@ -93,7 +101,7 @@ __all__ = [
 
 # Item classes that route through the build worker.
 _PHASE2_BUILD_CLASSES: frozenset[str] = frozenset(
-    {"phase2_toolchain", "phase2_common_dep"}
+    {"phase2_toolchain", "phase2_toolchain_validate", "phase2_common_dep"}
 )
 
 
@@ -108,6 +116,13 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
     onto the same worker for kernel page-cache reuse.
     """
     item_class = header.item_class
+    if item_class == "phase0_eval":
+        # Phase 0 distributed-eval: one task per binary. Pinned by
+        # binary so we get a stable affinity bucket per package
+        # (handy for log grepping; framework just treats it as a
+        # tag).
+        binary = header.payload.get("binary", "?")
+        return ("phase0", "eval", binary)
     if item_class == "phase1a_partition":
         return ("phase1a", "partition", None)
     if item_class == "phase1b_merge":
@@ -121,6 +136,16 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
         compiler = header.payload.get("compiler_label", "?")
         arch = header.payload.get("arch", "?")
         return ("phase_build", "toolchain", f"{compiler}-{arch}")
+    if item_class == "phase2_toolchain_validate":
+        # Validate-only items use a dedicated type_id so the
+        # build_worker can branch on it (fetch-from-peer instead of
+        # nix-build) without having to inspect the manifest payload.
+        # Affinity follows the build variant for cache reuse: the
+        # secondary that pulls a toolchain is the natural candidate
+        # to pick up the variants that depend on it.
+        compiler = header.payload.get("compiler_label", "?")
+        arch = header.payload.get("arch", "?")
+        return ("phase_build", "toolchain_validate", f"{compiler}-{arch}")
     if item_class == "phase2_common_dep":
         return ("phase_build", "common_dep", None)
     if item_class == "phase3_variant":
@@ -251,6 +276,12 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
     # lets the workload flow continuously: toolchains finish, their
     # downstream variants unblock via the nix dep graph, tarballs
     # emerge as soon as their full closure is realized.
+    # ``toolchain_validate`` is uncapped: the work is a path-info
+    # probe + at most one ``nix copy`` per item, so the build-heavy
+    # cap (which targets nix-build oversubscription) doesn't apply.
+    # Keeping it uncapped also avoids starving phase-3 variants
+    # behind the validate phase when the same cap is configured low
+    # for compile-throttling.
     return (
         PhaseSpec(
             phase_id="phase_build",
@@ -259,6 +290,10 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
                     type_id="toolchain",
                     worker_module="compiler_suit_runner.workers.build_worker",
                     **build_kwargs,
+                ),
+                TaskTypeSpec(
+                    type_id="toolchain_validate",
+                    worker_module="compiler_suit_runner.workers.build_worker",
                 ),
                 TaskTypeSpec(
                     type_id="common_dep",
@@ -331,6 +366,26 @@ class SuitTaskConfig:
     # variant ordering at the daemon build-lock level — we never needed
     # framework-level deps for correctness, they were belt-and-suspenders.
     disable_task_deps: bool = False
+    # Policy flag for remote toolchain builds. Default ``False`` means
+    # secondaries only VALIDATE toolchains (path-info + targeted
+    # ``nix copy --from`` against the placement map), never build them
+    # — missing toolchains have to be realised on the primary before
+    # dispatch and surfaced as a :class:`PreflightError`. Flipping to
+    # ``True`` restores the legacy behaviour (every secondary may
+    # rebuild any toolchain whose outputs aren't in its local store);
+    # use this only when the primary's local store is a stale cache
+    # and the slowdown of remote toolchain builds is acceptable.
+    allow_toolchain_build: bool = False
+    # K=3 toolchain replication knobs. ``replication_k`` is the
+    # target holder count cluster-wide; default 3. Set to 1 to
+    # disable the K=3 cascade (every toolchain held by only its
+    # initial fetcher); set to 0 to disable replication entirely
+    # (no cascade, no repair). ``allow_observer_as_holder`` controls
+    # whether a late-attaching observer counts toward K when wired
+    # (Framework Ask #3); without observer support the flag has no
+    # effect.
+    replication_k: int = 3
+    allow_observer_as_holder: bool = True
     input_hash: str = ""
     toolchain_drvs: frozenset[str] = frozenset()
     common_threshold: int = 10
@@ -366,9 +421,15 @@ class SuitTask:
         self._signing_key: Optional[SigningKey] = None
         self._peer_watcher: Optional[PeerListWatcher] = None
         self._peer_nix_conf_watcher: Optional[Any] = None
+        self._placement_watcher: Optional[PathPlacementWatcher] = None
         self._cachix_uploader: Optional[CachixUploader] = None
         self._harmonia: Optional[HarmoniaProcess] = None
         self._push_server: Optional[PeerPushServer] = None
+        # K=3 replication coordination (consumer-side; not a framework
+        # task — runs parallel-async to the worker pool).
+        self._replication_sender: Optional[ReplicationSender] = None
+        self._replication_receiver: Optional[ReplicationReceiver] = None
+        self._replication_repair: Optional[ReplicationRepairWorker] = None
         self._setup_done: bool = False
         self._setup_lock = threading.Lock()
 
@@ -538,7 +599,7 @@ class SuitTask:
                 "--common-threshold",
                 str(self.config.common_threshold),
             ]
-        if type_id in {"toolchain", "common_dep", "variant"}:
+        if type_id in {"toolchain", "toolchain_validate", "common_dep", "variant"}:
             argv = common + [
                 "--flake-ref",
                 self.config.flake_ref,
@@ -548,6 +609,20 @@ class SuitTask:
             substituters = self._substituters_file_path()
             if substituters is not None:
                 argv += ["--substituters-file", str(substituters)]
+            # Cluster placement-map plumbing. ``shared_fs`` + the
+            # secondary identity let the build worker subprocess read
+            # ``peers/_paths_*.jsonl`` directly (no in-process watcher
+            # available across the framework's fork boundary) and write
+            # back its own placement records. The signing public-key
+            # authenticates the ``path-have`` push fan-out.
+            if self.config.shared_fs is not None:
+                argv += ["--shared-fs", str(self.config.shared_fs)]
+            if self.config.secondary_id:
+                argv += ["--secondary-id", self.config.secondary_id]
+            if self._signing_key is not None:
+                argv += [
+                    "--signing-public-key", self._signing_key.public_key,
+                ]
             return argv
         return common
 
@@ -621,6 +696,80 @@ class SuitTask:
                 )
                 self._peer_watcher = None
 
+            # 2a-bis. PathPlacementWatcher — same NFS-gossip + push-wake
+            # shape as PeerListWatcher, but aggregating per-secondary
+            # ``_paths_*.jsonl`` placement records. Workers query it
+            # before every fetch decision; the polling tick is the
+            # safety net for missed pushes.
+            try:
+                self._placement_watcher = PathPlacementWatcher(
+                    shared_fs=self.config.shared_fs,
+                    tick_seconds=60.0 if push_enabled else 5.0,
+                )
+                self._placement_watcher.start()
+            except Exception:  # noqa: BLE001 — log + continue
+                self._logger.exception(
+                    "on_run_start: PathPlacementWatcher failed to start"
+                )
+                self._placement_watcher = None
+
+            # 2b-pre. K=3 replication coordination plane.
+            #
+            # NOT a framework task — runs parallel-async to task/worker
+            # management. The receiver's handler callbacks need to be
+            # bound at PeerPushServer construction time (the server
+            # snapshots its callbacks into a generated handler class),
+            # so the replication classes have to be ready BEFORE the
+            # push server is constructed.
+            #
+            # Repair-on-death has two signal sources:
+            #
+            #   1. (primary, when shipped) Framework peer-removed hook —
+            #      sub-tick latency, see plan: Framework Ask #4.
+            #      Wired via ``ReplicationRepairWorker.on_peer_removed``.
+            #   2. (fallback) PathPlacementWatcher diff callback —
+            #      tick-bounded, kicks in if the framework hook is not
+            #      yet present in this dynrunner version.
+            if (
+                push_enabled
+                and self._peer_watcher is not None
+                and self._placement_watcher is not None
+                and self._signing_key is not None
+            ):
+                try:
+                    peer_watcher = self._peer_watcher
+                    placement_watcher = self._placement_watcher
+                    repl_ctx = ReplicationContext(
+                        my_secondary_id=self.config.secondary_id,
+                        our_pubkey=public_key,
+                        shared_fs=self.config.shared_fs,
+                        get_peers=lambda: list(peer_watcher.peers),
+                        get_placements=lambda: placement_watcher.snapshot(),
+                        replication_k=getattr(
+                            self.config, "replication_k",
+                            DEFAULT_REPLICATION_K,
+                        ),
+                    )
+                    self._replication_sender = ReplicationSender(repl_ctx)
+                    self._replication_receiver = ReplicationReceiver(
+                        repl_ctx, self._replication_sender,
+                    )
+                    self._replication_repair = ReplicationRepairWorker(
+                        repl_ctx, self._replication_sender,
+                    )
+                    # Fallback wiring: placement-diff drives repair.
+                    placement_watcher.register_diff_callback(
+                        self._replication_repair.on_diff,
+                    )
+                except Exception:  # noqa: BLE001 — log + continue
+                    self._logger.exception(
+                        "on_run_start: ReplicationSender/Receiver/Repair "
+                        "init failed; K=3 coordination disabled"
+                    )
+                    self._replication_sender = None
+                    self._replication_receiver = None
+                    self._replication_repair = None
+
             # 2b. Push server (listens BEFORE we announce so any peer
             # that pushes us in response sees a ready listener). Keyed
             # off ``public_key``: without the cluster signing key we
@@ -628,12 +777,66 @@ class SuitTask:
             if push_enabled and self._peer_watcher is not None:
                 try:
                     refresh_cb = self._peer_watcher.request_refresh
+                    placement_watcher = self._placement_watcher
+                    placement_refresh = (
+                        placement_watcher.request_refresh
+                        if placement_watcher is not None
+                        else (lambda: None)
+                    )
+                    receiver = self._replication_receiver
+                    sender = self._replication_sender
+
+                    def _on_path_have(record: dict) -> None:
+                        placement_refresh()
+                        # Notify the sender so any of OUR in-flight
+                        # offers to this peer settle and convergence
+                        # detection (path-cancel fan-out) can fire.
+                        if sender is not None:
+                            holder = record.get("secondary_id", "")
+                            outpath = record.get("outpath", "")
+                            if holder and outpath:
+                                try:
+                                    sender.on_path_have(holder, outpath)
+                                except Exception:  # noqa: BLE001
+                                    self._logger.exception(
+                                        "ReplicationSender.on_path_have raised"
+                                    )
+
+                    def _on_path_offer(record: dict) -> None:
+                        if receiver is not None:
+                            receiver.on_offer(record)
+
+                    def _on_path_accept(record: dict) -> None:
+                        if sender is not None:
+                            sender.on_accept(
+                                record.get("from_secondary_id", ""),
+                                record.get("outpath", ""),
+                            )
+
+                    def _on_path_reject(record: dict) -> None:
+                        if sender is not None:
+                            sender.on_reject(
+                                record.get("from_secondary_id", ""),
+                                record.get("outpath", ""),
+                                record.get("reason", ""),
+                            )
+
+                    def _on_path_cancel(record: dict) -> None:
+                        if receiver is not None:
+                            receiver.on_cancel(record)
+
                     self._push_server = PeerPushServer(
                         bind_host="0.0.0.0",
                         port=push_port_for(self.config.harmonia_port),
                         expected_pubkey=public_key,
                         on_announce=lambda _info: refresh_cb(),
                         on_withdraw=lambda _sid: refresh_cb(),
+                        on_path_have=_on_path_have,
+                        on_path_gone=lambda _rec: placement_refresh(),
+                        on_path_offer=_on_path_offer,
+                        on_path_accept=_on_path_accept,
+                        on_path_reject=_on_path_reject,
+                        on_path_cancel=_on_path_cancel,
                     )
                     self._push_server.start()
                 except Exception:  # noqa: BLE001 — log + continue
@@ -819,6 +1022,29 @@ class SuitTask:
                         "on_run_end: fan_out_withdraw failed"
                     )
 
+            # Stop the replication coordination plane before the push
+            # server: cancels any pending offer timers cleanly so they
+            # don't try to push through a torn-down server.
+            if self._replication_sender is not None:
+                try:
+                    self._replication_sender.stop()
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "on_run_end: ReplicationSender stop failed"
+                    )
+                finally:
+                    self._replication_sender = None
+            if self._replication_receiver is not None:
+                try:
+                    self._replication_receiver.stop()
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "on_run_end: ReplicationReceiver stop failed"
+                    )
+                finally:
+                    self._replication_receiver = None
+            self._replication_repair = None
+
             if self._push_server is not None:
                 try:
                     self._push_server.stop()
@@ -859,7 +1085,19 @@ class SuitTask:
                 finally:
                     self._peer_watcher = None
 
+            if self._placement_watcher is not None:
+                try:
+                    self._placement_watcher.stop()
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "on_run_end: PathPlacementWatcher stop failed"
+                    )
+                finally:
+                    self._placement_watcher = None
+
             try:
+                # Also unlinks ``peers/_paths_<sid>.jsonl`` so peers'
+                # placement watchers drop our entries on next tick.
                 withdraw_self(
                     self.config.shared_fs, self.config.secondary_id
                 )
@@ -969,6 +1207,15 @@ class SuitTask:
                 flake_ref=self.config.flake_ref,
                 dataset_output_dir=self.config.dataset_dir,
                 substituters_file=self._substituters_file_path(),
+                shared_fs=self.config.shared_fs,
+                secondary_id=self.config.secondary_id,
+                placement_watcher=self._placement_watcher,
+                peer_watcher=self._peer_watcher,
+                signing_public_key=(
+                    self._signing_key.public_key
+                    if self._signing_key is not None
+                    else ""
+                ),
             )
             self._build_worker(path, env)
             return

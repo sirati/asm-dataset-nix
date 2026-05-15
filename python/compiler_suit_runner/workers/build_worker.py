@@ -37,6 +37,7 @@ __all__ = [
     "BuildWorkerEnv",
     "VALID_ITEM_CLASSES",
     "ITEM_CLASS_PHASE2_TOOLCHAIN",
+    "ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE",
     "ITEM_CLASS_PHASE2_COMMON_DEP",
     "ITEM_CLASS_PHASE3_VARIANT",
     "parse_build_manifest",
@@ -50,12 +51,14 @@ __all__ = [
 # module-level constants so callers (manifest_gen, suit_task) reference
 # the same string literals.
 ITEM_CLASS_PHASE2_TOOLCHAIN = "phase2_toolchain"
+ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE = "phase2_toolchain_validate"
 ITEM_CLASS_PHASE2_COMMON_DEP = "phase2_common_dep"
 ITEM_CLASS_PHASE3_VARIANT = "phase3_variant"
 
 VALID_ITEM_CLASSES: frozenset[str] = frozenset(
     {
         ITEM_CLASS_PHASE2_TOOLCHAIN,
+        ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE,
         ITEM_CLASS_PHASE2_COMMON_DEP,
         ITEM_CLASS_PHASE3_VARIANT,
     }
@@ -103,6 +106,14 @@ class BuildWorkerResult:
     error: Optional[str] = None
     output_path: Optional[pathlib.Path] = None
     staged_outputs: tuple[pathlib.Path, ...] = ()
+    # Cluster-wide placement-map fields. Populated when the worker
+    # realises (or fetches) a store path; consumed by the post-build
+    # hook in :func:`build_worker` to register the path with the
+    # cluster placement gossip (:mod:`peer_paths`). ``outpath`` is
+    # the realised ``/nix/store/<hash>-name`` (NOT the .drv); ``drv``
+    # is the drv path the build worker was asked to realise.
+    outpath: Optional[str] = None
+    drv: Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -134,6 +145,21 @@ class BuildWorkerEnv:
     clock: Optional[Callable[[], float]] = None
     # Number of trailing log lines to retain on failure.
     log_excerpt_lines: int = 80
+    # Cluster placement-map plumbing. ``shared_fs`` is the NFS root
+    # used by :mod:`peer_paths` for the per-secondary
+    # ``_paths_<sid>.jsonl`` gossip file. ``secondary_id`` is this
+    # worker's identity. ``placement_watcher`` provides the
+    # ``snapshot()`` aggregate; ``peer_watcher`` carries the live
+    # peer list for targeted ``nix copy`` fetches and the path-have
+    # broadcast. ``signing_public_key`` is the cluster pubkey header
+    # used to authenticate the push fan-out. All are ``None`` /
+    # empty in unit tests; the worker treats absence as "no
+    # placement plumbing", skipping pre-fetch and record-self-has.
+    shared_fs: Optional[pathlib.Path] = None
+    secondary_id: str = ""
+    placement_watcher: Optional["object"] = None
+    peer_watcher: Optional["object"] = None
+    signing_public_key: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +493,306 @@ def _last_nonblank_line(stdout: bytes) -> Optional[str]:
     return None
 
 
+def _resolve_placements(env: BuildWorkerEnv) -> dict:
+    """Return the cluster placement aggregate accessible to this worker.
+
+    Prefers ``env.placement_watcher.snapshot()`` (in-process flow,
+    no disk I/O); falls back to a one-shot read of every
+    ``peers/_paths_*.jsonl`` on ``env.shared_fs`` (subprocess flow).
+    Empty dict when no source is available.
+    """
+    if env.placement_watcher is not None:
+        try:
+            return env.placement_watcher.snapshot()
+        except Exception:  # noqa: BLE001
+            pass
+    if env.shared_fs is not None:
+        try:
+            from compiler_suit_runner.peer_cache import (
+                _read_all_placement_files,
+            )
+            return _read_all_placement_files(env.shared_fs)
+        except Exception:  # noqa: BLE001
+            pass
+    return {}
+
+
+def _resolve_peers(env: BuildWorkerEnv) -> list:
+    """Return the live peer list accessible to this worker.
+
+    Prefers ``env.peer_watcher.peers``; falls back to a one-shot
+    NFS scan of ``peers/`` via :func:`peer_cache.list_peers`.
+    Excludes self if ``env.secondary_id`` is set.
+    """
+    if env.peer_watcher is not None:
+        try:
+            return list(env.peer_watcher.peers)
+        except Exception:  # noqa: BLE001
+            pass
+    if env.shared_fs is not None:
+        try:
+            from compiler_suit_runner.peer_cache import list_peers
+            return list_peers(
+                env.shared_fs,
+                exclude_id=env.secondary_id or None,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return []
+
+
+def _maybe_record_self_has(
+    env: BuildWorkerEnv,
+    outpath: Optional[str],
+    drv: Optional[str],
+    placement_class: str,
+) -> None:
+    """Best-effort cluster placement record for a realised store path.
+
+    Skipped silently when the placement plumbing is not configured
+    (unit tests, single-process flows) or when ``outpath`` is empty.
+    The on-disk JSONL gossip file is the source of truth; the push
+    fan-out is opportunistic — failures here never propagate to the
+    build result.
+
+    Side-effect that drives K=3 cascade: writing the placement record
+    makes the manager-process :class:`PathPlacementWatcher` see this
+    secondary as a new holder on its next refresh (call
+    ``request_refresh`` if the watcher handle is available here, e.g.
+    the legacy in-process flow). The watcher's diff callback then
+    fires :meth:`ReplicationRepairWorker.on_diff` which initiates the
+    cascade push_attempt for toolchain outpaths. The subprocess
+    worker flow has no ``placement_watcher`` handle, so the cascade
+    latency is bounded by the watcher's tick.
+    """
+    if not outpath:
+        return
+    if env.shared_fs is None or not env.secondary_id:
+        return
+    try:
+        from compiler_suit_runner import peer_paths  # local import: keeps
+        # import-time graph lean for unit tests that don't load peer_paths.
+        peers = _resolve_peers(env) if env.signing_public_key else None
+        peer_paths.record_self_has(
+            env.shared_fs,
+            my_secondary_id=env.secondary_id,
+            outpath=outpath,
+            drv_path=drv or "",
+            item_class=placement_class,
+            peers=peers,
+            our_pubkey=env.signing_public_key or None,
+        )
+    except Exception:  # noqa: BLE001 - placement is best-effort
+        pass
+    # Wake the manager-process placement watcher so the cascade
+    # diff-callback fires within a few ms instead of one tick. Only
+    # available in the legacy in-process flow (subprocess workers
+    # don't carry the watcher handle).
+    watcher = getattr(env, "placement_watcher", None)
+    if watcher is not None:
+        try:
+            request_refresh = getattr(watcher, "request_refresh", None)
+            if callable(request_refresh):
+                request_refresh()
+        except Exception:  # noqa: BLE001 - wake is best-effort
+            pass
+
+
+def _validate_toolchain(
+    payload: dict,
+    env: BuildWorkerEnv,
+    *,
+    item_class: str,
+    name: str,
+    start: float,
+    clock: Callable[[], float],
+) -> BuildWorkerResult:
+    """Handle a ``phase2_toolchain_validate`` item: fetch instead of build.
+
+    Cheap path-info probe first; on miss, run a single targeted
+    ``nix copy --from http://<peer>:<port>`` against the placement
+    map (primary preferred). On success, record the outpath in our
+    own placement gossip so the next variant looking for this
+    toolchain finds us as a candidate.
+
+    Failure to fetch is fatal for the validate item (the toolchain
+    is required by every downstream variant); the result surfaces a
+    NonRecoverable-equivalent error message that the framework
+    treats as a hard failure.
+    """
+    outpath = payload.get("outpath")
+    drv = payload.get("drv")
+    if not isinstance(outpath, str) or not outpath:
+        return BuildWorkerResult(
+            item_class=item_class,
+            name=name,
+            success=False,
+            duration_seconds=max(0.0, clock() - start),
+            error=(
+                "phase2_toolchain_validate manifest missing"
+                " 'payload.outpath'; the primary's emit_all_manifests"
+                " should have included it"
+            ),
+            drv=drv if isinstance(drv, str) else None,
+        )
+
+    # Local-import the fetch helpers so unit tests that don't exercise
+    # the validate path don't pay the import cost.
+    from compiler_suit_runner.peer_paths_fetch import (
+        PRIMARY_CANDIDATE_ID,
+        fetch_from_peer,
+        is_path_locally_valid,
+    )
+
+    drv_str = drv if isinstance(drv, str) else None
+    if is_path_locally_valid(outpath, run_subprocess=env.run_subprocess):
+        _maybe_record_self_has(env, outpath, drv_str, "toolchain")
+        return BuildWorkerResult(
+            item_class=item_class,
+            name=name,
+            success=True,
+            duration_seconds=max(0.0, clock() - start),
+            outpath=outpath,
+            drv=drv_str,
+        )
+
+    placements = _resolve_placements(env)
+    peers = _resolve_peers(env)
+    # Wrap run_subprocess so a FAILED validate has the per-candidate
+    # argv + rc + stderr captured for triage. fetch_from_peer logs at
+    # DEBUG (filtered in production), so without this the only signal
+    # is "source is None". We only write the diag file on failure —
+    # writing on success would trip the ``build_failures`` invariant
+    # which counts entries in ``/app/log-network/build-failures/``.
+    fetch_log: list[tuple[list[str], int, bytes]] = []
+
+    def _wrapped(argv: list[str]) -> tuple[bytes, bytes, int]:
+        if env.run_subprocess is not None:
+            stdout, stderr, rc = env.run_subprocess(argv)
+        else:
+            import subprocess as _sub
+            p = _sub.run(  # noqa: S603
+                argv, check=False, capture_output=True, shell=False,
+            )
+            stdout, stderr, rc = p.stdout, p.stderr, p.returncode
+        fetch_log.append((list(argv), rc, stderr[-1500:]))
+        return stdout, stderr, rc
+
+    source = fetch_from_peer(
+        outpath,
+        placements,
+        peers,
+        prefer=PRIMARY_CANDIDATE_ID,
+        run_subprocess=_wrapped,
+        check_local=False,  # we just checked
+    )
+    if source is None:
+        # Only on failure: drop a diag log next to the build-failures
+        # so an operator can see exactly which candidate(s) refused.
+        try:
+            log_dir = pathlib.Path("/app/log-network/build-failures")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            diag_path = log_dir / f"{name}.validate-diag.log"
+            candidate_set = placements.get(outpath, set())
+            with diag_path.open("w", encoding="utf-8") as f:
+                f.write(
+                    f"outpath={outpath}\n"
+                    f"shared_fs={env.shared_fs}\n"
+                    f"secondary_id={env.secondary_id}\n"
+                    f"placements_keys_total={len(placements)}\n"
+                    f"candidates_for_outpath={sorted(candidate_set)!r}\n"
+                    f"peers={[(p.secondary_id, p.hostname, p.port) for p in peers]!r}\n"
+                    f"---\nfetch_attempts={len(fetch_log)}\n"
+                )
+                for argv, rc, err_tail in fetch_log:
+                    f.write(f"argv={argv!r}\n")
+                    f.write(f"rc={rc}\n")
+                    f.write(
+                        f"stderr_tail={err_tail.decode('utf-8', errors='replace')!r}\n"
+                    )
+        except Exception:  # noqa: BLE001 - diagnostic is best-effort
+            pass
+    if source is None:
+        return BuildWorkerResult(
+            item_class=item_class,
+            name=name,
+            success=False,
+            duration_seconds=max(0.0, clock() - start),
+            error=(
+                f"toolchain {outpath} not in local store and"
+                " no peer in the placement map could serve it;"
+                " primary may not have realised it yet, or"
+                " --allow-toolchain-build is needed"
+            ),
+            outpath=outpath,
+            drv=drv_str,
+        )
+    _maybe_record_self_has(env, outpath, drv_str, "toolchain")
+    return BuildWorkerResult(
+        item_class=item_class,
+        name=name,
+        success=True,
+        duration_seconds=max(0.0, clock() - start),
+        outpath=outpath,
+        drv=drv_str,
+    )
+
+
+def _prefetch_variant_inputs(
+    payload: dict,
+    env: BuildWorkerEnv,
+) -> None:
+    """Best-effort pre-fetch of every input dep in the placement map.
+
+    Reads ``payload['input_drvs']`` (list[str]) +
+    ``payload['input_outpaths']`` (dict[drv, outpath]) emitted by
+    :func:`manifest_gen.make_variant_header`. For each input whose
+    outpath is in the cluster placement map (i.e. some peer has it)
+    and not yet locally valid, issues a targeted ``nix copy --from``
+    against that peer. Failures are logged at debug and do not
+    affect the build: nix's native substituter resolution
+    (cache.nixos.org + the peer federation) handles anything the
+    pre-fetch didn't get.
+    """
+    input_drvs = payload.get("input_drvs")
+    input_outpaths = payload.get("input_outpaths")
+    if not isinstance(input_drvs, list) or not isinstance(input_outpaths, dict):
+        return
+    if not input_drvs:
+        return
+    placements = _resolve_placements(env)
+    if not placements:
+        return
+    peers = _resolve_peers(env)
+    if not peers:
+        return
+
+    from compiler_suit_runner.peer_paths_fetch import fetch_from_peer
+
+    for input_drv in input_drvs:
+        if not isinstance(input_drv, str):
+            continue
+        outpath = input_outpaths.get(input_drv)
+        if not isinstance(outpath, str) or not outpath:
+            continue
+        if outpath not in placements:
+            continue  # nobody has it; let nix's substituters handle it
+        try:
+            # ``fetch_from_peer`` runs a path-info check before
+            # invoking ``nix copy``; absent peers / network errors
+            # surface as ``None`` and are silently ignored — the
+            # downstream ``nix build`` will fetch via substituters
+            # or rebuild from source.
+            fetch_from_peer(
+                outpath,
+                placements,
+                peers,
+                run_subprocess=env.run_subprocess,
+            )
+        except Exception:  # noqa: BLE001 - pre-fetch is best-effort
+            continue
+
+
 def build_worker(
     manifest_json_path: pathlib.Path,
     env: BuildWorkerEnv,
@@ -538,6 +864,18 @@ def build_worker(
             duration_seconds=max(0.0, clock() - start),
             error="manifest missing 'payload' object",
         )
+
+    # Validate-only items have a different shape: no ``nix build``,
+    # just a path-info probe + targeted ``nix copy`` against the
+    # placement map. Branch here so the rest of the dispatch keeps
+    # its build-shaped invariants.
+    if item_class == ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE:
+        return _validate_toolchain(
+            payload, env,
+            item_class=item_class, name=name,
+            start=start, clock=clock,
+        )
+
     # Prefer the absolute drv path when the manifest carries it: lets
     # the secondary build via ``nix build /nix/store/...drv^*`` so the
     # drv (and its closure) substitutes from peer harmonias without
@@ -557,6 +895,13 @@ def build_worker(
     extra_args: list[str] = []
     if item_class == ITEM_CLASS_PHASE2_COMMON_DEP:
         extra_args.append("--skip-existing")
+
+    # Variant pre-fetch: pull every input dep the placement map
+    # knows about from a single targeted peer (no fanout). Runs
+    # before nix build so the deps are already in the local store
+    # when nix walks the closure. Best-effort — silent on failure.
+    if item_class == ITEM_CLASS_PHASE3_VARIANT:
+        _prefetch_variant_inputs(payload, env)
 
     try:
         success, stdout, stderr = build_attr(attr, env, extra_args=extra_args)
@@ -686,6 +1031,23 @@ def build_worker(
             duration_seconds=max(0.0, clock() - start),
             output_path=output_path,
             staged_outputs=tuple(staged),
+            outpath=str(out_store),
+            drv=drv if isinstance(drv, str) else None,
+        )
+
+    # Phase-2 success branch (toolchain build or common_dep). Capture
+    # the realised outpath from nix's stdout for the placement record;
+    # variants already returned above with their own outpath wiring.
+    success_outpath = _last_nonblank_line(stdout)
+    drv_str = drv if isinstance(drv, str) else None
+    if success_outpath:
+        placement_class = (
+            "common_dep"
+            if item_class == ITEM_CLASS_PHASE2_COMMON_DEP
+            else "toolchain"
+        )
+        _maybe_record_self_has(
+            env, success_outpath, drv_str, placement_class,
         )
 
     return BuildWorkerResult(
@@ -694,6 +1056,8 @@ def build_worker(
         success=True,
         duration_seconds=max(0.0, clock() - start),
         output_path=output_path,
+        outpath=success_outpath,
+        drv=drv_str,
     )
 
 
@@ -746,8 +1110,63 @@ def main() -> int:
             " PeerListWatcher; read fresh on every nix build."
         ),
     )
+    parser.add_argument(
+        "--shared-fs",
+        type=str,
+        default=None,
+        help=(
+            "NFS root where the cluster placement gossip lives"
+            " (peers/_paths_*.jsonl). Enables targeted nix copy"
+            " fetches + per-worker placement records. Absent =>"
+            " worker runs without the placement map."
+        ),
+    )
+    parser.add_argument(
+        "--secondary-id",
+        type=str,
+        default="",
+        help="This worker's secondary id; used as the placement-record author.",
+    )
+    parser.add_argument(
+        "--signing-public-key",
+        type=str,
+        default="",
+        help=(
+            "Cluster signing public key. Authenticates the"
+            " ``path-have`` push fan-out; without it placement"
+            " records are still written to disk but not broadcast."
+        ),
+    )
     parser.add_argument("--skip-existing", action="store_true")
     args, _ = parser.parse_known_args()
+
+    # Route the worker subprocess's stdlib-logging output to a file so
+    # framework runtime INFO/WARN/ERROR records aren't swallowed by the
+    # silenced worker stdio. Prefer ``--log-file`` if the framework
+    # passed it (multi-computer local factory does); otherwise write to
+    # ``/app/log-network/worker_<pid>.log`` which is the run-wide log
+    # bind-mount under the SLURM wrapper. ``force=True`` overrides any
+    # handlers an import-time side-effect installed.
+    import logging  # noqa: PLC0415 — late import is intentional: keep
+    # the module import path lean for unit tests.
+    _worker_log = args.log_file or f"/app/log-network/worker_{os.getpid()}.log"
+    try:
+        logging.basicConfig(
+            filename=_worker_log,
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            force=True,
+        )
+        logging.getLogger("compiler_suit_runner.build_worker.startup").info(
+            "build_worker subprocess started; pid=%d argv=%r",
+            os.getpid(), sys.argv,
+        )
+    except OSError:
+        # Best-effort — if the path isn't writable (eg outside the
+        # SLURM wrapper, or running unit tests with no mount), fall
+        # through and let stdlib logging route to stderr (which the
+        # framework silences anyway in this case). No tracebacks.
+        pass
 
     env = BuildWorkerEnv(
         flake_ref=args.flake_ref,
@@ -757,7 +1176,14 @@ def main() -> int:
             if args.substituters_file
             else None
         ),
+        shared_fs=(
+            pathlib.Path(args.shared_fs) if args.shared_fs else None
+        ),
+        secondary_id=args.secondary_id or "",
+        signing_public_key=args.signing_public_key or "",
     )
+
+    _handle_log = logging.getLogger("compiler_suit_runner.build_worker.handle")
 
     def handle(task: Task) -> Optional[WorkerOutput]:
         manifest_data = task.payload if isinstance(task.payload, dict) else None
@@ -766,7 +1192,31 @@ def main() -> int:
             if task.relative_path
             else pathlib.Path("<inline>")
         )
-        result = build_worker(manifest_path, env, manifest_data=manifest_data)
+        _handle_log.info(
+            "handle: starting task relative_path=%r resolved_path=%r",
+            task.relative_path, task.resolved_path,
+        )
+        # Wrap the consumer body in a broad-catch and re-raise as
+        # NonRecoverableError so we ALWAYS opt into Bug A's exit-1
+        # contract on build failure. The plain ``raise
+        # NonRecoverableError`` below is what we INTEND to hit, but if
+        # build_worker itself (somehow) re-raises a CalledProcessError
+        # or similar, the framework's runtime classifier would map it
+        # to Recoverable and Bug A wouldn't fire. Catch-and-re-raise
+        # makes the exception class explicit at this seam.
+        try:
+            result = build_worker(manifest_path, env, manifest_data=manifest_data)
+        except BaseException as exc:  # noqa: BLE001
+            _handle_log.exception(
+                "handle: build_worker raised unexpectedly (re-raising as NonRecoverable)"
+            )
+            raise NonRecoverableError(
+                f"build_worker crashed: {type(exc).__name__}: {exc}"
+            ) from exc
+        _handle_log.info(
+            "handle: build_worker returned success=%s name=%r error=%r",
+            result.success, result.name, (result.error or "")[:200],
+        )
         if not result.success:
             raise NonRecoverableError(result.error or "build failed")
         # Atomic stage→destination publish via the framework: the

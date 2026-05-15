@@ -15,10 +15,15 @@ from typing import Optional
 import pytest
 
 from compiler_suit_runner.preflight import (
+    PreflightError,
     PreflightResult,
+    build_toolchains_locally,
+    check_toolchains_locally,
     enumerate_toolchains,
+    enumerate_toolchains_only,
     enumerate_variants,
     filter_existing_variants,
+    path_info_batch,
     preflight,
     run_nix_eval,
 )
@@ -639,5 +644,358 @@ def test_filter_existing_handles_legacy_flat_layout(
     kept, skipped = filter_existing_variants(variants, dataset_dir=dataset)
     assert skipped == 1
     assert [v["label"] for v in kept] == ["b"]
+
+
+# ---------------------------------------------------------------------------
+# check_toolchains_locally / build_toolchains_locally
+# ---------------------------------------------------------------------------
+
+
+def test_check_toolchains_locally_returns_only_missing():
+    """``nix path-info <drv>^*`` returns 0 for realised, non-zero for
+    missing. The helper aggregates and returns the failing subset."""
+    realised = "/nix/store/aaa.drv"
+    missing = "/nix/store/bbb.drv"
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        drv_arg = argv[-1]
+        # ``<drv>^*`` expands to every output; the helper feeds the
+        # full ``^*`` suffix.
+        assert drv_arg.endswith("^*"), drv_arg
+        if drv_arg.startswith(realised):
+            return b"valid\n", b"", 0
+        return b"", b"path is not valid\n", 1
+
+    out = check_toolchains_locally(
+        frozenset({realised, missing}), run_subprocess=runner,
+    )
+    assert out == frozenset({missing})
+    # One probe per drv, regardless of order.
+    assert len(calls) == 2
+    for argv in calls:
+        assert argv[0] == "nix"
+        assert "path-info" in argv
+
+
+def test_check_toolchains_locally_handles_empty_set():
+    def runner(_argv):
+        raise AssertionError("runner must not be called for empty input")
+
+    assert check_toolchains_locally(frozenset(), run_subprocess=runner) == frozenset()
+
+
+def test_check_toolchains_locally_skips_falsy_entries():
+    """A drv path that is the empty string is a no-op (defensive: the
+    primary's eval may produce ``""`` for an unresolvable attr; we
+    don't want to count those as missing toolchains)."""
+
+    def runner(_argv):
+        return b"", b"", 0
+
+    # An empty string is silently dropped; no probe issued for it.
+    out = check_toolchains_locally(
+        frozenset({""}), run_subprocess=runner,
+    )
+    assert out == frozenset()
+
+
+def test_build_toolchains_locally_runs_nix_build_per_drv():
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        return b"", b"", 0
+
+    build_toolchains_locally(
+        frozenset({"/nix/store/aaa.drv", "/nix/store/bbb.drv"}),
+        run_subprocess=runner,
+    )
+    assert len(calls) == 2
+    for argv in calls:
+        assert argv[0] == "nix"
+        assert "build" in argv
+        assert "--no-link" in argv
+        # ``<drv>^*`` realises every output.
+        assert argv[-2].endswith("^*")
+
+
+def test_build_toolchains_locally_raises_preflight_error_on_failure():
+    def runner(_argv):
+        return b"", b"compilation failed: missing /lib/foo\n", 1
+
+    with pytest.raises(PreflightError, match="rc=1"):
+        build_toolchains_locally(
+            frozenset({"/nix/store/aaa.drv"}), run_subprocess=runner,
+        )
+
+
+def test_build_toolchains_locally_stops_at_first_failure():
+    """Once one build fails, the helper raises immediately — the
+    rest of the queue is implicitly abandoned because the operator
+    needs to investigate the first failure before continuing."""
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        # First drv fails; second would succeed if we got there.
+        if calls and len(calls) == 1:
+            return b"", b"boom\n", 1
+        return b"", b"", 0
+
+    # ``sorted`` order matters: the helper iterates sorted(drv_set).
+    drvs = frozenset({"/nix/store/aaa.drv", "/nix/store/bbb.drv"})
+    with pytest.raises(PreflightError):
+        build_toolchains_locally(drvs, run_subprocess=runner)
+    assert len(calls) == 1
+
+
+
+
+def test_enumerate_variants_defer_to_phase0_returns_metadata_only():
+    """``defer_to_phase0=True`` returns per-binary metadata without
+    forcing drv instantiation."""
+    runner, calls = _make_run_subprocess(_all_responses())
+    result = enumerate_variants(
+        ".",
+        "x86_64-linux",
+        sample_size=3,
+        sample_seed="alpha",
+        defer_to_phase0=True,
+        run_subprocess=runner,
+    )
+    # Return shape: dict[pkg, metadata_dict].
+    assert isinstance(result, dict)
+    assert set(result.keys()) == {"hello", "busybox"}
+
+    hello = result["hello"]
+    assert sorted(hello["archs"]) == ["aarch64", "x86_64"]
+    assert hello["sample_size"] == 3
+    assert hello["sample_seed"] == "alpha"
+    assert hello["tier"] == 1
+    # Suffixes per arch listed; NOT yet sampled (worker re-samples
+    # deterministically with the same seed).
+    assert hello["suffixes_by_arch"]["x86_64"] == [
+        "gcc15-O0-baseline-unhardened",
+        "gcc15-O2-baseline-unhardened",
+    ]
+    assert hello["suffixes_by_arch"]["aarch64"] == [
+        "gcc15-O2-baseline-unhardened",
+    ]
+
+    busybox = result["busybox"]
+    assert busybox["archs"] == ["x86_64"]
+    assert busybox["suffixes_by_arch"]["x86_64"] == [
+        "gcc15-O2-baseline-unhardened",
+    ]
+
+    # Regression guard: the slow drv-instantiation path is never hit.
+    # No call should target ``_drvPaths.<sys>`` (the cached full-matrix
+    # eval) and no nix-eval-jobs subprocess should be spawned.
+    for argv in calls:
+        if argv and pathlib.Path(argv[0]).name == "nix-eval-jobs":
+            raise AssertionError(
+                f"nix-eval-jobs spawned in deferred mode: {argv}"
+            )
+        for tok in argv:
+            if "#_drvPaths." in tok:
+                raise AssertionError(
+                    f"_drvPaths eval triggered in deferred mode: {tok}"
+                )
+
+
+def test_enumerate_variants_defer_to_phase0_honours_filters():
+    """``packages`` / ``archs`` filters still apply in deferred mode."""
+    runner, _ = _make_run_subprocess(_all_responses())
+    result = enumerate_variants(
+        ".",
+        "x86_64-linux",
+        packages=["hello"],
+        archs=["x86_64"],
+        defer_to_phase0=True,
+        run_subprocess=runner,
+    )
+    assert set(result.keys()) == {"hello"}
+    assert result["hello"]["archs"] == ["x86_64"]
+    assert "aarch64" not in result["hello"]["suffixes_by_arch"]
+
+
+def test_enumerate_variants_legacy_mode_unchanged():
+    """Regression: ``defer_to_phase0=False`` (default) returns the
+    legacy ``(variants, toolchain_drvs)`` shape."""
+    runner, _ = _make_run_subprocess(_all_responses())
+    legacy = enumerate_variants(
+        ".",
+        "x86_64-linux",
+        run_subprocess=runner,
+    )
+    # Tuple of (variants, drv_set) — not a dict.
+    assert isinstance(legacy, tuple)
+    assert len(legacy) == 2
+    variants, drv_set = legacy
+    assert len(variants) == 4
+    assert isinstance(drv_set, frozenset)
+    assert len(drv_set) == 4
+
+
+# ---------------------------------------------------------------------------
+# enumerate_toolchains_only
+# ---------------------------------------------------------------------------
+
+
+def test_enumerate_toolchains_only_returns_pairs_and_drv_paths():
+    """``enumerate_toolchains_only`` is the submitter-side toolchain
+    bootstrap surface; it returns ``(pairs, drv_paths)`` and never
+    touches variants."""
+    responses = _all_responses()
+    # Stub drv resolution for every toolchain pair the fixture exposes.
+    for arch, comp in (("x86_64", "gcc15"), ("x86_64", "clang20"),
+                       ("aarch64", "gcc15")):
+        responses[
+            f"_crossToolchainMap.x86_64-linux.{arch}.{comp}.drvPath"
+        ] = b"/nix/store/" + f"{arch}-{comp}.drv".encode()
+
+    runner, calls = _make_run_subprocess(responses)
+    pairs, drv_paths = enumerate_toolchains_only(
+        ".",
+        "x86_64-linux",
+        run_subprocess=runner,
+    )
+    assert pairs == (
+        ("aarch64", "gcc15"),
+        ("x86_64", "clang20"),
+        ("x86_64", "gcc15"),
+    )
+    assert drv_paths == {
+        ("aarch64", "gcc15"): "/nix/store/aarch64-gcc15.drv",
+        ("x86_64", "clang20"): "/nix/store/x86_64-clang20.drv",
+        ("x86_64", "gcc15"): "/nix/store/x86_64-gcc15.drv",
+    }
+    # No variant-side eval — we never look at _meta or _drvPaths.
+    for argv in calls:
+        for tok in argv:
+            if "#_meta." in tok or "#_drvPaths." in tok:
+                raise AssertionError(
+                    f"toolchains-only path touched variant attrs: {tok}"
+                )
+
+
+def test_enumerate_toolchains_only_empty_pairs_skip_drv_eval():
+    """If no toolchain pairs survive filtering, drv eval is skipped."""
+    runner, calls = _make_run_subprocess(_all_responses())
+    pairs, drv_paths = enumerate_toolchains_only(
+        ".",
+        "x86_64-linux",
+        archs=["nonexistent"],
+        run_subprocess=runner,
+    )
+    assert pairs == ()
+    assert drv_paths == {}
+    # Only the _crossToolchainsMeta eval ran; no per-pair drv resolve.
+    for argv in calls:
+        for tok in argv:
+            if "_crossToolchainMap" in tok:
+                raise AssertionError(
+                    f"drv eval ran on empty pairs: {tok}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# path_info_batch — one subprocess for many drvs
+# ---------------------------------------------------------------------------
+
+
+def test_path_info_batch_uses_single_subprocess_call():
+    """All drvs go through ONE ``nix path-info`` invocation, not N."""
+    captured: list[list[str]] = []
+
+    def runner(argv):
+        captured.append(list(argv))
+        # Modern nix shape: output path keyed, with ``deriver`` field.
+        payload = {
+            "/nix/store/out-a": {"deriver": "/nix/store/aaa.drv"},
+            "/nix/store/out-b": {"deriver": "/nix/store/bbb.drv"},
+            "/nix/store/out-c": {"deriver": "/nix/store/ccc.drv"},
+        }
+        return json.dumps(payload).encode("utf-8"), b"", 0
+
+    drvs = [
+        "/nix/store/aaa.drv",
+        "/nix/store/bbb.drv",
+        "/nix/store/ccc.drv",
+    ]
+    out = path_info_batch(drvs, run_subprocess=runner)
+
+    # Single subprocess call covered every drv.
+    assert len(captured) == 1
+    argv = captured[0]
+    assert argv[0] == "nix"
+    assert argv[1] == "path-info"
+    # Every drv shows up as a ``<drv>^*`` argument in the one call.
+    joined = " ".join(argv)
+    for drv in drvs:
+        assert f"{drv}^*" in joined
+
+    # Resolved outpaths flow back as drv -> outpath.
+    assert out == {
+        "/nix/store/aaa.drv": "/nix/store/out-a",
+        "/nix/store/bbb.drv": "/nix/store/out-b",
+        "/nix/store/ccc.drv": "/nix/store/out-c",
+    }
+
+
+def test_path_info_batch_empty_input_skips_subprocess():
+    """Empty drv list short-circuits without spawning nix."""
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        return b"{}", b"", 0
+
+    assert path_info_batch([], run_subprocess=runner) == {}
+    assert calls == []
+
+
+def test_path_info_batch_legacy_array_shape():
+    """Legacy ``nix path-info --json`` array output parses correctly."""
+
+    def runner(argv):
+        payload = [
+            {
+                "path": "/nix/store/out-a",
+                "deriver": "/nix/store/aaa.drv",
+                "valid": True,
+            },
+            {
+                "path": "/nix/store/out-b",
+                "deriver": "/nix/store/bbb.drv",
+                "valid": True,
+            },
+        ]
+        return json.dumps(payload).encode("utf-8"), b"", 0
+
+    out = path_info_batch(
+        ["/nix/store/aaa.drv", "/nix/store/bbb.drv"],
+        run_subprocess=runner,
+    )
+    assert out == {
+        "/nix/store/aaa.drv": "/nix/store/out-a",
+        "/nix/store/bbb.drv": "/nix/store/out-b",
+    }
+
+
+def test_path_info_batch_nonzero_returns_empty():
+    """Subprocess failure surfaces as an empty result (callers treat
+    missing keys as 'not in local store')."""
+
+    def runner(argv):
+        return b"", b"some error", 2
+
+    out = path_info_batch(
+        ["/nix/store/aaa.drv"],
+        run_subprocess=runner,
+    )
+    assert out == {}
 
 
