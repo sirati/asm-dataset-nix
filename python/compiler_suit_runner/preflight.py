@@ -27,7 +27,7 @@ import random
 import re
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Optional
 
 from compiler_suit_runner.partition import VariantSpec
@@ -377,6 +377,12 @@ def _parse_compiler_major(version: str) -> Optional[int]:
     return int(m.group(1)) if m is not None else None
 
 
+def _parse_compiler_minor(version: str) -> int:
+    """Best-effort parse of the minor version (0 if absent)."""
+    m = re.match(r"^\d+\.(\d+)", version)
+    return int(m.group(1)) if m is not None else 0
+
+
 # --- Primitives ----------------------------------------------------------
 #
 # Every rule below is one of three shapes:
@@ -532,6 +538,28 @@ def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
             f"{march}: missing {_LEGACY_BROKEN_MARCH[march]}"
         )
 
+    # Per-(arch, compiler-version) broken combos — the wrapper builds,
+    # ABI flags are right, hardening is stripped, but the variant
+    # build still fails for compiler-internal reasons (no
+    # integrated-as for that target+version, autoconf-vs-direct
+    # divergence, etc.). Lib/architectures.nix's brokenClangVersions
+    # is the source of truth on the Nix side; Python mirrors it
+    # via compiler_suit_runner.compiler_flag_support so the runner
+    # never enumerates these even if the Nix matrix gate is
+    # accidentally bypassed.
+    arch = meta_entry.get("arch", "")
+    minor = _parse_compiler_minor(meta_entry.get("compilerVersion", ""))
+    if family in ("gcc", "clang") and arch and major:
+        try:
+            from compiler_suit_runner.compiler_flag_support import is_known_broken
+            reason = is_known_broken(arch, family, major, minor)
+            if reason is not None:
+                return (
+                    f"{family} {major}.{minor} on {arch}: known-broken — {reason}"
+                )
+        except Exception:  # noqa: BLE001 — module-import safety
+            pass
+
     return None
 
 
@@ -586,8 +614,9 @@ def enumerate_variants(
     archs: Optional[list[str]] = None,
     sample_size: int = 0,
     sample_seed: str = "42",
+    defer_to_phase0: bool = False,
     run_subprocess: Optional[RunSubprocess] = None,
-) -> tuple[tuple[VariantSpec, ...], frozenset[str]]:
+):
     """Enumerate every ``(pkg, arch, suffix)`` variant the matrix exposes.
 
     Filters by ``packages`` and ``archs`` if provided (each is an inclusion
@@ -600,10 +629,32 @@ def enumerate_variants(
     ``_drvPaths`` eval is still scoped per ``(pkg, arch)``; sampling
     happens against the meta layer (instant) before any drv lookups.
 
-    Returns ``(variants, toolchain_drvs)`` where ``toolchain_drvs`` is the
-    set of nix drv paths corresponding to the variants. (The plan calls
-    this the canonical set; phase 1b uses it to filter "toolchain" from
-    "common host dep" classification.)
+    When ``defer_to_phase0=True``, **skip the drv-instantiation step**
+    entirely and return only the per-binary metadata that a Phase 0
+    eval-worker needs to do the slow ``nix-eval-jobs`` work itself.
+    The return shape is::
+
+        {
+          <pkg>: {
+            "archs": [arch, ...],
+            "suffixes_by_arch": {arch: [suffix, ...], ...},
+            "sample_size": int,
+            "sample_seed": str,
+            "tier": int,
+          },
+          ...
+        }
+
+    Note: ``suffixes_by_arch`` lists suffixes *after* support-table and
+    known-bad-combo filtering but *before* sampling — the Phase 0 worker
+    re-applies the deterministic sample with the same ``sample_seed`` so
+    the submitter never needs to know the sampled subset.
+
+    With ``defer_to_phase0=False`` (default) the function behaves exactly
+    as before and returns ``(variants, toolchain_drvs)`` where
+    ``toolchain_drvs`` is the set of nix drv paths corresponding to the
+    variants. (The plan calls this the canonical set; phase 1b uses it
+    to filter "toolchain" from "common host dep" classification.)
     """
     pkg_filter = set(packages) if packages else None
     arch_filter = set(archs) if archs else None
@@ -656,6 +707,52 @@ def enumerate_variants(
         if not isinstance(cell, dict):
             continue
         meta.setdefault(pkg, {})[arch] = cell
+
+    # Deferred Phase 0 mode: we have the per-(pkg, arch) meta but skip
+    # the drv-instantiation step entirely. The Phase 0 eval-worker on a
+    # secondary will do the slow ``nix-eval-jobs`` work itself, seeded
+    # with the same ``sample_seed`` so the resulting variant set is
+    # deterministic without the submitter ever forcing drv paths.
+    if defer_to_phase0:
+        from compiler_suit_runner.support_table import (  # noqa: PLC0415
+            is_supported,
+            load_support_table,
+        )
+        support = load_support_table()
+        out: dict[str, dict] = {}
+        for pkg, arch_attrs in sorted(meta.items()):
+            if pkg_filter is not None and pkg not in pkg_filter:
+                continue
+            if not isinstance(arch_attrs, dict):
+                continue
+            per_arch: dict[str, list[str]] = {}
+            for arch, suffix_attrs in sorted(arch_attrs.items()):
+                if arch_filter is not None and arch not in arch_filter:
+                    continue
+                if not isinstance(suffix_attrs, dict):
+                    continue
+                kept: list[str] = []
+                for suffix, meta_entry in sorted(suffix_attrs.items()):
+                    if not isinstance(meta_entry, dict):
+                        continue
+                    if not is_supported(
+                        support, meta_entry.get("compiler", ""), arch
+                    ):
+                        continue
+                    if is_known_bad_combo(meta_entry):
+                        continue
+                    kept.append(suffix)
+                if kept:
+                    per_arch[arch] = kept
+            if per_arch:
+                out[pkg] = {
+                    "archs": sorted(per_arch.keys()),
+                    "suffixes_by_arch": per_arch,
+                    "sample_size": sample_size,
+                    "sample_seed": sample_seed,
+                    "tier": _tier_from_pkg(pkg),
+                }
+        return out
 
     # Scope the (slow, drv-instantiating) `_drvPaths` eval to just the
     # (pkg, arch) combos the operator actually asked for. The full-matrix
@@ -971,6 +1068,126 @@ def enumerate_toolchains(
     return tuple(pairs)
 
 
+def enumerate_toolchains_only(
+    flake_ref: str,
+    sys_name: str,
+    *,
+    archs: Optional[list[str]] = None,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> tuple[tuple[tuple[str, str], ...], dict[tuple[str, str], str]]:
+    """Submitter-side toolchain-only preflight.
+
+    Resolves the (arch, compiler) toolchain set and their drv paths
+    without touching any variant matrix data. This is the fast surface
+    Phase -1 bootstrap uses to seed the cluster with toolchain drvs
+    before Phase 0 eval-tasks fire on secondaries.
+
+    Returns ``(pairs, drv_paths)`` where ``pairs`` is the sorted
+    ``(arch, compiler)`` tuple list and ``drv_paths`` maps each pair to
+    its resolved ``.drv`` path. Entries with failed drv evaluation are
+    dropped from ``drv_paths`` but stay in ``pairs`` so the caller can
+    decide what to do with them (e.g. log a warning, fall back to
+    flake-attr resolution downstream).
+    """
+    pairs = enumerate_toolchains(
+        flake_ref, sys_name, archs=archs, run_subprocess=run_subprocess,
+    )
+    if not pairs:
+        return pairs, {}
+    drv_paths = eval_toolchain_drvs(
+        flake_ref, sys_name, pairs, run_subprocess=run_subprocess,
+    )
+    return pairs, drv_paths
+
+
+# ---------------------------------------------------------------------------
+# Batched ``nix path-info`` helper
+# ---------------------------------------------------------------------------
+
+
+def path_info_batch(
+    drvs: list[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> dict[str, str]:
+    """Resolve outpaths for many ``.drv`` paths in **one** subprocess call.
+
+    Calls ``nix path-info <drv1> <drv2> ... <drvN> --json`` once and
+    parses the JSON result into a ``{drv: outpath}`` dict. Drvs whose
+    outpath isn't realised locally are *absent* from the returned dict
+    (callers should treat the missing key as "not in local store").
+    Empty input returns ``{}`` without spawning nix.
+
+    This replaces the legacy N-subprocess-calls loop (one
+    ``nix path-info`` per drv) which had per-fork startup overhead in
+    the hundreds-of-milliseconds range — a few minutes wall on 300+
+    toolchains. Batching collapses that to a single nix invocation.
+
+    Both nix's ``--json`` output shapes are handled:
+
+    - Modern (nix ≥ 2.19): a JSON object keyed by the path argument
+      (drv path) with the output paths nested inside.
+    - Legacy: a JSON array of entries each carrying a ``"path"`` field
+      pointing at the output and a separate ``"valid"`` flag.
+
+    The function uses the queried drv path's ``^*`` form so nix resolves
+    the drv's outputs rather than treating the drv itself as the path.
+    """
+    drvs = [d for d in drvs if isinstance(d, str) and d.endswith(".drv")]
+    if not drvs:
+        return {}
+    runner = run_subprocess or _default_run_subprocess
+    # The ``^*`` suffix tells ``nix path-info`` to resolve every output
+    # of the derivation (e.g. ``out``, ``lib``, ``bin``). Without it the
+    # subcommand looks for the drv path itself in the store, which
+    # always exists when the drv was written, defeating the existence
+    # probe semantics callers want.
+    argv: list[str] = [
+        "nix",
+        "path-info",
+        "--extra-experimental-features",
+        "nix-command flakes",
+        "--json",
+    ]
+    argv.extend(f"{d}^*" for d in drvs)
+    stdout, _stderr, rc = runner(argv)
+    if rc != 0:
+        return {}
+    try:
+        payload = json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return {}
+
+    out: dict[str, str] = {}
+    # Modern shape: {drv_or_output_path: {...}, ...}
+    if isinstance(payload, dict):
+        for key, entry in payload.items():
+            if not isinstance(key, str):
+                continue
+            # ``key`` is typically the output path (not the drv); the
+            # drv-of-origin lives in ``deriver`` on each entry.
+            if isinstance(entry, dict):
+                deriver = entry.get("deriver")
+                if isinstance(deriver, str) and deriver.endswith(".drv"):
+                    out[deriver] = key
+                    continue
+            # Fallback: the key itself is the drv (some nix variants).
+            if key.endswith(".drv"):
+                out[key] = key
+    elif isinstance(payload, list):
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            valid = entry.get("valid", True)
+            if not valid:
+                continue
+            path = entry.get("path")
+            deriver = entry.get("deriver")
+            if isinstance(deriver, str) and isinstance(path, str):
+                out[deriver] = path
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Composite
 # ---------------------------------------------------------------------------
@@ -1093,3 +1310,113 @@ def filter_existing_variants(
         else:
             remaining.append(variant)
     return tuple(remaining), skipped
+
+
+# ---------------------------------------------------------------------------
+# Local toolchain validation + realisation
+# ---------------------------------------------------------------------------
+
+
+class PreflightError(RuntimeError):
+    """Raised when preflight detects a state the dispatch cannot recover
+    from on its own — e.g. missing toolchains while remote-build is off.
+
+    Subclass of :class:`RuntimeError` so callers that already catch the
+    broader exception keep working; the dedicated type lets the CLI
+    surface a clean ``error:`` line without a traceback for known
+    failure modes.
+    """
+
+
+def check_toolchains_locally(
+    toolchain_drvs: frozenset[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> frozenset[str]:
+    """Return the subset of toolchain drvs not yet realised locally.
+
+    For each drv path in ``toolchain_drvs``, runs
+    ``nix path-info <drv>^*`` (one invocation per drv) and treats a
+    non-zero exit as "outputs are missing". ``^*`` expands to every
+    output of the drv, so a partially-realised toolchain (e.g. ``lib``
+    present but ``out`` missing) is correctly flagged as missing.
+
+    Returns a :class:`frozenset` so the caller can compare cheaply
+    against the full toolchain set without re-allocating.
+    """
+    runner = run_subprocess or _default_run_subprocess
+    missing: set[str] = set()
+    for drv in toolchain_drvs:
+        if not drv:
+            continue
+        cmd = [
+            "nix",
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "path-info",
+            f"{drv}^*",
+        ]
+        _stdout, _stderr, rc = runner(cmd)
+        if rc != 0:
+            missing.add(drv)
+    return frozenset(missing)
+
+
+def query_initial_toolchain_placement(
+    toolchain_outpaths: Iterable[str],
+) -> dict[str, list[str]]:
+    """Return the K=3 placement map for *toolchain_outpaths* at submit.
+
+    On the primary at submit time the placement map is typically
+    empty: no secondary has fetched the toolchains yet, and the
+    primary itself does NOT count toward K (per plan: primary may
+    disconnect; K is about secondary redundancy). The map converges
+    via cascade as soon as secondaries start fetching.
+
+    Returns ``{outpath: []}`` for every outpath so callers can iterate
+    keys without ``KeyError`` checks; empty lists mean "no preference"
+    when read by :func:`manifest_gen.emit_all_manifests`.
+
+    Function exists so the plumbing exists; in a future revision we
+    may pre-seed placement based on a "submitter-as-peer" observation,
+    but for now this is intentionally trivial.
+    """
+    return {op: [] for op in toolchain_outpaths if op}
+
+
+def build_toolchains_locally(
+    toolchain_drvs: frozenset[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> None:
+    """Realise every toolchain drv in the local nix store.
+
+    Calls ``nix build <drv>^* --no-link`` per drv (sequentially —
+    nix handles internal parallelism). On the first non-zero exit,
+    raises :class:`PreflightError` with the stderr snippet so the
+    operator can see why the build aborted.
+
+    ``--no-link`` avoids polluting the cwd with ``result`` symlinks;
+    the build artefacts land in the store regardless and the
+    placement gossip will be written from the first secondary that
+    pulls them.
+    """
+    runner = run_subprocess or _default_run_subprocess
+    for drv in sorted(toolchain_drvs):
+        if not drv:
+            continue
+        cmd = [
+            "nix",
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "build",
+            f"{drv}^*",
+            "--no-link",
+        ]
+        _stdout, stderr, rc = runner(cmd)
+        if rc != 0:
+            decoded = stderr.decode("utf-8", errors="replace").strip()
+            raise PreflightError(
+                f"local toolchain build failed for {drv} (rc={rc}): "
+                f"{decoded[-1000:]}"
+            )

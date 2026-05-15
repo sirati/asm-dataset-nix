@@ -92,6 +92,32 @@ def test_build_parser_clear_cache_accepts_hash():
     assert args.hash == "abc"
 
 
+def test_build_parser_submit_allow_toolchain_build_defaults_false(
+    tmp_path: pathlib.Path,
+):
+    """The new ``--allow-toolchain-build`` flag must default to False —
+    that's the whole point of the no-build-on-secondaries refactor.
+    Anyone flipping the default trips this test."""
+    parser = build_parser()
+    args = parser.parse_args(
+        ["submit", "--shared-fs", str(tmp_path),
+         "--multi-computer", "single-process"],
+    )
+    assert getattr(args, "allow_toolchain_build", None) is False
+
+
+def test_build_parser_submit_allow_toolchain_build_can_be_set(
+    tmp_path: pathlib.Path,
+):
+    parser = build_parser()
+    args = parser.parse_args(
+        ["submit", "--shared-fs", str(tmp_path),
+         "--multi-computer", "single-process",
+         "--allow-toolchain-build"],
+    )
+    assert args.allow_toolchain_build is True
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -286,7 +312,10 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
 
     def fake_emit(
         *, target_dir, sys_name, pre, num_workers, toolchain_drvs=None,
+        allow_toolchain_build=False, per_variant_inputs=None,
+        drv_outpaths=None,
     ):
+        del allow_toolchain_build, per_variant_inputs, drv_outpaths
         state["emit_calls"].append((target_dir, sys_name, num_workers))
 
         # Simulate manifest_dir population so cache.store can pack it.
@@ -313,6 +342,7 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
         state["restore_calls"].append((archive, target_dir))
         target_dir.mkdir(parents=True, exist_ok=True)
         (target_dir / "from-cache.json").write_text("{}")
+        return {}
 
     monkeypatch.setattr(cli_module, "_restore_manifests_from_archive", fake_restore)
 
@@ -542,8 +572,13 @@ def test_serialize_then_restore_preflight_roundtrip(tmp_path: pathlib.Path):
 
     # The toolchain manifest must carry the realised drv path so the
     # SLURM-side build worker doesn't fall back to flake-attr lookup
-    # (which fails — secondaries have no flake.nix in /app).
-    tc_files = list(target_dir.glob("toolchain__*.json"))
+    # (which fails — secondaries have no flake.nix in /app). The default
+    # (--allow-toolchain-build off) emits ``toolchain_validate__*.json``;
+    # opting in to local builds emits ``toolchain__*.json``. Both carry
+    # the drv path, which is what this regression test guards.
+    tc_files = list(target_dir.glob("toolchain__*.json")) + list(
+        target_dir.glob("toolchain_validate__*.json")
+    )
     assert len(tc_files) == 1
     tc = json.loads(tc_files[0].read_text())
     assert tc["payload"].get("drv") == "/nix/store/tc.drv"
