@@ -71,6 +71,18 @@ let
   meetsMaxVersion =
     cv: mv: mv.major == 0 || cv.major < mv.major || (cv.major == mv.major && cv.minor <= mv.minor);
 
+  # Per-target "known broken" version lists: an evaluable+buildable
+  # toolchain wrapper still fails to compile real code under that
+  # `(arch, compiler-version)` pair, for reasons documented in
+  # `lib/architectures.nix` next to each entry (e.g. missing
+  # integrated-as for ppc64+clang3.x, autoconf-vs-direct divergence
+  # for aarch64+clang3_5). Dropping at matrix-build time means the
+  # framework never enumerates the combo and the dispatch never
+  # wastes a worker on a known-impossible variant.
+  isVersionInBrokenList =
+    cv: brokenList:
+    builtins.any (b: b.major == cv.major && b.minor == cv.minor) brokenList;
+
   isValidArchCombo =
     compiler: target:
     let
@@ -87,8 +99,15 @@ let
             major = 0;
             minor = 0;
           };
+      brokenList =
+        if compiler.family == "gcc" then
+          target.brokenGccVersions or [ ]
+        else
+          target.brokenClangVersions or [ ];
     in
-    meetsMinVersion cv minV && meetsMaxVersion cv maxV;
+    meetsMinVersion cv minV
+    && meetsMaxVersion cv maxV
+    && !(isVersionInBrokenList cv brokenList);
 
   # All valid (compiler, optLevel) pairs
   compilerOptPairs = lib.concatMap (
