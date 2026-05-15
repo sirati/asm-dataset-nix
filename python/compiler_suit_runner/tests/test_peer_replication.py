@@ -20,8 +20,11 @@ from unittest import mock
 
 from compiler_suit_runner.peer_cache import PeerInfo, PlacementDiff
 from compiler_suit_runner.peer_replication import (
+    BROADCAST_ITEM_CLASS,
+    DEFAULT_BROADCAST_MAX_HOP,
     DEFAULT_OFFER_TIMEOUT_SECONDS,
     DEFAULT_REPLICATION_K,
+    BroadcastReceiver,
     BroadcastResult,
     BroadcastSender,
     ReplicationContext,
@@ -946,3 +949,367 @@ def test_broadcast_wait_for_unknown_id_returns_none() -> None:
         assert result is None
     finally:
         sender.stop()
+
+
+# ---------------------------------------------------------------------------
+# BroadcastReceiver
+# ---------------------------------------------------------------------------
+
+
+def _make_broadcast_receiver(
+    *,
+    self_peer_id: str = "me",
+    url_map: Optional[dict[str, str]] = None,
+    locally_valid: Optional[set[str]] = None,
+    fetch_ok: bool = True,
+    fan_out_result: tuple[int, int, list[str]] = (0, 0, []),
+    shared_fs: Optional[pathlib.Path] = None,
+    record_self_has=None,
+    max_hop: int = DEFAULT_BROADCAST_MAX_HOP,
+) -> tuple[
+    BroadcastReceiver,
+    dict[str, list],
+    mock.MagicMock,
+]:
+    """Construct a receiver with fakes; return (recv, recorders, fan_out_mock)."""
+    url_map = dict(url_map or {})
+    locally_valid_set = set(locally_valid or set())
+    recorders: dict[str, list] = {
+        "fetches": [], "records": [],
+    }
+
+    def _fetch(path: str, origin_url: str) -> bool:
+        recorders["fetches"].append((path, origin_url))
+        return bool(fetch_ok)
+
+    def _is_local(path: str) -> bool:
+        return path in locally_valid_set
+
+    fan_out_mock = mock.MagicMock(return_value=fan_out_result)
+
+    if record_self_has is None:
+        def record_self_has(
+            shared_fs_arg, *,
+            my_secondary_id, outpath, drv_path, item_class,
+            **_kwargs,
+        ) -> None:
+            recorders["records"].append((
+                shared_fs_arg, my_secondary_id, outpath,
+                drv_path, item_class,
+            ))
+
+    recv = BroadcastReceiver(
+        self_peer_id=self_peer_id,
+        peer_url_provider=lambda: dict(url_map),
+        is_path_locally_valid=_is_local,
+        fetch_path_from_peer=_fetch,
+        our_pubkey="me:PK",
+        shared_fs=shared_fs,
+        record_self_has=record_self_has,
+        fan_out=fan_out_mock,
+        max_hop=max_hop,
+        timeout=0.5,
+    )
+    return recv, recorders, fan_out_mock
+
+
+def test_broadcast_receiver_already_have_short_circuits(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Path already locally valid → no fetch, no fan-out, returns True.
+
+    A placement record is still written so peers learn we hold it.
+    """
+    recv, rec, fan_out = _make_broadcast_receiver(
+        url_map={"origin": "http://origin:6000", "me": "http://me:6000"},
+        locally_valid={"/nix/store/x.drv"},
+        shared_fs=tmp_path,
+    )
+    try:
+        ok = recv.on_broadcast_offer(
+            "/nix/store/x.drv", 1024, "origin", "bid-A", 0,
+        )
+        assert ok is True
+        assert rec["fetches"] == []
+        # Give the fan-out worker a tick to run; it should NOT.
+        time.sleep(0.05)
+        fan_out.assert_not_called()
+        # Placement record: phase0_eval_drv item class.
+        assert len(rec["records"]) == 1
+        _shared, sid, outpath, drv, klass = rec["records"][0]
+        assert sid == "me"
+        assert outpath == "/nix/store/x.drv"
+        assert drv == "/nix/store/x.drv"
+        assert klass == BROADCAST_ITEM_CLASS == "phase0_eval_drv"
+    finally:
+        recv.stop()
+
+
+def test_broadcast_receiver_unknown_origin_returns_false(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Origin peer not in the URL map → return False, no fetch, no
+    fan-out, no record."""
+    recv, rec, fan_out = _make_broadcast_receiver(
+        url_map={"some-other-peer": "http://o:6000"},
+        shared_fs=tmp_path,
+    )
+    try:
+        ok = recv.on_broadcast_offer(
+            "/nix/store/u.drv", 1024, "unknown-origin", "bid-U", 0,
+        )
+        assert ok is False
+        assert rec["fetches"] == []
+        assert rec["records"] == []
+        time.sleep(0.05)
+        fan_out.assert_not_called()
+    finally:
+        recv.stop()
+
+
+def test_broadcast_receiver_fetch_then_fan_out(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Successful fetch from origin → record + fan-out to peers minus
+    self minus origin, returns True."""
+    url_map = {
+        "me": "http://me:6000",
+        "origin": "http://origin-host:6000",
+        "peer-a": "http://a:6000",
+        "peer-b": "http://b:6000",
+    }
+    recv, rec, fan_out = _make_broadcast_receiver(
+        url_map=url_map,
+        fetch_ok=True,
+        fan_out_result=(2, 0, []),
+        shared_fs=tmp_path,
+    )
+    try:
+        ok = recv.on_broadcast_offer(
+            "/nix/store/f.drv", 4096, "origin", "bid-F", 2,
+        )
+        assert ok is True
+        # Fetch was called against the origin's URL.
+        assert rec["fetches"] == [
+            ("/nix/store/f.drv", "http://origin-host:6000"),
+        ]
+        # Wait for fan-out worker to dispatch.
+        deadline = time.time() + 2.0
+        while time.time() < deadline and fan_out.call_count == 0:
+            time.sleep(0.02)
+        assert fan_out.call_count == 1
+        _, kwargs = fan_out.call_args
+        assert set(kwargs["peer_urls"]) == {
+            "http://a:6000", "http://b:6000",
+        }
+        # origin (excluded by id) + self (excluded by id) are NOT in
+        # the fan-out target list.
+        assert "http://origin-host:6000" not in kwargs["peer_urls"]
+        assert "http://me:6000" not in kwargs["peer_urls"]
+        # Hop count is incremented by one.
+        assert kwargs["hop_count"] == 3
+        # origin_peer_id on the cascaded broadcast is ME (the
+        # cascading peer); preserves the broadcast_id.
+        assert kwargs["origin_peer_id"] == "me"
+        assert kwargs["broadcast_id"] == "bid-F"
+        assert kwargs["path"] == "/nix/store/f.drv"
+        assert kwargs["size"] == 4096
+        # Placement record written.
+        assert len(rec["records"]) == 1
+        assert rec["records"][0][2] == "/nix/store/f.drv"
+        assert rec["records"][0][4] == BROADCAST_ITEM_CLASS
+    finally:
+        recv.stop()
+
+
+def test_broadcast_receiver_fetch_failure_no_fan_out(
+    tmp_path: pathlib.Path,
+) -> None:
+    """fetch_path_from_peer returning False → return False, no fan-out,
+    no placement record (we don't have the path)."""
+    recv, rec, fan_out = _make_broadcast_receiver(
+        url_map={
+            "me": "http://me:6000",
+            "origin": "http://origin:6000",
+            "p1": "http://p1:6000",
+        },
+        fetch_ok=False,
+        shared_fs=tmp_path,
+    )
+    try:
+        ok = recv.on_broadcast_offer(
+            "/nix/store/dead.drv", 100, "origin", "bid-X", 0,
+        )
+        assert ok is False
+        # Fetch WAS attempted.
+        assert rec["fetches"] == [
+            ("/nix/store/dead.drv", "http://origin:6000"),
+        ]
+        # But no record + no fan-out.
+        assert rec["records"] == []
+        time.sleep(0.05)
+        fan_out.assert_not_called()
+    finally:
+        recv.stop()
+
+
+def test_broadcast_receiver_hop_cap_records_but_no_fan_out(
+    tmp_path: pathlib.Path,
+) -> None:
+    """At/above max_hop: fetch + record still happen but the cascade
+    is suppressed."""
+    recv, rec, fan_out = _make_broadcast_receiver(
+        url_map={
+            "me": "http://me:6000",
+            "origin": "http://origin:6000",
+            "p1": "http://p1:6000",
+            "p2": "http://p2:6000",
+        },
+        fetch_ok=True,
+        shared_fs=tmp_path,
+        max_hop=3,
+    )
+    try:
+        ok = recv.on_broadcast_offer(
+            "/nix/store/h.drv", 99, "origin", "bid-H", 3,
+        )
+        assert ok is True
+        # Fetch + record still ran.
+        assert rec["fetches"] == [("/nix/store/h.drv", "http://origin:6000")]
+        assert len(rec["records"]) == 1
+        # No cascade.
+        time.sleep(0.05)
+        fan_out.assert_not_called()
+    finally:
+        recv.stop()
+
+
+def test_broadcast_receiver_already_have_skips_record_when_no_shared_fs() -> None:
+    """When shared_fs is None the placement-record write is skipped
+    but the True-return contract is preserved."""
+    recv, rec, fan_out = _make_broadcast_receiver(
+        url_map={"origin": "http://origin:6000"},
+        locally_valid={"/nix/store/n.drv"},
+        shared_fs=None,
+    )
+    try:
+        ok = recv.on_broadcast_offer(
+            "/nix/store/n.drv", 1, "origin", "bid-N", 0,
+        )
+        assert ok is True
+        assert rec["records"] == []  # no record_self_has when shared_fs is None
+        time.sleep(0.05)
+        fan_out.assert_not_called()
+    finally:
+        recv.stop()
+
+
+def test_broadcast_receiver_excludes_self_and_origin_when_singleton(
+    tmp_path: pathlib.Path,
+) -> None:
+    """If the only peers in the map are self + origin, fan-out target
+    list is empty; we still return True (we did fetch + record)."""
+    recv, rec, fan_out = _make_broadcast_receiver(
+        url_map={
+            "me": "http://me:6000",
+            "origin": "http://origin:6000",
+        },
+        fetch_ok=True,
+        shared_fs=tmp_path,
+    )
+    try:
+        ok = recv.on_broadcast_offer(
+            "/nix/store/s.drv", 1, "origin", "bid-S", 0,
+        )
+        assert ok is True
+        # Wait briefly; the worker may or may not have run (no
+        # targets to fan-out to, so it short-circuits).
+        time.sleep(0.1)
+        fan_out.assert_not_called()
+        # Record was still written.
+        assert len(rec["records"]) == 1
+    finally:
+        recv.stop()
+
+
+def test_broadcast_receiver_stop_idempotent_and_rejects_new_offers(
+    tmp_path: pathlib.Path,
+) -> None:
+    """After stop(), on_broadcast_offer returns False without doing
+    any I/O. stop() is idempotent."""
+    recv, rec, fan_out = _make_broadcast_receiver(
+        url_map={"origin": "http://origin:6000"},
+        fetch_ok=True,
+        shared_fs=tmp_path,
+    )
+    recv.stop()
+    recv.stop()  # idempotent
+    ok = recv.on_broadcast_offer(
+        "/nix/store/late.drv", 1, "origin", "bid-L", 0,
+    )
+    assert ok is False
+    assert rec["fetches"] == []
+    assert rec["records"] == []
+    fan_out.assert_not_called()
+
+
+def test_broadcast_receiver_provider_exception_yields_unknown_origin(
+    tmp_path: pathlib.Path,
+) -> None:
+    """If peer_url_provider raises, we treat the map as empty (origin
+    becomes unknown) and reject the offer."""
+
+    def boom() -> dict[str, str]:
+        raise RuntimeError("provider went away")
+
+    recv = BroadcastReceiver(
+        self_peer_id="me",
+        peer_url_provider=boom,
+        is_path_locally_valid=lambda _p: False,
+        fetch_path_from_peer=lambda _p, _u: True,
+        shared_fs=tmp_path,
+        record_self_has=lambda *a, **kw: None,
+        fan_out=mock.MagicMock(return_value=(0, 0, [])),
+    )
+    try:
+        ok = recv.on_broadcast_offer(
+            "/nix/store/p.drv", 1, "origin", "bid-P", 0,
+        )
+        assert ok is False
+    finally:
+        recv.stop()
+
+
+def test_broadcast_receiver_fetch_exception_returns_false(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A fetch helper that raises is treated as a failed fetch
+    (False return, no record, no fan-out) — the receiver never propagates
+    out into the HTTP handler thread."""
+    fan_out = mock.MagicMock(return_value=(0, 0, []))
+    records: list[tuple] = []
+
+    def _record(*_a, **kw) -> None:
+        records.append((kw.get("outpath"), kw.get("item_class")))
+
+    def _fetch(_path, _url):
+        raise RuntimeError("simulated transport blow-up")
+
+    recv = BroadcastReceiver(
+        self_peer_id="me",
+        peer_url_provider=lambda: {"origin": "http://o:6000"},
+        is_path_locally_valid=lambda _p: False,
+        fetch_path_from_peer=_fetch,
+        shared_fs=tmp_path,
+        record_self_has=_record,
+        fan_out=fan_out,
+    )
+    try:
+        ok = recv.on_broadcast_offer(
+            "/nix/store/boom.drv", 1, "origin", "bid-B", 0,
+        )
+        assert ok is False
+        assert records == []
+        fan_out.assert_not_called()
+    finally:
+        recv.stop()

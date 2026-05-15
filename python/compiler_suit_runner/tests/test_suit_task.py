@@ -505,3 +505,130 @@ def test_make_broadcast_record_self_has_swallows_record_exceptions(
         )
         # Must not raise.
         cb("/nix/store/raises.drv")
+
+
+# ---------------------------------------------------------------------------
+# BroadcastReceiver wiring inside on_run_start
+# ---------------------------------------------------------------------------
+
+
+def test_push_url_to_substituter_url_strips_push_offset() -> None:
+    """The push port = harmonia_port + PUSH_PORT_OFFSET (1000); the
+    translator inverts that so the broadcast fetch can call
+    ``nix copy --from <harmonia_url>``."""
+    from compiler_suit_runner.suit_task import _push_url_to_substituter_url
+
+    assert (
+        _push_url_to_substituter_url("http://node-a:6000")
+        == "http://node-a:5000"
+    )
+    assert (
+        _push_url_to_substituter_url("https://node-a:6500/")
+        == "https://node-a:5500"
+    )
+    # Garbage in, None out (caller falls back to raw URL → nix copy errors).
+    assert _push_url_to_substituter_url("") is None
+    assert _push_url_to_substituter_url("not-a-url") is None
+    assert _push_url_to_substituter_url("http://hostnoport") is None
+    # Port too small to subtract PUSH_PORT_OFFSET.
+    assert _push_url_to_substituter_url("http://x:500") is None
+
+
+def test_on_run_start_wires_broadcast_receiver_into_push_server(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After ``on_run_start``:
+
+    1. ``task._broadcast_receiver`` is a :class:`BroadcastReceiver`.
+    2. The :class:`PeerPushServer` was constructed with a callable
+       wired to the receiver's ``on_broadcast_offer`` (so a real
+       HTTP POST would route through the consumer).
+    """
+    # Stand in for the signing key so the push code path runs without
+    # invoking the real ``nix-store --generate-binary-cache-key``.
+    from compiler_suit_runner import peer_cache as _peer_cache
+    from compiler_suit_runner.peer_replication import BroadcastReceiver
+
+    fake_key = _peer_cache.SigningKey(
+        name="test-key",
+        secret_path=tmp_path / "key.secret",
+        public_path=tmp_path / "key.public",
+        public_key="test-pubkey:AAAA",
+    )
+    fake_key.secret_path.write_text("secret")
+    fake_key.public_path.write_text(fake_key.public_key)
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.generate_signing_key",
+        lambda *a, **kw: fake_key,
+    )
+
+    # Use a config that disables harmonia + cachix so on_run_start
+    # doesn't try to spawn external subprocesses.
+    config = _make_config(tmp_path)
+    # Use a port low enough that push_port_for(port) stays in
+    # unprivileged-port range.
+    config = dataclasses_replace(config, harmonia_port=5005, enable_harmonia=False)
+
+    # Empty manifest dir → no phase0 watcher attached.
+    config.manifest_dir.mkdir(parents=True, exist_ok=True)
+    config.shared_fs.mkdir(parents=True, exist_ok=True)
+
+    task = SuitTask(config)
+    try:
+        task.on_run_start(output_dir=tmp_path / "out")
+        # The receiver must be wired (we only assert presence; the
+        # full behaviour is covered in test_peer_replication.py).
+        assert isinstance(task._broadcast_receiver, BroadcastReceiver)
+        # The push server's bound handler holds a reference to the
+        # configured on_broadcast_offer callback; round-trip through
+        # the handler's class attr to confirm it is NOT the
+        # uninitialised default-reject lambda (returns False without
+        # touching the receiver).
+        push_server = task._push_server
+        assert push_server is not None
+        handler_cls = push_server._handler_cls
+        callback = handler_cls.on_broadcast_offer
+        # The default callback returns False unconditionally; ours
+        # routes into the receiver which (with an empty url map and
+        # path-not-local) returns False after fetch failure attempts.
+        # Drive a synthetic offer through it.
+        result = callback(
+            "/nix/store/wire.drv", 1, "unknown-origin", "bid-wire", 0,
+        )
+        # The wired callback routes through the receiver, whose
+        # unknown-origin branch returns False. The DEFAULT no-op
+        # lambda would also return False — but we can verify a
+        # round-trip got into our receiver by passing self_peer_id
+        # as origin (which the receiver also rejects as "unknown"
+        # because self is filtered). To prove routing, instead patch
+        # the receiver's on_broadcast_offer.
+        del result  # not load-bearing
+        called: list[tuple] = []
+
+        def _spy(*args, **kw):
+            called.append((args, kw))
+            return True
+
+        # Swap the receiver method to verify the push handler routes
+        # to it. We rebind the staticmethod on the bound handler
+        # class — the same mechanism PeerPushServer uses.
+        task._broadcast_receiver.on_broadcast_offer = _spy  # type: ignore[method-assign]
+        # The handler's class attribute was captured at construction
+        # time and closes over the on_run_start local; it dispatches
+        # through that local's broadcast_receiver. Call the wrapper.
+        cb = handler_cls.on_broadcast_offer
+        ok = cb("/nix/store/v.drv", 9, "origin", "bid-v", 0)
+        assert ok is True
+        assert called == [
+            (("/nix/store/v.drv", 9, "origin", "bid-v", 0), {}),
+        ]
+    finally:
+        task.on_run_end(success=True)
+
+
+# Local alias used by the test above so the import line stays compact.
+def dataclasses_replace(obj, /, **changes):
+    import dataclasses as _dc
+    return _dc.replace(obj, **changes)
