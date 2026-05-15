@@ -73,16 +73,24 @@ def test_phase1a_phase1b_no_longer_dispatched(tmp_path: pathlib.Path) -> None:
     assert "phase1b" not in phases
 
 
-def test_phase_build_carries_all_three_task_types(
+def test_phase_build_carries_all_four_task_types(
     tmp_path: pathlib.Path,
 ) -> None:
-    """All three build-shaped types (toolchain, common_dep, variant)
-    live in the single phase_build, all routed to build_worker."""
+    """All four build-shaped types (toolchain, toolchain_validate,
+    common_dep, variant) live in the single phase_build, all routed
+    to build_worker. ``toolchain_validate`` is the default fetch-only
+    counterpart to ``toolchain``; only one of the two is emitted per
+    submit, controlled by ``--allow-toolchain-build``."""
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
     types = phases["phase_build"].types
     type_ids = {t.type_id for t in types}
-    assert type_ids == {"toolchain", "common_dep", "variant"}
+    assert type_ids == {
+        "toolchain",
+        "toolchain_validate",
+        "common_dep",
+        "variant",
+    }
     for t in types:
         assert (
             t.worker_module
