@@ -1091,3 +1091,172 @@ def test_initial_prime_does_not_fire_diff_callback(
     time.sleep(0.05)
     assert received == []
     watcher.stop()
+
+
+# ---------------------------------------------------------------------------
+# SubmitterPeer.seed_toolchain_drvs (Phase -1 toolchain drv flood-fill)
+# ---------------------------------------------------------------------------
+
+
+def _make_submitter_for_seed(
+    public_key: str = "submitter-pub:AAAA",
+) -> "peer_cache.SubmitterPeer":
+    """Construct a SubmitterPeer skipping ``start()`` and stub its key.
+
+    ``seed_toolchain_drvs`` only reads ``self._public_key`` and
+    ``self.peer_id`` / ``self.log``; no harmonia, no SSH, no polling
+    thread needed for these unit tests.
+    """
+    peer = peer_cache.SubmitterPeer(
+        gateway_url="ssh://user@gateway.example",
+        slurm_root="/srv/slurm",
+        local_port=5005,
+        gateway_port=5005,
+    )
+    peer._public_key = public_key  # type: ignore[attr-defined]
+    return peer
+
+
+def _write_drv(path: pathlib.Path, payload: bytes) -> str:
+    """Write *payload* to *path* and return the path as str."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return str(path)
+
+
+def test_seed_toolchain_drvs_empty_set_returns_zero_summary() -> None:
+    """An empty drv_set short-circuits without any peer_push call."""
+    peer = _make_submitter_for_seed()
+    result = peer.seed_toolchain_drvs(set(), "http://node1:6000")
+    assert result == {"sent": 0, "failed": 0, "failed_drvs": []}
+
+
+def test_seed_toolchain_drvs_happy_path_one_call_per_drv(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each drv triggers exactly one ``push_path_broadcast_offer`` call
+    with size from disk, fresh broadcast_id, origin=submitter, hop=0."""
+    drv_a = _write_drv(tmp_path / "a.drv", b"alpha" * 7)
+    drv_b = _write_drv(tmp_path / "b.drv", b"beta" * 11)
+    drv_c = _write_drv(tmp_path / "c.drv", b"gamma" * 13)
+    expected_sizes = {
+        drv_a: pathlib.Path(drv_a).stat().st_size,
+        drv_b: pathlib.Path(drv_b).stat().st_size,
+        drv_c: pathlib.Path(drv_c).stat().st_size,
+    }
+
+    calls: list[dict] = []
+
+    def fake_push(**kwargs):
+        calls.append(kwargs)
+        return {"dedup": False, "accepted": True}
+
+    from compiler_suit_runner import peer_push
+    monkeypatch.setattr(peer_push, "push_path_broadcast_offer", fake_push)
+
+    peer = _make_submitter_for_seed(public_key="submitter-pub:KEY")
+    target = "http://node1:6000"
+    result = peer.seed_toolchain_drvs({drv_a, drv_b, drv_c}, target)
+
+    assert result == {"sent": 3, "failed": 0, "failed_drvs": []}
+    assert len(calls) == 3
+    seen_drvs: set[str] = set()
+    seen_bids: set[str] = set()
+    for kw in calls:
+        assert kw["target_url"] == target
+        assert kw["origin_peer_id"] == peer.peer_id == "submitter"
+        assert kw["hop_count"] == 0
+        assert kw["our_pubkey"] == "submitter-pub:KEY"
+        assert kw["size"] == expected_sizes[kw["path"]]
+        # Fresh UUID-hex broadcast_id per call (32 hex chars).
+        assert isinstance(kw["broadcast_id"], str)
+        assert len(kw["broadcast_id"]) == 32
+        int(kw["broadcast_id"], 16)  # all-hex
+        seen_drvs.add(kw["path"])
+        seen_bids.add(kw["broadcast_id"])
+    assert seen_drvs == {drv_a, drv_b, drv_c}
+    assert len(seen_bids) == 3  # all distinct
+
+
+def test_seed_toolchain_drvs_partial_failure_records_failed_drvs(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A None response from push_path_broadcast_offer for one drv lands
+    it in ``failed_drvs`` while the rest of the set still succeeds."""
+    drv_ok1 = _write_drv(tmp_path / "ok1.drv", b"x" * 16)
+    drv_bad = _write_drv(tmp_path / "bad.drv", b"y" * 32)
+    drv_ok2 = _write_drv(tmp_path / "ok2.drv", b"z" * 48)
+
+    def fake_push(**kwargs):
+        if kwargs["path"] == drv_bad:
+            return None
+        return {"dedup": False, "accepted": True}
+
+    from compiler_suit_runner import peer_push
+    monkeypatch.setattr(peer_push, "push_path_broadcast_offer", fake_push)
+
+    peer = _make_submitter_for_seed()
+    result = peer.seed_toolchain_drvs(
+        {drv_ok1, drv_bad, drv_ok2}, "http://node1:6000",
+    )
+
+    assert result["sent"] == 2
+    assert result["failed"] == 1
+    assert result["failed_drvs"] == [drv_bad]
+
+
+def test_seed_toolchain_drvs_all_failure(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If every push returns None, sent=0 and failed_drvs lists all."""
+    drvs = {
+        _write_drv(tmp_path / f"drv{i}.drv", bytes([i]) * (8 + i))
+        for i in range(4)
+    }
+
+    from compiler_suit_runner import peer_push
+    monkeypatch.setattr(
+        peer_push, "push_path_broadcast_offer",
+        lambda **_kwargs: None,
+    )
+
+    peer = _make_submitter_for_seed()
+    result = peer.seed_toolchain_drvs(drvs, "http://node1:6000")
+
+    assert result["sent"] == 0
+    assert result["failed"] == 4
+    assert set(result["failed_drvs"]) == drvs
+
+
+def test_seed_toolchain_drvs_missing_file_lands_in_failed_drvs(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A drv whose on-disk file is missing (stat raises OSError) is
+    recorded as a failure WITHOUT a peer_push call for that path."""
+    drv_ok = _write_drv(tmp_path / "ok.drv", b"present")
+    drv_missing = str(tmp_path / "nope.drv")  # never created
+
+    calls: list[dict] = []
+
+    def fake_push(**kwargs):
+        calls.append(kwargs)
+        return {"dedup": False, "accepted": True}
+
+    from compiler_suit_runner import peer_push
+    monkeypatch.setattr(peer_push, "push_path_broadcast_offer", fake_push)
+
+    peer = _make_submitter_for_seed()
+    result = peer.seed_toolchain_drvs(
+        {drv_ok, drv_missing}, "http://node1:6000",
+    )
+
+    assert result["sent"] == 1
+    assert result["failed"] == 1
+    assert result["failed_drvs"] == [drv_missing]
+    # Only the present drv was actually broadcast.
+    assert len(calls) == 1
+    assert calls[0]["path"] == drv_ok
