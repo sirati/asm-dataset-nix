@@ -395,3 +395,113 @@ def test_build_phase0_watcher_falls_back_to_shared_fs_when_no_output_dir(
     w = task._build_phase0_watcher(output_dir=None)
     assert w is not None
     assert w._out_dir == config.shared_fs / "out"
+
+
+# ---------------------------------------------------------------------------
+# Broadcast record_self_has callable assembly (T67)
+# ---------------------------------------------------------------------------
+
+
+def test_make_broadcast_record_self_has_invokes_record_with_phase0_class(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The callable wired into PeerPushServer.record_broadcast_self_has
+    must invoke peer_paths.record_self_has with item_class
+    ``phase0_eval_drv`` (the broadcast-receive tag) so placement-map
+    gossip distinguishes phase0 drvs from toolchain/variant holders."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+
+    captured: list[dict] = []
+
+    def fake_record(shared_fs, *, my_secondary_id, outpath, drv_path,
+                    item_class, peers=None, our_pubkey=None):
+        captured.append({
+            "shared_fs": shared_fs,
+            "my_secondary_id": my_secondary_id,
+            "outpath": outpath,
+            "drv_path": drv_path,
+            "item_class": item_class,
+            "peers": list(peers) if peers is not None else None,
+            "our_pubkey": our_pubkey,
+        })
+
+    fake_watcher = mock.MagicMock()
+    fake_watcher.peers = []
+
+    with mock.patch(
+        "compiler_suit_runner.suit_task.peer_paths.record_self_has",
+        side_effect=fake_record,
+    ):
+        cb = task._make_broadcast_record_self_has(
+            fake_watcher, public_key="pk-test",
+        )
+        cb("/nix/store/aaa-phase0.drv")
+
+    assert len(captured) == 1
+    call = captured[0]
+    assert call["my_secondary_id"] == "primary"
+    assert call["outpath"] == "/nix/store/aaa-phase0.drv"
+    assert call["drv_path"] == "/nix/store/aaa-phase0.drv"
+    assert call["item_class"] == "phase0_eval_drv"
+    assert call["our_pubkey"] == "pk-test"
+    assert call["peers"] == []
+    assert call["shared_fs"] == config.shared_fs
+
+
+def test_make_broadcast_record_self_has_passes_live_peers(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``peers`` is snapshotted at CALL time from the watcher, not at
+    closure construction — so a peer joining between push-server-start
+    and the first broadcast accept gets the fan-out."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+
+    captured: list[list] = []
+
+    def fake_record(_shared_fs, *, peers=None, **_kw):
+        captured.append(list(peers) if peers is not None else None)
+
+    fake_watcher = mock.MagicMock()
+    # Initially empty peer list.
+    fake_watcher.peers = []
+
+    with mock.patch(
+        "compiler_suit_runner.suit_task.peer_paths.record_self_has",
+        side_effect=fake_record,
+    ):
+        cb = task._make_broadcast_record_self_has(
+            fake_watcher, public_key="pk-test",
+        )
+        # First call: empty peers.
+        cb("/nix/store/x.drv")
+        # A peer joins after wire-up.
+        fake_watcher.peers = ["peer-a-info"]
+        cb("/nix/store/y.drv")
+
+    assert captured == [[], ["peer-a-info"]]
+
+
+def test_make_broadcast_record_self_has_swallows_record_exceptions(
+    tmp_path: pathlib.Path,
+) -> None:
+    """If peer_paths.record_self_has raises (NFS hiccup, peer push
+    fan-out failure), the callable must not propagate — best-effort
+    gossip is part of the contract; the broadcast handshake response
+    is independent of placement-map success."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+
+    fake_watcher = mock.MagicMock()
+    fake_watcher.peers = []
+
+    with mock.patch(
+        "compiler_suit_runner.suit_task.peer_paths.record_self_has",
+        side_effect=RuntimeError("nfs hiccup"),
+    ):
+        cb = task._make_broadcast_record_self_has(
+            fake_watcher, public_key="pk-test",
+        )
+        # Must not raise.
+        cb("/nix/store/raises.drv")

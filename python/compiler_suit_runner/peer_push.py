@@ -150,6 +150,13 @@ class _PushHandler(http.server.BaseHTTPRequestHandler):
     on_broadcast_offer: Callable[..., bool] = staticmethod(
         lambda path, size, origin_peer_id, broadcast_id, hop_count: False,
     )
+    # Post-accept hook. Called with the broadcast path AFTER
+    # ``on_broadcast_offer`` returns True (the consumer has fetched the
+    # path into the local store). Default is a no-op so an un-wired
+    # server stays silent on the placement-map.
+    record_broadcast_self_has: Callable[[str], None] = staticmethod(
+        lambda _path: None,
+    )
     seen_broadcast_ids: set[str] = set()
     broadcast_lock: threading.Lock = threading.Lock()
 
@@ -280,6 +287,20 @@ class _PushHandler(http.server.BaseHTTPRequestHandler):
                     )
                     self._respond(500)
                     return
+                # Placement-map gossip: only record self as a holder
+                # when the consumer accepted (the path is now in our
+                # local store). A rejected offer means no fetch
+                # happened, so no placement record. Exceptions are
+                # swallowed so the gossip layer cannot corrupt the
+                # handshake response to the originator.
+                if accepted:
+                    try:
+                        self.record_broadcast_self_has(path)
+                    except Exception:  # noqa: BLE001 - best-effort
+                        logger.exception(
+                            "PeerPushServer: record_broadcast_self_has "
+                            "raised for %s", path,
+                        )
                 self._respond_json(
                     200, {"dedup": False, "accepted": accepted},
                 )
@@ -343,6 +364,7 @@ class PeerPushServer(threading.Thread):
         on_broadcast_offer: Optional[
             Callable[[str, int, str, str, int], bool]
         ] = None,
+        record_broadcast_self_has: Optional[Callable[[str], None]] = None,
     ) -> None:
         super().__init__(name="PeerPushServer", daemon=True)
         self._bind_host = str(bind_host)
@@ -364,6 +386,13 @@ class PeerPushServer(threading.Thread):
         bound_broadcast = on_broadcast_offer or (
             lambda _p, _sz, _opid, _bid, _hop: False
         )
+        # Default record-self-has hook is a no-op; the suit_task
+        # lifecycle wires it to ``peer_paths.record_self_has`` with
+        # ``item_class="phase0_eval_drv"`` so placement-map gossip
+        # captures broadcast holders.
+        bound_record_broadcast = record_broadcast_self_has or (
+            lambda _p: None
+        )
         bound_pubkey = str(expected_pubkey)
         # Per-instance dedup state — never shared between servers.
         bound_seen: set[str] = set()
@@ -380,6 +409,7 @@ class PeerPushServer(threading.Thread):
             on_path_reject = staticmethod(bound_path_reject)
             on_path_cancel = staticmethod(bound_path_cancel)
             on_broadcast_offer = staticmethod(bound_broadcast)
+            record_broadcast_self_has = staticmethod(bound_record_broadcast)
             seen_broadcast_ids = bound_seen
             broadcast_lock = bound_broadcast_lock
 
