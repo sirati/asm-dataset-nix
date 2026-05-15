@@ -16,10 +16,14 @@ from typing import Optional
 
 import pytest
 
+from unittest import mock
+
 from compiler_suit_runner.peer_cache import PeerInfo, PlacementDiff
 from compiler_suit_runner.peer_replication import (
     DEFAULT_OFFER_TIMEOUT_SECONDS,
     DEFAULT_REPLICATION_K,
+    BroadcastResult,
+    BroadcastSender,
     ReplicationContext,
     ReplicationReceiver,
     ReplicationRepairWorker,
@@ -724,5 +728,221 @@ def test_repair_uses_drv_metadata_lookup(ctx_factory) -> None:
             and klass == "toolchain"
             for _t, op, drv, klass in rec.offers
         )
+    finally:
+        sender.stop()
+
+
+# ---------------------------------------------------------------------------
+# BroadcastSender
+# ---------------------------------------------------------------------------
+
+
+def _wait_for(condition, timeout: float = 1.0, interval: float = 0.01) -> bool:
+    """Spin until *condition* returns truthy or *timeout* elapses."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if condition():
+            return True
+        time.sleep(interval)
+    return bool(condition())
+
+
+def test_broadcast_enqueue_returns_fresh_ids() -> None:
+    """Each ``enqueue_broadcast`` mints a unique UUID-hex id."""
+    fan_out = mock.MagicMock(return_value=(0, 0, []))
+    sender = BroadcastSender(
+        self_peer_id="me",
+        peer_url_provider=lambda: [],
+        our_pubkey="me:PK",
+        fan_out=fan_out,
+    )
+    try:
+        ids = {
+            sender.enqueue_broadcast("/nix/store/a", 42, "drv-toolchain")
+            for _ in range(8)
+        }
+        assert len(ids) == 8
+        for bid in ids:
+            assert isinstance(bid, str) and len(bid) == 32  # uuid4().hex
+    finally:
+        sender.stop()
+
+
+def test_broadcast_worker_invokes_fan_out_with_all_peer_urls() -> None:
+    """The worker thread calls ``fan_out_broadcast_drv`` with the
+    current peer URL list, hop_count=0, and the originator id."""
+    urls = ["http://h1:6000", "http://h2:6000", "http://h3:6000"]
+    fan_out = mock.MagicMock(return_value=(3, 0, []))
+    sender = BroadcastSender(
+        self_peer_id="me",
+        peer_url_provider=lambda: list(urls),
+        our_pubkey="me:PK",
+        fan_out=fan_out,
+    )
+    try:
+        bid = sender.enqueue_broadcast("/nix/store/d.drv", 1234, "drv-toolchain")
+        assert _wait_for(lambda: fan_out.call_count == 1)
+        _, kwargs = fan_out.call_args
+        assert kwargs["peer_urls"] == urls
+        assert kwargs["path"] == "/nix/store/d.drv"
+        assert kwargs["size"] == 1234
+        assert kwargs["broadcast_id"] == bid
+        assert kwargs["origin_peer_id"] == "me"
+        assert kwargs["hop_count"] == 0
+        assert kwargs["our_pubkey"] == "me:PK"
+    finally:
+        sender.stop()
+
+
+def test_broadcast_wait_for_completion_returns_fanout_tuple() -> None:
+    """``wait_for_completion`` returns the (success, fail, failed)
+    tuple recorded from the fan-out call."""
+    fan_out = mock.MagicMock(
+        return_value=(2, 1, ["http://dead:6000"]),
+    )
+    sender = BroadcastSender(
+        self_peer_id="me",
+        peer_url_provider=lambda: [
+            "http://h1:6000", "http://h2:6000", "http://dead:6000",
+        ],
+        fan_out=fan_out,
+    )
+    try:
+        bid = sender.enqueue_broadcast("/nix/store/x.drv", 99, "drv-toolchain")
+        result = sender.wait_for_completion(bid, timeout=2.0)
+        assert isinstance(result, BroadcastResult)
+        assert result.broadcast_id == bid
+        assert result.success_count == 2
+        assert result.fail_count == 1
+        assert result.failed_peers == ("http://dead:6000",)
+    finally:
+        sender.stop()
+
+
+def test_broadcast_empty_peer_list_yields_zero_zero() -> None:
+    """An empty peer list short-circuits to ``(0, 0, [])`` without
+    invoking the fan-out callable."""
+    fan_out = mock.MagicMock(return_value=(0, 0, []))
+    sender = BroadcastSender(
+        self_peer_id="me",
+        peer_url_provider=lambda: [],
+        fan_out=fan_out,
+    )
+    try:
+        bid = sender.enqueue_broadcast("/nix/store/empty.drv", 0, None)
+        result = sender.wait_for_completion(bid, timeout=2.0)
+        assert result is not None
+        assert (result.success_count, result.fail_count) == (0, 0)
+        assert result.failed_peers == ()
+        # Short-circuit: we did NOT call the fan-out helper.
+        fan_out.assert_not_called()
+    finally:
+        sender.stop()
+
+
+def test_broadcast_fan_out_exception_does_not_kill_worker() -> None:
+    """If ``fan_out_broadcast_drv`` raises, the worker thread logs
+    and continues; subsequent enqueues still complete."""
+    call_count = {"n": 0}
+
+    def flaky(*_, **__):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated transport blow-up")
+        return (1, 0, [])
+
+    urls = ["http://h1:6000"]
+    sender = BroadcastSender(
+        self_peer_id="me",
+        peer_url_provider=lambda: list(urls),
+        fan_out=flaky,
+    )
+    try:
+        bid_bad = sender.enqueue_broadcast("/nix/store/bad.drv", 1, None)
+        bid_good = sender.enqueue_broadcast("/nix/store/good.drv", 1, None)
+        result_bad = sender.wait_for_completion(bid_bad, timeout=2.0)
+        result_good = sender.wait_for_completion(bid_good, timeout=2.0)
+        # Bad broadcast: full failure, but DID record so waiter
+        # is released.
+        assert result_bad is not None
+        assert result_bad.success_count == 0
+        assert result_bad.fail_count == len(urls)
+        assert list(result_bad.failed_peers) == urls
+        # Good broadcast: worker is still alive and processed it.
+        assert result_good is not None
+        assert result_good.success_count == 1
+        assert result_good.fail_count == 0
+    finally:
+        sender.stop()
+
+
+def test_broadcast_peer_provider_exception_yields_empty_fanout() -> None:
+    """If the peer-URL provider raises, the worker treats it as empty
+    peers (0/0) rather than crashing."""
+    fan_out = mock.MagicMock(return_value=(0, 0, []))
+
+    def boom() -> list[str]:
+        raise RuntimeError("provider unavailable")
+
+    sender = BroadcastSender(
+        self_peer_id="me",
+        peer_url_provider=boom,
+        fan_out=fan_out,
+    )
+    try:
+        bid = sender.enqueue_broadcast("/nix/store/p.drv", 1, None)
+        result = sender.wait_for_completion(bid, timeout=2.0)
+        assert result is not None
+        assert (result.success_count, result.fail_count) == (0, 0)
+        fan_out.assert_not_called()
+    finally:
+        sender.stop()
+
+
+def test_broadcast_stop_exits_worker_thread_promptly() -> None:
+    """``stop()`` causes the worker thread to exit; the thread should
+    be joined within a reasonable window."""
+    fan_out = mock.MagicMock(return_value=(0, 0, []))
+    sender = BroadcastSender(
+        self_peer_id="me",
+        peer_url_provider=lambda: [],
+        fan_out=fan_out,
+    )
+    # Force the worker thread to spin up via an enqueue + wait.
+    bid = sender.enqueue_broadcast("/nix/store/q.drv", 1, None)
+    sender.wait_for_completion(bid, timeout=1.0)
+    worker = sender._thread  # noqa: SLF001 — white-box; we check it died
+    assert worker is not None and worker.is_alive()
+    sender.stop()
+    # stop() joins with 2 s timeout; if the thread didn't exit, it's
+    # still alive here.
+    assert _wait_for(lambda: not worker.is_alive(), timeout=2.0), (
+        "worker thread did not exit promptly after stop()"
+    )
+
+
+def test_broadcast_enqueue_after_stop_raises() -> None:
+    """Enqueueing after ``stop()`` is a programmer error and raises."""
+    sender = BroadcastSender(
+        self_peer_id="me",
+        peer_url_provider=lambda: [],
+        fan_out=mock.MagicMock(return_value=(0, 0, [])),
+    )
+    sender.stop()
+    with pytest.raises(RuntimeError):
+        sender.enqueue_broadcast("/nix/store/late.drv", 1, None)
+
+
+def test_broadcast_wait_for_unknown_id_returns_none() -> None:
+    """Unknown broadcast_id results in ``None`` from
+    ``wait_for_completion`` (rather than blocking forever)."""
+    sender = BroadcastSender(
+        self_peer_id="me",
+        peer_url_provider=lambda: [],
+        fan_out=mock.MagicMock(return_value=(0, 0, [])),
+    )
+    try:
+        result = sender.wait_for_completion("nonexistent-id", timeout=0.1)
+        assert result is None
     finally:
         sender.stop()
