@@ -530,14 +530,15 @@ class _Phase0QuiesceWatcher:
     ignores a non-phase-0 task_id or marks the matching phase-0 task
     as complete. Once the completed set covers the expected set, the
     watcher fires :func:`phase1_planner.plan_phase1` exactly once and
-    hands the resulting :class:`ManifestHeader` list to
-    ``spawn_tasks``.
+    hands the resulting :class:`ManifestHeader` list to ``_spawn_tasks``.
 
-    The ``spawn_tasks`` callback today is a stub: it serialises the
-    header list to ``out_dir / "_phase1_graph.json"`` and emits an INFO
-    log line with the header count. When the framework's Q5
-    ``primary.spawn_tasks`` API lands the stub gets swapped out for the
-    real dispatch (see TODO inline).
+    The real dispatch path translates each :class:`ManifestHeader` into
+    a framework ``TaskInfo`` and calls ``primary_handle.spawn_tasks``;
+    a ``_phase1_graph.json`` dump is written alongside (regardless of
+    whether the primary_handle is bound) for offline inspection /
+    debugging. When ``primary_handle`` is None (single-process tests,
+    framework-pin gap) the dispatch path degrades to the JSON-only
+    behavior.
 
     The watcher is NOT a framework task — it runs entirely in-process
     on whichever thread the framework's task-completion notification is
@@ -551,6 +552,7 @@ class _Phase0QuiesceWatcher:
         out_dir: pathlib.Path,
         toolchain_task_ids: dict[str, str],
         *,
+        primary_handle: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
         sys_name: str = "x86_64-linux",
     ) -> None:
@@ -558,6 +560,7 @@ class _Phase0QuiesceWatcher:
         self._completed: set[str] = set()
         self._out_dir = pathlib.Path(out_dir)
         self._toolchain_task_ids: dict[str, str] = dict(toolchain_task_ids)
+        self._primary_handle = primary_handle
         self._sys_name = sys_name
         self._fired: bool = False
         self._lock = threading.Lock()
@@ -650,7 +653,7 @@ class _Phase0QuiesceWatcher:
             phase1_planner.plan_phase1(
                 phase0_manifests,
                 self._toolchain_task_ids,
-                self._spawn_tasks_stub,
+                self._spawn_tasks,
                 sys_name=self._sys_name,
             )
         except Exception:  # noqa: BLE001 — log + degrade
@@ -659,23 +662,17 @@ class _Phase0QuiesceWatcher:
                 " not scheduled"
             )
 
-    # ── spawn_tasks stub ───────────────────────────────────────────────
+    # ── spawn_tasks dispatch ──────────────────────────────────────────
 
-    def _spawn_tasks_stub(
-        self, headers: list[ManifestHeader]
-    ) -> None:
-        """Serialise ``headers`` to ``_phase1_graph.json`` + log count.
-
-        TODO(Q5): once the framework exposes
-        ``primary.spawn_tasks(...)`` replace this stub with a thin
-        adapter that translates :class:`ManifestHeader` records into
-        the framework's ``TaskInfo`` shape and calls the API. The
-        graph dump stays useful for offline inspection / resume.
-        """
+    def _dump_phase1_graph(
+        self, headers: list[ManifestHeader],
+    ) -> pathlib.Path:
+        """Serialise ``headers`` to ``_phase1_graph.json`` for offline
+        inspection. Returns the path written (or attempted). Best-
+        effort: an OSError is logged + swallowed so the spawn path can
+        still proceed."""
         self._out_dir.mkdir(parents=True, exist_ok=True)
         graph_path = self._out_dir / "_phase1_graph.json"
-        # Serialise to a JSON-safe shape — ManifestHeader is a frozen
-        # dataclass, so we round-trip via dict.
         serialised = [
             {
                 "item_class": h.item_class,
@@ -698,11 +695,162 @@ class _Phase0QuiesceWatcher:
                 "_Phase0QuiesceWatcher: failed writing %s",
                 graph_path,
             )
+        return graph_path
+
+    def _spawn_tasks(
+        self, headers: list[ManifestHeader]
+    ) -> None:
+        """Q5 spawn-dispatch path.
+
+        Always writes ``_phase1_graph.json`` alongside (useful for
+        offline inspection / resume).  When ``self._primary_handle`` is
+        bound:
+
+        1. Convert each :class:`ManifestHeader` into a framework
+           ``TaskInfo`` via :meth:`_header_to_task_info`.
+        2. Call ``primary_handle.spawn_tasks(task_infos)``.
+        3. Log spawn count + error count.  Per-error log severity:
+           - ``duplicate_task_hash`` → WARN (we expect a fresh
+             content-hash for every header; a duplicate means we hit
+             the framework's idempotent-respawn guard for a hash that
+             we believed was new).
+           - ``unknown_dependency`` → WARN with the offending
+             ``task_hash`` + ``dep_task_id`` (graph builder produced a
+             dep that doesn't exist — real bug).
+           - any other ``kind`` → WARN with the raw dict.
+
+        When ``self._primary_handle`` is None (single-process tests,
+        framework-pin gap) the JSON dump is the only side effect; an
+        INFO log explains the degradation.
+        """
+        graph_path = self._dump_phase1_graph(headers)
+
+        if self._primary_handle is None:
+            self._logger.info(
+                "_Phase0QuiesceWatcher: primary_handle unbound; wrote"
+                " %s (Phase 1 dispatch falls back to JSON-only)",
+                graph_path,
+            )
+            return
+
+        task_infos: list = []
+        for header in headers:
+            try:
+                task_infos.append(self._header_to_task_info(header))
+            except Exception:  # noqa: BLE001 — log + skip
+                self._logger.exception(
+                    "_Phase0QuiesceWatcher: header→TaskInfo conversion"
+                    " failed for %s (task_id=%s); skipping",
+                    header.name,
+                    header.task_id,
+                )
+
+        if not task_infos:
+            self._logger.warning(
+                "_Phase0QuiesceWatcher: no valid TaskInfo entries to"
+                " spawn (received %d header(s)); wrote %s",
+                len(headers),
+                graph_path,
+            )
+            return
+
+        try:
+            errors = self._primary_handle.spawn_tasks(task_infos)
+        except Exception:  # noqa: BLE001 — log + degrade
+            self._logger.exception(
+                "_Phase0QuiesceWatcher: primary_handle.spawn_tasks"
+                " raised for %d task(s); Phase 1 may stall",
+                len(task_infos),
+            )
+            return
+
+        errors_list = list(errors) if errors is not None else []
         self._logger.info(
-            "_Phase0QuiesceWatcher: spawn_tasks stub received %d"
-            " header(s); wrote %s (Q5 not yet wired)",
-            len(headers),
+            "_Phase0QuiesceWatcher: spawn_tasks dispatched %d task(s)"
+            " with %d error(s); wrote %s",
+            len(task_infos),
+            len(errors_list),
             graph_path,
+        )
+        for idx_err in errors_list:
+            try:
+                idx, err = idx_err
+            except (TypeError, ValueError):
+                self._logger.warning(
+                    "_Phase0QuiesceWatcher: malformed spawn error"
+                    " entry %r; skipping",
+                    idx_err,
+                )
+                continue
+            kind = err.get("kind") if isinstance(err, dict) else ""
+            task_hash = err.get("task_hash") if isinstance(err, dict) else ""
+            offending = (
+                headers[idx] if 0 <= idx < len(headers) else None
+            )
+            offending_name = offending.name if offending is not None else "?"
+            if kind == "duplicate_task_hash":
+                # Plan builder produced a hash collision with the
+                # ledger.  This is a real signal: the framework does
+                # NOT silently re-spawn Failed / Unfulfillable entries
+                # on duplicate hash, so a hit here means the planner
+                # re-emitted a hash we'd already submitted (e.g. on a
+                # planner retry).  WARN so operators see it.
+                self._logger.warning(
+                    "_Phase0QuiesceWatcher: spawn_tasks duplicate"
+                    " task_hash for header %s (idx=%d task_hash=%s)",
+                    offending_name, idx, task_hash,
+                )
+            elif kind == "unknown_dependency":
+                dep_task_id = (
+                    err.get("dep_task_id")
+                    if isinstance(err, dict)
+                    else ""
+                )
+                self._logger.warning(
+                    "_Phase0QuiesceWatcher: spawn_tasks unknown"
+                    " dependency for header %s (idx=%d"
+                    " task_hash=%s dep_task_id=%s)",
+                    offending_name, idx, task_hash, dep_task_id,
+                )
+            else:
+                self._logger.warning(
+                    "_Phase0QuiesceWatcher: spawn_tasks unrecognised"
+                    " error kind for header %s (idx=%d err=%r)",
+                    offending_name, idx, err,
+                )
+
+    def _header_to_task_info(self, header: ManifestHeader):
+        """Convert one :class:`ManifestHeader` directly into a framework
+        ``TaskInfo``.  Mirrors the call shape used by
+        :func:`_make_task_info` (the disk-round-trip path used by
+        :meth:`SuitTask.discover_items`) so spawn-side and discover-side
+        items differ only by source, not by encoding.
+
+        The ``payload`` carried on the resulting TaskInfo is the same
+        header_dict shape ``discover_items`` emits, so downstream
+        workers see a uniform payload regardless of whether the item
+        came from preflight or from Phase 1 planning.
+        """
+        phase_id, type_id, affinity_id = _classify(header)
+        header_dict = {
+            "item_class": header.item_class,
+            "name": header.name,
+            "size": header.size,
+            "payload": dict(header.payload),
+        }
+        # ManifestHeader carries a synthetic "path" only by name; the
+        # framework treats path as an opaque tag for non-file-based
+        # tasks (SuitTask.uses_file_based_items = False), so we just
+        # use the header name as the path component.
+        return _make_task_info(
+            pathlib.Path(f"{header.name}.json"),
+            header.size,
+            phase_id=phase_id,
+            type_id=type_id,
+            affinity_id=affinity_id,
+            payload=header_dict,
+            task_id=header.task_id or "",
+            task_depends_on=tuple(header.task_depends_on),
         )
 
 
@@ -898,6 +1046,46 @@ class SuitTask:
     @property
     def peer_lifecycle_listener(self) -> Optional["_PeerLifecycleListener"]:
         return self._peer_lifecycle_listener
+
+    @property
+    def task_completed_listener(
+        self,
+    ) -> Callable[[Optional[str], bool, Optional[str]], None]:
+        """Return the duck-typed callable the framework picks off
+        ``getattr(task, "task_completed_listener", None)``.
+
+        The framework invokes the returned callable on every
+        ``TaskCompleted`` / ``TaskFailed`` apply with
+        ``(task_id, success, error_kind)``.  We forward the event into
+        ``self._phase0_watcher.on_task_completed`` when the watcher is
+        active AND the task_id is in its expected set; non-matching ids
+        (e.g. toolchain completions) and absent-watcher conditions are
+        NoOps.  The watcher itself is already idempotent on duplicate
+        fires, so the dispatch can be invoked freely.
+
+        Exceptions are swallowed so a buggy consumer-side listener can
+        not stall the framework's apply path.
+        """
+        def _dispatch(
+            task_id: Optional[str],
+            success: bool,
+            error_kind: Optional[str],
+        ) -> None:
+            del success, error_kind  # not consumed by the watcher today
+            try:
+                watcher = self._phase0_watcher
+                if watcher is None or not task_id:
+                    return
+                if task_id not in watcher.expected:
+                    return
+                watcher.on_task_completed(task_id)
+            except Exception:  # noqa: BLE001 — never raise out
+                self._logger.exception(
+                    "task_completed_listener: dispatch raised for"
+                    " task_id=%s",
+                    task_id,
+                )
+        return _dispatch
 
     # ── Worker-function injection seams (used by tests) ────────────────
 
@@ -1106,12 +1294,30 @@ class SuitTask:
         source_dir: Optional[pathlib.Path] = None,
         output_dir: Optional[pathlib.Path] = None,
         args: Optional[Namespace] = None,
+        primary_handle: Optional[Any] = None,
     ) -> None:
-        """Bring up peer-cache state. Idempotent."""
+        """Bring up peer-cache state. Idempotent.
+
+        ``primary_handle`` is the in-flight runtime control surface
+        the framework's modern dispatcher (post-``5fa212c``) passes via
+        kwarg.  Captured onto ``self._primary_handle`` so subsequent
+        Phase 0 → Phase 1 dispatch via ``_Phase0QuiesceWatcher`` can
+        drive ``primary_handle.spawn_tasks(...)``.  When the kwarg is
+        absent (legacy callers, single-process tests) the watcher
+        degrades to the JSON-only fallback.
+        """
         del source_dir, args  # unused (output_dir consumed below)
         with self._setup_lock:
             if self._setup_done:
+                # Late-binding the handle on a re-entry is harmless;
+                # the watcher reads ``self._primary_handle`` through
+                # the SuitTask reference, so a flip after construction
+                # still takes effect for any later spawn fire.
+                if primary_handle is not None:
+                    self._primary_handle = primary_handle
                 return
+            if primary_handle is not None:
+                self._primary_handle = primary_handle
 
             # 1. Signing key — idempotent on shared FS.
             try:
@@ -2186,6 +2392,7 @@ class SuitTask:
             expected_task_ids=expected_ids,
             out_dir=resolved_out_dir,
             toolchain_task_ids=toolchain_task_ids,
+            primary_handle=self._primary_handle,
             logger=self._logger,
             sys_name=self.config.sys_name,
         )
