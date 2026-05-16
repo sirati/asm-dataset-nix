@@ -69,9 +69,8 @@ import pathlib
 import random
 import re
 import subprocess
-import sys
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from typing import Any, Optional
 
 from compiler_suit_runner.peer_replication import BroadcastSender
@@ -583,31 +582,24 @@ def run_eval_task(
 __all__ = [
     "PHASE_0_ITEM_CLASS",
     "RunSubprocess",
-    "main",
     "parse_payload",
+    "read_peer_push_urls",
     "run_eval_task",
     "sample_suffix_attrs",
 ]
 
 
 # ---------------------------------------------------------------------------
-# Subprocess entry point
+# Peer push URL enumeration (public helper)
 #
-# Spawned by the dynamic_runner framework as
-# ``python -m compiler_suit_runner.workers.eval_worker``. The per-task
-# wire driving (Ready handshake, command framing, exception → wire
-# mapping, SIGTERM → SystemExit) is owned by ``dynamic_runner.worker.run``;
-# this module supplies the per-task body via the ``handle`` closure.
-#
-# Mirror of :func:`build_worker.main` in shape (argparse layout, log-file
-# routing, ``handle`` returning :class:`WorkerOutput`) so the framework's
-# worker-spawn wrapper produces identical argv for both worker classes.
-# The flake-ref is intentionally NOT a CLI flag here: the phase0_eval
-# payload already carries ``attr`` (fully-qualified flake attribute) and
-# the ``_meta`` lookup uses the current working directory by default.
+# Exported so :func:`workers.build_worker.main` can construct a
+# :class:`BroadcastSender` configured to fan phase0_eval drv broadcasts
+# out to the cluster. The unified build_worker entry point owns the
+# subprocess CLI shape now; ``eval_worker`` is a pure library module
+# (``run_eval_task`` + this helper).
 
 
-def _read_peer_push_urls(
+def read_peer_push_urls(
     shared_fs: Optional[pathlib.Path],
     self_secondary_id: str,
 ) -> list[str]:
@@ -647,167 +639,9 @@ def _read_peer_push_urls(
     return urls
 
 
-def main() -> int:
-    """Subprocess entry point for the phase 0 eval worker.
-
-    Parses the framework's worker argv (same shape as
-    :func:`build_worker.main`), constructs a :class:`BroadcastSender`
-    that reads peer gossip from ``--shared-fs/peers/`` on each
-    fan-out, and dispatches one phase0_eval task per call into
-    :func:`run_eval_task`.
-
-    A :class:`RuntimeError` raised by :func:`run_eval_task` is
-    re-raised as :class:`NonRecoverableError` so the framework
-    surfaces it as ``error:non_recoverable:`` — matching the
-    "Errored = retry-pass" contract documented in this module's
-    top-level docstring (the framework's harness maps NonRecoverable
-    crash to Errored, NOT Unfulfillable).
-    """
-    import argparse  # noqa: PLC0415 — match build_worker's late-import style.
-
-    from dynamic_runner.worker import (  # noqa: PLC0415
-        NonRecoverableError,
-        Task,
-        WorkerOutput,
-        run,
-    )
-
-    parser = argparse.ArgumentParser(
-        prog="compiler_suit_runner.workers.eval_worker",
-    )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--dynamic_queue", type=int)
-    group.add_argument("--socket-path", type=str)
-    parser.add_argument("--source", type=str, default=None)
-    parser.add_argument("--output", type=str, default=None)
-    parser.add_argument("--log-file", type=str, default=None)
-    parser.add_argument(
-        "--shared-fs",
-        type=str,
-        default=None,
-        help=(
-            "NFS root: peer gossip lives under ``peers/`` and the"
-            " phase-0 resume marker is written into ``out/<binary>/"
-            "_phase0/manifest.json``."
-        ),
-    )
-    parser.add_argument(
-        "--secondary-id",
-        type=str,
-        default="",
-        help="This worker's secondary id (broadcast origin author).",
-    )
-    parser.add_argument(
-        "--signing-public-key",
-        type=str,
-        default="",
-        help=(
-            "Cluster signing public key. Authenticates the broadcast"
-            " fan-out; without it the BroadcastSender still runs but"
-            " peers may reject the offers."
-        ),
-    )
-    args, _ = parser.parse_known_args()
-
-    # Log routing matches build_worker: prefer the framework's
-    # ``--log-file`` if supplied; else fall back to the SLURM-wrapper
-    # bind-mount location. Best-effort — stderr is silenced by the
-    # framework when ``--socket-path`` mode is active anyway, so a
-    # write failure should not crash the worker before ``run()`` even
-    # starts.
-    import logging  # noqa: PLC0415
-
-    _worker_log = args.log_file or f"/app/log-network/worker_{os.getpid()}.log"
-    try:
-        logging.basicConfig(
-            filename=_worker_log,
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-            force=True,
-        )
-        logging.getLogger("compiler_suit_runner.eval_worker.startup").info(
-            "eval_worker subprocess started; pid=%d argv=%r",
-            os.getpid(), sys.argv,
-        )
-    except OSError:
-        pass
-
-    shared_fs = (
-        pathlib.Path(args.shared_fs) if args.shared_fs else None
-    )
-    out_dir = (
-        pathlib.Path(args.output)
-        if args.output
-        else (shared_fs / "out" if shared_fs is not None else pathlib.Path("out"))
-    )
-
-    self_sid = args.secondary_id or ""
-
-    def _peer_url_provider() -> list[str]:
-        return _read_peer_push_urls(shared_fs, self_sid)
-
-    broadcast_sender = BroadcastSender(
-        self_peer_id=self_sid,
-        peer_url_provider=_peer_url_provider,
-        our_pubkey=args.signing_public_key or "",
-    )
-
-    _handle_log = logging.getLogger(
-        "compiler_suit_runner.eval_worker.handle"
-    )
-
-    def handle(task: Task) -> Optional[WorkerOutput]:
-        # task.payload is the header_dict wrapper emitted by discover_items /
-        # _header_to_task_info: {"item_class": ..., "name": ..., "payload": {...}}.
-        # The inner "payload" key holds the actual phase0_eval data (binary, sys,
-        # archs, suffixes, attr, ...).  Extract it before passing to run_eval_task.
-        outer = task.payload if isinstance(task.payload, dict) else {}
-        inner = outer.get("payload")
-        payload = inner if isinstance(inner, dict) else outer
-        _handle_log.info(
-            "handle: starting phase0_eval task task_id=%r payload_keys=%r",
-            getattr(task, "task_id", None), sorted(payload.keys()),
-        )
-        try:
-            run_eval_task(
-                payload,
-                out_dir=out_dir,
-                broadcast_sender=broadcast_sender,
-            )
-        except RuntimeError as exc:
-            # Per module docstring: transient eval failures map to
-            # ErrorType::Errored (retry-pass eligible). The framework
-            # treats NonRecoverableError as a worker-side hard fail
-            # which the primary classifies as Errored — NOT
-            # Unfulfillable. (Unfulfillable is reserved for "this
-            # peer structurally cannot do this task" which the eval
-            # worker does not surface.)
-            _handle_log.exception(
-                "handle: run_eval_task raised RuntimeError (retry-eligible)"
-            )
-            raise NonRecoverableError(
-                f"phase0_eval failed: {exc}"
-            ) from exc
-        except BaseException as exc:  # noqa: BLE001
-            _handle_log.exception(
-                "handle: run_eval_task raised unexpectedly"
-            )
-            raise NonRecoverableError(
-                f"phase0_eval crashed: {type(exc).__name__}: {exc}"
-            ) from exc
-        return WorkerOutput()
-
-    try:
-        run(handle, args=args)
-    finally:
-        # Daemon thread, but a clean stop drains in-flight broadcasts
-        # before the subprocess exits.
-        try:
-            broadcast_sender.stop()
-        except Exception:  # noqa: BLE001
-            pass
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+# Backwards-compatible private alias. ``_read_peer_push_urls`` was the
+# original name when this helper lived next to the (now removed)
+# ``eval_worker.main`` entry point; existing unit tests reference the
+# underscored form. The public symbol is :func:`read_peer_push_urls`
+# (exported via ``__all__``).
+_read_peer_push_urls = read_peer_push_urls
