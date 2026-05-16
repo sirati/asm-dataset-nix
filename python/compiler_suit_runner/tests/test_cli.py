@@ -582,3 +582,292 @@ def test_serialize_then_restore_preflight_roundtrip(tmp_path: pathlib.Path):
     assert len(tc_files) == 1
     tc = json.loads(tc_files[0].read_text())
     assert tc["payload"].get("drv") == "/nix/store/tc.drv"
+
+
+# ---------------------------------------------------------------------------
+# --unfulfillable-reinject-max-per-task
+# ---------------------------------------------------------------------------
+
+
+def test_unfulfillable_reinject_flag_defaults_to_none(
+    tmp_path: pathlib.Path,
+):
+    """Without the flag the parsed namespace should carry ``None`` —
+    matching the framework default of an unbounded per-task reinject
+    budget."""
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "submit",
+            "--shared-fs",
+            str(tmp_path),
+            "--multi-computer",
+            "single-process",
+        ]
+    )
+    assert args.unfulfillable_reinject_max_per_task is None
+
+
+def test_unfulfillable_reinject_flag_parses_positive_int(
+    tmp_path: pathlib.Path,
+):
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "submit",
+            "--shared-fs",
+            str(tmp_path),
+            "--multi-computer",
+            "single-process",
+            "--unfulfillable-reinject-max-per-task=10",
+        ]
+    )
+    assert args.unfulfillable_reinject_max_per_task == 10
+
+
+def test_unfulfillable_reinject_flag_accepts_zero(
+    tmp_path: pathlib.Path,
+):
+    """Zero is a valid cap — means 'don't auto-reinject at all'. The
+    framework's matcher honours zero distinct from None."""
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "submit",
+            "--shared-fs",
+            str(tmp_path),
+            "--multi-computer",
+            "single-process",
+            "--unfulfillable-reinject-max-per-task=0",
+        ]
+    )
+    assert args.unfulfillable_reinject_max_per_task == 0
+
+
+def test_unfulfillable_reinject_flag_rejects_negative(
+    tmp_path: pathlib.Path,
+):
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "submit",
+                "--shared-fs",
+                str(tmp_path),
+                "--multi-computer",
+                "single-process",
+                "--unfulfillable-reinject-max-per-task=-1",
+            ]
+        )
+
+
+def test_unfulfillable_reinject_flag_rejects_non_int(
+    tmp_path: pathlib.Path,
+):
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "submit",
+                "--shared-fs",
+                str(tmp_path),
+                "--multi-computer",
+                "single-process",
+                "--unfulfillable-reinject-max-per-task=not-an-int",
+            ]
+        )
+
+
+def test_unfulfillable_reinject_plumbs_into_suit_task_config(
+    tmp_path: pathlib.Path,
+):
+    """``_config_from_args`` must propagate the parsed value verbatim
+    onto :class:`SuitTaskConfig` (otherwise the framework default
+    sticks regardless of what the operator passed)."""
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "submit",
+            "--shared-fs",
+            str(tmp_path),
+            "--multi-computer",
+            "single-process",
+            "--unfulfillable-reinject-max-per-task=7",
+        ]
+    )
+
+    config = cli_module._config_from_args(
+        args,
+        run_id="r1",
+        secondary_id="primary",
+        input_hash="h",
+        toolchain_drvs=frozenset(),
+        variants=(),
+    )
+    assert config.unfulfillable_reinject_max_per_task == 7
+
+
+def test_unfulfillable_reinject_default_plumbs_none_into_config(
+    tmp_path: pathlib.Path,
+):
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "submit",
+            "--shared-fs",
+            str(tmp_path),
+            "--multi-computer",
+            "single-process",
+        ]
+    )
+    config = cli_module._config_from_args(
+        args,
+        run_id="r1",
+        secondary_id="primary",
+        input_hash="h",
+        toolchain_drvs=frozenset(),
+        variants=(),
+    )
+    assert config.unfulfillable_reinject_max_per_task is None
+
+
+def test_unfulfillable_reinject_not_stripped_from_framework_argv():
+    """The flag must NOT be in the CSR-only strip set: the framework's
+    own argparse parses ``--unfulfillable-reinject-max-per-task`` and
+    plumbs it into PrimaryCoordinator(__init__). If we strip it before
+    handing argv to the framework, the operator's value silently
+    reverts to the framework default."""
+    forwarded = cli_module._strip_csr_argv_for_framework(
+        [
+            "submit",
+            "--shared-fs",
+            "/tmp/x",
+            "--multi-computer",
+            "slurm",
+            "--unfulfillable-reinject-max-per-task",
+            "5",
+        ]
+    )
+    assert "--unfulfillable-reinject-max-per-task" in forwarded
+    # Adjacent value must survive too (argparse consumes the next token).
+    idx = forwarded.index("--unfulfillable-reinject-max-per-task")
+    assert forwarded[idx + 1] == "5"
+
+
+def test_apply_unfulfillable_reinject_cap_calls_setter_when_set(
+    tmp_path: pathlib.Path,
+):
+    """SuitTask helper should invoke the framework setter exactly once
+    with the configured value when the cap is not None."""
+    from unittest.mock import MagicMock
+
+    from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
+
+    config = SuitTaskConfig(
+        flake_ref=".",
+        sys_name="x86_64-linux",
+        shared_fs=tmp_path,
+        manifest_dir=tmp_path / "m",
+        raw_partition_dir=tmp_path / "p" / "raw",
+        partition_dir=tmp_path / "p",
+        dataset_dir=tmp_path / "d",
+        peers_dir=tmp_path / "peers",
+        run_id="r1",
+        secondary_id="primary",
+        hostname="h",
+        unfulfillable_reinject_max_per_task=4,
+    )
+    task = SuitTask(config)
+    handle = MagicMock()
+    task.apply_unfulfillable_reinject_cap(handle)
+    handle.set_unfulfillable_reinject_max_per_task.assert_called_once_with(4)
+
+
+def test_apply_unfulfillable_reinject_cap_skips_when_none(
+    tmp_path: pathlib.Path,
+):
+    """With ``None`` (the default) the setter must NOT be called — that
+    lets the framework keep its own default semantics (unbounded)."""
+    from unittest.mock import MagicMock
+
+    from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
+
+    config = SuitTaskConfig(
+        flake_ref=".",
+        sys_name="x86_64-linux",
+        shared_fs=tmp_path,
+        manifest_dir=tmp_path / "m",
+        raw_partition_dir=tmp_path / "p" / "raw",
+        partition_dir=tmp_path / "p",
+        dataset_dir=tmp_path / "d",
+        peers_dir=tmp_path / "peers",
+        run_id="r1",
+        secondary_id="primary",
+        hostname="h",
+        unfulfillable_reinject_max_per_task=None,
+    )
+    task = SuitTask(config)
+    handle = MagicMock()
+    task.apply_unfulfillable_reinject_cap(handle)
+    handle.set_unfulfillable_reinject_max_per_task.assert_not_called()
+
+
+def test_apply_unfulfillable_reinject_cap_accepts_zero(
+    tmp_path: pathlib.Path,
+):
+    """Zero is a valid cap (means 'don't auto-reinject') — the helper
+    must distinguish it from None and call the setter with 0."""
+    from unittest.mock import MagicMock
+
+    from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
+
+    config = SuitTaskConfig(
+        flake_ref=".",
+        sys_name="x86_64-linux",
+        shared_fs=tmp_path,
+        manifest_dir=tmp_path / "m",
+        raw_partition_dir=tmp_path / "p" / "raw",
+        partition_dir=tmp_path / "p",
+        dataset_dir=tmp_path / "d",
+        peers_dir=tmp_path / "peers",
+        run_id="r1",
+        secondary_id="primary",
+        hostname="h",
+        unfulfillable_reinject_max_per_task=0,
+    )
+    task = SuitTask(config)
+    handle = MagicMock()
+    task.apply_unfulfillable_reinject_cap(handle)
+    handle.set_unfulfillable_reinject_max_per_task.assert_called_once_with(0)
+
+
+def test_apply_unfulfillable_reinject_cap_handles_missing_setter(
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    """If the framework version doesn't expose the setter, the helper
+    must log a warning + continue rather than raising."""
+
+    from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
+
+    config = SuitTaskConfig(
+        flake_ref=".",
+        sys_name="x86_64-linux",
+        shared_fs=tmp_path,
+        manifest_dir=tmp_path / "m",
+        raw_partition_dir=tmp_path / "p" / "raw",
+        partition_dir=tmp_path / "p",
+        dataset_dir=tmp_path / "d",
+        peers_dir=tmp_path / "peers",
+        run_id="r1",
+        secondary_id="primary",
+        hostname="h",
+        unfulfillable_reinject_max_per_task=4,
+    )
+    task = SuitTask(config)
+
+    class _LegacyHandle:
+        pass
+
+    # Must not raise.
+    task.apply_unfulfillable_reinject_cap(_LegacyHandle())

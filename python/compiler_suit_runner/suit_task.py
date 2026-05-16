@@ -614,6 +614,15 @@ class SuitTaskConfig:
     # effect.
     replication_k: int = 3
     allow_observer_as_holder: bool = True
+    # Per-task budget for the framework's auto-reinject of permanently
+    # Unfulfillable tasks (triggered by ``HoldingMatcher`` and by
+    # explicit ``PrimaryHandle.reinject_task`` calls). ``None`` =
+    # unbounded; matches the framework default. A non-negative int
+    # caps how many reinjects a single task hash may absorb before
+    # the framework refuses further reinjects on that task. Kept
+    # distinct from ``--retry-max-passes`` (the Recoverable-failure
+    # retry budget); see ``feedback_state_machine_semantics.md``.
+    unfulfillable_reinject_max_per_task: Optional[int] = None
     input_hash: str = ""
     toolchain_drvs: frozenset[str] = frozenset()
     common_threshold: int = 10
@@ -1487,6 +1496,41 @@ class SuitTask:
             self._phase0_watcher = None
             self._signing_key = None
             self._setup_done = False
+
+    def apply_unfulfillable_reinject_cap(self, primary_handle: Any) -> None:
+        """Forward the configured reinject cap onto a primary handle.
+
+        Must be called BEFORE ``primary_handle.run()`` starts: the
+        framework freezes the per-task budget cell when ``run()``
+        flips ``run_started``. When the config field is ``None`` we
+        skip the setter call entirely so the framework keeps its
+        own default (unbounded). The call is wrapped in a guarded
+        try/except so a framework version that doesn't expose
+        ``set_unfulfillable_reinject_max_per_task`` simply logs +
+        continues instead of aborting the run.
+        """
+        cap = self.config.unfulfillable_reinject_max_per_task
+        if cap is None:
+            return
+        setter = getattr(
+            primary_handle,
+            "set_unfulfillable_reinject_max_per_task",
+            None,
+        )
+        if setter is None:
+            self._logger.warning(
+                "primary_handle has no "
+                "set_unfulfillable_reinject_max_per_task; "
+                "framework default (unbounded) remains in effect"
+            )
+            return
+        try:
+            setter(cap)
+        except Exception:  # noqa: BLE001 — never raise out
+            self._logger.exception(
+                "set_unfulfillable_reinject_max_per_task(%d) failed",
+                cap,
+            )
 
     def on_phase_start(self, phase_id: str) -> None:
         self._logger.info("phase %s starting", phase_id)
