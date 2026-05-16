@@ -400,11 +400,18 @@ let
         mkStdenv =
           targetPkgs: target:
           if target.crossAttr == null && !(target ? crossSystem) then
-            # Native: use extractClangCC on the native LLVM package
+            # Native: use extractClangCC on the native LLVM package.
+            # Backfill ``targetPrefix = ""`` for very-old clang wrappers
+            # (nixpkgs 15.09 / 18.03 — clang3.4 through clang4) that
+            # predate the attribute; upstream nixpkgs derivations
+            # (gawk, busybox, zlib, ...) read ``stdenv.cc.targetPrefix``
+            # unconditionally and throw ``attribute 'targetPrefix' missing``
+            # at eval time otherwise. Mirrors the gcc4_x backfill in the
+            # native branch of ``mkOldGccEntry`` above.
             let
               cc = extractClangCC oldPkgs.${attr};
             in
-            targetPkgs.overrideCC targetPkgs.stdenv cc
+            targetPkgs.overrideCC targetPkgs.stdenv (ensureTargetPrefix "" cc)
           else if oldPkgs ? pkgsCross then
             # pkgsCross available (22.11+): get cross-clang from buildPackages.
             # Use .clang directly (not extractClangCC) because
@@ -431,7 +438,11 @@ let
                       postFixup = (old.postFixup or "") + abiPostFixup abiFlags;
                     });
               in
-              targetPkgs.overrideCC targetPkgs.stdenv crossClang
+              # Defensive ``targetPrefix`` backfill: 22.11+ cross wrappers
+              # generally expose it, but old-LLVM cross attrs vary across
+              # nixpkgs eras. Idempotent — no-op when already present.
+              targetPkgs.overrideCC targetPkgs.stdenv
+                (ensureTargetPrefix "${target.crossConfig}-" crossClang)
           else
             # Pre-pkgsCross (18.03, 15.09): hybrid wrapper approach.
             # The old nixpkgs' cross infrastructure has broken C++ stdlib
