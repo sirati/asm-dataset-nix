@@ -311,7 +311,7 @@ let
   # ---------- Embedded VMs / interpreters ----------
   interpreters = {
     high = [
-      (pkg "tcc" "tcc")
+      (pkg "tinycc" "tcc")
       (pkg "duktape" "duktape")
       (pkg "quickjs" "quickjs")
       (pkg "mujs" "mujs")
