@@ -69,11 +69,15 @@ let
 
   # Generalised cc-wrapper attribute backfill. Modern cc-wrappers always
   # expose a set of attrs (``targetPrefix``, ``isGNU``, ``isClang``,
-  # ``libc``, ...) that upstream nixpkgs derivations read unconditionally:
+  # ``libc``, ``bintools``, ``version``, ``cc``, ...) that upstream
+  # nixpkgs derivations read unconditionally:
   #
-  #   - openssl/default.nix:        stdenv.cc.isGNU
-  #   - tinycc/package.nix:         stdenv.cc.libc
-  #   - busybox/zlib/gawk:          stdenv.cc.targetPrefix
+  #   - openssl/default.nix:           stdenv.cc.isGNU
+  #   - tinycc/package.nix:            stdenv.cc.libc
+  #   - busybox/zlib/gawk:             stdenv.cc.targetPrefix
+  #   - libgcrypt/package.nix:         stdenv.cc.bintools.{isLLVM,version}
+  #   - kissfft/package.nix:           stdenv.cc.{isClang,version}
+  #   - libwebsockets/package.nix:     stdenv.cc.cc
   #
   # Very old wrappers (15.09 / 18.03) and the raw-binary clang3.4/3.5
   # path (where ``extractClangCC`` returns ``llvmPkg.clang`` itself, not
@@ -81,14 +85,45 @@ let
   # only the missing ones with the caller-supplied defaults; present
   # attrs pass through unchanged (idempotent).
   #
+  # Special-cased ``bintools`` key: the value MUST be an attrset of the
+  # shape ``{ _fallback = <bintools-drv>; isLLVM = ...; version = ...; }``
+  # — a fallback drv + a flat list of sub-attrs to ensure on the
+  # bintools. The helper handles two failure shapes seen in the probe:
+  #   (a) ``cc.bintools`` entirely missing on very-old 15.09/18.03
+  #       wrappers (18 libgcrypt fails) → use ``_fallback`` wholesale.
+  #   (b) ``cc.bintools`` present but lacking ``isLLVM`` — nixpkgs-22.11
+  #       ``binutils-wrapper-2.39`` predates the attr (300 libgcrypt
+  #       fails across 22.11 gcc/clang) → overlay missing sub-attrs.
+  # All other keys go through plain ``//`` semantics: set the value
+  # only when the key is absent on ``drv``.
+  #
   # ``defaults`` is an attrset of ``{ attrName = defaultValue; ... }``;
   # the same shape as ``//`` but applied per-attr with a presence check.
   ensureCcAttrs =
     defaults: drv:
     let
-      missing = lib.filterAttrs (n: _: !(drv ? ${n})) defaults;
+      # Top-level scalar keys: keep only the ones the wrapper is missing.
+      topScalar = lib.filterAttrs (n: _: n != "bintools" && !(drv ? ${n})) defaults;
+
+      # Nested ``bintools`` backfill. ``_fallback`` is the drv to splice
+      # in when the wrapper has no ``bintools`` attr at all; the other
+      # keys describe the sub-attrs to ensure on the bintools.
+      btDefault = defaults.bintools or null;
+      btPatch =
+        if btDefault == null then
+          { }
+        else
+          let
+            fallback = btDefault._fallback;
+            subDefaults = builtins.removeAttrs btDefault [ "_fallback" ];
+            bt = drv.bintools or fallback;
+            subMissing = lib.filterAttrs (n: _: !(bt ? ${n})) subDefaults;
+            patched = bt // subMissing;
+            needsWrite = !(drv ? bintools) || subMissing != { };
+          in
+          if needsWrite then { bintools = patched; } else { };
     in
-    drv // missing;
+    drv // topScalar // btPatch;
 
   # Per-family defaults for the cc-wrapper backfills. ``targetPrefix``
   # varies between native ("") and cross ("<triple>-"), so it's
@@ -98,15 +133,44 @@ let
   # glibc (or musl) the wrapper effectively links against once it's
   # plugged into the target stdenv via ``overrideCC``. ``isGNU``/
   # ``isClang`` are constants per family.
+  #
+  # ``bintools`` carries the modern target stdenv's bintools as its
+  # ``_fallback`` (used wholesale when the wrapper lacks the attr) plus
+  # the two sub-attrs upstream nixpkgs reads off ``cc.bintools``:
+  #   - ``isLLVM`` — gates ``--undefined-version`` linker workarounds
+  #     (libgcrypt). For gcc-family wrappers the linker is GNU ld
+  #     regardless of the cc; for clang we use modern bintools too so
+  #     ``isLLVM = false`` mirrors the actual ld in use.
+  #   - ``version`` — the binutils version string; already exposed on
+  #     22.11 ``binutils-wrapper-2.39`` so the patch is a no-op there,
+  #     but very-old wrappers may lack it.
+  #
+  # ``version``/``cc`` are caller-supplied because they vary per entry:
+  #   - ``version``: the compiler's own version string (kissfft reads
+  #     ``stdenv.cc.version``) — taken from the entry's ``version``.
+  #   - ``cc``: the unwrapped compiler binary; only needed for the
+  #     raw-binary clang3.4/3.5 fallback in ``extractClangCC`` where
+  #     ``drv`` is the binary itself with no ``.cc`` indirection
+  #     (libwebsockets reads ``stdenv.cc.cc``).
   gccCcDefaults = targetPkgs: {
     isGNU = true;
     isClang = false;
     libc = targetPkgs.stdenv.cc.libc;
+    bintools = {
+      _fallback = targetPkgs.stdenv.cc.bintools;
+      isLLVM = false;
+      version = targetPkgs.stdenv.cc.bintools.version or "0";
+    };
   };
   clangCcDefaults = targetPkgs: {
     isGNU = false;
     isClang = true;
     libc = targetPkgs.stdenv.cc.libc;
+    bintools = {
+      _fallback = targetPkgs.stdenv.cc.bintools;
+      isLLVM = false; # we still link with GNU ld via modern bintools
+      version = targetPkgs.stdenv.cc.bintools.version or "0";
+    };
   };
 
   # Extract version string from a Clang package across different nixpkgs eras.
@@ -375,11 +439,25 @@ let
             # ``isClang`` and ``libc`` are already present on gcc4_x
             # wrappers but we pass them through ``ensureCcAttrs`` for
             # symmetry (idempotent — no-op when attr already present).
+            # ``version`` is the compiler entry's own version (kissfft
+            # reads ``stdenv.cc.version``); modern wrappers expose it
+            # so the patch is a no-op there. ``bintools`` carries the
+            # nested ``isLLVM``/``version`` sub-attrs libgcrypt reads.
             targetPkgs.overrideCC targetPkgs.stdenv (
-              ensureCcAttrs (gccCcDefaults targetPkgs // { targetPrefix = ""; }) cleanGcc
+              ensureCcAttrs
+                (gccCcDefaults targetPkgs // {
+                  targetPrefix = "";
+                  version = tried.value;
+                })
+                cleanGcc
             )
           else if oldPkgs ? pkgsCross then
-            # pkgsCross available (22.11+): use buildPackages with depsBuildBuild bootstrap
+            # pkgsCross available (22.11+): use buildPackages with
+            # depsBuildBuild bootstrap. ``ensureCcAttrs`` defensively
+            # backfills the bintools' missing ``isLLVM`` — 22.11's
+            # ``binutils-wrapper-2.39`` predates the attr and libgcrypt
+            # reads ``stdenv.cc.bintools.isLLVM`` unconditionally
+            # (300 of the 300+18+7+1 missing-attr fails).
             let
               oldCrossPkgs = getOldCrossPkgs nixpkgsInfo target;
             in
@@ -396,7 +474,14 @@ let
                 });
                 rewrapped = oldCrossGcc.override { cc = bootstrappedCC; };
               in
-              targetPkgs.overrideCC targetPkgs.stdenv rewrapped
+              targetPkgs.overrideCC targetPkgs.stdenv (
+                ensureCcAttrs
+                  (gccCcDefaults targetPkgs // {
+                    targetPrefix = "${target.crossConfig}-";
+                    version = tried.value;
+                  })
+                  rewrapped
+              )
           else if nixpkgsInfo.nixpkgsSrc != null && nixpkgsInfo.system != null && gccSubdir != null then
             # Pre-buildPackages (15.09): call old gcc expression directly with
             # cross params, build using native gccN, wrap with modern cc-wrapper.
@@ -455,8 +540,11 @@ let
             #   - targetPrefix  (gawk, busybox, zlib)
             #   - isGNU         (openssl)
             #   - libc          (tinycc)
+            #   - version       (kissfft) — 7 missing-attr fails
+            #   - cc            (libwebsockets) — 1 missing-attr fail
+            #   - bintools.{isLLVM,version} (libgcrypt) — 318 fails
             # The very-old clang3.4/3.5 path returns ``llvmPkg.clang``
-            # itself (no real wrapper) so all three are missing.
+            # itself (no real wrapper) so all the above are missing.
             # Wrappers that already expose the attr keep their value
             # unchanged — ``ensureCcAttrs`` only fills holes. (The
             # 15.09 clang3.6 wrapper inherits ``isGNU=true`` from the
@@ -465,9 +553,16 @@ let
             # eval, so we leave it.)
             let
               cc = extractClangCC oldPkgs.${attr};
+              unwrapped = extractUnwrappedClang oldPkgs.${attr};
             in
             targetPkgs.overrideCC targetPkgs.stdenv (
-              ensureCcAttrs (clangCcDefaults targetPkgs // { targetPrefix = ""; }) cc
+              ensureCcAttrs
+                (clangCcDefaults targetPkgs // {
+                  targetPrefix = "";
+                  inherit version;
+                  cc = unwrapped;
+                })
+                cc
             )
           else if oldPkgs ? pkgsCross then
             # pkgsCross available (22.11+): get cross-clang from buildPackages.
@@ -496,12 +591,18 @@ let
                     });
               in
               # Defensive backfill: 22.11+ cross wrappers generally
-              # expose all cc-attrs, but old-LLVM cross attrs vary
-              # across nixpkgs eras. Idempotent — no-op when present.
+              # expose top-level cc-attrs, but their bintools
+              # (binutils-wrapper-2.39) predates ``isLLVM`` — libgcrypt
+              # reads ``stdenv.cc.bintools.isLLVM`` for the
+              # ``--undefined-version`` workaround. Idempotent — no-op
+              # when present. ``version`` flows from the entry; ``cc``
+              # is already present on real wrappers from buildPackages.
               targetPkgs.overrideCC targetPkgs.stdenv (
                 ensureCcAttrs
-                  (clangCcDefaults targetPkgs
-                   // { targetPrefix = "${target.crossConfig}-"; })
+                  (clangCcDefaults targetPkgs // {
+                    targetPrefix = "${target.crossConfig}-";
+                    inherit version;
+                  })
                   crossClang
               )
           else
