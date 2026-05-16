@@ -1106,6 +1106,7 @@ def test_main_handle_dispatches_phase0_eval_to_run_eval_task(
             "--flake-ref", ".",
             "--dataset-output-dir", str(tmp_path / "dataset"),
             "--shared-fs", str(tmp_path),
+            "--phase0-out-dir", str(tmp_path / "phase0"),
             "--secondary-id", "sec1",
             "--signing-public-key", "k:abc",
         ],
@@ -1137,7 +1138,7 @@ def test_main_handle_dispatches_phase0_eval_to_run_eval_task(
     # The inner payload was unwrapped before dispatch.
     assert captured["payload"] == wrapper["payload"]
     assert captured["broadcast_sender"] is sender_instance
-    assert captured["out_dir"] == tmp_path / "out"
+    assert captured["out_dir"] == tmp_path / "phase0"
 
 
 def test_main_handle_dispatches_build_manifest_to_build_worker(
@@ -1213,6 +1214,7 @@ def test_main_handle_phase0_eval_runtime_error_becomes_non_recoverable(
             "--flake-ref", ".",
             "--dataset-output-dir", str(tmp_path / "dataset"),
             "--shared-fs", str(tmp_path),
+            "--phase0-out-dir", str(tmp_path / "phase0"),
         ],
     )
 
@@ -1230,6 +1232,32 @@ def test_main_handle_phase0_eval_runtime_error_becomes_non_recoverable(
     with pytest.raises(NonRecoverable) as exc_info:
         handle(Task(payload=_phase0_eval_wrapper_payload()))
     assert "nix-eval-jobs fell over" in str(exc_info.value)
+
+
+def test_main_handle_phase0_eval_without_phase0_out_dir_is_non_recoverable(
+    monkeypatch, tmp_path
+):
+    """phase0_eval requires --phase0-out-dir (shared bind-mounted marker
+    dir). Receiving the task without that flag — even with --shared-fs
+    — is a structural misconfiguration -> NonRecoverableError."""
+    handle, _, _ = _run_build_worker_main_with_capture(
+        monkeypatch,
+        [
+            "--socket-path", str(tmp_path / "sock"),
+            "--flake-ref", ".",
+            "--dataset-output-dir", str(tmp_path / "dataset"),
+            "--shared-fs", str(tmp_path),
+            # --phase0-out-dir OMITTED
+        ],
+    )
+
+    import sys as _sys
+    fake_mod = _sys.modules["dynamic_runner.worker"]
+    Task = fake_mod.Task
+    NonRecoverable = fake_mod.NonRecoverableError
+    with pytest.raises(NonRecoverable) as exc_info:
+        handle(Task(payload=_phase0_eval_wrapper_payload()))
+    assert "phase0-out-dir" in str(exc_info.value)
 
 
 def test_main_handle_phase0_eval_without_shared_fs_is_non_recoverable(
@@ -1270,6 +1298,7 @@ def test_main_stops_broadcast_sender_on_exit(monkeypatch, tmp_path):
             "--flake-ref", ".",
             "--dataset-output-dir", str(tmp_path / "dataset"),
             "--shared-fs", str(tmp_path),
+            "--phase0-out-dir", str(tmp_path / "phase0"),
             "--secondary-id", "sec1",
         ],
     )

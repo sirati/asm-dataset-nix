@@ -616,7 +616,7 @@ class _Phase0QuiesceWatcher:
 
         ``result`` is forwarded by the framework's hook (eventual API);
         we don't currently inspect it because the Phase 0 worker writes
-        its manifest to ``out_dir/<binary>/_phase0/manifest.json`` and
+        its manifest to ``phase0_out_dir/<binary>/manifest.json`` and
         the planner re-reads them. The result slot is kept on the
         signature so the framework's call site doesn't need a wrapper.
 
@@ -970,6 +970,11 @@ class SuitTaskConfig:
     toolchain_drvs: frozenset[str] = frozenset()
     common_threshold: int = 10
     variants: tuple = ()
+    # Shared bind-mounted path where phase0_eval workers write their
+    # resume markers. Submitter side: <shared_fs>/dataset/_phase0;
+    # secondary container side: /app/out-network/_phase0 (same physical
+    # dir via the framework's --output bind mount).
+    phase0_out_dir: Optional[pathlib.Path] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1308,6 +1313,12 @@ class SuitTask:
                 argv += [
                     "--signing-public-key", self._signing_key.public_key,
                 ]
+            # Phase 0 eval marker dir: bind-mount-visible path so the
+            # primary's _Phase0QuiesceWatcher can read what the worker
+            # wrote. Only meaningful for type_id == "eval"; the other
+            # types ignore it.
+            if type_id == "eval" and self.config.phase0_out_dir is not None:
+                argv += ["--phase0-out-dir", str(self.config.phase0_out_dir)]
             return argv
         return common
 
@@ -2358,12 +2369,10 @@ class SuitTask:
         present — that's the legacy-eval path (``--distributed-eval``
         off) and there's nothing to wait for.
 
-        ``output_dir`` is the framework-supplied per-run output
-        directory; the planner reads ``out/<binary>/_phase0/
-        manifest.json`` under it and dumps ``_phase1_graph.json`` into
-        it. When the framework doesn't pass one we fall back to
-        ``config.shared_fs / 'out'`` so the layout stays consistent
-        with what the workers write.
+        ``config.phase0_out_dir`` (when set) is used as the marker root;
+        it overrides ``output_dir`` and the legacy ``shared_fs/'out'``
+        fallback. ``output_dir`` is the framework-supplied per-run output
+        directory used only when ``phase0_out_dir`` is absent.
         """
         manifest_dir = self.config.manifest_dir
         try:
@@ -2414,9 +2423,13 @@ class SuitTask:
             return None
 
         resolved_out_dir = (
-            pathlib.Path(output_dir)
-            if output_dir is not None
-            else self.config.shared_fs / "out"
+            self.config.phase0_out_dir
+            if self.config.phase0_out_dir is not None
+            else (
+                pathlib.Path(output_dir)
+                if output_dir is not None
+                else self.config.shared_fs / "out"
+            )
         )
 
         return _Phase0QuiesceWatcher(

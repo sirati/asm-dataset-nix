@@ -663,6 +663,16 @@ def _config_from_args(
     # (``/app/out-network``) so finished tarballs don't end up wedged
     # under the per-run log dir.
     dataset_dir = pathlib.Path(getattr(args, "dataset_dir", None) or shared / "dataset")
+    # phase0_out_dir: explicit override wins; fall back to
+    # <dataset_dir>/_phase0. On the submitter side this resolves to
+    # <shared_fs>/dataset/_phase0 (host view of the shared bind mount);
+    # on the secondary side the synthesised namespace passes the container
+    # view (/app/out-network/_phase0) via getattr.
+    _raw_phase0_out = getattr(args, "phase0_out_dir", None)
+    phase0_out_dir = (
+        pathlib.Path(_raw_phase0_out) if _raw_phase0_out is not None
+        else dataset_dir / "_phase0"
+    )
     return SuitTaskConfig(
         flake_ref=args.flake,
         sys_name=args.sys_name,
@@ -680,6 +690,7 @@ def _config_from_args(
         input_hash=input_hash,
         toolchain_drvs=toolchain_drvs,
         variants=variants,
+        phase0_out_dir=phase0_out_dir,
         # Defaults the user is unlikely to override from the CLI; tests
         # build SuitTaskConfig directly when they need to tweak these.
         # Harmonia ON by default — it's the whole point of cluster
@@ -1595,6 +1606,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # surface (used by lifecycle / stats reporting) points at the
         # same location.
         config.dataset_dir.mkdir(parents=True, exist_ok=True)
+        if config.phase0_out_dir is not None:
+            config.phase0_out_dir.mkdir(parents=True, exist_ok=True)
         if "--output" not in forwarded and not any(
             t.startswith("--output=") for t in forwarded
         ):
@@ -1948,6 +1961,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # from other consumers (e.g. asm-tokenizer) of the same
             # shared output dir on the gateway.
             dataset_dir=pathlib.Path("/app/out-tmp/dataset"),
+            # phase0 markers land on the shared bind mount so the
+            # primary's watcher can read them. /app/out-network is the
+            # container view of <shared_fs>/dataset (host view).
+            phase0_out_dir=pathlib.Path("/app/out-network/_phase0"),
             run_id=None,
             sys_name="x86_64-linux",
             packages=None,

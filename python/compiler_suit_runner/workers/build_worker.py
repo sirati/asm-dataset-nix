@@ -1138,6 +1138,17 @@ def main() -> int:
         ),
     )
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--phase0-out-dir",
+        type=str,
+        default=None,
+        help=(
+            "Shared bind-mounted directory for phase0_eval resume"
+            " markers. Marker is written to"
+            " ``<phase0-out-dir>/<binary>/manifest.json``. Required"
+            " for phase0_eval tasks; ignored by build/toolchain types."
+        ),
+    )
     args, _ = parser.parse_known_args()
 
     # Route the worker subprocess's stdlib-logging output to a file so
@@ -1269,15 +1280,23 @@ def main() -> int:
         eval_payload = _extract_phase0_eval_payload(payload)
         if eval_payload is not None:
             if broadcast_sender is None:
-                # phase0_eval requires shared_fs (the resume marker
-                # path and the peer-gossip directory both live under
-                # it). Without it we can't honour the contract.
+                # phase0_eval requires shared_fs for the peer-gossip
+                # directory (BroadcastSender peer URL lookups). Without
+                # it we can't honour the broadcast contract.
                 raise NonRecoverableError(
-                    "phase0_eval requires --shared-fs (resume marker"
-                    " + peer gossip both live under it); refusing to"
-                    " proceed without it"
+                    "phase0_eval requires --shared-fs for peer gossip;"
+                    " refusing to proceed without it"
                 )
-            out_dir = pathlib.Path(args.shared_fs) / "out"
+            if not args.phase0_out_dir:
+                # phase0_eval marker dir must be passed explicitly —
+                # it's the bind-mounted shared output, distinct from
+                # the per-secondary scratch ``--shared-fs``.
+                raise NonRecoverableError(
+                    "phase0_eval requires --phase0-out-dir (shared"
+                    " bind-mounted marker dir); refusing to proceed"
+                    " without it"
+                )
+            out_dir = pathlib.Path(args.phase0_out_dir)
             _handle_log.info(
                 "handle: dispatching phase0_eval task binary=%r archs=%r",
                 eval_payload.get("binary"), eval_payload.get("archs"),

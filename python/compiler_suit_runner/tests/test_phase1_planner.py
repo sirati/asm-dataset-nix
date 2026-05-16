@@ -284,11 +284,11 @@ def test_spawn_tasks_called_exactly_once_with_full_list() -> None:
 
 
 def test_read_phase0_manifests_glob_walk(tmp_path: pathlib.Path) -> None:
-    """Glob-walks out/<binary>/_phase0/manifest.json under ``out_dir``."""
+    """Glob-walks <binary>/manifest.json under ``out_dir``."""
     out_dir = tmp_path / "out"
     for binary in ("hello", "yes"):
-        (out_dir / binary / "_phase0").mkdir(parents=True)
-        (out_dir / binary / "_phase0" / "manifest.json").write_text(
+        (out_dir / binary).mkdir(parents=True)
+        (out_dir / binary / "manifest.json").write_text(
             json.dumps(
                 {
                     "binary": binary,
@@ -300,8 +300,8 @@ def test_read_phase0_manifests_glob_walk(tmp_path: pathlib.Path) -> None:
         )
     # Garbage files outside the expected layout must be ignored.
     (out_dir / "stray.json").write_text("not a manifest", encoding="utf-8")
-    (out_dir / "no" / "_phase0").mkdir(parents=True)
-    (out_dir / "no" / "_phase0" / "manifest.json").write_text(
+    (out_dir / "no").mkdir(parents=True)
+    (out_dir / "no" / "manifest.json").write_text(
         "not json", encoding="utf-8"
     )
 

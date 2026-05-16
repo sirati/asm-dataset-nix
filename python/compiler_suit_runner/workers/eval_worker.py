@@ -16,7 +16,7 @@ worker:
    onward). Each receiver substitutes the drv into its local store
    so Phase 1+ tasks scheduled anywhere in the cluster can read the
    graph immediately.
-3. Writes a resume marker at ``out/<binary>/_phase0/manifest.json``
+3. Writes a resume marker at ``<phase0_out_dir>/<binary>/manifest.json``
    listing ``[{label, drv}, ...]`` so a re-execution after the task
    was preempted short-circuits to the broadcast-already-happened
    path.
@@ -367,7 +367,9 @@ def _drv_size(drv_path: str) -> int:
 
 
 def _marker_path(out_dir: pathlib.Path, binary: str) -> pathlib.Path:
-    return out_dir / binary / "_phase0" / "manifest.json"
+    # out_dir is already the phase0-specific dir (e.g. _phase0 on host,
+    # /app/out-network/_phase0 in container), so no extra segment needed.
+    return out_dir / binary / "manifest.json"
 
 
 def _read_marker(marker: pathlib.Path) -> Optional[dict]:
@@ -424,7 +426,7 @@ def run_eval_task(
 
     See the module docstring for the protocol. The function returns
     the marker dict (also persisted to
-    ``out_dir/<binary>/_phase0/manifest.json``) on success.
+    ``out_dir/<binary>/manifest.json``) on success.
 
     Failure modes raise :class:`RuntimeError` — the framework worker
     harness then surfaces ``ErrorType::Errored`` to the primary,
@@ -440,9 +442,9 @@ def run_eval_task(
         The phase0_eval manifest payload (see
         :func:`manifest_gen.make_phase0_eval_header`).
     out_dir :
-        Per-secondary output directory (typically the worker's
-        scratch root). The marker is written to
-        ``out_dir / <binary> / _phase0 / manifest.json``.
+        Phase0-specific output directory (the bind-mounted shared
+        path). The marker is written to
+        ``out_dir / <binary> / manifest.json``.
     broadcast_sender :
         :class:`peer_replication.BroadcastSender` instance owned by
         the worker process — lifecycle management (start/stop) is
