@@ -25,6 +25,7 @@ from compiler_suit_runner.preflight import (
     filter_existing_variants,
     path_info_batch,
     preflight,
+    query_initial_toolchain_placement,
     run_nix_eval,
 )
 
@@ -997,5 +998,161 @@ def test_path_info_batch_nonzero_returns_empty():
         run_subprocess=runner,
     )
     assert out == {}
+
+
+# ---------------------------------------------------------------------------
+# query_initial_toolchain_placement — submitter seed for placement map
+# ---------------------------------------------------------------------------
+
+
+def _make_check_validity_runner(invalid_outpaths: set[str]):
+    """Fake ``nix-store --check-validity --print-invalid`` runner.
+
+    Captures every argv it sees so the caller can assert one-call
+    batching. Returns the configured invalid-subset of the queried
+    outpaths on stdout (newline-delimited), rc=0. Refuses any argv that
+    isn't a ``check-validity --print-invalid`` invocation so accidental
+    fallthrough to per-outpath probes loudly fails.
+    """
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        assert argv[0] == "nix-store", argv
+        assert "--check-validity" in argv, argv
+        assert "--print-invalid" in argv, argv
+        # Everything after the flags is an outpath argument.
+        queried = [
+            a for a in argv[1:]
+            if not a.startswith("--")
+        ]
+        out_lines = [op for op in queried if op in invalid_outpaths]
+        return ("\n".join(out_lines) + ("\n" if out_lines else "")).encode("utf-8"), b"", 0
+
+    return runner, calls
+
+
+def test_query_initial_toolchain_placement_all_local_seeds_submitter():
+    """Every toolchain outpath is in the local store -> every entry
+    seeded with ``["submitter"]``. One batched subprocess call."""
+    drv_outpaths = {
+        "/nix/store/aaa.drv": "/nix/store/aaa-out",
+        "/nix/store/bbb.drv": "/nix/store/bbb-out",
+        "/nix/store/ccc.drv": "/nix/store/ccc-out",
+    }
+    drvs = frozenset(drv_outpaths.keys())
+    # invalid_outpaths is empty: all queried outpaths are present.
+    runner, calls = _make_check_validity_runner(invalid_outpaths=set())
+
+    result = query_initial_toolchain_placement(
+        drvs, drv_outpaths, run_subprocess=runner,
+    )
+
+    assert len(calls) == 1
+    assert result == {
+        "/nix/store/aaa-out": ["submitter"],
+        "/nix/store/bbb-out": ["submitter"],
+        "/nix/store/ccc-out": ["submitter"],
+    }
+
+
+def test_query_initial_toolchain_placement_none_local_returns_empty_lists():
+    """Submitter has none of the toolchains locally -> every entry's
+    placement list is empty."""
+    drv_outpaths = {
+        "/nix/store/aaa.drv": "/nix/store/aaa-out",
+        "/nix/store/bbb.drv": "/nix/store/bbb-out",
+    }
+    drvs = frozenset(drv_outpaths.keys())
+    invalid = set(drv_outpaths.values())  # everything missing
+    runner, calls = _make_check_validity_runner(invalid_outpaths=invalid)
+
+    result = query_initial_toolchain_placement(
+        drvs, drv_outpaths, run_subprocess=runner,
+    )
+
+    assert len(calls) == 1
+    assert result == {
+        "/nix/store/aaa-out": [],
+        "/nix/store/bbb-out": [],
+    }
+
+
+def test_query_initial_toolchain_placement_mixed_local_and_missing():
+    """Submitter has some toolchains but not others -> the locally-
+    present subset gets ``["submitter"]``, the rest get ``[]``."""
+    drv_outpaths = {
+        "/nix/store/aaa.drv": "/nix/store/aaa-out",  # local
+        "/nix/store/bbb.drv": "/nix/store/bbb-out",  # missing
+        "/nix/store/ccc.drv": "/nix/store/ccc-out",  # local
+        "/nix/store/ddd.drv": "/nix/store/ddd-out",  # missing
+    }
+    drvs = frozenset(drv_outpaths.keys())
+    invalid = {"/nix/store/bbb-out", "/nix/store/ddd-out"}
+    runner, calls = _make_check_validity_runner(invalid_outpaths=invalid)
+
+    result = query_initial_toolchain_placement(
+        drvs, drv_outpaths, run_subprocess=runner,
+    )
+
+    assert len(calls) == 1
+    assert result == {
+        "/nix/store/aaa-out": ["submitter"],
+        "/nix/store/bbb-out": [],
+        "/nix/store/ccc-out": ["submitter"],
+        "/nix/store/ddd-out": [],
+    }
+
+
+def test_query_initial_toolchain_placement_empty_input_skips_subprocess():
+    """Empty drv set -> empty result dict, runner never called."""
+
+    def runner(_argv):
+        raise AssertionError("runner must not be called on empty input")
+
+    result = query_initial_toolchain_placement(
+        frozenset(), {}, run_subprocess=runner,
+    )
+    assert result == {}
+
+
+def test_query_initial_toolchain_placement_drops_drvs_without_outpath():
+    """Drvs missing from ``drv_outpaths`` are silently dropped — the
+    submitter's drv->outpath table was incomplete for them and no
+    placement record can be seeded."""
+    drv_outpaths = {
+        "/nix/store/aaa.drv": "/nix/store/aaa-out",
+        # bbb.drv intentionally absent.
+    }
+    drvs = frozenset({"/nix/store/aaa.drv", "/nix/store/bbb.drv"})
+    runner, calls = _make_check_validity_runner(invalid_outpaths=set())
+
+    result = query_initial_toolchain_placement(
+        drvs, drv_outpaths, run_subprocess=runner,
+    )
+
+    assert len(calls) == 1
+    # Only the outpath that resolved appears in the result.
+    assert result == {"/nix/store/aaa-out": ["submitter"]}
+
+
+def test_query_initial_toolchain_placement_probe_failure_falls_back_to_empty():
+    """nix-store probe rc!=0 -> conservative fallback: every entry is
+    ``[]`` (no known holders). Cascade will repopulate later."""
+
+    def runner(_argv):
+        return b"", b"daemon down\n", 1
+
+    drv_outpaths = {
+        "/nix/store/aaa.drv": "/nix/store/aaa-out",
+        "/nix/store/bbb.drv": "/nix/store/bbb-out",
+    }
+    result = query_initial_toolchain_placement(
+        frozenset(drv_outpaths.keys()), drv_outpaths, run_subprocess=runner,
+    )
+    assert result == {
+        "/nix/store/aaa-out": [],
+        "/nix/store/bbb-out": [],
+    }
 
 

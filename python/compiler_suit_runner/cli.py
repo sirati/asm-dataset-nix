@@ -79,6 +79,27 @@ _VALID_MULTI_COMPUTER = ("single-process", "slurm")
 _VALID_PACKAGING = ("podman", "none")
 
 
+def _non_negative_int(value: str) -> int:
+    """argparse ``type`` for a non-negative integer.
+
+    Mirrors the framework's own validation for
+    ``--unfulfillable-reinject-max-per-task``: zero is a valid value
+    (means "don't auto-reinject at all"), negatives are rejected with
+    an ``ArgumentTypeError`` so argparse surfaces a clean error.
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer, got {value!r}",
+        ) from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(
+            f"value must be >= 0, got {parsed}",
+        )
+    return parsed
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
@@ -238,6 +259,19 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "holder set. Default: observers count (when Framework "
             "Ask #3 is shipped). Has no effect without observer "
             "support in the running dynrunner version."
+        ),
+    )
+    parser.add_argument(
+        "--unfulfillable-reinject-max-per-task",
+        type=_non_negative_int,
+        default=None,
+        metavar="N",
+        help=(
+            "Cap how many times a permanently-Unfulfillable task may "
+            "auto-reinject when an observer broadcasts the missing "
+            "outpath. Default: unbounded. Useful for flap-tolerance "
+            "when a flaky peer keeps re-joining. Mirrors the framework "
+            "kwarg of the same name; 0 disables auto-reinject entirely."
         ),
     )
     parser.add_argument(
@@ -644,6 +678,9 @@ def _config_from_args(
         replication_k=getattr(args, "replication_k", 3),
         allow_observer_as_holder=getattr(
             args, "allow_observer_as_holder", True,
+        ),
+        unfulfillable_reinject_max_per_task=getattr(
+            args, "unfulfillable_reinject_max_per_task", None,
         ),
     )
 

@@ -1363,25 +1363,89 @@ def check_toolchains_locally(
 
 
 def query_initial_toolchain_placement(
-    toolchain_outpaths: Iterable[str],
+    toolchain_drvs: Iterable[str],
+    drv_outpaths: dict[str, str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
 ) -> dict[str, list[str]]:
-    """Return the K=3 placement map for *toolchain_outpaths* at submit.
+    """Return the initial placement seed for each toolchain outpath.
 
-    On the primary at submit time the placement map is typically
-    empty: no secondary has fetched the toolchains yet, and the
-    primary itself does NOT count toward K (per plan: primary may
-    disconnect; K is about secondary redundancy). The map converges
-    via cascade as soon as secondaries start fetching.
+    For every outpath the submitter's local nix store already has (it
+    built or substituted the toolchain ahead of dispatch), seed
+    ``["submitter"]`` as the first holder. For outpaths the submitter
+    lacks, seed ``[]`` — no preference until the first secondary
+    fetches via cascade.
 
-    Returns ``{outpath: []}`` for every outpath so callers can iterate
-    keys without ``KeyError`` checks; empty lists mean "no preference"
-    when read by :func:`manifest_gen.emit_all_manifests`.
+    Seeding ``"submitter"`` lets the variant's first scheduling
+    decision (Q2 wire-in's static ``preferred_secondaries`` channel)
+    pick a secondary that can fetch the toolchain from the submitter's
+    harmonia listener immediately, instead of waiting for a remote
+    holder to appear.
 
-    Function exists so the plumbing exists; in a future revision we
-    may pre-seed placement based on a "submitter-as-peer" observation,
-    but for now this is intentionally trivial.
+    The local-store presence probe is a single batched
+    ``nix-store --check-validity --print-invalid <outpaths...>`` call:
+    that subcommand returns rc=0 and prints the invalid (i.e.
+    not-locally-realised) subset to stdout. The complement of the
+    invalid set is "locally present" — we seed ``["submitter"]`` for
+    those and ``[]`` for the rest.
+
+    The returned dict's keys are the outpaths derived by looking up
+    each drv in *drv_outpaths*. Drvs missing from ``drv_outpaths`` (or
+    mapped to a falsy outpath) are silently dropped — the caller knows
+    their drv→outpath table was incomplete and the omission is
+    equivalent to "no placement record for that toolchain".
+
+    Empty input dict → empty output dict, no subprocess call.
+
+    ``run_subprocess`` is the same injection seam every preflight
+    helper exposes: tests stub it; production code lets it default to
+    :func:`_default_run_subprocess`.
     """
-    return {op: [] for op in toolchain_outpaths if op}
+    outpaths: list[str] = []
+    seen: set[str] = set()
+    for drv in toolchain_drvs:
+        if not isinstance(drv, str) or not drv:
+            continue
+        op = drv_outpaths.get(drv)
+        if not isinstance(op, str) or not op:
+            continue
+        if op in seen:
+            continue
+        seen.add(op)
+        outpaths.append(op)
+
+    if not outpaths:
+        return {}
+
+    runner = run_subprocess or _default_run_subprocess
+    # ``nix-store --check-validity --print-invalid`` is the canonical
+    # batched local-store presence probe: rc=0 always (unless the
+    # subcommand itself is unavailable), stdout = newline-delimited
+    # list of the queried paths that are NOT valid in the local store.
+    # Complement → locally present → submitter is a valid initial
+    # holder for the path.
+    argv: list[str] = [
+        "nix-store",
+        "--check-validity",
+        "--print-invalid",
+        *outpaths,
+    ]
+    stdout, _stderr, rc = runner(argv)
+    if rc != 0:
+        # Probe itself failed (nix-store missing, daemon down, etc.).
+        # Conservative fallback: nobody known to hold any outpath yet;
+        # cascade will populate placement later.
+        return {op: [] for op in outpaths}
+
+    invalid: set[str] = {
+        line.strip()
+        for line in stdout.decode("utf-8", errors="replace").splitlines()
+        if line.strip()
+    }
+    return {
+        op: ([] if op in invalid else ["submitter"])
+        for op in outpaths
+    }
 
 
 def build_toolchains_locally(
