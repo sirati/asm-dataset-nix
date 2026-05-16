@@ -57,6 +57,8 @@ from compiler_suit_runner.preflight import (
     PreflightResult,
     build_toolchains_locally,
     check_toolchains_locally,
+    enumerate_toolchains_only,
+    enumerate_variants,
     eval_toolchain_drvs,
     filter_existing_variants,
     preflight as run_preflight,
@@ -272,6 +274,22 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "outpath. Default: unbounded. Useful for flap-tolerance "
             "when a flaky peer keeps re-joining. Mirrors the framework "
             "kwarg of the same name; 0 disables auto-reinject entirely."
+        ),
+    )
+    parser.add_argument(
+        "--distributed-eval",
+        action="store_true",
+        default=False,
+        help=(
+            "Switch the submitter to the distributed-eval flow. When "
+            "ON: pre-flight runs ``enumerate_toolchains_only`` + "
+            "``enumerate_variants(defer_to_phase0=True)`` and emits "
+            "only ``phase_minus1`` + ``phase0`` manifests; the slow "
+            "per-binary drv-instantiation is deferred to Phase 0 "
+            "eval-workers on secondaries; Phase 1+ is spawned at "
+            "runtime by the primary's quiesce watcher. When OFF "
+            "(default): legacy submit-time enumerate-everything + "
+            "emit-all-phases flow."
         ),
     )
     parser.add_argument(
@@ -578,6 +596,7 @@ _CSR_BOOL_FLAGS: frozenset[str] = frozenset({
     "--no-task-depends",
     "--allow-toolchain-build",
     "--no-observer-as-holder",
+    "--distributed-eval",
 })
 _CSR_SUBCOMMANDS: frozenset[str] = frozenset({
     "submit", "secondary", "preflight", "clear-cache",
@@ -1025,7 +1044,174 @@ def cmd_submit(args: argparse.Namespace) -> int:
             cache_hit = None
             tc_drvs = {}
 
-    if cache_hit is None:
+    distributed_eval = getattr(args, "distributed_eval", False)
+
+    if cache_hit is None and distributed_eval:
+        # Distributed-eval submit path: only enumerate toolchains
+        # locally and emit Phase -1 + Phase 0 manifests. The slow
+        # per-binary drv-instantiation is deferred to Phase 0 eval
+        # workers on secondaries (see ``workers/eval_worker.py``).
+        # Phase 1+ is spawned at runtime by the primary's quiesce
+        # watcher (``_Phase0QuiesceWatcher`` in suit_task.py).
+        log.info("running distributed-eval pre-flight (toolchains + per-binary metadata only)")
+        try:
+            tc_pairs, tc_drvs = enumerate_toolchains_only(
+                args.flake, args.sys_name, archs=args.archs,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("distributed-eval toolchain enumeration failed")
+            return 1
+        try:
+            per_binary_meta_raw = enumerate_variants(
+                args.flake,
+                args.sys_name,
+                packages=args.packages,
+                archs=args.archs,
+                sample_size=getattr(args, "variant_sample", 0) or 0,
+                sample_seed=getattr(args, "variant_seed", "42") or "42",
+                defer_to_phase0=True,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("distributed-eval variant enumeration failed")
+            return 1
+        if not isinstance(per_binary_meta_raw, dict):
+            log.error(
+                "distributed-eval: enumerate_variants(defer_to_phase0=True) "
+                "returned %r instead of a dict; aborting",
+                type(per_binary_meta_raw).__name__,
+            )
+            return 1
+
+        # Flatten the {pkg: {"archs": [...], "suffixes_by_arch":
+        # {arch: [...]}, "sample_size": ..., "sample_seed": ...}} shape
+        # returned by enumerate_variants(defer_to_phase0=True) into the
+        # {binary: {"archs": [...], "suffixes": [...], "variant_sample":
+        # ..., "variant_seed": ...}} shape that
+        # emit_phase0_eval_manifests / eval_worker.parse_payload
+        # expect. ``suffixes`` is the union across archs because the
+        # Phase 0 worker re-applies per-(arch, compiler, opt) sampling
+        # with the same seed.
+        per_binary_metadata: dict[str, dict] = {}
+        for pkg, meta in per_binary_meta_raw.items():
+            if not isinstance(meta, dict):
+                continue
+            archs_list = list(meta.get("archs", ()))
+            suffix_union: set[str] = set()
+            suffixes_by_arch = meta.get("suffixes_by_arch") or {}
+            if isinstance(suffixes_by_arch, dict):
+                for sfx_list in suffixes_by_arch.values():
+                    if isinstance(sfx_list, list):
+                        suffix_union.update(s for s in sfx_list if isinstance(s, str))
+            per_binary_metadata[pkg] = {
+                "archs": archs_list,
+                "suffixes": sorted(suffix_union),
+                "variant_sample": meta.get("sample_size"),
+                "variant_seed": meta.get("sample_seed"),
+            }
+        log.info(
+            "distributed-eval: %d toolchains, %d binaries queued for Phase 0",
+            len(tc_drvs), len(per_binary_metadata),
+        )
+
+        # Local toolchain availability check (same contract as the
+        # legacy path: phase2_toolchain_validate requires the primary
+        # to actually have the outputs unless --allow-toolchain-build).
+        allow_tc_build = getattr(args, "allow_toolchain_build", False)
+        tc_drv_set = frozenset(d for d in tc_drvs.values() if d)
+        if tc_drv_set:
+            try:
+                missing_tcs = check_toolchains_locally(tc_drv_set)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "distributed-eval: toolchain local-validity check failed"
+                )
+                missing_tcs = tc_drv_set
+            if missing_tcs:
+                if not allow_tc_build:
+                    log.error(
+                        "distributed-eval: %d/%d toolchains missing locally "
+                        "and --allow-toolchain-build is off",
+                        len(missing_tcs), len(tc_drv_set),
+                    )
+                    for drv in sorted(missing_tcs):
+                        log.error("  %s", drv)
+                    return 1
+                log.warning(
+                    "distributed-eval: building %d missing toolchains locally",
+                    len(missing_tcs),
+                )
+                try:
+                    build_toolchains_locally(missing_tcs)
+                except PreflightError as exc:
+                    log.error("local toolchain build aborted: %s", exc)
+                    return 1
+                except Exception:  # noqa: BLE001
+                    log.exception("local toolchain build failed")
+                    return 1
+
+        # Resolve toolchain outpaths so phase2_toolchain_validate
+        # manifests carry ``payload.outpath``. Without this the
+        # build_worker's validate path fails immediately with
+        # "manifest missing 'payload.outpath'".
+        dist_eval_drv_outpaths: Optional[dict[str, str]] = None
+        if tc_drvs:
+            try:
+                tc_outpaths = eval_drv_outpaths(
+                    [d for d in tc_drvs.values() if d]
+                )
+                dist_eval_drv_outpaths = dict(tc_outpaths) if tc_outpaths else {}
+                log.info(
+                    "distributed-eval: toolchain outpath eval: %d/%d resolved",
+                    len(dist_eval_drv_outpaths), len(tc_drvs),
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "distributed-eval: toolchain outpath eval failed;"
+                    " validate manifests will be missing payload.outpath"
+                )
+                dist_eval_drv_outpaths = {}
+
+        # Emit only Phase -1 (toolchain) + Phase 0 (per-binary eval)
+        # manifests. Phase 1+ is spawned dynamically by the primary's
+        # quiesce watcher after every phase0_eval task completes.
+        try:
+            emit_all_manifests(
+                target_dir=manifest_dir,
+                sys_name=args.sys_name,
+                variants=(),
+                toolchain_specs=tc_pairs,
+                common_deps=(),
+                num_workers=num_workers,
+                toolchain_drvs=tc_drvs,
+                allow_toolchain_build=allow_tc_build,
+                per_binary_metadata=per_binary_metadata,
+                drv_outpaths=dist_eval_drv_outpaths,
+                stages=["phase_minus1", "phase0"],
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("distributed-eval manifest emission failed")
+            return 1
+
+        # Expose the toolchain outpaths to the submitter-peer placement
+        # block below. Without this, ``partition_drv_outpaths`` stays
+        # None and the submitter never populates the gossip file, so
+        # secondaries see no peer for ``toolchain_validate`` fetches.
+        partition_drv_outpaths = dist_eval_drv_outpaths
+
+        # Build a synthetic PreflightResult so the rest of cmd_submit
+        # (SuitTaskConfig construction, submitter placement block,
+        # cache.store) operates on a non-None ``pre``. Variants are
+        # empty by design — phase 1+ variant headers are spawned at
+        # runtime by the primary, not at submit time.
+        pre = PreflightResult(
+            sys_name=args.sys_name,
+            variants=(),
+            toolchain_specs=tc_pairs,
+            common_dep_drvs=(),
+            toolchain_drvs=frozenset(tc_drv_set),
+        )
+
+    if cache_hit is None and not distributed_eval:
         log.info("running pre-flight")
         try:
             pre = run_preflight(
@@ -1355,6 +1541,21 @@ def cmd_submit(args: argparse.Namespace) -> int:
                         placements.append((outpath, drv, "toolchain"))
                 if placements:
                     submitter.set_placements(placements)
+                # Phase -1 toolchain drv seed for the distributed-eval
+                # flow. The submitter's poll loop flushes this via
+                # SubmitterPeer.seed_toolchain_drvs exactly once after
+                # a non-submitter peer file appears on the gateway —
+                # so we don't need a synchronously-known
+                # ``first_secondary_url`` here. Empty set (legacy
+                # local-eval flow) short-circuits to a no-op.
+                if distributed_eval:
+                    tc_drv_set_for_seed = frozenset(
+                        d for d in tc_drvs.values() if d
+                    )
+                    if tc_drv_set_for_seed:
+                        submitter.set_pending_toolchain_seed_drvs(
+                            tc_drv_set_for_seed
+                        )
                 submitter.start()
                 extra_pf = submitter.deployment_extra_port_forwards
             except Exception:  # noqa: BLE001 — never block dispatch

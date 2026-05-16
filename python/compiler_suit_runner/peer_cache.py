@@ -1507,6 +1507,14 @@ class SubmitterPeer:
         # file into a stale dispatch's run dir (which the current
         # dispatch's compute-nodes never read).
         self._initial_run_ids: set[str] = set()
+        # Distributed-eval Phase -1 toolchain drv seed set. Buffered
+        # here by the cli's distributed-eval submit path; the poll
+        # loop flushes it via :meth:`seed_toolchain_drvs` exactly
+        # once after the peer file is published AND a non-submitter
+        # secondary peer file appears on the gateway. Empty set =
+        # no-op (legacy local-eval flow).
+        self._pending_toolchain_seed_drvs: set[str] = set()
+        self._toolchain_seed_done = False
 
     def set_placements(
         self, outpaths: Iterable[tuple[str, str, str]],
@@ -1520,6 +1528,22 @@ class SubmitterPeer:
         identity before they're told what paths it serves)."""
         self._pending_placements = list(outpaths)
         self._placements_published = False
+
+    def set_pending_toolchain_seed_drvs(
+        self, drv_set: Iterable[str],
+    ) -> None:
+        """Buffer the Phase -1 toolchain drv set for deferred seeding.
+
+        Called by the cli's ``--distributed-eval`` submit path before
+        (or after) :meth:`start`. The :meth:`_poll_loop` calls
+        :meth:`seed_toolchain_drvs` exactly once after both the
+        submitter peer file is published AND a non-submitter peer
+        file appears on the gateway (so we have a real
+        ``first_secondary_url`` to broadcast to). Empty set short-
+        circuits to a no-op.
+        """
+        self._pending_toolchain_seed_drvs = {str(d) for d in drv_set if d}
+        self._toolchain_seed_done = False
 
     def __enter__(self) -> "SubmitterPeer":
         self.start()
@@ -1737,10 +1761,36 @@ class SubmitterPeer:
                     if self.publish_placements(self._pending_placements):
                         self._placements_published = True
                 if (
+                    self._run_id is not None
+                    and self._peer_published
+                    and not self._toolchain_seed_done
+                    and self._pending_toolchain_seed_drvs
+                ):
+                    first_url = self._discover_first_secondary_url()
+                    if first_url:
+                        try:
+                            self.seed_toolchain_drvs(
+                                self._pending_toolchain_seed_drvs,
+                                first_url,
+                            )
+                        except Exception:  # noqa: BLE001
+                            self.log.exception(
+                                "submitter-peer: deferred"
+                                " seed_toolchain_drvs failed"
+                            )
+                        # One-shot regardless of per-drv success — the
+                        # broadcast helper logs partial failures and the
+                        # cluster keeps working via harmonia substitution.
+                        self._toolchain_seed_done = True
+                if (
                     self._peer_published
                     and (
                         self._placements_published
                         or not self._pending_placements
+                    )
+                    and (
+                        self._toolchain_seed_done
+                        or not self._pending_toolchain_seed_drvs
                     )
                 ):
                     return
@@ -1749,6 +1799,58 @@ class SubmitterPeer:
                     "submitter-peer poll iteration failed"
                 )
             self._stop_evt.wait(2.0)
+
+    def _discover_first_secondary_url(self) -> str | None:
+        """Return one non-submitter secondary's push-listener base URL.
+
+        Reads ``${slurm_root}/log/${run_id}/peers/`` on the gateway,
+        picks any ``<id>.json`` that is NOT ``submitter.json`` or a
+        reserved ``__*`` bookkeeping file, decodes its ``host`` +
+        ``port`` fields, and returns the bare push base URL
+        (``http://<host>:<push_port>``). ``push_port`` is derived
+        from the peer's harmonia port via :func:`push_port_for`.
+        Returns ``None`` if no secondary peer is published yet, or
+        on any decode error — the caller retries on the next poll
+        tick.
+        """
+        if not self._run_id:
+            return None
+        from compiler_suit_runner.peer_push import push_port_for
+        peers_dir = f"{self.slurm_root}/log/{self._run_id}/peers"
+        # ls -1 then filter; cat the first matching file to read its
+        # JSON. Two round-trips per discovery attempt is fine since
+        # this only fires once.
+        rc, out, _err = self._ssh_oneshot([
+            f"ls -1 {peers_dir} 2>/dev/null"
+            " | grep -E '^[^_].*\\.json$'"
+            " | grep -v '^submitter\\.json$'"
+            " | head -1",
+        ])
+        if rc != 0 or not out.strip():
+            return None
+        peer_file = out.strip().splitlines()[0].strip()
+        if not peer_file:
+            return None
+        rc2, blob, _err2 = self._ssh_oneshot([
+            f"cat {peers_dir}/{peer_file} 2>/dev/null",
+        ])
+        if rc2 != 0 or not blob.strip():
+            return None
+        try:
+            info = json.loads(blob)
+        except (ValueError, TypeError):
+            return None
+        # Each secondary's ``peers/<id>.json`` (written by
+        # :func:`announce_self`) carries ``hostname`` + ``port``;
+        # the submitter's own ``peers/submitter.json`` uses ``host``.
+        # We're filtering out submitter.json above, so prefer
+        # ``hostname`` and fall back to ``host`` for robustness.
+        host = info.get("hostname") or info.get("host")
+        port = info.get("port")
+        if not host or not isinstance(port, int):
+            return None
+        push_port = push_port_for(int(port))
+        return f"http://{host}:{push_port}"
 
     def _ssh_oneshot(
         self, remote_cmds: list[str], stdin_input: bytes | None = None,
