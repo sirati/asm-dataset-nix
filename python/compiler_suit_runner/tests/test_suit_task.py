@@ -1391,9 +1391,17 @@ def test_phase_specs_returns_phase0_and_phase_build() -> None:
     assert set(by_id.keys()) == {"phase0", "phase_build"}
 
 
-def test_phase_specs_phase0_routes_to_eval_worker() -> None:
+def test_phase_specs_phase0_routes_to_build_worker() -> None:
     """phase0 has a single ``eval`` type pointing at
-    ``compiler_suit_runner.workers.eval_worker``."""
+    ``compiler_suit_runner.workers.build_worker``.
+
+    The framework binds ONE ``worker_module`` per secondary pool
+    (first registered wins), so every task — phase0_eval +
+    phase_build.* — must funnel through ``build_worker.main``.
+    Its ``handle`` closure dispatches phase0_eval payloads to
+    :func:`eval_worker.run_eval_task` and build manifests to
+    :func:`build_worker.build_worker`.
+    """
     pytest.importorskip("dynamic_runner.task_protocol")
     from compiler_suit_runner.suit_task import _phase_specs
     specs = _phase_specs(build_max_concurrent=None)
@@ -1402,8 +1410,23 @@ def test_phase_specs_phase0_routes_to_eval_worker() -> None:
     assert phase0.types[0].type_id == "eval"
     assert (
         phase0.types[0].worker_module
-        == "compiler_suit_runner.workers.eval_worker"
+        == "compiler_suit_runner.workers.build_worker"
     )
+
+
+def test_phase_specs_all_types_share_single_worker_module() -> None:
+    """Sanity: every TaskTypeSpec across all phases binds to the
+    SAME worker_module string. The framework's secondary pool only
+    spawns one worker module — if any spec disagrees the framework
+    silently picks the first and other types arrive at the wrong
+    dispatcher (the bug second smoke run discovered)."""
+    pytest.importorskip("dynamic_runner.task_protocol")
+    from compiler_suit_runner.suit_task import _phase_specs
+    specs = _phase_specs(build_max_concurrent=None)
+    modules = {
+        t.worker_module for spec in specs for t in spec.types
+    }
+    assert modules == {"compiler_suit_runner.workers.build_worker"}
 
 
 def test_phase_specs_phase_build_depends_on_phase0() -> None:

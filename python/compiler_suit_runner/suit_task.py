@@ -341,7 +341,16 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
             types=(
                 TaskTypeSpec(
                     type_id="eval",
-                    worker_module="compiler_suit_runner.workers.eval_worker",
+                    # Unified entry: the framework picks ONE
+                    # ``worker_module`` for the whole secondary pool
+                    # (the first registered one wins), so every task
+                    # type — phase0_eval, toolchain, common_dep,
+                    # variant — funnels through ``build_worker.main``.
+                    # Its ``handle`` closure sniffs ``task.payload``
+                    # (``item_class == "phase0_eval"``) and dispatches
+                    # to :func:`eval_worker.run_eval_task` for eval
+                    # tasks, otherwise to the build path.
+                    worker_module="compiler_suit_runner.workers.build_worker",
                 ),
             ),
         ),

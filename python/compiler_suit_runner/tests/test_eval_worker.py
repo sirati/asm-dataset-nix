@@ -3,6 +3,12 @@
 The nix subprocess and the BroadcastSender are always stubbed; tests
 run in milliseconds and never touch the network or the local
 /nix/store.
+
+Note: ``eval_worker`` is a pure library module. The subprocess
+entry point lives in :func:`workers.build_worker.main`, which
+sniffs ``task.payload`` and dispatches phase0_eval tasks into
+:func:`run_eval_task`. The framework-entry tests are in
+``test_build_worker.py`` accordingly.
 """
 
 from __future__ import annotations
@@ -700,265 +706,13 @@ def test_default_run_subprocess_uses_real_subprocess() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Subprocess entry point (main + handle closure)
+# read_peer_push_urls — public helper consumed by build_worker.main
 # ---------------------------------------------------------------------------
-
-
-def _run_main_with_capture(
-    monkeypatch: pytest.MonkeyPatch,
-    argv: list[str],
-) -> tuple[Any, MagicMock, MagicMock]:
-    """Invoke ``eval_worker.main()`` with framework dependencies
-    monkey-patched so the test never opens a real socket or thread.
-
-    Returns a ``(captured_handle, run_mock, sender_class_mock)`` tuple
-    where ``captured_handle`` is the ``handle`` callable the worker
-    passed to ``run(handle, args=args)``.
-    """
-    # Patch the dynamic_runner.worker subpackage with a stub so the
-    # ``from dynamic_runner.worker import ...`` inside main() picks
-    # up our fakes. We model ``Task`` / ``WorkerOutput`` /
-    # ``NonRecoverableError`` as plain classes, and ``run`` captures
-    # the handle in a list for assertions.
-    import sys as _sys
-    import types as _types
-
-    fake_worker = _types.ModuleType("dynamic_runner.worker")
-
-    class FakeTask:
-        def __init__(
-            self,
-            payload: Optional[dict] = None,
-            task_id: str = "phase0_eval__hello",
-        ) -> None:
-            self.payload = payload or {}
-            self.task_id = task_id
-
-    class FakeWorkerOutput:
-        def __init__(self) -> None:
-            pass
-
-    class FakeNonRecoverable(Exception):
-        pass
-
-    run_mock = MagicMock()
-    fake_worker.Task = FakeTask
-    fake_worker.WorkerOutput = FakeWorkerOutput
-    fake_worker.NonRecoverableError = FakeNonRecoverable
-    fake_worker.run = run_mock
-
-    # Pre-install a parent ``dynamic_runner`` module if absent.
-    if "dynamic_runner" not in _sys.modules:
-        _sys.modules["dynamic_runner"] = _types.ModuleType("dynamic_runner")
-    monkeypatch.setitem(_sys.modules, "dynamic_runner.worker", fake_worker)
-
-    # Patch BroadcastSender on the module the eval worker uses so we
-    # don't spin up a daemon thread.
-    sender_class_mock = MagicMock()
-    sender_instance = MagicMock()
-    sender_class_mock.return_value = sender_instance
-    monkeypatch.setattr(
-        eval_worker, "BroadcastSender", sender_class_mock,
-    )
-
-    # Patch sys.argv so argparse sees what we want.
-    monkeypatch.setattr(_sys, "argv", ["eval_worker", *argv])
-
-    rc = eval_worker.main()
-    assert rc == 0
-    run_mock.assert_called_once()
-    # ``run(handle, args=args)`` - extract the handle.
-    captured_handle = run_mock.call_args.args[0]
-    return captured_handle, run_mock, sender_class_mock
-
-
-def test_main_argparse_accepts_socket_path(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    handle, run_mock, sender_cls = _run_main_with_capture(
-        monkeypatch,
-        [
-            "--socket-path", str(tmp_path / "sock"),
-            "--shared-fs", str(tmp_path),
-            "--secondary-id", "sec1",
-            "--signing-public-key", "k:abc",
-            "--log-file", str(tmp_path / "worker.log"),
-        ],
-    )
-    assert callable(handle)
-    # BroadcastSender constructed with secondary id + pubkey.
-    sender_cls.assert_called_once()
-    kwargs = sender_cls.call_args.kwargs
-    assert kwargs["self_peer_id"] == "sec1"
-    assert kwargs["our_pubkey"] == "k:abc"
-    assert callable(kwargs["peer_url_provider"])
-
-
-def test_main_argparse_accepts_dynamic_queue(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    handle, run_mock, _ = _run_main_with_capture(
-        monkeypatch,
-        ["--dynamic_queue", "7", "--shared-fs", str(tmp_path)],
-    )
-    args_passed = run_mock.call_args.kwargs.get("args")
-    assert args_passed is not None
-    assert args_passed.dynamic_queue == 7
-    assert args_passed.socket_path is None
-
-
-def test_main_handle_invokes_run_eval_task(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    handle, _, sender_cls = _run_main_with_capture(
-        monkeypatch,
-        [
-            "--socket-path", str(tmp_path / "sock"),
-            "--shared-fs", str(tmp_path),
-            "--secondary-id", "sec1",
-        ],
-    )
-    sender_instance = sender_cls.return_value
-
-    captured: dict[str, Any] = {}
-
-    def _fake_run_eval(payload, *, out_dir, broadcast_sender):
-        captured["payload"] = payload
-        captured["out_dir"] = out_dir
-        captured["broadcast_sender"] = broadcast_sender
-        return {"ok": True}
-
-    monkeypatch.setattr(eval_worker, "run_eval_task", _fake_run_eval)
-
-    # Build a fake Task with a phase0_eval payload — same fake module
-    # ``_run_main_with_capture`` registered under sys.modules.
-    import sys as _sys
-    fake_worker_module = _sys.modules["dynamic_runner.worker"]
-    fake_task_cls = fake_worker_module.Task
-    fake_output_cls = fake_worker_module.WorkerOutput
-
-    payload = _make_payload(binary="hello")
-    task = fake_task_cls(payload=payload)
-    output = handle(task)
-    assert isinstance(output, fake_output_cls)
-    assert captured["payload"] == payload
-    assert captured["broadcast_sender"] is sender_instance
-    # out_dir resolves to <shared_fs>/out when --output is absent.
-    assert captured["out_dir"] == tmp_path / "out"
-
-
-def test_main_handle_explicit_output_overrides_shared_fs(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    explicit_out = tmp_path / "custom-out"
-    handle, _, _ = _run_main_with_capture(
-        monkeypatch,
-        [
-            "--socket-path", str(tmp_path / "sock"),
-            "--shared-fs", str(tmp_path),
-            "--output", str(explicit_out),
-        ],
-    )
-    captured: dict[str, Any] = {}
-
-    def _fake_run_eval(payload, *, out_dir, broadcast_sender):
-        captured["out_dir"] = out_dir
-
-    monkeypatch.setattr(eval_worker, "run_eval_task", _fake_run_eval)
-    import sys as _sys
-    fake_task_cls = _sys.modules["dynamic_runner.worker"].Task
-    handle(fake_task_cls(payload=_make_payload()))
-    assert captured["out_dir"] == explicit_out
-
-
-def test_main_handle_reraises_runtime_as_non_recoverable(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    handle, _, _ = _run_main_with_capture(
-        monkeypatch,
-        [
-            "--socket-path", str(tmp_path / "sock"),
-            "--shared-fs", str(tmp_path),
-        ],
-    )
-
-    def _boom(payload, *, out_dir, broadcast_sender):
-        raise RuntimeError("nix-eval-jobs fell over")
-
-    monkeypatch.setattr(eval_worker, "run_eval_task", _boom)
-
-    import sys as _sys
-    fake_worker_module = _sys.modules["dynamic_runner.worker"]
-    NonRecoverable = fake_worker_module.NonRecoverableError
-    Task = fake_worker_module.Task
-
-    with pytest.raises(NonRecoverable) as exc_info:
-        handle(Task(payload=_make_payload()))
-    assert "nix-eval-jobs fell over" in str(exc_info.value)
-
-
-def test_main_handle_reraises_unexpected_as_non_recoverable(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """A non-RuntimeError crash still funnels through NonRecoverableError
-    so the framework's exit-1 contract fires cleanly."""
-    handle, _, _ = _run_main_with_capture(
-        monkeypatch,
-        [
-            "--socket-path", str(tmp_path / "sock"),
-            "--shared-fs", str(tmp_path),
-        ],
-    )
-
-    def _crash(payload, *, out_dir, broadcast_sender):
-        raise ValueError("malformed")
-
-    monkeypatch.setattr(eval_worker, "run_eval_task", _crash)
-    import sys as _sys
-    fake_worker_module = _sys.modules["dynamic_runner.worker"]
-    NonRecoverable = fake_worker_module.NonRecoverableError
-    Task = fake_worker_module.Task
-    with pytest.raises(NonRecoverable):
-        handle(Task(payload=_make_payload()))
-
-
-def test_main_stops_broadcast_sender_on_exit(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """``BroadcastSender.stop`` is called even if ``run`` raises (the
-    daemon thread is drained before the subprocess exits)."""
-    _, _, sender_cls = _run_main_with_capture(
-        monkeypatch,
-        [
-            "--socket-path", str(tmp_path / "sock"),
-            "--shared-fs", str(tmp_path),
-        ],
-    )
-    sender_cls.return_value.stop.assert_called_once()
-
-
-def test_main_peer_url_provider_returns_empty_when_no_gossip(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """When ``shared_fs/peers/`` is empty (submitter-gossip race or
-    single-peer cluster), the peer_url_provider returns [] so
-    BroadcastSender treats the fan-out as a 0/0 success."""
-    _, _, sender_cls = _run_main_with_capture(
-        monkeypatch,
-        [
-            "--socket-path", str(tmp_path / "sock"),
-            "--shared-fs", str(tmp_path),
-            "--secondary-id", "sec1",
-        ],
-    )
-    provider = sender_cls.call_args.kwargs["peer_url_provider"]
-    # No peers/<id>.json files exist under tmp_path => empty list.
-    assert provider() == []
 
 
 def test_read_peer_push_urls_returns_empty_when_shared_fs_none() -> None:
     """The shared-fs unset path is the offline / unit-test default."""
-    assert eval_worker._read_peer_push_urls(None, "sec1") == []
+    assert eval_worker.read_peer_push_urls(None, "sec1") == []
 
 
 def test_read_peer_push_urls_enumerates_peers(
@@ -985,13 +739,31 @@ def test_read_peer_push_urls_enumerates_peers(
         )
         peer_cache.announce_self(tmp_path, info)
 
-    urls = eval_worker._read_peer_push_urls(tmp_path, "self")
+    urls = eval_worker.read_peer_push_urls(tmp_path, "self")
     assert f"http://host-a:{push_port_for(5001)}" in urls
     assert f"http://host-b:{push_port_for(5002)}" in urls
     assert not any("host-self" in u for u in urls)
 
 
-def test_main_module_exports() -> None:
-    """`main` is exported so ``python -m eval_worker`` works."""
-    assert "main" in eval_worker.__all__
-    assert callable(eval_worker.main)
+def test_read_peer_push_urls_private_alias_is_public_helper() -> None:
+    """``_read_peer_push_urls`` is a back-compat alias for the public
+    :func:`read_peer_push_urls` (kept while in-tree callers migrate)."""
+    assert eval_worker._read_peer_push_urls is eval_worker.read_peer_push_urls
+
+
+def test_module_exports_drop_main() -> None:
+    """``eval_worker`` is now a pure library module: ``main`` is gone,
+    the framework entry lives in :mod:`build_worker`. The ``__all__``
+    list must reflect that (no ``main`` symbol)."""
+    assert "main" not in eval_worker.__all__
+    assert not hasattr(eval_worker, "main")
+    # The library surface stays exported.
+    for name in (
+        "PHASE_0_ITEM_CLASS",
+        "RunSubprocess",
+        "parse_payload",
+        "read_peer_push_urls",
+        "run_eval_task",
+        "sample_suffix_attrs",
+    ):
+        assert name in eval_worker.__all__, name
