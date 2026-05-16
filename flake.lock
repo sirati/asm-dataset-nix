@@ -7,11 +7,11 @@
         "rust-overlay": "rust-overlay"
       },
       "locked": {
-        "lastModified": 1778907923,
-        "narHash": "sha256-pkAfYzvOTAWvq/AmX9wIwZZ1wgMTyp5SUlZqd58MdEg=",
+        "lastModified": 1778910419,
+        "narHash": "sha256-g844YXQOUOAzzl/maRD+NBoUxxHiR4yNWug8FLO9SjA=",
         "owner": "sirati",
         "repo": "dynamic-runner",
-        "rev": "b839a2ac26c96cd0806b6c9eeac6c4e4282a5489",
+        "rev": "99b8b1e5a2304e54955db01905153d15158fa56d",
         "type": "github"
       },
       "original": {
