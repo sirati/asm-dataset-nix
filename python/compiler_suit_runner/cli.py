@@ -1149,6 +1149,28 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     log.exception("local toolchain build failed")
                     return 1
 
+        # Resolve toolchain outpaths so phase2_toolchain_validate
+        # manifests carry ``payload.outpath``. Without this the
+        # build_worker's validate path fails immediately with
+        # "manifest missing 'payload.outpath'".
+        dist_eval_drv_outpaths: Optional[dict[str, str]] = None
+        if tc_drvs:
+            try:
+                tc_outpaths = eval_drv_outpaths(
+                    [d for d in tc_drvs.values() if d]
+                )
+                dist_eval_drv_outpaths = dict(tc_outpaths) if tc_outpaths else {}
+                log.info(
+                    "distributed-eval: toolchain outpath eval: %d/%d resolved",
+                    len(dist_eval_drv_outpaths), len(tc_drvs),
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "distributed-eval: toolchain outpath eval failed;"
+                    " validate manifests will be missing payload.outpath"
+                )
+                dist_eval_drv_outpaths = {}
+
         # Emit only Phase -1 (toolchain) + Phase 0 (per-binary eval)
         # manifests. Phase 1+ is spawned dynamically by the primary's
         # quiesce watcher after every phase0_eval task completes.
@@ -1163,6 +1185,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 toolchain_drvs=tc_drvs,
                 allow_toolchain_build=allow_tc_build,
                 per_binary_metadata=per_binary_metadata,
+                drv_outpaths=dist_eval_drv_outpaths,
                 stages=["phase_minus1", "phase0"],
             )
         except Exception:  # noqa: BLE001
