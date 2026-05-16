@@ -377,11 +377,15 @@ def default_invocation_for_smoke(
         packaging="podman",
         jobs=jobs,
         # Pin to 2 workers per secondary, matching the slurm-test-env's
-        # WORKER_CPUS=2 and our slurm_cpus_per_task=2. Without this the
-        # framework's --cores defaults to "-0" (all available) and
-        # available_parallelism returns 32 inside the container,
-        # immediately fork-storming the new per-job cgroup.
+        # WORKER_CPUS=2. Without this the framework's --cores defaults
+        # to "-0" (all available) and available_parallelism returns 32
+        # inside the container, immediately fork-storming the per-job
+        # cgroup.
         cores=2,
+        # Match the test-env's WORKER_CPUS=2. The framework default
+        # (14 cpus-per-task) exceeds what the test cluster offers
+        # and causes sbatch to reject the job.
+        slurm_cpus_per_task=2,
         # Tight nominal memory budget to absorb the
         # ``ResourceStealingScheduler``'s descending per-worker
         # ``budget_mb`` over-allocation. The scheduler's design
