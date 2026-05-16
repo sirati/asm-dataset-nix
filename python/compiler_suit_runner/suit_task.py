@@ -879,6 +879,26 @@ class SuitTask:
         self._setup_done: bool = False
         self._setup_lock = threading.Lock()
 
+    # ── Framework dispatch kwargs (post-b839a2a) ───────────────────────
+    #
+    # The framework's `_dispatch_local`, `_dispatch_multi_computer_local`,
+    # and `_dispatch_slurm` helpers (post-`b839a2a`) duck-type these
+    # attributes off the task object via
+    # `getattr(task, "fulfillability_matcher", None)` /
+    # `getattr(task, "peer_lifecycle_listener", None)` and thread them
+    # into `RustPrimaryCoordinator(fulfillability_matcher=…,
+    # peer_lifecycle_listener=…)`. The underscore-prefixed attributes
+    # remain the internal source-of-truth; these properties are just the
+    # contracted public surface.
+
+    @property
+    def fulfillability_matcher(self) -> Optional[Callable[..., bool]]:
+        return self._fulfillability_matcher
+
+    @property
+    def peer_lifecycle_listener(self) -> Optional["_PeerLifecycleListener"]:
+        return self._peer_lifecycle_listener
+
     # ── Worker-function injection seams (used by tests) ────────────────
 
     @property
