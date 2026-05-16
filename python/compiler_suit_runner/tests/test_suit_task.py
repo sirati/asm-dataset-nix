@@ -1374,3 +1374,57 @@ def test_task_completed_listener_attribute_signature(
     listener("some-task", False, "recoverable")
     listener("other-task", True, None)
     listener(None, True, None)
+
+
+# ---------------------------------------------------------------------------
+# _phase_specs (Phase 0 + phase_build topology)
+# ---------------------------------------------------------------------------
+
+
+def test_phase_specs_returns_phase0_and_phase_build() -> None:
+    """``_phase_specs`` declares both phases so the framework can
+    schedule Phase 0 distributed-eval before Phase 1 build tasks."""
+    pytest.importorskip("dynamic_runner.task_protocol")
+    from compiler_suit_runner.suit_task import _phase_specs
+    specs = _phase_specs(build_max_concurrent=None)
+    by_id = {s.phase_id: s for s in specs}
+    assert set(by_id.keys()) == {"phase0", "phase_build"}
+
+
+def test_phase_specs_phase0_routes_to_eval_worker() -> None:
+    """phase0 has a single ``eval`` type pointing at
+    ``compiler_suit_runner.workers.eval_worker``."""
+    pytest.importorskip("dynamic_runner.task_protocol")
+    from compiler_suit_runner.suit_task import _phase_specs
+    specs = _phase_specs(build_max_concurrent=None)
+    phase0 = next(s for s in specs if s.phase_id == "phase0")
+    assert len(phase0.types) == 1
+    assert phase0.types[0].type_id == "eval"
+    assert (
+        phase0.types[0].worker_module
+        == "compiler_suit_runner.workers.eval_worker"
+    )
+
+
+def test_phase_specs_phase_build_depends_on_phase0() -> None:
+    """phase_build declares ``depends_on=("phase0",)`` so the framework
+    drains phase0 before dispatching any toolchain / variant task."""
+    pytest.importorskip("dynamic_runner.task_protocol")
+    from compiler_suit_runner.suit_task import _phase_specs
+    specs = _phase_specs(build_max_concurrent=None)
+    phase_build = next(s for s in specs if s.phase_id == "phase_build")
+    assert phase_build.depends_on == ("phase0",)
+
+
+def test_phase_specs_phase_build_carries_all_four_build_types() -> None:
+    pytest.importorskip("dynamic_runner.task_protocol")
+    from compiler_suit_runner.suit_task import _phase_specs
+    specs = _phase_specs(build_max_concurrent=None)
+    phase_build = next(s for s in specs if s.phase_id == "phase_build")
+    type_ids = {t.type_id for t in phase_build.types}
+    assert type_ids == {
+        "toolchain",
+        "toolchain_validate",
+        "common_dep",
+        "variant",
+    }

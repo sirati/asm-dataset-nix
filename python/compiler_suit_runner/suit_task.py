@@ -327,9 +327,27 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
     # Keeping it uncapped also avoids starving phase-3 variants
     # behind the validate phase when the same cap is configured low
     # for compile-throttling.
+    # ``phase0`` precedes ``phase_build`` via an explicit ``depends_on``
+    # edge: the framework's phase scheduler computes ordering from the
+    # dependency graph, not from tuple order. Phase 0 eval workers must
+    # complete (and the ``_Phase0QuiesceWatcher`` on the consumer side
+    # must spawn the phase 1 build tasks via primary_handle.spawn_tasks)
+    # before any phase_build task can dispatch. When ``--distributed-eval``
+    # is OFF the phase0 type set is simply empty for this run; the
+    # framework treats an empty phase as immediately-drained.
     return (
         PhaseSpec(
+            phase_id="phase0",
+            types=(
+                TaskTypeSpec(
+                    type_id="eval",
+                    worker_module="compiler_suit_runner.workers.eval_worker",
+                ),
+            ),
+        ),
+        PhaseSpec(
             phase_id="phase_build",
+            depends_on=("phase0",),
             types=(
                 TaskTypeSpec(
                     type_id="toolchain",
