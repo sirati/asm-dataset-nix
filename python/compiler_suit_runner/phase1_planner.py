@@ -77,7 +77,7 @@ def _default_reader(drv_path: str) -> set[str]:
 
 
 def read_phase0_manifests(out_dir: pathlib.Path) -> dict[str, dict]:
-    """Read every ``out/<binary>/_phase0/manifest.json`` under ``out_dir``.
+    """Read every ``<binary>/manifest.json`` under ``out_dir``.
 
     Returns a mapping from ``binary`` (the manifest's ``binary`` field)
     to the parsed manifest dict. Missing or malformed manifests are
@@ -87,10 +87,10 @@ def read_phase0_manifests(out_dir: pathlib.Path) -> dict[str, dict]:
 
     The expected on-disk layout is::
 
-        out/<binary>/_phase0/manifest.json
+        <out_dir>/<binary>/manifest.json
 
-    matching the resume marker described in the plan's "Resume
-    support" section.
+    where ``out_dir`` is the phase0-specific directory (e.g.
+    ``<shared_fs>/dataset/_phase0`` on the host).
     """
     out_dir = pathlib.Path(out_dir)
     manifests: dict[str, dict] = {}
@@ -98,8 +98,8 @@ def read_phase0_manifests(out_dir: pathlib.Path) -> dict[str, dict]:
         return manifests
 
     # Glob walks the layout exactly so peer-side scratch dirs that
-    # happen to live alongside ``out`` don't get pulled in.
-    for manifest_path in sorted(out_dir.glob("*/_phase0/manifest.json")):
+    # happen to live alongside the phase0 dir don't get pulled in.
+    for manifest_path in sorted(out_dir.glob("*/manifest.json")):
         try:
             text = manifest_path.read_text(encoding="utf-8")
             parsed = json.loads(text)

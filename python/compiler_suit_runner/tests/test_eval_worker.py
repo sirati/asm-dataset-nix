@@ -352,7 +352,7 @@ def test_run_eval_task_happy_path(tmp_path: pathlib.Path) -> None:
     assert sender.wait_for_completion.call_count == 4
 
     # Marker file written, parses to the returned dict.
-    marker = tmp_path / "hello" / "_phase0" / "manifest.json"
+    marker = tmp_path / "hello" / "manifest.json"
     assert marker.exists()
     with open(marker, "r", encoding="utf-8") as fh:
         on_disk = json.load(fh)
@@ -388,7 +388,7 @@ def test_run_eval_task_resume_short_circuits(tmp_path: pathlib.Path) -> None:
     nix-eval-jobs or BroadcastSender.
     """
     payload = _make_payload()
-    marker_dir = tmp_path / "hello" / "_phase0"
+    marker_dir = tmp_path / "hello"
     marker_dir.mkdir(parents=True)
     pre_existing = {
         "binary": "hello",
@@ -426,7 +426,7 @@ def test_run_eval_task_corrupt_marker_falls_through(
     permanently wedge.
     """
     payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
-    marker_dir = tmp_path / "hello" / "_phase0"
+    marker_dir = tmp_path / "hello"
     marker_dir.mkdir(parents=True)
     (marker_dir / "manifest.json").write_text(
         "{not json}", encoding="utf-8"
@@ -566,7 +566,7 @@ def test_run_eval_task_subprocess_failure_raises(
     assert "rc=1" in msg
     assert "eval-time OOM" in msg
     # No marker on failure — re-execution must re-eval.
-    marker = tmp_path / "hello" / "_phase0" / "manifest.json"
+    marker = tmp_path / "hello" / "manifest.json"
     assert not marker.exists()
     # No broadcasts fired (we failed before the first arch's
     # drvs were extracted).
@@ -607,7 +607,7 @@ def test_run_eval_task_broadcast_timeout_recorded(
     assert len(result["broadcasts"]) == 1
     assert result["broadcasts"][0]["status"] == "timeout"
     # Marker still persisted.
-    assert (tmp_path / "hello" / "_phase0" / "manifest.json").exists()
+    assert (tmp_path / "hello" / "manifest.json").exists()
 
 
 # ---------------------------------------------------------------------------
