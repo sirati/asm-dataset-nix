@@ -563,6 +563,118 @@ def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# (pkg, arch) availability gate — pure consumer of the nix-side gate
+# ---------------------------------------------------------------------------
+#
+# Counterpart to ``pkgIsBuildableForTarget`` in ``lib/matrix.nix``. The nix
+# matrix returns an empty attrset for any (pkg, arch) cell whose underlying
+# nixpkgs derivation declares itself unavailable on the requested host
+# platform (``meta.available = false`` — combines
+# ``meta.platforms``/``meta.badPlatforms`` with ``meta.broken`` and
+# nixpkgs' insecure-allowlist check). Cells excluded for stdenv reasons
+# (e.g. nanopb-only-stdenvNoCC packages on archs where the override
+# wrapper isn't applicable) also come back empty.
+#
+# Rather than mirror the platform metadata in a separate Python table
+# (which would drift), this helper asks the nix matrix directly: a
+# (pkg, arch) is "supported" iff ``_meta.<sys>.<pkg>.<arch>`` has any
+# suffix attrs at all. The result is cached per (flake_ref, sys_name,
+# pkg, arch) so a sampler can probe thousands of tuples without
+# re-shelling out.
+
+
+_PKG_SUPPORTS_ARCH_CACHE: dict[tuple[str, str, str, str], bool] = {}
+
+
+def pkg_supports_arch(
+    pkg: str,
+    arch: str,
+    *,
+    flake_ref: str = ".",
+    sys_name: str = "x86_64-linux",
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> bool:
+    """Return ``True`` iff the matrix exposes any variants for ``(pkg, arch)``.
+
+    Mirrors the nix-side ``pkgIsBuildableForTarget`` gate (see
+    ``lib/matrix.nix``) by querying ``_meta.<sys>.<pkg>.<arch>`` and
+    checking whether its attribute-name list is non-empty. Cells that
+    nix dropped — because the underlying package's ``meta.available``
+    is ``false`` on that platform, or the package doesn't take a
+    ``stdenv`` argument — return ``False``.
+
+    Results are memoised so a Python sampler can call this once per
+    (pkg, arch) tuple without re-shelling out to nix. Cache key
+    includes ``flake_ref`` and ``sys_name`` so callers querying
+    different flakes / systems stay isolated.
+
+    Failures (no such pkg attr, nix eval crashes, missing flake) all
+    map to ``False`` — the caller's contract is "drop the tuple", and
+    a missing/broken cell is operationally equivalent to "unsupported".
+    """
+    key = (flake_ref, sys_name, pkg, arch)
+    cached = _PKG_SUPPORTS_ARCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        attr_names = run_nix_eval(
+            flake_ref,
+            f"_meta.{sys_name}.{pkg}.{arch}",
+            run_subprocess=run_subprocess,
+            apply="m: builtins.attrNames m",
+        )
+    except RuntimeError:
+        _PKG_SUPPORTS_ARCH_CACHE[key] = False
+        return False
+
+    supported = isinstance(attr_names, list) and len(attr_names) > 0
+    _PKG_SUPPORTS_ARCH_CACHE[key] = supported
+    return supported
+
+
+def supported_archs_for_pkg(
+    pkg: str,
+    *,
+    flake_ref: str = ".",
+    sys_name: str = "x86_64-linux",
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> tuple[str, ...]:
+    """Return every arch label for which ``pkg`` has at least one variant.
+
+    Batched companion to :func:`pkg_supports_arch`: one ``nix eval``
+    asks for the per-arch attribute-name counts in a single call, then
+    populates the per-(pkg, arch) cache with the result so subsequent
+    point queries hit the cache.
+
+    Returns ``()`` if the pkg doesn't appear in ``_meta`` at all (eg
+    typo or pkg not in ``lib/packages.nix``); the per-(pkg, arch) cache
+    entries are still written so repeated calls don't re-shell out.
+    """
+    try:
+        per_arch_counts = run_nix_eval(
+            flake_ref,
+            f"_meta.{sys_name}.{pkg}",
+            run_subprocess=run_subprocess,
+            apply="m: builtins.mapAttrs (_: a: builtins.length (builtins.attrNames a)) m",
+        )
+    except RuntimeError:
+        return ()
+    if not isinstance(per_arch_counts, dict):
+        return ()
+    supported: list[str] = []
+    for arch, count in per_arch_counts.items():
+        if not isinstance(arch, str) or not isinstance(count, int):
+            continue
+        is_supported = count > 0
+        _PKG_SUPPORTS_ARCH_CACHE[(flake_ref, sys_name, pkg, arch)] = is_supported
+        if is_supported:
+            supported.append(arch)
+    supported.sort()
+    return tuple(supported)
+
+
 def _sample_suffix_attrs(
     suffix_attrs: dict,
     *,
