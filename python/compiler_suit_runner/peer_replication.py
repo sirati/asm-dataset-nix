@@ -112,6 +112,13 @@ class ReplicationContext:
     The push/fetch/record callables are dependency-injected to keep
     the module testable: tests substitute fakes that record arguments
     instead of hitting the network.
+
+    The framework-handle callables (``mark_task_unfulfillable``,
+    ``reinject_task``, ``update_preferred_secondaries``,
+    ``lookup_task_hash_for_outpath``) default to ``None`` so the
+    legacy NFS-poll fallback path stays unbroken when the primary has
+    not bound them yet (e.g. on secondaries, or before
+    ``suit_task.on_run_start`` has wired the ``PrimaryHandle``).
     """
 
     my_secondary_id: str
@@ -134,9 +141,31 @@ class ReplicationContext:
     record_self_has: Callable[..., None] = field(
         repr=False, default=peer_paths.record_self_has,
     )
+    # Framework PrimaryHandle bindings (consumer-side hex strings; the
+    # binding layer in suit_task.on_run_start converts hex→bytes before
+    # invoking the Rust API). Default None ⇒ no-op + legacy fallback.
+    mark_task_unfulfillable: Optional[Callable[[str, str], None]] = field(
+        repr=False, default=None,
+    )
+    reinject_task: Optional[Callable[[str], None]] = field(
+        repr=False, default=None,
+    )
+    update_preferred_secondaries: Optional[
+        Callable[[str, list[str]], None]
+    ] = field(repr=False, default=None)
+    lookup_task_hash_for_outpath: Optional[
+        Callable[[str], Optional[str]]
+    ] = field(repr=False, default=None)
     # Knobs
     replication_k: int = DEFAULT_REPLICATION_K
     offer_timeout_seconds: float = DEFAULT_OFFER_TIMEOUT_SECONDS
+    # Q2 settle-window: debounce between cascade convergence
+    # (`len(holders) >= K`) and the single `update_preferred_secondaries`
+    # call. Picked at the module's default of 5 s per the wire-in plan;
+    # tests can override (typically with a tiny value via the fake
+    # timer factory) and production callers can knob it down for
+    # latency-sensitive deployments.
+    preferred_secondaries_settle_seconds: float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +192,14 @@ class ReplicationSender:
     all funnel through the same critical sections.
     """
 
-    def __init__(self, ctx: ReplicationContext) -> None:
+    def __init__(
+        self,
+        ctx: ReplicationContext,
+        *,
+        timer_factory: Optional[
+            Callable[[float, Callable[[], None]], "threading.Timer"]
+        ] = None,
+    ) -> None:
         self._ctx = ctx
         # outpath -> {target_sid: _InFlightOffer}
         self._in_flight: dict[str, dict[str, _InFlightOffer]] = {}
@@ -173,6 +209,35 @@ class ReplicationSender:
         self._metadata: dict[str, tuple[str, str]] = {}  # outpath -> (drv_path, item_class)
         self._lock = threading.RLock()
         self._stopped = False
+        # Q2 batched preferred_secondaries updater state.
+        # outpath -> debounce Timer arming the single
+        # update_preferred_secondaries call. We track per-outpath
+        # rather than per-task_hash because the consumer-side cascade
+        # signal we observe (on_path_have / placement diff) is
+        # outpath-keyed; the bound callable resolves the toolchain
+        # task_hash itself at settle time.
+        self._settle_timer: dict[str, threading.Timer] = {}
+        # outpath -> True once we've fired the single
+        # update_preferred_secondaries call. Idempotency guard so a
+        # later K+1 race or duplicate path-have doesn't refire.
+        self._preferred_secondaries_fired: dict[str, bool] = {}
+        # Factory hook for tests — defaults to threading.Timer so
+        # production paths don't pay any extra cost. Signature mirrors
+        # the threading.Timer(interval, function) ctor; the factory
+        # owns daemon-setting + start().
+        self._timer_factory = (
+            timer_factory if timer_factory is not None
+            else self._default_timer_factory
+        )
+
+    @staticmethod
+    def _default_timer_factory(
+        interval: float, function: Callable[[], None],
+    ) -> threading.Timer:
+        timer = threading.Timer(interval, function)
+        timer.daemon = True
+        timer.start()
+        return timer
 
     # --- public API ---------------------------------------------------------
 
@@ -248,6 +313,14 @@ class ReplicationSender:
         If the new holder was one of OUR in-flight targets, settle
         that slot. After settling, if K is met (or exceeded) cancel
         the remaining outstanding offers for this outpath.
+
+        When the cascade hits K for the first time this also arms the
+        Q2 debounce timer so a single
+        ``ReplicationContext.update_preferred_secondaries`` call fires
+        once the converged set has had a chance to settle. K+1 races
+        observed during the debounce just reschedule the timer with
+        the freshest converged set; a drop below K cancels the timer
+        so we don't publish a stale set.
         """
         with self._lock:
             # Settle our slot if applicable.
@@ -257,7 +330,10 @@ class ReplicationSender:
             # Note: include the freshly-broadcasting sid since the
             # placement watcher might not have refreshed yet.
             effective = set(holders) | {holder_sid}
-            if len(effective) < self._ctx.replication_k:
+            converged = len(effective) >= self._ctx.replication_k
+            # Q2 batched preferred_secondaries — arm the debounce.
+            self._arm_settle_locked(outpath, converged)
+            if not converged:
                 return
             # K satisfied: cancel any remaining outstanding offers.
             outstanding = list(self._in_flight.get(outpath, {}).items())
@@ -293,6 +369,12 @@ class ReplicationSender:
                     if slot.timer is not None:
                         slot.timer.cancel()
             self._in_flight.clear()
+            for timer in self._settle_timer.values():
+                try:
+                    timer.cancel()
+                except Exception:  # noqa: BLE001 — defensive
+                    pass
+            self._settle_timer.clear()
 
     # --- introspection (mostly for tests) -----------------------------------
 
@@ -380,6 +462,109 @@ class ReplicationSender:
             slot.timer.cancel()
         if not slots:
             self._in_flight.pop(outpath, None)
+
+    # --- Q2 batched preferred_secondaries -----------------------------------
+
+    def _arm_settle_locked(self, outpath: str, converged: bool) -> None:
+        """Arm or cancel the per-outpath settle timer.
+
+        Caller must hold ``self._lock``. Behaviour:
+
+        * converged (``len(effective_holders) >= K``): if we have not
+          yet fired ``update_preferred_secondaries`` for this outpath,
+          (re-)arm a fresh debounce timer. A second arm during the
+          window simply replaces the previous timer with one that
+          fires later — equivalent to "the freshest converged set is
+          the one we publish".
+        * not converged (cascade un-settled): cancel any pending
+          timer; we will arm again when the cascade re-converges.
+        """
+        existing = self._settle_timer.get(outpath)
+        if not converged:
+            if existing is not None:
+                try:
+                    existing.cancel()
+                except Exception:  # noqa: BLE001 — defensive
+                    pass
+                self._settle_timer.pop(outpath, None)
+            return
+        # Already fired this outpath → idempotent no-op. Subsequent
+        # K+1 / K+2 holders don't refire (the converged set at first
+        # settle is what we committed to).
+        if self._preferred_secondaries_fired.get(outpath):
+            return
+        # Skip entirely if the framework hook is unbound (legacy path).
+        if self._ctx.update_preferred_secondaries is None:
+            return
+        # Replace any pending timer with a fresh one anchored at "now".
+        if existing is not None:
+            try:
+                existing.cancel()
+            except Exception:  # noqa: BLE001 — defensive
+                pass
+        timer = self._timer_factory(
+            self._ctx.preferred_secondaries_settle_seconds,
+            lambda: self._fire_settle(outpath),
+        )
+        self._settle_timer[outpath] = timer
+
+    def _fire_settle(self, outpath: str) -> None:
+        """Timer-callback: publish the converged holder set once.
+
+        Resolves the live holder set at fire time (not at arm time);
+        the cascade may have grown to K+1 since the arm, and we want
+        the freshest snapshot. Bound callable receives the
+        toolchain task_hash (hex) + sorted holder list.
+        """
+        with self._lock:
+            if self._stopped:
+                return
+            # Idempotency guard: a manual fire racing the timer.
+            if self._preferred_secondaries_fired.get(outpath):
+                self._settle_timer.pop(outpath, None)
+                return
+            updater = self._ctx.update_preferred_secondaries
+            lookup = self._ctx.lookup_task_hash_for_outpath
+            holders = sorted(
+                self._ctx.get_placements().get(outpath, set())
+            )
+            # Drop the timer slot now so a re-arm after fire is fresh.
+            self._settle_timer.pop(outpath, None)
+            # Mark fired BEFORE invoking the bound callable so a
+            # callable that itself triggers a path-have can't recurse.
+            self._preferred_secondaries_fired[outpath] = True
+        if updater is None:
+            return
+        # Resolve task_hash. The lookup may legitimately return None
+        # (outpath not in the manifest's toolchain set — e.g. a
+        # common_dep cascade that happens to converge); in that case
+        # we silently skip.
+        task_hash_hex: Optional[str] = None
+        if lookup is not None:
+            try:
+                task_hash_hex = lookup(outpath)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "ReplicationSender: lookup_task_hash_for_outpath "
+                    "raised for %s", outpath,
+                )
+                return
+        if not task_hash_hex:
+            return
+        if len(holders) < self._ctx.replication_k:
+            # Settle conditions un-met by fire time (cascade dropped
+            # mid-debounce after we set fired=True). Roll back the
+            # fired flag so a re-converge can fire again.
+            with self._lock:
+                self._preferred_secondaries_fired.pop(outpath, None)
+            return
+        try:
+            updater(task_hash_hex, list(holders))
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "ReplicationSender: update_preferred_secondaries raised "
+                "for outpath=%s task_hash=%s", outpath, task_hash_hex,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +948,7 @@ class ReplicationRepairWorker:
         outpaths: Iterable[str],
         excludes: Optional[frozenset[str]] = None,
     ) -> None:
+        excludes = excludes or frozenset()
         for outpath in outpaths:
             drv_path, item_class = self._get_drv_metadata(outpath)
             try:
@@ -775,6 +961,65 @@ class ReplicationRepairWorker:
                     "ReplicationRepairWorker: push_attempt raised for %s",
                     outpath,
                 )
+            # Q1 wire-in: after the repair attempt, if NO live holder
+            # remains (the dead peer(s) excluded), the toolchain is
+            # effectively gone from the cluster. Signal the framework
+            # so it can transition the toolchain task to Unfulfillable
+            # and cascade-block dependents. Skip silently when the
+            # framework hook is unbound (legacy NFS-poll fallback).
+            self._maybe_mark_unfulfillable(outpath, excludes)
+
+    def _maybe_mark_unfulfillable(
+        self, outpath: str, excludes: frozenset[str],
+    ) -> None:
+        """Emit ``mark_task_unfulfillable`` when this outpath has zero
+        live holders post-repair.
+
+        Conditions (all must hold):
+
+        * ``ReplicationContext.mark_task_unfulfillable`` bound;
+        * ``ReplicationContext.lookup_task_hash_for_outpath`` resolves
+          to a task hash (i.e. this outpath belongs to a toolchain
+          TaskInfo — common_dep / variant fall-through skips the
+          signal);
+        * ``len(live_holders) == 0`` where live = placement-snapshot
+          minus ``excludes`` (the just-removed-dead-peer set).
+        """
+        ctx = self._ctx
+        if ctx.mark_task_unfulfillable is None:
+            return
+        if ctx.lookup_task_hash_for_outpath is None:
+            return
+        placements = ctx.get_placements()
+        holders = set(placements.get(outpath, set())) - set(excludes)
+        if holders:
+            return  # at least one live holder; nothing permanent here
+        try:
+            task_hash_hex = ctx.lookup_task_hash_for_outpath(outpath)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "ReplicationRepairWorker: lookup_task_hash_for_outpath "
+                "raised for %s", outpath,
+            )
+            return
+        if not task_hash_hex:
+            return
+        # Reason format contract (Q3 holding_matcher consumer):
+        #   f"toolchain outpath={outpath} dead_holders={sorted(last_known)}"
+        # TODO: swap to `holding_matcher.UNFULFILLABLE_REASON_TEMPLATE`
+        # once #70 (holding_matcher.py) lands so the format definition
+        # lives in exactly one place.
+        last_known = sorted(excludes)
+        reason = (
+            f"toolchain outpath={outpath} dead_holders={last_known}"
+        )
+        try:
+            ctx.mark_task_unfulfillable(task_hash_hex, reason)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "ReplicationRepairWorker: mark_task_unfulfillable raised "
+                "for outpath=%s task_hash=%s", outpath, task_hash_hex,
+            )
 
 
 # ---------------------------------------------------------------------------
