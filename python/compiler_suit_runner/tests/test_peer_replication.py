@@ -736,6 +736,397 @@ def test_repair_uses_drv_metadata_lookup(ctx_factory) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Q1 + Q2 wire-in: framework PrimaryHandle callable hooks
+# ---------------------------------------------------------------------------
+
+
+class _FakeTimer:
+    """Minimal threading.Timer drop-in for fake-time tests.
+
+    Implements ``cancel()``; ``fire()`` invokes the captured callback
+    synchronously so tests can assert behaviour without sleeping.
+    """
+
+    def __init__(self, interval: float, function) -> None:
+        self.interval = interval
+        self.function = function
+        self.cancelled = False
+        self.fired = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def fire(self) -> None:
+        if self.cancelled or self.fired:
+            return
+        self.fired = True
+        self.function()
+
+
+class _FakeTimerRegistry:
+    """Tracks every timer the sender constructs through the factory."""
+
+    def __init__(self) -> None:
+        self.timers: list[_FakeTimer] = []
+
+    def factory(self, interval: float, function) -> _FakeTimer:
+        t = _FakeTimer(interval, function)
+        self.timers.append(t)
+        return t
+
+    @property
+    def alive(self) -> list[_FakeTimer]:
+        return [t for t in self.timers if not t.cancelled and not t.fired]
+
+
+def test_replication_context_defaults_new_callables_to_none(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Regression guard — Q1/Q2 callables default to None so legacy
+    consumers that haven't migrated their construction site keep
+    working (NFS-poll fallback path)."""
+    ctx = ReplicationContext(
+        my_secondary_id="me",
+        our_pubkey="me:PK",
+        shared_fs=tmp_path,
+        get_peers=lambda: [],
+        get_placements=lambda: {},
+    )
+    assert ctx.mark_task_unfulfillable is None
+    assert ctx.reinject_task is None
+    assert ctx.update_preferred_secondaries is None
+    assert ctx.lookup_task_hash_for_outpath is None
+    # Sanity: existing knobs preserved.
+    assert ctx.replication_k == DEFAULT_REPLICATION_K
+    assert ctx.offer_timeout_seconds == DEFAULT_OFFER_TIMEOUT_SECONDS
+
+
+def test_repair_marks_unfulfillable_with_canonical_reason_format(
+    ctx_factory,
+) -> None:
+    """Zero live holders post-repair + lookup resolves → exactly one
+    ``mark_task_unfulfillable`` call with the canonical reason
+    string.
+
+    Reason format contract (must match holding_matcher's regex / Q3
+    parser): ``f"toolchain outpath={outpath} dead_holders={sorted(last_known)}"``.
+    The ``dead_holders`` field is the ``sorted()`` repr of a Python
+    list, exactly as ``str(sorted(...))`` produces.
+    """
+    ctx, _, _ = ctx_factory(
+        peers=[_peer("me"), _peer("d1"), _peer("d2")],
+        # No live holders post-exclusion: holders = {d1, d2};
+        # excludes = {d1, d2} → empty. The path is effectively gone.
+        placements={"/nix/store/lost": {"d1", "d2"}},
+        replication_k=3,
+    )
+    marks: list[tuple[str, str]] = []
+    ctx = replace(
+        ctx,
+        mark_task_unfulfillable=lambda h, r: marks.append((h, r)),
+        lookup_task_hash_for_outpath=lambda op: "abc123",
+    )
+    sender = ReplicationSender(ctx)
+    worker = ReplicationRepairWorker(ctx, sender)
+    try:
+        worker._maybe_mark_unfulfillable(  # noqa: SLF001 — white-box
+            "/nix/store/lost", frozenset({"d1", "d2"}),
+        )
+        assert marks == [(
+            "abc123",
+            "toolchain outpath=/nix/store/lost dead_holders=['d1', 'd2']",
+        )]
+    finally:
+        sender.stop()
+
+
+def test_repair_marks_unfulfillable_integrates_with_on_diff(
+    ctx_factory,
+) -> None:
+    """End-to-end through the public ``on_diff`` API: we are a holder
+    but the cluster lost our only co-holder (and our copy is somehow
+    also expected gone — simulated by an empty placements ref). The
+    public repair flow walks outpaths-we-hold AND post-repair holder
+    count below K; the Q1 helper then fires when post-exclusion live
+    holders are empty.
+
+    This is the realistic wire-in path: framework signals a peer
+    death → repair worker calls ``_repair_for_outpaths`` → which
+    inside the loop invokes ``_maybe_mark_unfulfillable`` once.
+    """
+    # The framework signal: dead-peer's removal. We hold the outpath
+    # AND dead was the only OTHER holder. Once the placement watcher
+    # refreshes the snapshot will drop to {me}; in the meantime, the
+    # excludes set tells the sender to treat `dead` as a ghost.
+    # The mark_unfulfillable fires only when holders - excludes is
+    # empty; here {me, dead} - {dead} = {me}, so it does NOT fire
+    # (we still hold a copy → cluster not lost the toolchain). The
+    # integration test is therefore the "stays-silent" case.
+    ctx, _, _ = ctx_factory(
+        peers=[_peer("me"), _peer("dead")],
+        placements={"/nix/store/safe": {"me", "dead"}},
+        replication_k=3,
+    )
+    marks: list[tuple[str, str]] = []
+    ctx = replace(
+        ctx,
+        mark_task_unfulfillable=lambda h, r: marks.append((h, r)),
+        lookup_task_hash_for_outpath=lambda op: "tch",
+    )
+    sender = ReplicationSender(ctx)
+    worker = ReplicationRepairWorker(ctx, sender)
+    try:
+        worker.on_peer_removed("dead")
+        # We still hold it → no unfulfillable signal.
+        assert marks == []
+    finally:
+        sender.stop()
+
+
+def test_repair_falls_back_when_mark_unfulfillable_unbound(
+    ctx_factory,
+) -> None:
+    """When ``mark_task_unfulfillable`` is None (legacy / pre-Q1), the
+    repair worker silently completes the push_attempt and does NOT
+    invoke any framework hook. Regression guard for the fallback
+    contract."""
+    ctx, rec, _ = ctx_factory(
+        peers=[_peer("me"), _peer("d1")],
+        placements={"/nix/store/lost": {"d1"}},
+        replication_k=3,
+    )
+    # mark_task_unfulfillable left as default None.
+    assert ctx.mark_task_unfulfillable is None
+    sender = ReplicationSender(ctx)
+    worker = ReplicationRepairWorker(ctx, sender)
+    try:
+        # Even with a "would-fire" exclude set, no fail-permanent
+        # signal is dispatched because the callable is unbound.
+        worker._maybe_mark_unfulfillable(  # noqa: SLF001
+            "/nix/store/lost", frozenset({"d1"}),
+        )
+        # No exception, no marks — and offers weren't issued from the
+        # private helper (separate from push_attempt).
+        assert rec.offers == []
+    finally:
+        sender.stop()
+
+
+def test_repair_skips_unfulfillable_when_lookup_returns_none(
+    ctx_factory,
+) -> None:
+    """A non-toolchain outpath (lookup returns None) silently skips
+    the unfulfillable signal — only TaskInfo-registered toolchains
+    are eligible."""
+    ctx, _, _ = ctx_factory(
+        peers=[_peer("me"), _peer("d1")],
+        placements={"/nix/store/common": {"d1"}},
+        replication_k=3,
+    )
+    marks: list[tuple[str, str]] = []
+    ctx = replace(
+        ctx,
+        mark_task_unfulfillable=lambda h, r: marks.append((h, r)),
+        lookup_task_hash_for_outpath=lambda op: None,  # not in manifest
+    )
+    sender = ReplicationSender(ctx)
+    worker = ReplicationRepairWorker(ctx, sender)
+    try:
+        worker._maybe_mark_unfulfillable(  # noqa: SLF001
+            "/nix/store/common", frozenset({"d1"}),
+        )
+        assert marks == []
+    finally:
+        sender.stop()
+
+
+def test_repair_skips_unfulfillable_when_live_holder_remains(
+    ctx_factory,
+) -> None:
+    """If at least one live holder remains post-repair, the cluster
+    still has the toolchain; the framework hook is not invoked."""
+    ctx, _, _ = ctx_factory(
+        peers=[_peer("me"), _peer("alive"), _peer("dead")],
+        placements={"/nix/store/x": {"alive", "dead"}},
+        replication_k=3,
+    )
+    marks: list[tuple[str, str]] = []
+    ctx = replace(
+        ctx,
+        mark_task_unfulfillable=lambda h, r: marks.append((h, r)),
+        lookup_task_hash_for_outpath=lambda op: "task-hash-hex",
+    )
+    sender = ReplicationSender(ctx)
+    worker = ReplicationRepairWorker(ctx, sender)
+    try:
+        worker._maybe_mark_unfulfillable(  # noqa: SLF001
+            "/nix/store/x", frozenset({"dead"}),
+        )
+        # `alive` is still a holder; cluster still has the path.
+        assert marks == []
+    finally:
+        sender.stop()
+
+
+def test_sender_preferred_secondaries_fires_once_after_settle(
+    ctx_factory,
+) -> None:
+    """On cascade convergence (>= K holders) the sender arms a settle
+    timer; firing it triggers exactly ONE
+    update_preferred_secondaries(task_hash, sorted_holders) call."""
+    placements: dict[str, set[str]] = {"/nix/store/tc": {"s1", "s2", "s3"}}
+    ctx, _, ref = ctx_factory(
+        peers=[_peer("s1"), _peer("s2"), _peer("s3"), _peer("me")],
+        placements=placements,
+        replication_k=3,
+    )
+    updates: list[tuple[str, list[str]]] = []
+    ctx = replace(
+        ctx,
+        update_preferred_secondaries=lambda h, ss: updates.append((h, list(ss))),
+        lookup_task_hash_for_outpath=lambda op: "tchash",
+        preferred_secondaries_settle_seconds=99.0,  # only fires manually
+    )
+    registry = _FakeTimerRegistry()
+    sender = ReplicationSender(ctx, timer_factory=registry.factory)
+    try:
+        # Synthesize a path-have event that puts us at K.
+        sender.on_path_have("s3", "/nix/store/tc")
+        # Exactly one settle timer armed.
+        assert len(registry.timers) == 1
+        timer = registry.timers[0]
+        assert not timer.cancelled
+        assert updates == [], "should not fire before timer elapses"
+        # Fire the timer (fake-time settle).
+        timer.fire()
+        assert len(updates) == 1
+        h, ss = updates[0]
+        assert h == "tchash"
+        assert ss == sorted({"s1", "s2", "s3"})
+        # Idempotency: a subsequent path-have for a K+1 holder must
+        # NOT arm a new timer or refire.
+        ref["/nix/store/tc"].add("s4")
+        sender.on_path_have("s4", "/nix/store/tc")
+        assert len(registry.timers) == 1  # no new timer
+        assert len(updates) == 1  # no refire
+    finally:
+        sender.stop()
+
+
+def test_sender_preferred_secondaries_cancels_on_unsettle(
+    ctx_factory,
+) -> None:
+    """If a path-have during the debounce window drops effective
+    holders BELOW K (e.g. simulating watcher refresh that revealed a
+    previously-thought holder was a ghost), the pending timer is
+    cancelled."""
+    placements: dict[str, set[str]] = {"/nix/store/tc": {"s1", "s2", "s3"}}
+    ctx, _, ref = ctx_factory(
+        peers=[_peer("s1"), _peer("s2"), _peer("s3"), _peer("me")],
+        placements=placements,
+        replication_k=3,
+    )
+    updates: list[tuple[str, list[str]]] = []
+    ctx = replace(
+        ctx,
+        update_preferred_secondaries=lambda h, ss: updates.append((h, list(ss))),
+        lookup_task_hash_for_outpath=lambda op: "tchash",
+        preferred_secondaries_settle_seconds=99.0,
+    )
+    registry = _FakeTimerRegistry()
+    sender = ReplicationSender(ctx, timer_factory=registry.factory)
+    try:
+        sender.on_path_have("s3", "/nix/store/tc")
+        assert len(registry.timers) == 1
+        first_timer = registry.timers[0]
+        assert not first_timer.cancelled
+        # Cascade un-settles: placement watcher dropped two holders.
+        ref["/nix/store/tc"] = {"s1"}
+        sender.on_path_have("s1", "/nix/store/tc")
+        # First timer cancelled; no new timer armed (still below K).
+        assert first_timer.cancelled
+        assert len(registry.timers) == 1
+        # Firing the cancelled timer is a no-op (defensive).
+        first_timer.fire()  # the _FakeTimer.fire() respects cancelled
+        assert updates == []
+    finally:
+        sender.stop()
+
+
+def test_sender_preferred_secondaries_no_timer_when_callable_unbound(
+    ctx_factory,
+) -> None:
+    """When update_preferred_secondaries is None (legacy ctx), no
+    settle timer is ever armed — even when cascade converges."""
+    ctx, _, _ = ctx_factory(
+        peers=[_peer("s1"), _peer("s2"), _peer("s3"), _peer("me")],
+        placements={"/nix/store/tc": {"s1", "s2", "s3"}},
+        replication_k=3,
+    )
+    # update_preferred_secondaries left default None.
+    assert ctx.update_preferred_secondaries is None
+    registry = _FakeTimerRegistry()
+    sender = ReplicationSender(ctx, timer_factory=registry.factory)
+    try:
+        sender.on_path_have("s3", "/nix/store/tc")
+        assert registry.timers == []
+    finally:
+        sender.stop()
+
+
+def test_sender_preferred_secondaries_skips_when_lookup_returns_none(
+    ctx_factory,
+) -> None:
+    """If the task-hash lookup yields None at settle time (e.g. this
+    converged outpath isn't a TaskInfo toolchain), the bound callable
+    is not invoked."""
+    ctx, _, _ = ctx_factory(
+        peers=[_peer("s1"), _peer("s2"), _peer("s3"), _peer("me")],
+        placements={"/nix/store/common": {"s1", "s2", "s3"}},
+        replication_k=3,
+    )
+    updates: list[tuple[str, list[str]]] = []
+    ctx = replace(
+        ctx,
+        update_preferred_secondaries=lambda h, ss: updates.append((h, list(ss))),
+        lookup_task_hash_for_outpath=lambda op: None,
+        preferred_secondaries_settle_seconds=99.0,
+    )
+    registry = _FakeTimerRegistry()
+    sender = ReplicationSender(ctx, timer_factory=registry.factory)
+    try:
+        sender.on_path_have("s3", "/nix/store/common")
+        assert len(registry.timers) == 1
+        registry.timers[0].fire()
+        assert updates == []
+    finally:
+        sender.stop()
+
+
+def test_sender_stop_cancels_settle_timers(ctx_factory) -> None:
+    """stop() must cancel pending settle timers in addition to the
+    in-flight offer timers."""
+    ctx, _, _ = ctx_factory(
+        peers=[_peer("s1"), _peer("s2"), _peer("s3"), _peer("me")],
+        placements={"/nix/store/tc": {"s1", "s2", "s3"}},
+        replication_k=3,
+    )
+    ctx = replace(
+        ctx,
+        update_preferred_secondaries=lambda h, ss: None,
+        lookup_task_hash_for_outpath=lambda op: "h",
+        preferred_secondaries_settle_seconds=99.0,
+    )
+    registry = _FakeTimerRegistry()
+    sender = ReplicationSender(ctx, timer_factory=registry.factory)
+    sender.on_path_have("s3", "/nix/store/tc")
+    assert len(registry.timers) == 1
+    assert not registry.timers[0].cancelled
+    sender.stop()
+    assert registry.timers[0].cancelled
+
+
+# ---------------------------------------------------------------------------
 # BroadcastSender
 # ---------------------------------------------------------------------------
 
