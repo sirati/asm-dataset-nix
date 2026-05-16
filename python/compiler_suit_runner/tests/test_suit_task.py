@@ -227,18 +227,20 @@ def test_watcher_is_idempotent_on_duplicate_completion(
         plan_mock.assert_called_once()
 
 
-def test_spawn_tasks_stub_writes_phase1_graph_and_logs_count(
+def test_spawn_tasks_no_handle_writes_phase1_graph_and_logs_count(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The Q5 stub serialises the headers to ``_phase1_graph.json``
-    and emits an INFO log with the count."""
+    """With ``primary_handle=None`` the Q5 path falls back to writing
+    ``_phase1_graph.json`` and emits an INFO log explaining the
+    degradation."""
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    logger = logging.getLogger("test_spawn_stub")
+    logger = logging.getLogger("test_spawn_no_handle")
     w = _Phase0QuiesceWatcher(
         expected_task_ids={phase0_eval_task_id("hello")},
         out_dir=out_dir,
         toolchain_task_ids={},
+        primary_handle=None,
         logger=logger,
     )
     headers = [
@@ -254,13 +256,17 @@ def test_spawn_tasks_stub_writes_phase1_graph_and_logs_count(
             item_class="phase3_variant",
             name="variant__hello__x86_64__gcc15-O0",
             size=0,
-            payload={"pkg": "hello"},
+            payload={
+                "pkg": "hello",
+                "compiler_id": "gcc15",
+                "arch": "x86_64",
+            },
             task_id="variant__hello__abc",
             task_depends_on=("common_dep__x-glibc",),
         ),
     ]
-    with caplog.at_level(logging.INFO, logger="test_spawn_stub"):
-        w._spawn_tasks_stub(headers)
+    with caplog.at_level(logging.INFO, logger="test_spawn_no_handle"):
+        w._spawn_tasks(headers)
     graph_path = out_dir / "_phase1_graph.json"
     assert graph_path.is_file()
     parsed = json.loads(graph_path.read_text(encoding="utf-8"))
@@ -269,27 +275,208 @@ def test_spawn_tasks_stub_writes_phase1_graph_and_logs_count(
     assert parsed[0]["item_class"] == "phase2_common_dep"
     assert parsed[1]["item_class"] == "phase3_variant"
     assert parsed[1]["task_depends_on"] == ["common_dep__x-glibc"]
-    # INFO log line mentions the header count.
+    # INFO log line mentions the JSON-only fallback.
     assert any(
-        "spawn_tasks stub received 2" in rec.message
+        "primary_handle unbound" in rec.message
         for rec in caplog.records
     )
 
 
-def test_spawn_tasks_stub_creates_missing_out_dir(
+def test_spawn_tasks_no_handle_creates_missing_out_dir(
     tmp_path: pathlib.Path,
 ) -> None:
-    """The stub mkdirs ``out_dir`` if absent so the planner can fire
-    on a fresh shared-fs that hasn't seen Phase 0 output yet."""
+    """The fallback path mkdirs ``out_dir`` if absent so the planner
+    can fire on a fresh shared-fs that hasn't seen Phase 0 output yet."""
     out_dir = tmp_path / "fresh-out"
     assert not out_dir.exists()
     w = _Phase0QuiesceWatcher(
         expected_task_ids={phase0_eval_task_id("hello")},
         out_dir=out_dir,
         toolchain_task_ids={},
+        primary_handle=None,
     )
-    w._spawn_tasks_stub([])
+    w._spawn_tasks([])
     assert (out_dir / "_phase1_graph.json").is_file()
+
+
+def test_spawn_tasks_with_handle_calls_primary_handle(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When a primary_handle is bound, ``_spawn_tasks`` converts each
+    header into a TaskInfo and calls ``primary_handle.spawn_tasks(...)``;
+    the JSON dump is also written for offline inspection."""
+    out_dir = tmp_path / "out"
+    handle = mock.MagicMock()
+    handle.spawn_tasks.return_value = []  # empty errors list = full success
+    logger = logging.getLogger("test_spawn_with_handle")
+    w = _Phase0QuiesceWatcher(
+        expected_task_ids={phase0_eval_task_id("hello")},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+        primary_handle=handle,
+        logger=logger,
+    )
+    headers = [
+        ManifestHeader(
+            item_class="phase2_common_dep",
+            name="common_dep__glibc",
+            size=0,
+            payload={"drv": "/nix/store/x-glibc.drv", "label": "glibc",
+                     "attr": "/nix/store/x-glibc.drv"},
+            task_id="common_dep__x-glibc",
+        ),
+        ManifestHeader(
+            item_class="phase3_variant",
+            name="variant__hello__x86_64__gcc15-O0",
+            size=0,
+            payload={
+                "pkg": "hello",
+                "compiler_id": "gcc15",
+                "arch": "x86_64",
+            },
+            task_id="variant__hello__abc",
+            task_depends_on=("common_dep__x-glibc",),
+        ),
+    ]
+    with caplog.at_level(logging.INFO, logger="test_spawn_with_handle"):
+        w._spawn_tasks(headers)
+    handle.spawn_tasks.assert_called_once()
+    args, _ = handle.spawn_tasks.call_args
+    task_infos = list(args[0])
+    assert len(task_infos) == 2
+    # Identifier / payload of the first task carries the manifest data.
+    ti0 = task_infos[0]
+    assert ti0.task_id == "common_dep__x-glibc"
+    assert ti0.payload["item_class"] == "phase2_common_dep"
+    ti1 = task_infos[1]
+    assert ti1.task_id == "variant__hello__abc"
+    assert ti1.task_depends_on == ("common_dep__x-glibc",)
+    # The phase1_graph dump is written alongside.
+    assert (out_dir / "_phase1_graph.json").is_file()
+    assert any(
+        "spawn_tasks dispatched 2 task(s) with 0 error(s)" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_spawn_tasks_duplicate_task_hash_logs_warning(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``duplicate_task_hash`` error from spawn_tasks gets logged at
+    WARNING — we expected a fresh hash and the framework deduped."""
+    handle = mock.MagicMock()
+    handle.spawn_tasks.return_value = [
+        (0, {"kind": "duplicate_task_hash", "task_hash": "abc123"}),
+    ]
+    logger = logging.getLogger("test_spawn_dup")
+    w = _Phase0QuiesceWatcher(
+        expected_task_ids={phase0_eval_task_id("hello")},
+        out_dir=tmp_path / "out",
+        toolchain_task_ids={},
+        primary_handle=handle,
+        logger=logger,
+    )
+    headers = [
+        ManifestHeader(
+            item_class="phase2_common_dep",
+            name="common_dep__glibc",
+            size=0,
+            payload={"drv": "/nix/store/x-glibc.drv", "label": "glibc",
+                     "attr": "/nix/store/x-glibc.drv"},
+            task_id="common_dep__x-glibc",
+        ),
+    ]
+    with caplog.at_level(logging.WARNING, logger="test_spawn_dup"):
+        w._spawn_tasks(headers)
+    handle.spawn_tasks.assert_called_once()
+    assert any(
+        "duplicate task_hash" in rec.message
+        and "common_dep__glibc" in rec.message
+        and rec.levelno == logging.WARNING
+        for rec in caplog.records
+    )
+
+
+def test_spawn_tasks_unknown_dependency_logs_warning(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An ``unknown_dependency`` error logs WARN with task_hash +
+    dep_task_id; that's a real planner bug."""
+    handle = mock.MagicMock()
+    handle.spawn_tasks.return_value = [
+        (
+            0,
+            {
+                "kind": "unknown_dependency",
+                "task_hash": "deadbeef",
+                "dep_task_id": "missing-dep-id",
+            },
+        ),
+    ]
+    logger = logging.getLogger("test_spawn_unknown_dep")
+    w = _Phase0QuiesceWatcher(
+        expected_task_ids={phase0_eval_task_id("hello")},
+        out_dir=tmp_path / "out",
+        toolchain_task_ids={},
+        primary_handle=handle,
+        logger=logger,
+    )
+    headers = [
+        ManifestHeader(
+            item_class="phase3_variant",
+            name="variant__hello__x86_64__gcc15-O0",
+            size=0,
+            payload={
+                "pkg": "hello",
+                "compiler_id": "gcc15",
+                "arch": "x86_64",
+            },
+            task_id="variant__hello__abc",
+            task_depends_on=("missing-dep-id",),
+        ),
+    ]
+    with caplog.at_level(logging.WARNING, logger="test_spawn_unknown_dep"):
+        w._spawn_tasks(headers)
+    assert any(
+        "unknown dependency" in rec.message
+        and "deadbeef" in rec.message
+        and "missing-dep-id" in rec.message
+        and rec.levelno == logging.WARNING
+        for rec in caplog.records
+    )
+
+
+def test_spawn_tasks_swallows_handle_exception(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """primary_handle.spawn_tasks raising must not propagate; we log
+    + degrade (Phase 1 stalls, which is operator-visible)."""
+    handle = mock.MagicMock()
+    handle.spawn_tasks.side_effect = RuntimeError("boom")
+    logger = logging.getLogger("test_spawn_handle_raises")
+    w = _Phase0QuiesceWatcher(
+        expected_task_ids={phase0_eval_task_id("hello")},
+        out_dir=tmp_path / "out",
+        toolchain_task_ids={},
+        primary_handle=handle,
+        logger=logger,
+    )
+    headers = [
+        ManifestHeader(
+            item_class="phase2_common_dep",
+            name="common_dep__glibc",
+            size=0,
+            payload={"drv": "/nix/store/x-glibc.drv", "label": "glibc",
+                     "attr": "/nix/store/x-glibc.drv"},
+            task_id="common_dep__x-glibc",
+        ),
+    ]
+    with caplog.at_level(logging.ERROR, logger="test_spawn_handle_raises"):
+        w._spawn_tasks(headers)  # must not raise
+    assert any(
+        "primary_handle.spawn_tasks" in rec.message
+        for rec in caplog.records
+    )
 
 
 def test_watcher_swallows_plan_phase1_exception(
@@ -1031,3 +1218,159 @@ def test_replication_context_callables_route_through_self(
         )
     finally:
         task.on_run_end(success=True)
+
+
+# ---------------------------------------------------------------------------
+# Q5 wire-in: on_run_start primary_handle kwarg + task_completed_listener
+# ---------------------------------------------------------------------------
+
+
+def test_on_run_start_accepts_primary_handle_kwarg(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The Q5 ``on_run_start`` signature accepts the ``primary_handle``
+    kwarg and stores the value on the task."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    # Manifest dir must exist (on_run_start scans it for phase0_eval).
+    config.manifest_dir.mkdir(parents=True, exist_ok=True)
+    config.shared_fs.mkdir(parents=True, exist_ok=True)
+    handle = mock.MagicMock()
+    try:
+        task.on_run_start(
+            source_dir=tmp_path,
+            output_dir=tmp_path / "out",
+            args=None,
+            primary_handle=handle,
+        )
+        assert task._primary_handle is handle
+    finally:
+        task.on_run_end(success=True)
+
+
+def test_on_run_start_backward_compat_without_kwarg(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A caller that omits ``primary_handle`` (legacy single-process
+    CLI) still runs without raising; the attribute remains None."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    config.manifest_dir.mkdir(parents=True, exist_ok=True)
+    config.shared_fs.mkdir(parents=True, exist_ok=True)
+    try:
+        # No primary_handle kwarg.
+        task.on_run_start(output_dir=tmp_path / "out")
+        assert task._primary_handle is None
+    finally:
+        task.on_run_end(success=True)
+
+
+def test_task_completed_listener_forwards_to_watcher(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The ``task_completed_listener`` property returns a callable that
+    routes matching task_ids into the phase 0 watcher's
+    ``on_task_completed``; non-matching ids are NoOp."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+
+    hello = phase0_eval_task_id("hello")
+    watcher = _Phase0QuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=tmp_path / "out",
+        toolchain_task_ids={},
+    )
+    task._phase0_watcher = watcher
+    listener = task.task_completed_listener
+    assert callable(listener)
+
+    # Non-matching task_id → NoOp.
+    listener("toolchain__gcc15__x86_64", True, None)
+    assert watcher.completed == frozenset()
+    # Empty task_id → NoOp (also defensive against None).
+    listener("", True, None)
+    listener(None, True, None)
+    assert watcher.completed == frozenset()
+
+    # Matching task_id → registered; with one expected task, fires
+    # plan_phase1.
+    with mock.patch(
+        "compiler_suit_runner.suit_task.phase1_planner.plan_phase1"
+    ) as plan_mock, mock.patch(
+        "compiler_suit_runner.suit_task.phase1_planner"
+        ".read_phase0_manifests",
+        return_value={},
+    ):
+        listener(hello, True, None)
+    assert watcher.fired is True
+    plan_mock.assert_called_once()
+
+
+def test_task_completed_listener_noop_without_watcher(
+    tmp_path: pathlib.Path,
+) -> None:
+    """No watcher constructed (non-distributed-eval run) → the listener
+    callable still answers and silently no-ops on every call."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    assert task._phase0_watcher is None
+    listener = task.task_completed_listener
+    # Must not raise.
+    listener("anything", True, None)
+    listener("else", False, "recoverable")
+
+
+def test_task_completed_listener_swallows_watcher_exception(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A buggy watcher must not propagate into the framework's apply
+    path."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+
+    fake_watcher = mock.MagicMock()
+    # ``expected`` is consulted before on_task_completed.
+    fake_watcher.expected = frozenset({"task-x"})
+    fake_watcher.on_task_completed.side_effect = RuntimeError("boom")
+    task._phase0_watcher = fake_watcher
+
+    listener = task.task_completed_listener
+    with caplog.at_level(logging.ERROR):
+        listener("task-x", True, None)  # must not raise
+
+    assert any(
+        "task_completed_listener: dispatch raised" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_build_phase0_watcher_threads_primary_handle(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``_build_phase0_watcher`` reads ``self._primary_handle`` and
+    threads it onto the constructed watcher so the spawn path can
+    drive ``primary_handle.spawn_tasks``."""
+    config = _make_config(tmp_path)
+    config.manifest_dir.mkdir(parents=True, exist_ok=True)
+    write_manifest(config.manifest_dir, _phase0_eval_header("hello"))
+    task = SuitTask(config)
+    handle = mock.MagicMock()
+    task._primary_handle = handle
+
+    w = task._build_phase0_watcher(output_dir=tmp_path / "out")
+    assert w is not None
+    assert w._primary_handle is handle
+
+
+def test_task_completed_listener_attribute_signature(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The ``task_completed_listener`` callable accepts the framework's
+    ``(task_id, success, error_kind)`` shape."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    listener = task.task_completed_listener
+    # All three positional args; must not raise even without a watcher.
+    listener("some-task", False, "recoverable")
+    listener("other-task", True, None)
+    listener(None, True, None)
