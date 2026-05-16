@@ -52,6 +52,21 @@ let
     else
       drv;
 
+  # Ensure the cc-wrapper exposes ``targetPrefix``. Very old cc-wrappers
+  # (nixpkgs 15.09, 18.03 — gcc4.4/4.5/4.6) predate the attribute, so
+  # upstream nixpkgs derivations that read ``stdenv.cc.targetPrefix``
+  # unconditionally (busybox, zlib, ...) throw ``attribute 'targetPrefix'
+  # missing`` at eval time. Modern cc-wrappers compute it from the
+  # platform: empty string for native, ``"<target-triple>-"`` for cross.
+  #
+  # Callers pass the resolved prefix because we don't have a platform
+  # attrset on the wrapper itself at this point — native is just ``""``,
+  # cross paths build their wrapper via ``modernCrossGcc.override`` and
+  # therefore already have the modern wrapper's computed value.
+  ensureTargetPrefix =
+    prefix: drv:
+    if drv ? targetPrefix then drv else drv // { targetPrefix = prefix; };
+
   # Extract version string from a Clang package across different nixpkgs eras.
   # Modern: .clang.version exists
   # Old (3.7+): .clang.cc.name is "clang-X.Y.Z", extract version from name
@@ -311,8 +326,11 @@ let
         mkStdenv =
           targetPkgs: target:
           if target.crossAttr == null && !(target ? crossSystem) then
-            # Native: just use the old compiler directly
-            targetPkgs.overrideCC targetPkgs.stdenv cleanGcc
+            # Native: just use the old compiler directly. Backfill
+            # ``targetPrefix = ""`` for very-old wrappers (15.09, 18.03)
+            # that predate the attribute — upstream nixpkgs derivations
+            # (busybox, zlib, ...) read it unconditionally.
+            targetPkgs.overrideCC targetPkgs.stdenv (ensureTargetPrefix "" cleanGcc)
           else if oldPkgs ? pkgsCross then
             # pkgsCross available (22.11+): use buildPackages with depsBuildBuild bootstrap
             let
