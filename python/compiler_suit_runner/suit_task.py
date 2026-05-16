@@ -1280,7 +1280,7 @@ class SuitTask:
                 "--common-threshold",
                 str(self.config.common_threshold),
             ]
-        if type_id in {"toolchain", "toolchain_validate", "common_dep", "variant"}:
+        if type_id in {"eval", "toolchain", "toolchain_validate", "common_dep", "variant"}:
             argv = common + [
                 "--flake-ref",
                 self.config.flake_ref,
@@ -1295,7 +1295,11 @@ class SuitTask:
             # ``peers/_paths_*.jsonl`` directly (no in-process watcher
             # available across the framework's fork boundary) and write
             # back its own placement records. The signing public-key
-            # authenticates the ``path-have`` push fan-out.
+            # authenticates the ``path-have`` push fan-out. For the
+            # ``eval`` type (phase0_eval tasks), ``shared_fs`` is
+            # additionally required by :func:`build_worker.main`'s
+            # BroadcastSender init — the eval worker refuses to run
+            # without it and raises NonRecoverableError immediately.
             if self.config.shared_fs is not None:
                 argv += ["--shared-fs", str(self.config.shared_fs)]
             if self.config.secondary_id:
