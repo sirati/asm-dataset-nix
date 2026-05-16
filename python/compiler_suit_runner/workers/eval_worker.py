@@ -757,7 +757,13 @@ def main() -> int:
     )
 
     def handle(task: Task) -> Optional[WorkerOutput]:
-        payload = task.payload if isinstance(task.payload, dict) else {}
+        # task.payload is the header_dict wrapper emitted by discover_items /
+        # _header_to_task_info: {"item_class": ..., "name": ..., "payload": {...}}.
+        # The inner "payload" key holds the actual phase0_eval data (binary, sys,
+        # archs, suffixes, attr, ...).  Extract it before passing to run_eval_task.
+        outer = task.payload if isinstance(task.payload, dict) else {}
+        inner = outer.get("payload")
+        payload = inner if isinstance(inner, dict) else outer
         _handle_log.info(
             "handle: starting phase0_eval task task_id=%r payload_keys=%r",
             getattr(task, "task_id", None), sorted(payload.keys()),
