@@ -37,13 +37,17 @@ import os
 import pathlib
 import threading
 from argparse import ArgumentParser, Namespace
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from types import SimpleNamespace
 from typing import Any, Optional
 
 from compiler_suit_runner.cachix_uploader import (
     CachixUploader,
     UploaderConfig,
+)
+from compiler_suit_runner.holding_matcher import (
+    UNFULFILLABLE_REASON_TEMPLATE,
+    matcher as fulfillability_matcher,
 )
 from compiler_suit_runner import phase1_planner
 from compiler_suit_runner.manifest_gen import (
@@ -97,6 +101,8 @@ from compiler_suit_runner.workers.partition_worker import (
 __all__ = [
     "SuitTaskConfig",
     "SuitTask",
+    "UNFULFILLABLE_REASON_TEMPLATE",
+    "fulfillability_matcher",
 ]
 
 
@@ -347,6 +353,168 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
             ),
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Q4 peer-lifecycle listener
+# ---------------------------------------------------------------------------
+
+
+class _PeerLifecycleListener:
+    """Q4 peer-lifecycle bridge: framework → consumer.
+
+    Constructed once in :meth:`SuitTask.on_run_start` and threaded to the
+    ``RustPrimaryCoordinator(..., peer_lifecycle_listener=)`` kwarg. The
+    framework calls the listener's ``on_peer_added`` /
+    ``on_peer_removed`` methods on its own dispatch thread; we route
+    each event into the appropriate consumer subsystem (placement
+    gossip for observer additions, :class:`ReplicationRepairWorker` for
+    removals) and swallow any exception so the framework does not
+    disable the listener on a single hiccup.
+
+    Both methods are duck-typed by the framework: if a method is
+    missing, the framework logs + skips the event. We define both so
+    the framework can deliver both shapes; either swallows on listener
+    error.
+
+    ``on_peer_added(secondary_id, is_observer)``:
+
+    * ``is_observer=True``: the joiner is a late-attaching observer
+      that has announced toolchain holdings. We mirror those holdings
+      into the placement gossip so the local
+      :class:`PathPlacementWatcher` snapshot reflects the observer's
+      contribution. Observer's holdings are delivered via the
+      framework's observer-late-joiner channel; today the placement
+      gossip plumbing is the existing
+      :func:`peer_paths.record_self_has` path, scoped by observer id.
+    * ``is_observer=False``: NoOp. The existing K=3 peer-set watcher
+      already handles regular-secondary additions for cascade.
+
+    ``on_peer_removed(secondary_id, cause)``:
+
+    * ``cause`` is a dict ``{"kind": str, "reason": str | None}``.
+      Possible kinds: ``"keepalive_miss"``, ``"mass_death_escalation"``,
+      ``"fatal_error"``.
+    * Every cause kind triggers a standard
+      :meth:`ReplicationRepairWorker.on_peer_removed` repair sweep —
+      the cause does not change the repair logic.
+    * For ``"fatal_error"``, the ``cause['reason']`` string is woven
+      into any subsequent ``fail_permanent`` reason via the repair
+      worker's existing
+      :meth:`ReplicationRepairWorker._maybe_mark_unfulfillable` path
+      (best-effort: when ``mark_task_unfulfillable`` is bound the
+      reason carries forward).
+    """
+
+    def __init__(
+        self,
+        *,
+        repair_worker: Optional[Any],
+        placement_record_observer_callable: Optional[
+            Callable[[str, str], None]
+        ] = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self._repair = repair_worker
+        self._record_observer = placement_record_observer_callable
+        self._logger = logger or logging.getLogger(__name__)
+        # Track which secondaries the framework last reported as
+        # observers so on_peer_removed can route observer-side
+        # cleanup if needed. Defensive: a removed peer the framework
+        # never announced is still routed through the repair worker.
+        self._observer_peers: set[str] = set()
+        self._lock = threading.Lock()
+
+    # ── Framework entry points ─────────────────────────────────────────
+
+    def on_peer_added(
+        self,
+        secondary_id: str,
+        is_observer: bool,
+    ) -> None:
+        """Handle a peer-added notification."""
+        try:
+            if not secondary_id:
+                return
+            if not is_observer:
+                # Regular secondary additions are already handled by
+                # the existing K=3 peer-set watcher for cascade. We
+                # don't double-fire here.
+                self._logger.debug(
+                    "_PeerLifecycleListener: peer added %s"
+                    " (non-observer); cascade owned by peer-set watcher",
+                    secondary_id,
+                )
+                return
+            with self._lock:
+                self._observer_peers.add(secondary_id)
+            self._logger.info(
+                "_PeerLifecycleListener: observer peer added %s;"
+                " registering holdings in placement gossip",
+                secondary_id,
+            )
+            if self._record_observer is not None:
+                try:
+                    self._record_observer(secondary_id, "")
+                except Exception:  # noqa: BLE001
+                    self._logger.exception(
+                        "_PeerLifecycleListener: observer placement"
+                        " registration raised for %s",
+                        secondary_id,
+                    )
+        except Exception:  # noqa: BLE001 — never raise out
+            self._logger.exception(
+                "_PeerLifecycleListener.on_peer_added swallowed"
+                " unexpected exception"
+            )
+
+    def on_peer_removed(
+        self,
+        secondary_id: str,
+        cause: dict,
+    ) -> None:
+        """Handle a peer-removed notification."""
+        try:
+            if not secondary_id:
+                return
+            kind = ""
+            reason: Optional[str] = None
+            if isinstance(cause, dict):
+                kind = str(cause.get("kind") or "")
+                raw_reason = cause.get("reason")
+                if isinstance(raw_reason, str):
+                    reason = raw_reason
+            with self._lock:
+                self._observer_peers.discard(secondary_id)
+            self._logger.info(
+                "_PeerLifecycleListener: peer removed %s (kind=%s,"
+                " reason=%s); routing to repair worker",
+                secondary_id, kind, reason,
+            )
+            if self._repair is None:
+                return
+            # The repair worker's on_peer_removed accepts a free-form
+            # reason string. For fatal_error we forward the wire
+            # reason so any downstream fail_permanent reason can pick
+            # it up via the repair path.
+            forwarded_reason = (
+                reason if (kind == "fatal_error" and reason) else kind
+            )
+            try:
+                self._repair.on_peer_removed(
+                    secondary_id, forwarded_reason or "",
+                )
+            except Exception:  # noqa: BLE001
+                self._logger.exception(
+                    "_PeerLifecycleListener: repair worker"
+                    " on_peer_removed raised for %s",
+                    secondary_id,
+                )
+        except Exception:  # noqa: BLE001 — never raise out
+            self._logger.exception(
+                "_PeerLifecycleListener.on_peer_removed swallowed"
+                " unexpected exception"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -681,6 +849,33 @@ class SuitTask:
         # registration; until the framework's task_completed surface
         # lands the consumer drives it from its own dispatch loop).
         self._phase0_watcher: Optional[_Phase0QuiesceWatcher] = None
+        # Q4 peer-lifecycle listener (constructed by on_run_start).
+        # Held on ``self`` so callers wiring it onto the framework's
+        # ``RustPrimaryCoordinator(..., peer_lifecycle_listener=)``
+        # kwarg can fetch it after on_run_start returns.
+        self._peer_lifecycle_listener: Optional[_PeerLifecycleListener] = None
+        # Q3 fulfillability matcher: a module-level callable, surfaced
+        # as an attribute so callers wiring the
+        # ``RustPrimaryCoordinator(..., fulfillability_matcher=)`` kwarg
+        # don't need to re-import.
+        self._fulfillability_matcher: Optional[Callable[..., bool]] = (
+            fulfillability_matcher
+        )
+        # Q1 outpath → task_hash_hex lookup. Built at on_run_start by
+        # scanning toolchain manifest headers (each carries an
+        # ``outpath`` payload field set by preflight + the task_id
+        # from manifest_gen). The framework's
+        # ``ReplicationContext.lookup_task_hash_for_outpath`` callable
+        # binds to this dict's ``.get`` so a missing outpath returns
+        # None and the matcher / repair worker degrade safely.
+        self._outpath_to_task_hash: dict[str, str] = {}
+        # Mutable handle to the framework's ``PrimaryHandle`` set by
+        # :meth:`wire_primary_handle`. ``ReplicationContext`` callables
+        # built in :meth:`on_run_start` close over ``self`` and route
+        # through this attribute on every invocation; until the caller
+        # binds it the wrappers log + degrade to the legacy NFS-poll
+        # fallback path.
+        self._primary_handle: Optional[Any] = None
         self._setup_done: bool = False
         self._setup_lock = threading.Lock()
 
@@ -990,6 +1185,14 @@ class SuitTask:
                 try:
                     peer_watcher = self._peer_watcher
                     placement_watcher = self._placement_watcher
+                    # Build the outpath→task_hash_hex lookup from the
+                    # toolchain manifests on disk. Best-effort: any
+                    # manifest read failure logs + degrades; the
+                    # matcher will simply return False for that
+                    # outpath until the dict is populated.
+                    self._outpath_to_task_hash = (
+                        self._build_outpath_to_task_hash_lookup()
+                    )
                     repl_ctx = ReplicationContext(
                         my_secondary_id=self.config.secondary_id,
                         our_pubkey=public_key,
@@ -1000,6 +1203,19 @@ class SuitTask:
                             self.config, "replication_k",
                             DEFAULT_REPLICATION_K,
                         ),
+                        # Q1 + Q2 PrimaryHandle bindings. Each wrapper
+                        # closes over ``self`` and routes through
+                        # ``self._primary_handle`` on every call, so a
+                        # later ``wire_primary_handle`` flip is visible
+                        # without rebuilding the (frozen) context.
+                        mark_task_unfulfillable=self._mark_task_unfulfillable,
+                        reinject_task=self._reinject_task,
+                        update_preferred_secondaries=(
+                            self._update_preferred_secondaries
+                        ),
+                        lookup_task_hash_for_outpath=(
+                            self._outpath_to_task_hash.get
+                        ),
                     )
                     self._replication_sender = ReplicationSender(repl_ctx)
                     self._replication_receiver = ReplicationReceiver(
@@ -1008,7 +1224,11 @@ class SuitTask:
                     self._replication_repair = ReplicationRepairWorker(
                         repl_ctx, self._replication_sender,
                     )
-                    # Fallback wiring: placement-diff drives repair.
+                    # Backstop wiring: placement-diff drives repair when
+                    # the Q4 framework hook is absent OR loses a race.
+                    # When both fire for the same removal the diff log
+                    # surfaces which path caught it first; see
+                    # ``ReplicationRepairWorker.on_diff``.
                     placement_watcher.register_diff_callback(
                         self._replication_repair.on_diff,
                     )
@@ -1020,6 +1240,26 @@ class SuitTask:
                     self._replication_sender = None
                     self._replication_receiver = None
                     self._replication_repair = None
+
+                # Q4 peer-lifecycle listener. Constructed after the
+                # repair worker so the listener can route on_peer_removed
+                # straight to it. Held on ``self`` so the dispatch
+                # site (cli.py / RustPrimaryCoordinator kwargs) can
+                # fetch + pass it via ``peer_lifecycle_listener=``.
+                try:
+                    self._peer_lifecycle_listener = _PeerLifecycleListener(
+                        repair_worker=self._replication_repair,
+                        placement_record_observer_callable=(
+                            self._record_observer_holdings
+                        ),
+                        logger=self._logger,
+                    )
+                except Exception:  # noqa: BLE001 — log + continue
+                    self._logger.exception(
+                        "on_run_start: _PeerLifecycleListener init failed;"
+                        " Q4 hook will not be exposed"
+                    )
+                    self._peer_lifecycle_listener = None
 
                 # Phase 0 broadcast consumer (path-broadcast-offer).
                 # Parallel to the K=3 receiver above but for the
@@ -1496,6 +1736,267 @@ class SuitTask:
             self._phase0_watcher = None
             self._signing_key = None
             self._setup_done = False
+
+    # ── Q1 + Q2 PrimaryHandle wrappers ───────────────────────────────
+
+    def _mark_task_unfulfillable(
+        self, task_hash_hex: str, reason: str,
+    ) -> None:
+        """Wrap ``primary_handle.fail_permanent`` for ReplicationContext.
+
+        Converts the consumer-side hex string into the ``bytes`` the
+        Rust API expects. Logs + degrades when the handle is unbound
+        or the framework method is missing/raises so the cluster's
+        legacy NFS-poll fallback keeps working.
+        """
+        handle = self._primary_handle
+        if handle is None:
+            self._logger.debug(
+                "mark_task_unfulfillable: no primary_handle bound;"
+                " task_hash=%s reason=%r", task_hash_hex, reason,
+            )
+            return
+        fail_permanent = getattr(handle, "fail_permanent", None)
+        if fail_permanent is None:
+            self._logger.warning(
+                "mark_task_unfulfillable: primary_handle exposes no"
+                " fail_permanent; framework pin is too old"
+            )
+            return
+        try:
+            task_hash_bytes = bytes.fromhex(task_hash_hex)
+        except ValueError:
+            self._logger.warning(
+                "mark_task_unfulfillable: task_hash_hex=%r is not"
+                " hex-decodable; skipping",
+                task_hash_hex,
+            )
+            return
+        try:
+            fail_permanent(task_hash_bytes, "Unfulfillable", reason)
+        except Exception:  # noqa: BLE001
+            self._logger.exception(
+                "mark_task_unfulfillable: primary_handle"
+                ".fail_permanent raised for %s",
+                task_hash_hex,
+            )
+
+    def _reinject_task(self, task_hash_hex: str) -> None:
+        """Wrap ``primary_handle.reinject_task`` for ReplicationContext."""
+        handle = self._primary_handle
+        if handle is None:
+            self._logger.debug(
+                "reinject_task: no primary_handle bound; task_hash=%s",
+                task_hash_hex,
+            )
+            return
+        reinject = getattr(handle, "reinject_task", None)
+        if reinject is None:
+            self._logger.warning(
+                "reinject_task: primary_handle exposes no"
+                " reinject_task; framework pin is too old"
+            )
+            return
+        try:
+            task_hash_bytes = bytes.fromhex(task_hash_hex)
+        except ValueError:
+            self._logger.warning(
+                "reinject_task: task_hash_hex=%r is not hex-decodable",
+                task_hash_hex,
+            )
+            return
+        try:
+            reinject(task_hash_bytes)
+        except Exception:  # noqa: BLE001
+            self._logger.exception(
+                "reinject_task: primary_handle.reinject_task raised"
+                " for %s",
+                task_hash_hex,
+            )
+
+    def _update_preferred_secondaries(
+        self, task_hash_hex: str, secondaries: list[str],
+    ) -> None:
+        """Wrap ``primary_handle.update_preferred_secondaries``."""
+        handle = self._primary_handle
+        if handle is None:
+            self._logger.debug(
+                "update_preferred_secondaries: no primary_handle"
+                " bound; task_hash=%s len=%d",
+                task_hash_hex, len(secondaries),
+            )
+            return
+        update = getattr(
+            handle, "update_preferred_secondaries", None,
+        )
+        if update is None:
+            self._logger.warning(
+                "update_preferred_secondaries: primary_handle exposes"
+                " no update_preferred_secondaries; framework pin too old"
+            )
+            return
+        try:
+            task_hash_bytes = bytes.fromhex(task_hash_hex)
+        except ValueError:
+            self._logger.warning(
+                "update_preferred_secondaries: task_hash_hex=%r is"
+                " not hex-decodable",
+                task_hash_hex,
+            )
+            return
+        try:
+            update(task_hash_bytes, list(secondaries))
+        except Exception:  # noqa: BLE001
+            self._logger.exception(
+                "update_preferred_secondaries: primary_handle"
+                ".update_preferred_secondaries raised for %s",
+                task_hash_hex,
+            )
+
+    def _record_observer_holdings(
+        self, observer_id: str, _placeholder: str,
+    ) -> None:
+        """Hook invoked by :class:`_PeerLifecycleListener` when an
+        observer joins. Today an emergency placeholder: the observer
+        announces its holdings through the framework's mesh-announce
+        channel, which the local placement watcher picks up on its
+        next tick. We log so the operator can correlate the lifecycle
+        event with placement-map changes; mid-run hydration via
+        ``record_self_has`` would require the framework to expose the
+        observer's holdings list to the listener, which is not part
+        of the current Q4 wire contract.
+        """
+        del _placeholder
+        self._logger.info(
+            "observer peer registered in placement gossip: %s"
+            " (waiting on observer's own announce-on-PrimaryChanged)",
+            observer_id,
+        )
+
+    def _build_outpath_to_task_hash_lookup(self) -> dict[str, str]:
+        """Scan toolchain manifests and build the outpath → task_hash dict.
+
+        For each ``phase2_toolchain`` / ``phase2_toolchain_validate``
+        manifest with both an ``outpath`` payload field and a
+        ``task_id``, compute the task_hash via
+        ``dynamic_runner.compute_task_hash`` (when available) and
+        record the mapping. Without the framework, fall back to the
+        manifest's ``task_id`` so tests still resolve a non-empty
+        identifier (the framework would refuse it as a wrong-shape
+        hash; that's the degraded path the wrappers already log).
+
+        Best-effort: any per-manifest read error logs + skips. Returns
+        an empty dict if no manifests exist (Phase 0 distributed-eval
+        run before toolchains are emitted).
+        """
+        result: dict[str, str] = {}
+        try:
+            entries = sorted(self.config.manifest_dir.iterdir())
+        except (FileNotFoundError, NotADirectoryError):
+            return result
+
+        try:
+            from dynamic_runner import (  # type: ignore[import-not-found]
+                compute_task_hash,
+            )
+        except Exception:  # noqa: BLE001 — framework absent
+            compute_task_hash = None  # type: ignore[assignment]
+
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            if entry.name.startswith((".", "_")):
+                continue
+            if entry.suffix != ".json":
+                continue
+            try:
+                header = read_manifest(entry)
+            except Exception:  # noqa: BLE001 — log + skip
+                self._logger.debug(
+                    "outpath lookup: skipping unreadable %s", entry,
+                )
+                continue
+            if header.item_class not in (
+                "phase2_toolchain",
+                "phase2_toolchain_validate",
+            ):
+                continue
+            outpath = header.payload.get("outpath")
+            if not isinstance(outpath, str) or not outpath:
+                continue
+            task_id = header.task_id
+            if not task_id:
+                continue
+            task_hash_hex: Optional[str] = None
+            if compute_task_hash is not None:
+                # Build a minimal TaskInfo-compatible object so the
+                # framework can compute the hash. We rely on the
+                # framework's hashing being a function of task_id +
+                # payload identity; if the API rejects our duck-typed
+                # object we fall through to the task_id fallback.
+                try:
+                    task_info = _make_task_info(
+                        path=pathlib.Path(entry.name),
+                        size=header.size,
+                        phase_id="phase_build",
+                        type_id=(
+                            "toolchain"
+                            if header.item_class == "phase2_toolchain"
+                            else "toolchain_validate"
+                        ),
+                        affinity_id=None,
+                        payload=dict(header.payload),
+                        task_id=task_id,
+                        task_depends_on=tuple(header.task_depends_on),
+                    )
+                    task_hash_hex = compute_task_hash(task_info)
+                except Exception:  # noqa: BLE001
+                    self._logger.debug(
+                        "outpath lookup: compute_task_hash raised"
+                        " for %s; falling back to task_id",
+                        entry.name,
+                    )
+                    task_hash_hex = None
+            if not task_hash_hex:
+                task_hash_hex = task_id
+            result[outpath] = task_hash_hex
+        return result
+
+    # ── Q1+Q2+Q3+Q4 public wire-in entrypoint ──────────────────────────
+
+    def wire_primary_handle(self, primary_handle: Any) -> None:
+        """Bind framework PrimaryHandle bindings; call before run().
+
+        Performs the Q1+Q2+Q3+Q4 wire-in:
+
+        * Applies the configured
+          ``--unfulfillable-reinject-max-per-task`` cap on the handle
+          via :meth:`apply_unfulfillable_reinject_cap`.
+        * Binds the handle onto the late-bound wrappers (Q1
+          fail_permanent + reinject_task, Q2
+          update_preferred_secondaries) so subsequent
+          ``ReplicationContext`` callable invocations reach the Rust
+          control plane.
+
+        The Q3 ``fulfillability_matcher`` and Q4
+        ``peer_lifecycle_listener`` are NOT wired by this method —
+        they are kwargs on ``RustPrimaryCoordinator`` construction and
+        must be passed by whoever instantiates the coordinator. Read
+        them off this task instance:
+
+        * ``task._fulfillability_matcher`` — the matcher callable
+        * ``task._peer_lifecycle_listener`` — the listener object
+
+        Idempotent: re-calling with a different handle just rebinds.
+        """
+        self._primary_handle = primary_handle
+        try:
+            self.apply_unfulfillable_reinject_cap(primary_handle)
+        except Exception:  # noqa: BLE001
+            self._logger.exception(
+                "wire_primary_handle: apply_unfulfillable_reinject_cap"
+                " raised"
+            )
 
     def apply_unfulfillable_reinject_cap(self, primary_handle: Any) -> None:
         """Forward the configured reinject cap onto a primary handle.

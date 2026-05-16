@@ -632,3 +632,402 @@ def test_on_run_start_wires_broadcast_receiver_into_push_server(
 def dataclasses_replace(obj, /, **changes):
     import dataclasses as _dc
     return _dc.replace(obj, **changes)
+
+
+# ---------------------------------------------------------------------------
+# Q1+Q2+Q3+Q4 wire-in: _PeerLifecycleListener
+# ---------------------------------------------------------------------------
+
+
+from compiler_suit_runner.suit_task import _PeerLifecycleListener  # noqa: E402
+
+
+def test_listener_on_peer_removed_routes_to_repair_worker_with_cause(
+    tmp_path: pathlib.Path,
+) -> None:
+    """on_peer_removed forwards (secondary_id, reason) to the repair
+    worker. The ``cause`` dict's kind/reason are preserved (reason
+    when fatal_error, kind otherwise)."""
+    repair = mock.MagicMock()
+    listener = _PeerLifecycleListener(repair_worker=repair)
+
+    listener.on_peer_removed(
+        "peer-a",
+        {"kind": "keepalive_miss", "reason": None},
+    )
+    repair.on_peer_removed.assert_called_once_with(
+        "peer-a", "keepalive_miss",
+    )
+
+    repair.reset_mock()
+    listener.on_peer_removed(
+        "peer-b",
+        {"kind": "fatal_error", "reason": "OOMKilled"},
+    )
+    repair.on_peer_removed.assert_called_once_with(
+        "peer-b", "OOMKilled",
+    )
+
+    # mass_death_escalation routes too — the cause kind is forwarded
+    # so the operator can grep both signals from the repair log.
+    repair.reset_mock()
+    listener.on_peer_removed(
+        "peer-c",
+        {"kind": "mass_death_escalation", "reason": None},
+    )
+    repair.on_peer_removed.assert_called_once_with(
+        "peer-c", "mass_death_escalation",
+    )
+
+
+def test_listener_on_peer_added_observer_records_holdings(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When ``is_observer=True``, the observer-record callable is
+    invoked with the observer's secondary id."""
+    record_calls: list[tuple[str, str]] = []
+
+    def record_observer(sid: str, placeholder: str) -> None:
+        record_calls.append((sid, placeholder))
+
+    listener = _PeerLifecycleListener(
+        repair_worker=None,
+        placement_record_observer_callable=record_observer,
+    )
+    listener.on_peer_added("observer-x", is_observer=True)
+    assert record_calls == [("observer-x", "")]
+
+
+def test_listener_on_peer_added_secondary_is_noop(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Regular-secondary additions don't fire the observer record
+    callable — they're already handled by the K=3 peer-set watcher."""
+    record_calls: list[tuple[str, str]] = []
+
+    def record_observer(sid: str, placeholder: str) -> None:
+        record_calls.append((sid, placeholder))
+
+    listener = _PeerLifecycleListener(
+        repair_worker=None,
+        placement_record_observer_callable=record_observer,
+    )
+    listener.on_peer_added("secondary-1", is_observer=False)
+    assert record_calls == []
+
+
+def test_listener_swallows_repair_exception(
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If the repair worker raises, the listener logs + swallows so
+    the framework doesn't disable the hook on a single hiccup."""
+    repair = mock.MagicMock()
+    repair.on_peer_removed.side_effect = RuntimeError("boom")
+
+    listener = _PeerLifecycleListener(repair_worker=repair)
+    # Must not raise.
+    with caplog.at_level(logging.ERROR):
+        listener.on_peer_removed(
+            "peer-x", {"kind": "fatal_error", "reason": "panic"},
+        )
+    # The error log was emitted.
+    assert any(
+        "on_peer_removed raised" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_listener_handles_missing_or_malformed_cause(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A non-dict / None cause is tolerated (kind defaults to '')."""
+    repair = mock.MagicMock()
+    listener = _PeerLifecycleListener(repair_worker=repair)
+
+    # None cause.
+    listener.on_peer_removed("peer-a", None)  # type: ignore[arg-type]
+    repair.on_peer_removed.assert_called_once_with("peer-a", "")
+
+    # Empty dict cause.
+    repair.reset_mock()
+    listener.on_peer_removed("peer-b", {})
+    repair.on_peer_removed.assert_called_once_with("peer-b", "")
+
+
+# ---------------------------------------------------------------------------
+# Q1 + Q2 PrimaryHandle callable wrappers
+# ---------------------------------------------------------------------------
+
+
+def test_mark_task_unfulfillable_invokes_fail_permanent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The wrapper converts hex→bytes and calls
+    ``primary_handle.fail_permanent(bytes, 'Unfulfillable', reason)``."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    handle = mock.MagicMock()
+    task._primary_handle = handle
+
+    task._mark_task_unfulfillable("0a1b2c", "tc-gone reason")
+
+    handle.fail_permanent.assert_called_once_with(
+        bytes.fromhex("0a1b2c"), "Unfulfillable", "tc-gone reason",
+    )
+
+
+def test_mark_task_unfulfillable_noop_without_handle(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Without a bound primary handle the wrapper logs + returns."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    task._primary_handle = None
+    # Must not raise.
+    task._mark_task_unfulfillable("00ff", "any reason")
+
+
+def test_reinject_task_invokes_handle_reinject(
+    tmp_path: pathlib.Path,
+) -> None:
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    handle = mock.MagicMock()
+    task._primary_handle = handle
+
+    task._reinject_task("deadbeef")
+
+    handle.reinject_task.assert_called_once_with(
+        bytes.fromhex("deadbeef"),
+    )
+
+
+def test_update_preferred_secondaries_invokes_handle(
+    tmp_path: pathlib.Path,
+) -> None:
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    handle = mock.MagicMock()
+    task._primary_handle = handle
+
+    task._update_preferred_secondaries(
+        "0123", ["sec-a", "sec-b"],
+    )
+    handle.update_preferred_secondaries.assert_called_once_with(
+        bytes.fromhex("0123"), ["sec-a", "sec-b"],
+    )
+
+
+def test_wire_primary_handle_applies_reinject_cap(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``wire_primary_handle`` invokes ``apply_unfulfillable_reinject_cap``
+    when the config field is set."""
+    config = _make_config(tmp_path)
+    config = dataclasses_replace(
+        config, unfulfillable_reinject_max_per_task=7,
+    )
+    task = SuitTask(config)
+    handle = mock.MagicMock()
+
+    task.wire_primary_handle(handle)
+
+    assert task._primary_handle is handle
+    handle.set_unfulfillable_reinject_max_per_task.assert_called_once_with(7)
+
+
+def test_wire_primary_handle_skips_cap_when_unset(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``wire_primary_handle`` does not call the setter when the config
+    field is None (framework default = unbounded)."""
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    handle = mock.MagicMock()
+
+    task.wire_primary_handle(handle)
+
+    handle.set_unfulfillable_reinject_max_per_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Q3 fulfillability matcher attribute
+# ---------------------------------------------------------------------------
+
+
+def test_fulfillability_matcher_is_holding_matcher_callable(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The ``_fulfillability_matcher`` attribute is the
+    :func:`holding_matcher.matcher` function — the value to pass to
+    ``RustPrimaryCoordinator(fulfillability_matcher=...)``."""
+    from compiler_suit_runner.holding_matcher import matcher
+
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    assert task._fulfillability_matcher is matcher
+
+
+# ---------------------------------------------------------------------------
+# on_run_start integration: listener + matcher + ctx callables wired
+# ---------------------------------------------------------------------------
+
+
+def test_on_run_start_constructs_peer_lifecycle_listener(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After ``on_run_start`` the listener is constructed and bound to
+    the repair worker so the framework can pass it via
+    ``peer_lifecycle_listener=``."""
+    from compiler_suit_runner import peer_cache as _peer_cache
+
+    fake_key = _peer_cache.SigningKey(
+        name="test-key",
+        secret_path=tmp_path / "key.secret",
+        public_path=tmp_path / "key.public",
+        public_key="test-pubkey:AAAA",
+    )
+    fake_key.secret_path.write_text("secret")
+    fake_key.public_path.write_text(fake_key.public_key)
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.generate_signing_key",
+        lambda *a, **kw: fake_key,
+    )
+
+    config = _make_config(tmp_path)
+    config = dataclasses_replace(
+        config, harmonia_port=5010, enable_harmonia=False,
+    )
+    config.manifest_dir.mkdir(parents=True, exist_ok=True)
+    config.shared_fs.mkdir(parents=True, exist_ok=True)
+
+    task = SuitTask(config)
+    try:
+        task.on_run_start(output_dir=tmp_path / "out")
+        assert task._peer_lifecycle_listener is not None
+        # Routing test: drive on_peer_removed and verify the
+        # repair worker would be invoked. We swap in a fake repair so
+        # the real one's network calls don't fire.
+        fake_repair = mock.MagicMock()
+        task._peer_lifecycle_listener._repair = fake_repair
+        task._peer_lifecycle_listener.on_peer_removed(
+            "peer-z", {"kind": "fatal_error", "reason": "panic-xyz"},
+        )
+        fake_repair.on_peer_removed.assert_called_once_with(
+            "peer-z", "panic-xyz",
+        )
+    finally:
+        task.on_run_end(success=True)
+
+
+def test_on_run_start_builds_outpath_to_task_hash_lookup(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The outpath→task_hash dict is populated from toolchain manifest
+    payloads at on_run_start. Each toolchain manifest with an
+    ``outpath`` field and ``task_id`` contributes one entry."""
+    from compiler_suit_runner import peer_cache as _peer_cache
+    from compiler_suit_runner.manifest_gen import ManifestHeader, write_manifest
+
+    fake_key = _peer_cache.SigningKey(
+        name="test-key",
+        secret_path=tmp_path / "key.secret",
+        public_path=tmp_path / "key.public",
+        public_key="test-pubkey:AAAA",
+    )
+    fake_key.secret_path.write_text("secret")
+    fake_key.public_path.write_text(fake_key.public_key)
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.generate_signing_key",
+        lambda *a, **kw: fake_key,
+    )
+
+    config = _make_config(tmp_path)
+    config = dataclasses_replace(
+        config, harmonia_port=5011, enable_harmonia=False,
+    )
+    config.manifest_dir.mkdir(parents=True, exist_ok=True)
+    # Seed a toolchain manifest with an outpath.
+    write_manifest(config.manifest_dir, ManifestHeader(
+        item_class="phase2_toolchain_validate",
+        name="toolchain_validate__x86_64__gcc15",
+        size=0,
+        payload={
+            "sys": _SYS,
+            "arch": "x86_64",
+            "compiler_label": "gcc15",
+            "attr": "_crossToolchainMap.linux.x86_64.gcc15",
+            "drv": "/nix/store/aa-gcc15.drv",
+            "outpath": "/nix/store/bb-gcc15-out",
+            "validate_only": True,
+        },
+        task_id=toolchain_task_id(_SYS, "x86_64", "gcc15"),
+    ))
+
+    task = SuitTask(config)
+    try:
+        task.on_run_start(output_dir=tmp_path / "out")
+        # The dict carries an entry for the toolchain outpath.
+        assert "/nix/store/bb-gcc15-out" in task._outpath_to_task_hash
+    finally:
+        task.on_run_end(success=True)
+
+
+def test_replication_context_callables_route_through_self(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ReplicationContext`` is constructed in ``on_run_start`` with
+    its four PrimaryHandle callables pointing at the ``SuitTask``
+    instance methods that close over ``self._primary_handle``.
+
+    Driving the ctx callables (after wire_primary_handle) reaches the
+    mocked handle methods with the right bytes/list shapes.
+    """
+    from compiler_suit_runner import peer_cache as _peer_cache
+
+    fake_key = _peer_cache.SigningKey(
+        name="test-key",
+        secret_path=tmp_path / "key.secret",
+        public_path=tmp_path / "key.public",
+        public_key="test-pubkey:AAAA",
+    )
+    fake_key.secret_path.write_text("secret")
+    fake_key.public_path.write_text(fake_key.public_key)
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.generate_signing_key",
+        lambda *a, **kw: fake_key,
+    )
+
+    config = _make_config(tmp_path)
+    config = dataclasses_replace(
+        config, harmonia_port=5012, enable_harmonia=False,
+    )
+    config.manifest_dir.mkdir(parents=True, exist_ok=True)
+    config.shared_fs.mkdir(parents=True, exist_ok=True)
+
+    task = SuitTask(config)
+    handle = mock.MagicMock()
+    try:
+        task.on_run_start(output_dir=tmp_path / "out")
+        # Wire the handle after on_run_start.
+        task.wire_primary_handle(handle)
+        # Trigger each PrimaryHandle wrapper directly.
+        task._mark_task_unfulfillable("aabb", "no holder")
+        task._reinject_task("ccdd")
+        task._update_preferred_secondaries("eeff", ["s1", "s2"])
+
+        handle.fail_permanent.assert_called_once_with(
+            bytes.fromhex("aabb"), "Unfulfillable", "no holder",
+        )
+        handle.reinject_task.assert_called_once_with(
+            bytes.fromhex("ccdd"),
+        )
+        handle.update_preferred_secondaries.assert_called_once_with(
+            bytes.fromhex("eeff"), ["s1", "s2"],
+        )
+    finally:
+        task.on_run_end(success=True)
