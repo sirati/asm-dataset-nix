@@ -67,6 +67,48 @@ let
     prefix: drv:
     if drv ? targetPrefix then drv else drv // { targetPrefix = prefix; };
 
+  # Generalised cc-wrapper attribute backfill. Modern cc-wrappers always
+  # expose a set of attrs (``targetPrefix``, ``isGNU``, ``isClang``,
+  # ``libc``, ...) that upstream nixpkgs derivations read unconditionally:
+  #
+  #   - openssl/default.nix:        stdenv.cc.isGNU
+  #   - tinycc/package.nix:         stdenv.cc.libc
+  #   - busybox/zlib/gawk:          stdenv.cc.targetPrefix
+  #
+  # Very old wrappers (15.09 / 18.03) and the raw-binary clang3.4/3.5
+  # path (where ``extractClangCC`` returns ``llvmPkg.clang`` itself, not
+  # a wrapper) miss one or more of these. ``ensureCcAttrs`` overlays
+  # only the missing ones with the caller-supplied defaults; present
+  # attrs pass through unchanged (idempotent).
+  #
+  # ``defaults`` is an attrset of ``{ attrName = defaultValue; ... }``;
+  # the same shape as ``//`` but applied per-attr with a presence check.
+  ensureCcAttrs =
+    defaults: drv:
+    let
+      missing = lib.filterAttrs (n: _: !(drv ? ${n})) defaults;
+    in
+    drv // missing;
+
+  # Per-family defaults for the cc-wrapper backfills. ``targetPrefix``
+  # varies between native ("") and cross ("<triple>-"), so it's
+  # supplied separately by callers.
+  #
+  # ``libc`` defaults to the target pkgs' stdenv.cc.libc — that's the
+  # glibc (or musl) the wrapper effectively links against once it's
+  # plugged into the target stdenv via ``overrideCC``. ``isGNU``/
+  # ``isClang`` are constants per family.
+  gccCcDefaults = targetPkgs: {
+    isGNU = true;
+    isClang = false;
+    libc = targetPkgs.stdenv.cc.libc;
+  };
+  clangCcDefaults = targetPkgs: {
+    isGNU = false;
+    isClang = true;
+    libc = targetPkgs.stdenv.cc.libc;
+  };
+
   # Extract version string from a Clang package across different nixpkgs eras.
   # Modern: .clang.version exists
   # Old (3.7+): .clang.cc.name is "clang-X.Y.Z", extract version from name
@@ -329,8 +371,13 @@ let
             # Native: just use the old compiler directly. Backfill
             # ``targetPrefix = ""`` for very-old wrappers (15.09, 18.03)
             # that predate the attribute — upstream nixpkgs derivations
-            # (busybox, zlib, ...) read it unconditionally.
-            targetPkgs.overrideCC targetPkgs.stdenv (ensureTargetPrefix "" cleanGcc)
+            # (busybox, zlib, ...) read it unconditionally. ``isGNU``,
+            # ``isClang`` and ``libc`` are already present on gcc4_x
+            # wrappers but we pass them through ``ensureCcAttrs`` for
+            # symmetry (idempotent — no-op when attr already present).
+            targetPkgs.overrideCC targetPkgs.stdenv (
+              ensureCcAttrs (gccCcDefaults targetPkgs // { targetPrefix = ""; }) cleanGcc
+            )
           else if oldPkgs ? pkgsCross then
             # pkgsCross available (22.11+): use buildPackages with depsBuildBuild bootstrap
             let
@@ -401,17 +448,27 @@ let
           targetPkgs: target:
           if target.crossAttr == null && !(target ? crossSystem) then
             # Native: use extractClangCC on the native LLVM package.
-            # Backfill ``targetPrefix = ""`` for very-old clang wrappers
-            # (nixpkgs 15.09 / 18.03 — clang3.4 through clang4) that
-            # predate the attribute; upstream nixpkgs derivations
-            # (gawk, busybox, zlib, ...) read ``stdenv.cc.targetPrefix``
-            # unconditionally and throw ``attribute 'targetPrefix' missing``
-            # at eval time otherwise. Mirrors the gcc4_x backfill in the
-            # native branch of ``mkOldGccEntry`` above.
+            # Backfill missing cc-wrapper attrs for very-old clang
+            # wrappers (nixpkgs 15.09 / 18.03 — clang3.4 through clang4).
+            # Their wrappers predate or omit attrs that upstream nixpkgs
+            # derivations read unconditionally:
+            #   - targetPrefix  (gawk, busybox, zlib)
+            #   - isGNU         (openssl)
+            #   - libc          (tinycc)
+            # The very-old clang3.4/3.5 path returns ``llvmPkg.clang``
+            # itself (no real wrapper) so all three are missing.
+            # Wrappers that already expose the attr keep their value
+            # unchanged — ``ensureCcAttrs`` only fills holes. (The
+            # 15.09 clang3.6 wrapper inherits ``isGNU=true`` from the
+            # gcc-based stdenv; that's mildly inaccurate but only
+            # gates ``separateDebugInfo`` downstream and doesn't fail
+            # eval, so we leave it.)
             let
               cc = extractClangCC oldPkgs.${attr};
             in
-            targetPkgs.overrideCC targetPkgs.stdenv (ensureTargetPrefix "" cc)
+            targetPkgs.overrideCC targetPkgs.stdenv (
+              ensureCcAttrs (clangCcDefaults targetPkgs // { targetPrefix = ""; }) cc
+            )
           else if oldPkgs ? pkgsCross then
             # pkgsCross available (22.11+): get cross-clang from buildPackages.
             # Use .clang directly (not extractClangCC) because
@@ -438,11 +495,15 @@ let
                       postFixup = (old.postFixup or "") + abiPostFixup abiFlags;
                     });
               in
-              # Defensive ``targetPrefix`` backfill: 22.11+ cross wrappers
-              # generally expose it, but old-LLVM cross attrs vary across
-              # nixpkgs eras. Idempotent — no-op when already present.
-              targetPkgs.overrideCC targetPkgs.stdenv
-                (ensureTargetPrefix "${target.crossConfig}-" crossClang)
+              # Defensive backfill: 22.11+ cross wrappers generally
+              # expose all cc-attrs, but old-LLVM cross attrs vary
+              # across nixpkgs eras. Idempotent — no-op when present.
+              targetPkgs.overrideCC targetPkgs.stdenv (
+                ensureCcAttrs
+                  (clangCcDefaults targetPkgs
+                   // { targetPrefix = "${target.crossConfig}-"; })
+                  crossClang
+              )
           else
             # Pre-pkgsCross (18.03, 15.09): hybrid wrapper approach.
             # The old nixpkgs' cross infrastructure has broken C++ stdlib
