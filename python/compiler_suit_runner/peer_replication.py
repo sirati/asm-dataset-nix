@@ -858,7 +858,13 @@ class ReplicationRepairWorker:
 
         * **Repair** (``diff.removed``): for any outpath where we are
           still a holder AND total holders dropped below K, trigger
-          a repair push_attempt.
+          a repair push_attempt. With the Q4 ``peer_lifecycle_listener``
+          wired, the framework's keepalive-miss / fatal-error hook
+          races this diff signal — the INFO log line below lets the
+          operator see whether the framework hook or the diff polling
+          caught the death first. The diff path stays registered as a
+          backstop for clusters where the framework hook hasn't been
+          delivered yet (and for cascade-on-addition; see below).
         * **Cascade** (``diff.added``): for any outpath where WE just
           became a new holder AND the item_class (looked up via the
           metadata callable) is ``ITEM_CLASS_TOOLCHAIN``, trigger a
@@ -881,9 +887,12 @@ class ReplicationRepairWorker:
                     continue
                 outpaths_to_repair.append(outpath)
             if outpaths_to_repair:
+                # INFO so the operator can correlate diff vs. Q4
+                # framework hook for the same removal.
                 logger.info(
-                    "ReplicationRepairWorker: placement diff "
-                    "(degraded-mode signal); repairing %d outpaths",
+                    "ReplicationRepairWorker: diff-callback caught "
+                    "removal (backstop signal, races Q4 framework "
+                    "hook); repairing %d outpaths",
                     len(outpaths_to_repair),
                 )
             self._repair_for_outpaths(outpaths_to_repair)
