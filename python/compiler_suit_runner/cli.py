@@ -1192,6 +1192,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
             log.exception("distributed-eval manifest emission failed")
             return 1
 
+        # Expose the toolchain outpaths to the submitter-peer placement
+        # block below. Without this, ``partition_drv_outpaths`` stays
+        # None and the submitter never populates the gossip file, so
+        # secondaries see no peer for ``toolchain_validate`` fetches.
+        partition_drv_outpaths = dist_eval_drv_outpaths
+
         # Build a synthetic PreflightResult so the rest of cmd_submit
         # (SuitTaskConfig construction, submitter placement block,
         # cache.store) operates on a non-None ``pre``. Variants are
