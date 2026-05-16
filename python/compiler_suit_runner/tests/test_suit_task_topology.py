@@ -47,20 +47,37 @@ def _phases(task: SuitTask):
     return {p.phase_id: p for p in task.get_phases()}
 
 
-def test_get_phases_returns_single_build_phase(tmp_path: pathlib.Path) -> None:
-    """All build-shaped tasks (toolchain, common_dep, variant) live in
-    one ``phase_build``; nix's daemon serializes shared deps via its
-    build lock so an explicit phase 2 → phase 3 boundary isn't needed.
-    Phase 1a (partition) + 1b (merge) run inline on the primary."""
+def test_get_phases_returns_phase0_and_build(tmp_path: pathlib.Path) -> None:
+    """Two phases are declared: ``phase0`` (distributed eval) and
+    ``phase_build`` (all build-shaped tasks). ``phase_build`` depends
+    on ``phase0`` via the framework dependency edge so the eval flood
+    completes before any toolchain/variant build dispatches. Phase 1a
+    (partition) + 1b (merge) still run inline on the primary."""
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    assert set(phases.keys()) == {"phase_build"}
+    assert set(phases.keys()) == {"phase0", "phase_build"}
 
 
-def test_phase_build_has_no_dependencies(tmp_path: pathlib.Path) -> None:
+def test_phase_build_depends_on_phase0(tmp_path: pathlib.Path) -> None:
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    assert phases["phase_build"].depends_on == ()
+    assert phases["phase_build"].depends_on == ("phase0",)
+    assert phases["phase0"].depends_on == ()
+
+
+def test_phase0_carries_eval_task_type(tmp_path: pathlib.Path) -> None:
+    """``phase0`` declares a single ``eval`` task type routed to
+    ``compiler_suit_runner.workers.eval_worker`` (the Phase 0
+    distributed-eval worker)."""
+    task = SuitTask(_make_config(tmp_path))
+    phases = _phases(task)
+    types = phases["phase0"].types
+    assert len(types) == 1
+    assert types[0].type_id == "eval"
+    assert (
+        types[0].worker_module
+        == "compiler_suit_runner.workers.eval_worker"
+    )
 
 
 def test_phase1a_phase1b_no_longer_dispatched(tmp_path: pathlib.Path) -> None:
