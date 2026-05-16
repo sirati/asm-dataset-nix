@@ -731,7 +731,7 @@ def enumerate_variants(
                     continue
                 if not isinstance(suffix_attrs, dict):
                     continue
-                kept: list[str] = []
+                kept_map: dict[str, dict] = {}
                 for suffix, meta_entry in sorted(suffix_attrs.items()):
                     if not isinstance(meta_entry, dict):
                         continue
@@ -741,14 +741,31 @@ def enumerate_variants(
                         continue
                     if is_known_bad_combo(meta_entry):
                         continue
-                    kept.append(suffix)
-                if kept:
-                    per_arch[arch] = kept
+                    kept_map[suffix] = meta_entry
+                # Pre-apply sampling here so manifests stay small enough
+                # to transit the framework's ClusterMutation wire (a 8 MB
+                # suffix list for 150 k+ variants causes the SSH tunnel
+                # to reset before InitialAssignment arrives). The eval
+                # worker then uses the already-sampled list directly
+                # (variant_sample=None in payload → no re-sampling step).
+                if sample_size > 0 and sample_seed and kept_map:
+                    kept_map = _sample_suffix_attrs(
+                        kept_map,
+                        arch=arch,
+                        sample_size=sample_size,
+                        seed=sample_seed,
+                    )
+                if kept_map:
+                    per_arch[arch] = sorted(kept_map.keys())
             if per_arch:
                 out[pkg] = {
                     "archs": sorted(per_arch.keys()),
                     "suffixes_by_arch": per_arch,
-                    "sample_size": sample_size,
+                    # Signal to eval_worker that no re-sampling is needed:
+                    # suffixes are already the final sampled subset.
+                    # eval_worker skips the _meta lookup + re-sampling
+                    # step when sample_size is falsy.
+                    "sample_size": 0,
                     "sample_seed": sample_seed,
                     "tier": _tier_from_pkg(pkg),
                 }
