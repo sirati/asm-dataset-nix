@@ -25,3 +25,7 @@ __pycache__/
 
 # Local work-in-progress notes; not part of the dataset.
 transformer_spec.md
+
+# template_graph probe caches (auto-generated, large, easily regenerated).
+template_graph/tests/fixtures/.probe_cache*.json
+template_graph/tests/fixtures/.probe_cache*.json.backup*

@@ -1,0 +1,239 @@
+# probe_remaining_binaries.py summary
+# 217 binaries probed (excluding the 28 already covered).
+# opt level: O0
+# 63456 pass / 3431 fail
+
+# === per-binary (sorted by pass count) ===
+angelscript                     pass= 317  fail=   0
+argon2                          pass= 317  fail=   0
+aubio                           pass= 317  fail=   0
+avro-c                          pass= 317  fail=   0
+bc                              pass= 317  fail=   0
+bearssl                         pass= 317  fail=   0
+blst                            pass= 317  fail=   0
+botan3                          pass= 317  fail=   0
+brotli                          pass= 317  fail=   0
+bzip3                           pass= 317  fail=   0
+c-ares                          pass= 317  fail=   0
+cmark                           pass= 317  fail=   0
+cmark-gfm                       pass= 317  fail=   0
+cmph                            pass= 317  fail=   0
+codec2                          pass= 317  fail=   0
+czmq                            pass= 317  fail=   0
+dav1d                           pass= 317  fail=   0
+diffutils                       pass= 317  fail=   0
+discount                        pass= 317  fail=   0
+draco                           pass= 317  fail=   0
+ed                              pass= 317  fail=   0
+elfutils                        pass= 317  fail=   0
+expat                           pass= 317  fail=   0
+fftw                            pass= 317  fail=   0
+file                            pass= 317  fail=   0
+findutils                       pass= 317  fail=   0
+flac                            pass= 317  fail=   0
+flatbuffers                     pass= 317  fail=   0
+flatcc                          pass= 317  fail=   0
+flite                           pass= 317  fail=   0
+geos                            pass= 317  fail=   0
+gf2x                            pass= 317  fail=   0
+giflib                          pass= 317  fail=   0
+ginac                           pass= 317  fail=   0
+glpk                            pass= 317  fail=   0
+gnugrep                         pass= 317  fail=   0
+gnused                          pass= 317  fail=   0
+gnutls                          pass= 317  fail=   0
+gperf                           pass= 317  fail=   0
+gperftools                      pass= 317  fail=   0
+gsl                             pass= 317  fail=   0
+gumbo                           pass= 317  fail=   0
+h2o                             pass= 317  fail=   0
+hunspell                        pass= 317  fail=   0
+hwloc                           pass= 317  fail=   0
+imlib2                          pass= 317  fail=   0
+inih                            pass= 317  fail=   0
+iniparser                       pass= 317  fail=   0
+janet                           pass= 317  fail=   0
+jerryscript                     pass= 317  fail=   0
+jpegoptim                       pass= 317  fail=   0
+json_c                          pass= 317  fail=   0
+keystone                        pass= 317  fail=   0
+knot-dns                        pass= 317  fail=   0
+ladspa-sdk                      pass= 317  fail=   0
+lapack-reference                pass= 317  fail=   0
+lcms2                           pass= 317  fail=   0
+ldns                            pass= 317  fail=   0
+less                            pass= 317  fail=   0
+lexbor                          pass= 317  fail=   0
+libaio                          pass= 317  fail=   0
+libatomic_ops                   pass= 317  fail=   0
+libb2                           pass= 317  fail=   0
+libb64                          pass= 317  fail=   0
+libblake3                       pass= 317  fail=   0
+libcbor                         pass= 317  fail=   0
+libcoap                         pass= 317  fail=   0
+libconfig                       pass= 317  fail=   0
+libconfuse                      pass= 317  fail=   0
+libcork                         pass= 317  fail=   0
+libcorrect                      pass= 317  fail=   0
+libdatrie                       pass= 317  fail=   0
+libdmtx                         pass= 317  fail=   0
+libdnet                         pass= 317  fail=   0
+libidn                          pass= 317  fail=   0
+libjxl                          pass= 317  fail=   0
+liblzf                          pass= 317  fail=   0
+libmaxminddb                    pass= 317  fail=   0
+libmodbus                       pass= 317  fail=   0
+libmpack                        pass= 317  fail=   0
+libnids                         pass= 317  fail=   0
+libogg                          pass= 317  fail=   0
+libopus                         pass= 317  fail=   0
+liboqs                          pass= 317  fail=   0
+libsamplerate                   pass= 317  fail=   0
+libseccomp                      pass= 317  fail=   0
+libsndfile                      pass= 317  fail=   0
+libssh2                         pass= 317  fail=   0
+libstemmer                      pass= 317  fail=   0
+libtiff                         pass= 317  fail=   0
+libtomcrypt                     pass= 317  fail=   0
+libtommath                      pass= 317  fail=   0
+liburcu                         pass= 317  fail=   0
+liburing                        pass= 317  fail=   0
+libvorbis                       pass= 317  fail=   0
+libwebp                         pass= 317  fail=   0
+libxml2                         pass= 317  fail=   0
+libyaml                         pass= 317  fail=   0
+lilv                            pass= 317  fail=   0
+lmdb                            pass= 317  fail=   0
+lua                             pass= 317  fail=   0
+lv2                             pass= 317  fail=   0
+lz4                             pass= 317  fail=   0
+lzfse                           pass= 317  fail=   0
+lzham                           pass= 317  fail=   0
+lzip                            pass= 317  fail=   0
+lzo                             pass= 317  fail=   0
+lzop                            pass= 317  fail=   0
+mawk                            pass= 317  fail=   0
+md4c                            pass= 317  fail=   0
+meshoptimizer                   pass= 317  fail=   0
+miniz                           pass= 317  fail=   0
+monocypher                      pass= 317  fail=   0
+mosquitto                       pass= 317  fail=   0
+mozjpeg                         pass= 317  fail=   0
+mpg123                          pass= 317  fail=   0
+mpir                            pass= 317  fail=   0
+mruby                           pass= 317  fail=   0
+mujs                            pass= 317  fail=   0
+multimarkdown                   pass= 317  fail=   0
+nano                            pass= 317  fail=   0
+nanoflann                       pass= 317  fail=   0
+nanomsg                         pass= 317  fail=   0
+nauty                           pass= 317  fail=   0
+neon                            pass= 317  fail=   0
+nettle                          pass= 317  fail=   0
+nghttp3                         pass= 317  fail=   0
+nlopt                           pass= 317  fail=   0
+nng                             pass= 317  fail=   0
+oniguruma                       pass= 317  fail=   0
+openjpeg                        pass= 317  fail=   0
+optipng                         pass= 317  fail=   0
+patch                           pass= 317  fail=   0
+pbc                             pass= 317  fail=   0
+pcre2                           pass= 317  fail=   0
+pffft                           pass= 317  fail=   0
+picoc                           pass= 317  fail=   0
+pigz                            pass= 317  fail=   0
+proj                            pass= 317  fail=   0
+protobufc                       pass= 317  fail=   0
+pugixml                         pass= 317  fail=   0
+quickjs-ng                      pass= 317  fail=   0
+rapidjson                       pass= 317  fail=   0
+rapidxml                        pass= 317  fail=   0
+rapidyaml                       pass= 317  fail=   0
+re2                             pass= 317  fail=   0
+redis                           pass= 317  fail=   0
+rhash                           pass= 317  fail=   0
+rubberband                      pass= 317  fail=   0
+s2geometry                      pass= 317  fail=   0
+s2n-tls                         pass= 317  fail=   0
+secp256k1                       pass= 317  fail=   0
+serd                            pass= 317  fail=   0
+shapelib                        pass= 317  fail=   0
+simdjson                        pass= 317  fail=   0
+snappy                          pass= 317  fail=   0
+sord                            pass= 317  fail=   0
+soundtouch                      pass= 317  fail=   0
+sox                             pass= 317  fail=   0
+soxr                            pass= 317  fail=   0
+speex                           pass= 317  fail=   0
+sqlite                          pass= 317  fail=   0
+suitesparse-graphblas           pass= 317  fail=   0
+tinyscheme                      pass= 317  fail=   0
+tinyxml-2                       pass= 317  fail=   0
+tippecanoe                      pass= 317  fail=   0
+tomlc99                         pass= 317  fail=   0
+tomlplusplus                    pass= 317  fail=   0
+tre                             pass= 317  fail=   0
+unicorn                         pass= 317  fail=   0
+uriparser                       pass= 317  fail=   0
+utf8proc                        pass= 317  fail=   0
+wavpack                         pass= 317  fail=   0
+which                           pass= 317  fail=   0
+x264                            pass= 317  fail=   0
+x265                            pass= 317  fail=   0
+xxhash                          pass= 317  fail=   0
+xz                              pass= 317  fail=   0
+yyjson                          pass= 317  fail=   0
+zeromq                          pass= 317  fail=   0
+zlib-ng                         pass= 317  fail=   0
+zopfli                          pass= 317  fail=   0
+zpaq                            pass= 317  fail=   0
+zstd                            pass= 317  fail=   0
+zydis                           pass= 317  fail=   0
+libwebsockets                   pass= 316  fail=   1
+netpbm                          pass= 311  fail=   6
+kissfft                         pass= 310  fail=   7
+xed                             pass= 280  fail=  37
+avro-cpp                        pass= 277  fail=  40
+cgal                            pass= 277  fail=  40
+libimagequant                   pass= 277  fail=  40
+libtins                         pass= 277  fail=  40
+msgpack-cxx                     pass= 277  fail=  40
+vectorscan                      pass= 277  fail=  40
+vips                            pass= 277  fail=  40
+openh264                        pass= 236  fail=  81
+armadillo                       pass= 218  fail=  99
+flint                           pass= 218  fail=  99
+igraph                          pass= 218  fail=  99
+libgcrypt                       pass= 161  fail= 156
+talloc                          pass= 161  fail= 156
+bliss                           pass= 119  fail= 198
+ipopt                           pass=  82  fail= 235
+ntl                             pass=  82  fail= 235
+geogram                         pass=  78  fail= 239
+guetzli                         pass=  41  fail= 276
+hyperscan                       pass=  41  fail= 276
+dcraw                           pass=   0  fail= 317
+quickjs                         pass=   0  fail= 317
+wasm3                           pass=   0  fail= 317
+
+# === top error classes ===
+   317  Refusing to evaluate package 'dcraw-variant-9.28.0' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/dc/dcraw/package.nix:43 because it is marked as insecure
+   317  Refusing to evaluate package 'quickjs-variant-2025-09-13-2' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/qu/quickjs/package.nix:94 because it is marked as insecure
+   317  Refusing to evaluate package 'wasm3-variant-0.5.0' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/wa/wasm3/package.nix:33 because it is marked as insecure
+   300  attribute 'isLLVM' missing
+   297  Refusing to evaluate package 'blas-3' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/bl/blas/package.nix:190 because it is not available on the requested hostPlatform:
+   276  Refusing to evaluate package 'guetzli-variant-1.0.1' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/gu/guetzli/package.nix:29 because it is not available on the requested hostPlatf
+   276  Refusing to evaluate package 'hyperscan-variant-5.4.2' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/hy/hyperscan/package.nix:114 because it is not available on the requested host
+   239  Refusing to evaluate package 'geogram-variant-1.9.9' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/ge/geogram/package.nix:92 because it is not available on the requested hostPlatf
+   235  Refusing to evaluate package 'ntl-variant-11.6.0' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/nt/ntl/package.nix:72 because it has problems:
+   200  Refusing to evaluate package 'boost-1.89.0' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/development/libraries/boost/generic.nix:268 because it is not available on the requested hostPlat
+   198  Refusing to evaluate package 'bliss-variant-0.73' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/bl/bliss/package.nix:41 because it is not available on the requested hostPlatform:
+   136  Refusing to evaluate package 'libamplsolver-1.0.1' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/li/libamplsolver/package.nix:61 because it has problems:
+    99  Refusing to evaluate package 'openblas-0.3.32' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/development/libraries/science/math/openblas/default.nix:338 because it is not available on the
+    81  Refusing to evaluate package 'openh264-variant-2.6.0' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/op/openh264/package.nix:57 because it is not available on the requested hostPla
+    40  Refusing to evaluate package 'libimagequant-variant-4.4.1' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/li/libimagequant/package.nix:62 because it is not available on the request
+    40  Refusing to evaluate package 'rav1e-0.8.1' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/ra/rav1e/package.nix:59 because it is not available on the requested hostPlatform:
+    37  Refusing to evaluate package 'xed-variant-2025.12.14' in /nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/xe/xed/package.nix:93 because it has problems:
+    18  attribute 'bintools' missing
+     7  attribute 'version' missing
+     1  attribute 'cc' missing
