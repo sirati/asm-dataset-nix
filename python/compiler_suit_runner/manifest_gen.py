@@ -597,9 +597,8 @@ def emit_phase0_eval_manifests(
         }
 
     This shape is what :func:`compiler_suit_runner.preflight
-    .enumerate_variants` returns when invoked in
-    ``defer_to_phase0=True`` mode (see plan Part B, ``preflight.py``
-    split).
+    .enumerate_variants` returns (per-binary metadata for Phase 0
+    eval-workers; submitter never instantiates variant drvs).
 
     Each emitted header has ``task_depends_on=()`` for now. Once
     Phase -1 toolchain bootstrap tasks exist, this should reference

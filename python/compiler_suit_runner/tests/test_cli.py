@@ -276,7 +276,15 @@ def test_main_clear_cache_without_hash_calls_clear(
 @pytest.fixture
 def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path):
     """Wire up stubs so cmd_submit can run without real nix or the
-    SuitTask side-effects."""
+    SuitTask side-effects.
+
+    cmd_submit now drives the distributed-eval flow:
+    ``enumerate_toolchains_only`` + ``enumerate_variants`` (per-binary
+    metadata) + ``emit_all_manifests``. The legacy preflight composite
+    is no longer wired into cmd_submit; ``preflight_calls`` here counts
+    the distributed-path toolchain enumeration as a proxy for "pre-flight
+    ran" so the existing test contracts remain meaningful.
+    """
 
     state: dict[str, list] = {
         "preflight_calls": [],
@@ -287,35 +295,39 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
         "restore_calls": [],
     }
 
-    pre = PreflightResult(
-        sys_name="x86_64-linux",
-        variants=(),
-        toolchain_specs=(),
-        common_dep_drvs=(),
-        toolchain_drvs=frozenset(),
+    def fake_enumerate_toolchains_only(
+        flake_ref, sys_name, *, archs=None, run_subprocess=None,
+    ):
+        state["preflight_calls"].append((flake_ref, sys_name, None, archs))
+        # Empty toolchain set keeps downstream branches simple.
+        return (), {}
+
+    monkeypatch.setattr(
+        cli_module, "enumerate_toolchains_only", fake_enumerate_toolchains_only,
     )
 
-    def fake_preflight(
-        flake_ref,
-        sys_name,
-        *,
-        packages=None,
-        archs=None,
-        sample_size=0,
-        sample_seed="42",
-        run_subprocess=None,
+    def fake_enumerate_variants(
+        flake_ref, sys_name, *, packages=None, archs=None,
+        sample_size=0, sample_seed="42", run_subprocess=None,
     ):
-        state["preflight_calls"].append((flake_ref, sys_name, packages, archs))
-        return pre
+        del flake_ref, sys_name, packages, archs, sample_size, sample_seed
+        # Empty per-binary metadata; emit_all_manifests handles it.
+        return {}
 
-    monkeypatch.setattr(cli_module, "run_preflight", fake_preflight)
+    monkeypatch.setattr(
+        cli_module, "enumerate_variants", fake_enumerate_variants,
+    )
 
     def fake_emit(
-        *, target_dir, sys_name, pre, num_workers, toolchain_drvs=None,
-        allow_toolchain_build=False, per_variant_inputs=None,
-        drv_outpaths=None,
+        *, target_dir, sys_name, variants, toolchain_specs, common_deps,
+        num_workers, toolchain_drvs=None, allow_toolchain_build=False,
+        per_binary_metadata=None, drv_outpaths=None, stages=None,
+        **_kw,
     ):
-        del allow_toolchain_build, per_variant_inputs, drv_outpaths
+        del (
+            variants, toolchain_specs, common_deps, toolchain_drvs,
+            allow_toolchain_build, per_binary_metadata, drv_outpaths, stages,
+        )
         state["emit_calls"].append((target_dir, sys_name, num_workers))
 
         # Simulate manifest_dir population so cache.store can pack it.
@@ -323,9 +335,7 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
         target_dir.mkdir(parents=True, exist_ok=True)
         (target_dir / "stub.json").write_text("{}")
 
-    monkeypatch.setattr(
-        cli_module, "_emit_manifests_from_preflight", fake_emit
-    )
+    monkeypatch.setattr(cli_module, "emit_all_manifests", fake_emit)
 
     def fake_single_process(config, *, logger=None):
         state["single_process_calls"].append(config)

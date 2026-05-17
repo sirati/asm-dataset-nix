@@ -22,7 +22,6 @@ CLI; SLURM execution defers to dynamic_runner's pipeline.
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import logging
 import os
@@ -48,8 +47,6 @@ from compiler_suit_runner.incremental_cache import (
 )
 from compiler_suit_runner.manifest_gen import emit_all_manifests
 from compiler_suit_runner.partition_local import (
-    PartitionResult,
-    compute_partition_locally,
     eval_drv_outpaths,
 )
 from compiler_suit_runner.preflight import (
@@ -59,8 +56,6 @@ from compiler_suit_runner.preflight import (
     check_toolchains_locally,
     enumerate_toolchains_only,
     enumerate_variants,
-    eval_toolchain_drvs,
-    filter_existing_variants,
     preflight as run_preflight,
 )
 from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
@@ -281,15 +276,9 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help=(
-            "Switch the submitter to the distributed-eval flow. When "
-            "ON: pre-flight runs ``enumerate_toolchains_only`` + "
-            "``enumerate_variants(defer_to_phase0=True)`` and emits "
-            "only ``phase_minus1`` + ``phase0`` manifests; the slow "
-            "per-binary drv-instantiation is deferred to Phase 0 "
-            "eval-workers on secondaries; Phase 1+ is spawned at "
-            "runtime by the primary's quiesce watcher. When OFF "
-            "(default): legacy submit-time enumerate-everything + "
-            "emit-all-phases flow."
+            "No-op: distributed-eval is now the only supported mode. "
+            "The flag is accepted silently for backwards compatibility "
+            "and will be removed in a future release."
         ),
     )
     parser.add_argument(
@@ -715,40 +704,6 @@ def _config_from_args(
     )
 
 
-def _emit_manifests_from_preflight(
-    *,
-    target_dir: pathlib.Path,
-    sys_name: str,
-    pre: PreflightResult,
-    num_workers: int,
-    toolchain_drvs: Optional[dict[tuple[str, str], str]] = None,
-    allow_toolchain_build: bool = False,
-    per_variant_inputs: Optional[dict[str, frozenset[str]]] = None,
-    drv_outpaths: Optional[dict[str, str]] = None,
-):
-    """Bridge :mod:`preflight` output into ``emit_all_manifests``.
-
-    ``per_variant_inputs`` / ``drv_outpaths`` carry the transitive
-    input-drv set + output-path mapping for each variant so the
-    secondary's build_worker can pre-fetch input deps from the
-    placement map before invoking ``nix build``. Both are optional
-    — when absent, variants fall back to nix's native substituter
-    resolution (i.e. the legacy harmonia-federation path).
-    """
-    return emit_all_manifests(
-        target_dir=target_dir,
-        sys_name=sys_name,
-        variants=pre.variants,
-        toolchain_specs=pre.toolchain_specs,
-        common_deps=pre.common_dep_drvs,
-        num_workers=num_workers,
-        toolchain_drvs=toolchain_drvs,
-        allow_toolchain_build=allow_toolchain_build,
-        per_variant_inputs=per_variant_inputs,
-        drv_outpaths=drv_outpaths,
-    )
-
-
 def _restore_manifests_from_archive(
     archive: pathlib.Path, target_dir: pathlib.Path
 ) -> dict[tuple[str, str], str]:
@@ -1018,15 +973,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
         cache_hit = cache.lookup(input_hash)
 
     pre: Optional[PreflightResult] = None
-    # Default-init these so the cache-hit path (which skips preflight,
-    # partition, eval_toolchain_drvs) doesn't hit UnboundLocalError when
-    # downstream code references them: submitter placement broadcast,
-    # cache.store payload, etc. Cache restore re-emits manifests with
-    # the persisted ``allow_toolchain_build`` flag, so the placement-
-    # map plumbing isn't needed there (workers find peers via gossip).
+    # Default-init these so the cache-hit path (which skips preflight)
+    # doesn't hit UnboundLocalError when downstream code references them:
+    # submitter placement broadcast, cache.store payload, etc. Cache
+    # restore re-emits manifests with the persisted
+    # ``allow_toolchain_build`` flag, so the placement-map plumbing isn't
+    # needed there (workers find peers via gossip).
     tc_drvs: dict[tuple[str, str], str] = {}
     partition_drv_outpaths: Optional[dict[str, str]] = None
-    partition_per_variant_inputs: Optional[dict[str, frozenset[str]]] = None
 
     if cache_hit is not None:
         log.info("cache hit: %s", input_hash)
@@ -1055,9 +1009,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             cache_hit = None
             tc_drvs = {}
 
-    distributed_eval = getattr(args, "distributed_eval", False)
-
-    if cache_hit is None and distributed_eval:
+    if cache_hit is None:
         # Distributed-eval submit path: only enumerate toolchains
         # locally and emit Phase -1 + Phase 0 manifests. The slow
         # per-binary drv-instantiation is deferred to Phase 0 eval
@@ -1080,28 +1032,26 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 archs=args.archs,
                 sample_size=getattr(args, "variant_sample", 0) or 0,
                 sample_seed=getattr(args, "variant_seed", "42") or "42",
-                defer_to_phase0=True,
             )
         except Exception:  # noqa: BLE001
             log.exception("distributed-eval variant enumeration failed")
             return 1
         if not isinstance(per_binary_meta_raw, dict):
             log.error(
-                "distributed-eval: enumerate_variants(defer_to_phase0=True) "
-                "returned %r instead of a dict; aborting",
+                "distributed-eval: enumerate_variants returned %r "
+                "instead of a dict; aborting",
                 type(per_binary_meta_raw).__name__,
             )
             return 1
 
         # Flatten the {pkg: {"archs": [...], "suffixes_by_arch":
         # {arch: [...]}, "sample_size": ..., "sample_seed": ...}} shape
-        # returned by enumerate_variants(defer_to_phase0=True) into the
-        # {binary: {"archs": [...], "suffixes": [...], "variant_sample":
-        # ..., "variant_seed": ...}} shape that
-        # emit_phase0_eval_manifests / eval_worker.parse_payload
-        # expect. ``suffixes`` is the union across archs because the
-        # Phase 0 worker re-applies per-(arch, compiler, opt) sampling
-        # with the same seed.
+        # returned by enumerate_variants into the {binary: {"archs":
+        # [...], "suffixes": [...], "variant_sample": ...,
+        # "variant_seed": ...}} shape that emit_phase0_eval_manifests /
+        # eval_worker.parse_payload expect. ``suffixes`` is the union
+        # across archs because the Phase 0 worker re-applies per-(arch,
+        # compiler, opt) sampling with the same seed.
         per_binary_metadata: dict[str, dict] = {}
         for pkg, meta in per_binary_meta_raw.items():
             if not isinstance(meta, dict):
@@ -1222,226 +1172,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
             toolchain_drvs=frozenset(tc_drv_set),
         )
 
-    if cache_hit is None and not distributed_eval:
-        log.info("running pre-flight")
-        try:
-            pre = run_preflight(
-                args.flake,
-                args.sys_name,
-                packages=args.packages,
-                archs=args.archs,
-                sample_size=getattr(args, "variant_sample", 0) or 0,
-                sample_seed=getattr(args, "variant_seed", "42") or "42",
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("pre-flight failed")
-            return 1
-
-        sample_size = getattr(args, "variant_sample", 0) or 0
-        if sample_size > 0:
-            log.info(
-                "variant sampling: %d kept (sample=%d, seed=%r)",
-                len(pre.variants), sample_size, getattr(args, "variant_seed", "42"),
-            )
-
-        # Skip-existing: drop variants whose tarball is already on disk.
-        # Phase-2 toolchains / common-deps go through nix's own
-        # substitution path so don't need an explicit skip; phase-3
-        # variants land as flat .tar.zst files in dataset_dir, so we
-        # check existence there.
-        dataset_dir = pathlib.Path(args.shared_fs) / "dataset"
-        kept_variants, skipped = filter_existing_variants(
-            pre.variants, dataset_dir=dataset_dir
-        )
-        if skipped:
-            log.info(
-                "skip-existing: %d variants already built; %d remain",
-                skipped, len(kept_variants),
-            )
-            pre = dataclasses.replace(pre, variants=kept_variants)
-
-        max_variants = getattr(args, "max_variants", None)
-        if max_variants is not None and max_variants > 0:
-            capped = pre.variants[:max_variants]
-            # Narrow toolchain_specs too: only the (arch, compiler)
-            # pairs the kept variants actually depend on need a phase-2
-            # toolchain manifest. Otherwise --max-variants 1 still
-            # dispatches all 41 toolchains (stale from full preflight).
-            needed_pairs = {(v["arch"], v["compiler_id"]) for v in capped}
-            kept_tcs = tuple(
-                spec for spec in pre.toolchain_specs if spec in needed_pairs
-            )
-            log.info(
-                "max-variants: capping %d -> %d variants; %d -> %d toolchains",
-                len(pre.variants), len(capped),
-                len(pre.toolchain_specs), len(kept_tcs),
-            )
-            pre = dataclasses.replace(
-                pre, variants=capped, toolchain_specs=kept_tcs,
-            )
-
-        # Local partition: walk each variant's drv graph on the dev box
-        # (where preflight already instantiated them) and refcount input
-        # drvs to identify shared host deps. The result feeds phase-2
-        # ``common_dep`` task dispatch so secondaries build each shared
-        # dep ONCE (the first secondary to pick it up); other secondaries
-        # then substitute via the per-secondary harmonia federation
-        # (PeerListWatcher writes each peer's URL into nix.conf).
-        #
-        # ``compute_partition_locally`` returns ``(label, drv)`` tuples;
-        # ``emit_all_manifests`` iterates ``(drv, label)`` (matching
-        # ``make_common_dep_header``'s signature). Swap the pair on the
-        # boundary.
-        # (declared at function scope above so the cache-hit path
-        # doesn't need its own defaults; here we just (re-)initialize.)
-        partition_per_variant_inputs = None
-        partition_drv_outpaths = None
-        try:
-            partition = compute_partition_locally(
-                pre.variants,
-                toolchain_drvs=pre.toolchain_drvs,
-            )
-            common_dep_drvs = tuple(
-                (drv, label) for label, drv in partition.common_dep_drvs
-            )
-            log.info(
-                "partition: %d variants, %d common deps (refcount >= 10)",
-                len(pre.variants), len(common_dep_drvs),
-            )
-            pre = dataclasses.replace(pre, common_dep_drvs=common_dep_drvs)
-            partition_per_variant_inputs = dict(partition.per_variant_inputs)
-            # ``drv_outpaths`` carries every drv's realised store path
-            # so build_worker can pre-fetch input deps via the
-            # placement map without re-walking the graph on the
-            # secondary. Optional attribute — older PartitionResult
-            # revisions without it fall back to no-pre-fetch.
-            partition_drv_outpaths = dict(
-                getattr(partition, "drv_outpaths", {}) or {}
-            )
-        except Exception:  # noqa: BLE001 — partition is best-effort
-            log.exception(
-                "partition computation failed; proceeding without"
-                " common-dep classification (every variant rebuilds"
-                " its full closure)"
-            )
-
-        # toolchain_specs and common_dep_drvs are now real; emit phase-2
-        # toolchain + common_dep manifests. The framework's PhaseSpec
-        # dependency graph (``phase3.depends_on = ("phase2",)``) blocks
-        # phase-3 variant dispatch until phase-2 drains, so secondaries
-        # build the shared closure first; then they substitute from each
-        # other's harmonias when phase-3 starts.
-        #
-        # No local pre-build — distribution is the entire point. Each
-        # secondary does its share of phase-2 in parallel.
-
-        # Resolve toolchain drv paths so the phase-2 toolchain manifest
-        # can carry an absolute drv (the build worker on a SLURM
-        # secondary has no flake.nix and would otherwise try to resolve
-        # ``flake_ref="."#_crossToolchainMap...`` against /app, which
-        # fails with "could not find a flake.nix file").
-        try:
-            tc_drvs = eval_toolchain_drvs(
-                args.flake, args.sys_name, pre.toolchain_specs,
-            )
-            log.info(
-                "toolchain drv eval: %d/%d resolved",
-                len(tc_drvs), len(pre.toolchain_specs),
-            )
-        except Exception:  # noqa: BLE001
-            log.exception(
-                "toolchain drv eval failed; manifests fall back to"
-                " flake-attr (will fail on secondaries)"
-            )
-            tc_drvs = {}
-
-        # Resolve toolchain outpaths and merge them into
-        # ``partition_drv_outpaths``. Toolchains live in a disjoint
-        # subgraph from variants (reached via _crossToolchainMap, not
-        # the variant DAG), so compute_partition_locally's walk does
-        # not see them — without this merge, the phase-2 validate
-        # manifests have no ``payload.outpath`` and the worker can't
-        # do the path-info probe + targeted ``nix copy --from`` that
-        # the validate-only path requires.
-        if tc_drvs and partition_drv_outpaths is not None:
-            try:
-                tc_outpaths = eval_drv_outpaths(
-                    [d for d in tc_drvs.values() if d]
-                )
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "toolchain outpath eval failed; validate manifests"
-                    " will be missing payload.outpath"
-                )
-                tc_outpaths = {}
-            partition_drv_outpaths.update(tc_outpaths)
-            log.info(
-                "toolchain outpath eval: %d/%d resolved",
-                len(tc_outpaths), len(tc_drvs),
-            )
-
-        # Primary-side toolchain availability check. The phase-2
-        # validate-only item class fetches toolchains from a peer
-        # (primary first) instead of building them; that contract
-        # only holds if the primary actually has the toolchain
-        # outputs in its local store. Check up-front and either
-        # fail-fast (default) or build locally (opt-in).
-        allow_tc_build = getattr(args, "allow_toolchain_build", False)
-        tc_drv_set = frozenset(d for d in tc_drvs.values() if d)
-        if tc_drv_set:
-            try:
-                missing_tcs = check_toolchains_locally(tc_drv_set)
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "toolchain local-validity check failed; assuming"
-                    " all toolchains are missing"
-                )
-                missing_tcs = tc_drv_set
-            if missing_tcs:
-                if not allow_tc_build:
-                    log.error(
-                        "%d/%d toolchains missing locally and"
-                        " --allow-toolchain-build is off:",
-                        len(missing_tcs), len(tc_drv_set),
-                    )
-                    for drv in sorted(missing_tcs):
-                        log.error("  %s", drv)
-                    log.error(
-                        "Re-run with --allow-toolchain-build to build"
-                        " them locally before dispatch, or run"
-                        " `nix build <drv>^*` for each missing drv"
-                        " by hand."
-                    )
-                    return 1
-                log.warning(
-                    "building %d missing toolchains locally"
-                    " (--allow-toolchain-build is on)",
-                    len(missing_tcs),
-                )
-                try:
-                    build_toolchains_locally(missing_tcs)
-                except PreflightError as exc:
-                    log.error("local toolchain build aborted: %s", exc)
-                    return 1
-                except Exception:  # noqa: BLE001
-                    log.exception("local toolchain build failed")
-                    return 1
-
-        try:
-            _emit_manifests_from_preflight(
-                target_dir=manifest_dir,
-                sys_name=args.sys_name,
-                pre=pre,
-                num_workers=num_workers,
-                toolchain_drvs=tc_drvs,
-                allow_toolchain_build=allow_tc_build,
-                per_variant_inputs=partition_per_variant_inputs,
-                drv_outpaths=partition_drv_outpaths,
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("manifest emission failed")
-            return 1
-
     # Build SuitTaskConfig.
     toolchain_drvs = pre.toolchain_drvs if pre is not None else frozenset()
     variants = tuple(pre.variants) if pre is not None else ()
@@ -1557,16 +1287,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 # SubmitterPeer.seed_toolchain_drvs exactly once after
                 # a non-submitter peer file appears on the gateway —
                 # so we don't need a synchronously-known
-                # ``first_secondary_url`` here. Empty set (legacy
-                # local-eval flow) short-circuits to a no-op.
-                if distributed_eval:
-                    tc_drv_set_for_seed = frozenset(
-                        d for d in tc_drvs.values() if d
+                # ``first_secondary_url`` here.
+                tc_drv_set_for_seed = frozenset(
+                    d for d in tc_drvs.values() if d
+                )
+                if tc_drv_set_for_seed:
+                    submitter.set_pending_toolchain_seed_drvs(
+                        tc_drv_set_for_seed
                     )
-                    if tc_drv_set_for_seed:
-                        submitter.set_pending_toolchain_seed_drvs(
-                            tc_drv_set_for_seed
-                        )
                 submitter.start()
                 extra_pf = submitter.deployment_extra_port_forwards
             except Exception:  # noqa: BLE001 — never block dispatch
