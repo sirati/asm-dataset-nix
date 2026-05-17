@@ -1,7 +1,7 @@
-"""Phase 0 distributed-eval worker — one task per binary.
+"""Matrix-eval distributed-eval worker — one task per binary.
 
 Runs on a cluster secondary. Given a manifest payload built by
-:func:`compiler_suit_runner.manifest_gen.make_phase0_eval_header`, the
+:func:`compiler_suit_runner.manifest_gen.make_matrix_eval_header`, the
 worker:
 
 1. Resolves the per-(arch, suffix) drv set by invoking
@@ -16,7 +16,7 @@ worker:
    onward). Each receiver substitutes the drv into its local store
    so Phase 1+ tasks scheduled anywhere in the cluster can read the
    graph immediately.
-3. Writes a resume marker at ``<phase0_out_dir>/<binary>/manifest.json``
+3. Writes a resume marker at ``<matrix_eval_out_dir>/<binary>/manifest.json``
    listing ``[{label, drv}, ...]`` so a re-execution after the task
    was preempted short-circuits to the broadcast-already-happened
    path.
@@ -73,6 +73,7 @@ import time
 from collections.abc import Callable
 from typing import Any, Optional
 
+from compiler_suit_runner.peer_paths import ITEM_CLASS_MATRIX_EVAL_DRV
 from compiler_suit_runner.peer_replication import BroadcastSender
 
 
@@ -83,7 +84,7 @@ from compiler_suit_runner.peer_replication import BroadcastSender
 RunSubprocess = Callable[[list[str]], tuple[bytes, bytes, int]]
 
 
-PHASE_0_ITEM_CLASS = "phase0_eval"
+MATRIX_EVAL_ITEM_CLASS = "matrix_eval"
 """Item class string this worker handles (matches manifest_gen)."""
 
 
@@ -167,8 +168,8 @@ def sample_suffix_attrs(
 
 
 def parse_payload(payload: dict) -> dict[str, Any]:
-    """Validate a phase0_eval payload (as produced by
-    :func:`manifest_gen.make_phase0_eval_header`) and return a
+    """Validate a matrix_eval payload (as produced by
+    :func:`manifest_gen.make_matrix_eval_header`) and return a
     normalised dict.
 
     Raises :class:`ValueError` on shape errors so callers (and tests)
@@ -176,7 +177,7 @@ def parse_payload(payload: dict) -> dict[str, Any]:
     """
     if not isinstance(payload, dict):
         raise ValueError(
-            f"phase0_eval payload must be a dict, got {type(payload).__name__}"
+            f"matrix_eval payload must be a dict, got {type(payload).__name__}"
         )
     binary = payload.get("binary")
     sys_name = payload.get("sys")
@@ -184,34 +185,34 @@ def parse_payload(payload: dict) -> dict[str, Any]:
     suffixes = payload.get("suffixes")
     attr = payload.get("attr")
     if not isinstance(binary, str) or not binary:
-        raise ValueError(f"phase0_eval payload: invalid 'binary' ({binary!r})")
+        raise ValueError(f"matrix_eval payload: invalid 'binary' ({binary!r})")
     if not isinstance(sys_name, str) or not sys_name:
-        raise ValueError(f"phase0_eval payload: invalid 'sys' ({sys_name!r})")
+        raise ValueError(f"matrix_eval payload: invalid 'sys' ({sys_name!r})")
     if not isinstance(archs, list) or not all(isinstance(a, str) for a in archs):
-        raise ValueError(f"phase0_eval payload: invalid 'archs' ({archs!r})")
+        raise ValueError(f"matrix_eval payload: invalid 'archs' ({archs!r})")
     if not isinstance(suffixes, list) or not all(
         isinstance(s, str) for s in suffixes
     ):
         raise ValueError(
-            f"phase0_eval payload: invalid 'suffixes' ({suffixes!r})"
+            f"matrix_eval payload: invalid 'suffixes' ({suffixes!r})"
         )
     if not isinstance(attr, str) or not attr:
-        raise ValueError(f"phase0_eval payload: invalid 'attr' ({attr!r})")
+        raise ValueError(f"matrix_eval payload: invalid 'attr' ({attr!r})")
     for s in suffixes:
         if not _SAFE_SUFFIX_RE.match(s):
             raise ValueError(
-                f"phase0_eval payload: unsafe suffix {s!r} — refusing to splice"
+                f"matrix_eval payload: unsafe suffix {s!r} — refusing to splice"
             )
 
     variant_sample = payload.get("variant_sample")
     if variant_sample is not None and not isinstance(variant_sample, int):
         raise ValueError(
-            f"phase0_eval payload: invalid 'variant_sample' ({variant_sample!r})"
+            f"matrix_eval payload: invalid 'variant_sample' ({variant_sample!r})"
         )
     variant_seed = payload.get("variant_seed")
     if variant_seed is not None and not isinstance(variant_seed, str):
         raise ValueError(
-            f"phase0_eval payload: invalid 'variant_seed' ({variant_seed!r})"
+            f"matrix_eval payload: invalid 'variant_seed' ({variant_seed!r})"
         )
 
     return {
@@ -367,8 +368,9 @@ def _drv_size(drv_path: str) -> int:
 
 
 def _marker_path(out_dir: pathlib.Path, binary: str) -> pathlib.Path:
-    # out_dir is already the phase0-specific dir (e.g. _phase0 on host,
-    # /app/out-network/_phase0 in container), so no extra segment needed.
+    # out_dir is already the matrix-eval-specific dir (e.g. _matrix_eval on
+    # host, /app/out-network/_matrix_eval in container), so no extra segment
+    # needed.
     return out_dir / binary / "manifest.json"
 
 
@@ -422,7 +424,7 @@ def run_eval_task(
     broadcast_timeout: float = 10.0,
     now: Optional[Callable[[], float]] = None,
 ) -> dict:
-    """Phase 0 per-binary eval dispatch entry point.
+    """Matrix-eval per-binary eval dispatch entry point.
 
     See the module docstring for the protocol. The function returns
     the marker dict (also persisted to
@@ -432,17 +434,17 @@ def run_eval_task(
     harness then surfaces ``ErrorType::Errored`` to the primary,
     which charges the failure to the retry-pass budget. We
     deliberately do NOT raise ``Unfulfillable`` from this layer; a
-    secondary that cannot fulfil Phase 0 (e.g. permanently missing
-    toolchain) should signal that via Phase -1's task-dispatch
-    refusal, not by mutating a Phase 0 task's error type.
+    secondary that cannot fulfil matrix_eval (e.g. permanently missing
+    toolchain) should signal that via toolchain-validate's task-dispatch
+    refusal, not by mutating a matrix_eval task's error type.
 
     Parameters
     ----------
     payload :
-        The phase0_eval manifest payload (see
-        :func:`manifest_gen.make_phase0_eval_header`).
+        The matrix_eval manifest payload (see
+        :func:`manifest_gen.make_matrix_eval_header`).
     out_dir :
-        Phase0-specific output directory (the bind-mounted shared
+        Matrix-eval-specific output directory (the bind-mounted shared
         path). The marker is written to
         ``out_dir / <binary> / manifest.json``.
     broadcast_sender :
@@ -541,7 +543,7 @@ def run_eval_task(
             bid = broadcast_sender.enqueue_broadcast(
                 drv,
                 _drv_size(drv),
-                item_class="phase0_eval_drv",
+                item_class=ITEM_CLASS_MATRIX_EVAL_DRV,
             )
             broadcast_ids.append((label, bid))
 
@@ -582,7 +584,7 @@ def run_eval_task(
 
 
 __all__ = [
-    "PHASE_0_ITEM_CLASS",
+    "MATRIX_EVAL_ITEM_CLASS",
     "RunSubprocess",
     "parse_payload",
     "read_peer_push_urls",
@@ -595,7 +597,7 @@ __all__ = [
 # Peer push URL enumeration (public helper)
 #
 # Exported so :func:`workers.build_worker.main` can construct a
-# :class:`BroadcastSender` configured to fan phase0_eval drv broadcasts
+# :class:`BroadcastSender` configured to fan matrix_eval drv broadcasts
 # out to the cluster. The unified build_worker entry point owns the
 # subprocess CLI shape now; ``eval_worker`` is a pure library module
 # (``run_eval_task`` + this helper).
