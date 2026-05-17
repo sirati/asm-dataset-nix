@@ -225,7 +225,6 @@ let
   serialization = {
     high = [
       (pkg "msgpack-c" "msgpack-c")
-      (pkg "nanopb" "nanopb")
     ];
     med = [
       (pkg "flatbuffers" "flatbuffers")
