@@ -986,3 +986,320 @@ def test_variant_prefetch_skipped_without_placement_plumbing(tmp_path):
     # Only the variant build ran; no path-info, no copy.
     assert len(runner.calls) == 1
     assert "build" in runner.calls[0]
+
+
+# ---------------------------------------------------------------------------
+# Subprocess entry point — main + handle closure (unified dispatch)
+#
+# The framework picks ONE ``worker_module`` per secondary pool, so
+# ``build_worker.main`` must dispatch both phase0_eval payloads
+# (-> :func:`eval_worker.run_eval_task`) and the original build
+# manifests (-> :func:`build_worker.build_worker`). The handle closure
+# sniffs ``task.payload['item_class']`` to decide which branch fires.
+# ---------------------------------------------------------------------------
+
+
+def _run_build_worker_main_with_capture(
+    monkeypatch,
+    argv: list[str],
+):
+    """Invoke ``build_worker.main()`` with framework dependencies
+    monkey-patched so the test never opens a real socket or thread.
+
+    Returns ``(handle, run_mock, sender_class_mock)`` where ``handle``
+    is the closure the worker registered with the framework.
+    """
+    import sys as _sys
+    import types as _types
+    from unittest.mock import MagicMock
+
+    fake_worker = _types.ModuleType("dynamic_runner.worker")
+
+    class FakeTask:
+        def __init__(
+            self,
+            payload=None,
+            task_id: str = "phase0_eval__hello",
+            relative_path: str = "",
+            resolved_path: str = "",
+        ) -> None:
+            self.payload = payload or {}
+            self.task_id = task_id
+            self.relative_path = relative_path
+            self.resolved_path = resolved_path
+            self.publish_calls: list[tuple] = []
+
+        def publish_all(self, *args):
+            self.publish_calls.append(args)
+
+    class FakeWorkerOutput:
+        def __init__(self) -> None:
+            pass
+
+    class FakeNonRecoverable(Exception):
+        pass
+
+    class FakePublishError(Exception):
+        pass
+
+    run_mock = MagicMock()
+    fake_worker.Task = FakeTask
+    fake_worker.WorkerOutput = FakeWorkerOutput
+    fake_worker.NonRecoverableError = FakeNonRecoverable
+    fake_worker.PublishError = FakePublishError
+    fake_worker.run = run_mock
+
+    if "dynamic_runner" not in _sys.modules:
+        _sys.modules["dynamic_runner"] = _types.ModuleType("dynamic_runner")
+    monkeypatch.setitem(_sys.modules, "dynamic_runner.worker", fake_worker)
+
+    # Patch BroadcastSender on the build_worker module (where the
+    # late-import binds the symbol) so we don't spin up a daemon thread.
+    sender_class_mock = MagicMock()
+    sender_instance = MagicMock()
+    sender_class_mock.return_value = sender_instance
+    monkeypatch.setattr(
+        "compiler_suit_runner.peer_replication.BroadcastSender",
+        sender_class_mock,
+    )
+
+    monkeypatch.setattr(_sys, "argv", ["build_worker", *argv])
+
+    rc = bw.main()
+    assert rc == 0
+    run_mock.assert_called_once()
+    captured_handle = run_mock.call_args.args[0]
+    return captured_handle, run_mock, sender_class_mock
+
+
+def _phase0_eval_wrapper_payload(
+    *,
+    binary: str = "hello",
+    sys_name: str = "x86_64-linux",
+) -> dict:
+    """Return a header_dict wrapper as :class:`SuitTask._header_to_task_info`
+    would emit — ``payload`` field is the inner phase0_eval data."""
+    return {
+        "item_class": "phase0_eval",
+        "name": f"phase0_eval__{binary}",
+        "size": 1,
+        "payload": {
+            "binary": binary,
+            "sys": sys_name,
+            "archs": ["x86_64"],
+            "suffixes": ["O0", "O2"],
+            "attr": f"dataset.{sys_name}.{binary}",
+        },
+    }
+
+
+def test_main_handle_dispatches_phase0_eval_to_run_eval_task(
+    monkeypatch, tmp_path
+):
+    """A task whose ``item_class == 'phase0_eval'`` is routed to
+    :func:`eval_worker.run_eval_task` with the inner payload, the
+    shared-fs-derived out_dir, and the constructed BroadcastSender."""
+    handle, _, sender_cls = _run_build_worker_main_with_capture(
+        monkeypatch,
+        [
+            "--socket-path", str(tmp_path / "sock"),
+            "--flake-ref", ".",
+            "--dataset-output-dir", str(tmp_path / "dataset"),
+            "--shared-fs", str(tmp_path),
+            "--phase0-out-dir", str(tmp_path / "phase0"),
+            "--secondary-id", "sec1",
+            "--signing-public-key", "k:abc",
+        ],
+    )
+    sender_instance = sender_cls.return_value
+
+    captured: dict = {}
+
+    def _fake_run_eval(payload, *, out_dir, broadcast_sender):
+        captured["payload"] = payload
+        captured["out_dir"] = out_dir
+        captured["broadcast_sender"] = broadcast_sender
+        return {"ok": True}
+
+    # Patch on the eval_worker module (build_worker.main late-imports
+    # ``run_eval_task`` from there).
+    from compiler_suit_runner.workers import eval_worker as ew
+
+    monkeypatch.setattr(ew, "run_eval_task", _fake_run_eval)
+
+    import sys as _sys
+    fake_task_cls = _sys.modules["dynamic_runner.worker"].Task
+    fake_output_cls = _sys.modules["dynamic_runner.worker"].WorkerOutput
+
+    wrapper = _phase0_eval_wrapper_payload(binary="hello")
+    task = fake_task_cls(payload=wrapper)
+    output = handle(task)
+    assert isinstance(output, fake_output_cls)
+    # The inner payload was unwrapped before dispatch.
+    assert captured["payload"] == wrapper["payload"]
+    assert captured["broadcast_sender"] is sender_instance
+    assert captured["out_dir"] == tmp_path / "phase0"
+
+
+def test_main_handle_dispatches_build_manifest_to_build_worker(
+    monkeypatch, tmp_path
+):
+    """A task whose payload is NOT a phase0_eval wrapper (e.g. a
+    toolchain manifest) is routed to the existing build_worker path,
+    NOT to run_eval_task."""
+    handle, _, _ = _run_build_worker_main_with_capture(
+        monkeypatch,
+        [
+            "--socket-path", str(tmp_path / "sock"),
+            "--flake-ref", ".",
+            "--dataset-output-dir", str(tmp_path / "dataset"),
+        ],
+    )
+
+    eval_called: list[bool] = []
+    build_called: list[dict] = []
+
+    from compiler_suit_runner.workers import eval_worker as ew
+
+    def _fake_run_eval(*args, **kwargs):
+        eval_called.append(True)
+        return {}
+
+    monkeypatch.setattr(ew, "run_eval_task", _fake_run_eval)
+
+    def _fake_build_worker(manifest_path, env, *, manifest_data=None):
+        build_called.append({
+            "manifest_path": manifest_path,
+            "manifest_data": manifest_data,
+        })
+        return bw.BuildWorkerResult(
+            item_class=ITEM_CLASS_PHASE2_TOOLCHAIN,
+            name="tc",
+            success=True,
+            duration_seconds=0.0,
+            outpath="/nix/store/x",
+        )
+
+    monkeypatch.setattr(bw, "build_worker", _fake_build_worker)
+
+    import sys as _sys
+    fake_task_cls = _sys.modules["dynamic_runner.worker"].Task
+    fake_output_cls = _sys.modules["dynamic_runner.worker"].WorkerOutput
+
+    # A toolchain manifest wrapper (item_class is one of the build
+    # classes). The handle closure must NOT treat this as phase0_eval.
+    toolchain_payload = {
+        "item_class": ITEM_CLASS_PHASE2_TOOLCHAIN,
+        "name": "tc",
+        "payload": {"attr": "x.tc", "drv": "/nix/store/tc.drv"},
+    }
+    task = fake_task_cls(payload=toolchain_payload, relative_path="m.json")
+    output = handle(task)
+    assert isinstance(output, fake_output_cls)
+    assert not eval_called, "build manifest must NOT reach run_eval_task"
+    assert len(build_called) == 1
+    assert build_called[0]["manifest_data"] == toolchain_payload
+
+
+def test_main_handle_phase0_eval_runtime_error_becomes_non_recoverable(
+    monkeypatch, tmp_path
+):
+    """When run_eval_task raises RuntimeError the handle re-raises as
+    NonRecoverableError so the framework surfaces it as
+    ``error:non_recoverable:``."""
+    handle, _, _ = _run_build_worker_main_with_capture(
+        monkeypatch,
+        [
+            "--socket-path", str(tmp_path / "sock"),
+            "--flake-ref", ".",
+            "--dataset-output-dir", str(tmp_path / "dataset"),
+            "--shared-fs", str(tmp_path),
+            "--phase0-out-dir", str(tmp_path / "phase0"),
+        ],
+    )
+
+    from compiler_suit_runner.workers import eval_worker as ew
+
+    def _boom(payload, *, out_dir, broadcast_sender):
+        raise RuntimeError("nix-eval-jobs fell over")
+
+    monkeypatch.setattr(ew, "run_eval_task", _boom)
+
+    import sys as _sys
+    fake_mod = _sys.modules["dynamic_runner.worker"]
+    Task = fake_mod.Task
+    NonRecoverable = fake_mod.NonRecoverableError
+    with pytest.raises(NonRecoverable) as exc_info:
+        handle(Task(payload=_phase0_eval_wrapper_payload()))
+    assert "nix-eval-jobs fell over" in str(exc_info.value)
+
+
+def test_main_handle_phase0_eval_without_phase0_out_dir_is_non_recoverable(
+    monkeypatch, tmp_path
+):
+    """phase0_eval requires --phase0-out-dir (shared bind-mounted marker
+    dir). Receiving the task without that flag — even with --shared-fs
+    — is a structural misconfiguration -> NonRecoverableError."""
+    handle, _, _ = _run_build_worker_main_with_capture(
+        monkeypatch,
+        [
+            "--socket-path", str(tmp_path / "sock"),
+            "--flake-ref", ".",
+            "--dataset-output-dir", str(tmp_path / "dataset"),
+            "--shared-fs", str(tmp_path),
+            # --phase0-out-dir OMITTED
+        ],
+    )
+
+    import sys as _sys
+    fake_mod = _sys.modules["dynamic_runner.worker"]
+    Task = fake_mod.Task
+    NonRecoverable = fake_mod.NonRecoverableError
+    with pytest.raises(NonRecoverable) as exc_info:
+        handle(Task(payload=_phase0_eval_wrapper_payload()))
+    assert "phase0-out-dir" in str(exc_info.value)
+
+
+def test_main_handle_phase0_eval_without_shared_fs_is_non_recoverable(
+    monkeypatch, tmp_path
+):
+    """phase0_eval requires --shared-fs (resume marker + peer gossip
+    both live under it). Receiving the task without that flag is a
+    structural misconfiguration -> NonRecoverableError."""
+    handle, _, sender_cls = _run_build_worker_main_with_capture(
+        monkeypatch,
+        [
+            "--socket-path", str(tmp_path / "sock"),
+            "--flake-ref", ".",
+            "--dataset-output-dir", str(tmp_path / "dataset"),
+            # --shared-fs OMITTED
+        ],
+    )
+    # No shared-fs -> no BroadcastSender should be constructed.
+    sender_cls.assert_not_called()
+
+    import sys as _sys
+    fake_mod = _sys.modules["dynamic_runner.worker"]
+    Task = fake_mod.Task
+    NonRecoverable = fake_mod.NonRecoverableError
+    with pytest.raises(NonRecoverable) as exc_info:
+        handle(Task(payload=_phase0_eval_wrapper_payload()))
+    assert "shared-fs" in str(exc_info.value)
+
+
+def test_main_stops_broadcast_sender_on_exit(monkeypatch, tmp_path):
+    """``BroadcastSender.stop`` is called after ``run`` returns so the
+    daemon thread drains in-flight broadcasts before the subprocess
+    exits."""
+    _, _, sender_cls = _run_build_worker_main_with_capture(
+        monkeypatch,
+        [
+            "--socket-path", str(tmp_path / "sock"),
+            "--flake-ref", ".",
+            "--dataset-output-dir", str(tmp_path / "dataset"),
+            "--shared-fs", str(tmp_path),
+            "--phase0-out-dir", str(tmp_path / "phase0"),
+            "--secondary-id", "sec1",
+        ],
+    )
+    sender_cls.return_value.stop.assert_called_once()

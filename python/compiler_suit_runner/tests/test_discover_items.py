@@ -17,13 +17,11 @@ import pytest
 
 from compiler_suit_runner.manifest_gen import (
     make_common_dep_header,
-    make_merge_header,
-    make_partition_shard_header,
     make_toolchain_header,
     make_variant_header,
     write_manifest,
 )
-from compiler_suit_runner.partition import Shard, VariantSpec
+from compiler_suit_runner.partition import VariantSpec
 from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
 
 
@@ -135,17 +133,11 @@ def test_discover_items_classifies_each_manifest(tmp_path: pathlib.Path) -> None
     config = _make_config(tmp_path)
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
 
-    write_manifest(
-        config.manifest_dir,
-        make_partition_shard_header(
-            Shard(
-                pkg="hello",
-                arch="x86_64",
-                variants=(_variant("hello", "x86_64"),),
-            )
-        ),
-    )
-    write_manifest(config.manifest_dir, make_merge_header())
+    # Legacy phase1a_partition / phase1b_merge manifests were emitted
+    # by the partition/merge workers (now deleted); writing them here
+    # would just be skipped with a "unknown item_class" warning. The
+    # toolchain / common_dep / variant headers cover the live
+    # classification paths exercised by discover_items today.
     write_manifest(
         config.manifest_dir,
         make_toolchain_header("x86_64-linux", "x86_64", "gcc15"),
@@ -165,16 +157,7 @@ def test_discover_items_classifies_each_manifest(tmp_path: pathlib.Path) -> None
     for item in items:
         by_phase.setdefault(item.phase_id, []).append(item)
 
-    assert set(by_phase.keys()) == {
-        "phase1a",
-        "phase1b",
-        "phase_build",
-    }
-
-    # Spot-check classification.
-    assert by_phase["phase1a"][0].type_id == "partition"
-    assert by_phase["phase1a"][0].affinity_id is None
-    assert by_phase["phase1b"][0].type_id == "merge"
+    assert set(by_phase.keys()) == {"phase_build"}
 
     build_types = {item.type_id for item in by_phase["phase_build"]}
     assert build_types == {"toolchain", "common_dep", "variant"}
@@ -200,7 +183,10 @@ def test_discover_items_classifies_each_manifest(tmp_path: pathlib.Path) -> None
 def test_discover_items_yields_size_from_manifest(tmp_path: pathlib.Path) -> None:
     config = _make_config(tmp_path)
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
-    write_manifest(config.manifest_dir, make_merge_header())
+    write_manifest(
+        config.manifest_dir,
+        make_common_dep_header("/nix/store/glibc.drv", "glibc"),
+    )
     task = SuitTask(config)
     items = list(task.discover_items())
     assert len(items) == 1
@@ -215,7 +201,10 @@ def test_discover_items_skips_unreadable_manifests(
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
 
     # One good manifest...
-    write_manifest(config.manifest_dir, make_merge_header())
+    write_manifest(
+        config.manifest_dir,
+        make_common_dep_header("/nix/store/glibc.drv", "glibc"),
+    )
     # ...and one corrupt one (junk text in a .json file).
     bad = config.manifest_dir / "bad.json"
     bad.write_text("not json at all")
@@ -223,7 +212,7 @@ def test_discover_items_skips_unreadable_manifests(
     task = SuitTask(config)
     items = list(task.discover_items())
     assert len(items) == 1
-    assert items[0].type_id == "merge"
+    assert items[0].type_id == "common_dep"
 
 
 def test_discover_items_missing_manifest_dir_yields_nothing(
@@ -240,7 +229,10 @@ def test_discover_items_skips_dotfiles_and_underscored(
 ) -> None:
     config = _make_config(tmp_path)
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
-    write_manifest(config.manifest_dir, make_merge_header())
+    write_manifest(
+        config.manifest_dir,
+        make_common_dep_header("/nix/store/glibc.drv", "glibc"),
+    )
     (config.manifest_dir / ".hidden.json").write_text("{}")
     (config.manifest_dir / "_meta.json").write_text("{}")
 

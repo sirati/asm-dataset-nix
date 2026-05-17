@@ -98,6 +98,13 @@ in
       system = "mips64el-linux";
       minGccVersion = noMin;
       minClangVersion = noMin;
+      # gcc5 + mips64el: nixpkgs-22.11 pkgsCross.mips64el-linux-gnuabin32
+      # bootstrap throws a hard error from lib/old-gcc-cross.nix paths
+      # that escapes tryEval. Singleton bad version — gcc4_8, 4_9, 6+
+      # all build fine. Mirrors table.md ``gcc5 + mips64el = FAIL``.
+      # Wildcard form (no ``minor`` key) matches any GCC 5.x release;
+      # see ``isVersionInBrokenList`` in lib/matrix.nix.
+      brokenGccVersions = [ { major = 5; } ];
     };
     ppc32 = {
       label = "ppc32";
@@ -126,6 +133,48 @@ in
       system = "powerpc-linux";
       minGccVersion = noMin;
       minClangVersion = noMin;
+      # ppc32 has a non-contiguous compatibility window. Modern
+      # nixpkgs's pkgsCross.ppc32 chain fails to evaluate for the
+      # mid-range compilers (gcc4_8..gcc12, clang5..clang17) — the
+      # platform.kernelArch workaround (see ``crossSystem`` above)
+      # gets us past the linux-headers throw, but the cross-stdenv
+      # build still fails before the wrapper is reachable for these
+      # versions. gcc4_4..4_6 (15.09 path) and gcc13+ / clang3.x..4 /
+      # clang18+ all build successfully — they're listed as OK in
+      # table.md and are NOT in this broken list. Each entry below
+      # corresponds 1:1 to a FAIL cell for the ``ppc32`` column in
+      # ``table.md`` at the flake root.
+      # Wildcard entries (no ``minor`` key) match any minor of that
+      # major; see ``isVersionInBrokenList`` in lib/matrix.nix. GCC 4.8
+      # and 4.9 are surgical because we ship one minor of each
+      # (4.8.5, 4.9.4) — they're 4.x where 4.4/4.5/4.6 are OK.
+      brokenGccVersions = [
+        { major = 4; minor = 8; }
+        { major = 4; minor = 9; }
+        { major = 5; }
+        { major = 6; }
+        { major = 7; }
+        { major = 8; }
+        { major = 9; }
+        { major = 10; }
+        { major = 11; }
+        { major = 12; }
+      ];
+      brokenClangVersions = [
+        { major = 5; }
+        { major = 6; }
+        { major = 7; }
+        { major = 8; }
+        { major = 9; }
+        { major = 10; }
+        { major = 11; }
+        { major = 12; }
+        { major = 13; }
+        { major = 14; }
+        { major = 15; }
+        { major = 16; }
+        { major = 17; }
+      ];
     };
     ppc64 = {
       label = "ppc64";
@@ -137,6 +186,11 @@ in
         minor = 8;
       }; # gnuabielfv2 triple unknown to gcc <= 4.6 (15.09 old-expression path)
       minClangVersion = noMin;
+      # gcc5 + ppc64 (gnuabielfv2): bootstrap fails inside tryEval on
+      # nixpkgs-22.11. gcc4_8 / 4_9 (15.09 + old-cross path) and gcc6+
+      # all build. Singleton — mirrors table.md ``gcc5 + ppc64 = FAIL``.
+      # Wildcard (no ``minor`` key) matches any GCC 5.x.
+      brokenGccVersions = [ { major = 5; } ];
       # clang 3.x's ppc64 backend lacks an integrated assembler
       # and falls back to an external ``as`` that isn't on the
       # wrapper's PATH for this triple → ``Executable "as" doesn't
@@ -183,11 +237,17 @@ in
       else
         pkgs.pkgsCross.${target.crossAttr}
     else
-      # Custom crossSystem — re-import nixpkgs with the specified cross config
+      # Custom crossSystem — re-import nixpkgs with the specified cross config.
+      # Forward `pkgs.overlays` so attrs injected by the top-level overlay
+      # set remain reachable for these targets too. `pkgsCross.<crossAttr>`
+      # already inherits overlays automatically; only this manual re-import
+      # path needs the explicit handoff.
       import pkgs.path {
         localSystem = {
           system = pkgs.stdenv.buildPlatform.system;
         };
         crossSystem = target.crossSystem;
+        overlays = pkgs.overlays or [ ];
+        config = pkgs.config or { };
       };
 }

@@ -267,97 +267,79 @@ def test_run_nix_eval_invalid_json_raises():
 
 def test_enumerate_variants_full_matrix():
     runner, _calls = _make_run_subprocess(_all_responses())
-    variants, drvs = enumerate_variants(
+    result = enumerate_variants(
         ".",
         "x86_64-linux",
         run_subprocess=runner,
     )
-    # 2 (hello/x86_64) + 1 (hello/aarch64) + 1 (busybox/x86_64) = 4
-    assert len(variants) == 4
-    labels = {v["label"] for v in variants}
-    assert "hello-x86_64-gcc15-O0-baseline-unhardened" in labels
-    assert "busybox-x86_64-gcc15-O2-baseline-unhardened" in labels
-
-    # Each variant has the expected fields.
-    for v in variants:
-        assert v["pkg"]
-        assert v["arch"]
-        assert v["compiler_id"] == "gcc15"
-        assert v["drv"].startswith("/nix/store/")
-        assert v["variant_dir"] and not v["variant_dir"].endswith(".tar.zst")
-        assert isinstance(v["tier"], int)
-
-    # toolchain_drvs covers all distinct drv paths.
-    assert drvs == frozenset({
-        "/nix/store/aaa-hello-x86-O0.drv",
-        "/nix/store/bbb-hello-x86-O2.drv",
-        "/nix/store/ccc-hello-aarch.drv",
-        "/nix/store/ddd-busybox-x86.drv",
-    })
+    # Per-binary metadata for both fixture packages.
+    assert set(result.keys()) == {"hello", "busybox"}
+    assert sorted(result["hello"]["archs"]) == ["aarch64", "x86_64"]
+    assert result["busybox"]["archs"] == ["x86_64"]
+    assert result["hello"]["suffixes_by_arch"]["x86_64"] == [
+        "gcc15-O0-baseline-unhardened",
+        "gcc15-O2-baseline-unhardened",
+    ]
 
 
 def test_enumerate_variants_filter_by_packages():
     runner, _ = _make_run_subprocess(_all_responses())
-    variants, _drvs = enumerate_variants(
+    result = enumerate_variants(
         ".",
         "x86_64-linux",
         packages=["hello"],
         run_subprocess=runner,
     )
-    assert variants  # not empty
-    assert all(v["pkg"] == "hello" for v in variants)
-    assert {v["pkg"] for v in variants} == {"hello"}
+    assert set(result.keys()) == {"hello"}
 
 
 def test_enumerate_variants_filter_by_archs():
     runner, _ = _make_run_subprocess(_all_responses())
-    variants, _drvs = enumerate_variants(
+    result = enumerate_variants(
         ".",
         "x86_64-linux",
         archs=["aarch64"],
         run_subprocess=runner,
     )
-    assert variants  # at least one (hello/aarch64)
-    assert all(v["arch"] == "aarch64" for v in variants)
+    # Only hello has an aarch64 cell in the fixture; busybox is dropped.
+    assert set(result.keys()) == {"hello"}
+    assert result["hello"]["archs"] == ["aarch64"]
 
 
 def test_enumerate_variants_combined_filter():
     runner, _ = _make_run_subprocess(_all_responses())
-    variants, _drvs = enumerate_variants(
+    result = enumerate_variants(
         ".",
         "x86_64-linux",
         packages=["busybox"],
         archs=["x86_64"],
         run_subprocess=runner,
     )
-    assert len(variants) == 1
-    assert variants[0]["pkg"] == "busybox"
-    assert variants[0]["arch"] == "x86_64"
+    assert set(result.keys()) == {"busybox"}
+    assert result["busybox"]["archs"] == ["x86_64"]
 
 
 def test_enumerate_variants_filter_no_match_returns_empty():
     runner, _ = _make_run_subprocess(_all_responses())
-    variants, drvs = enumerate_variants(
+    result = enumerate_variants(
         ".",
         "x86_64-linux",
         packages=["nonexistent-pkg"],
         run_subprocess=runner,
     )
-    assert variants == ()
-    assert drvs == frozenset()
+    assert result == {}
 
 
 def test_enumerate_variants_tier_assignment():
     """``hello`` (tier 1), ``busybox`` (tier 1) — verify tier mapping."""
     runner, _ = _make_run_subprocess(_all_responses())
-    variants, _ = enumerate_variants(
+    result = enumerate_variants(
         ".",
         "x86_64-linux",
         run_subprocess=runner,
     )
-    by_pkg = {v["pkg"]: v["tier"] for v in variants}
-    assert by_pkg["hello"] == 1
-    assert by_pkg["busybox"] == 1
+    assert result["hello"]["tier"] == 1
+    assert result["busybox"]["tier"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +386,10 @@ def test_enumerate_toolchains_unknown_arch_returns_empty():
 # ---------------------------------------------------------------------------
 
 
-def test_preflight_composes_both_calls():
+def test_preflight_returns_toolchains_only():
+    """Composite now returns toolchains-only: variants and toolchain_drvs
+    are populated by Phase 0 eval-workers on secondaries, not by the
+    submitter."""
     runner, calls = _make_run_subprocess(_all_responses())
     result = preflight(
         ".",
@@ -413,23 +398,19 @@ def test_preflight_composes_both_calls():
     )
     assert isinstance(result, PreflightResult)
     assert result.sys_name == "x86_64-linux"
-    assert len(result.variants) == 4
-    assert len(result.toolchain_specs) == 3
-    # common_dep_drvs is left empty until phase 1b populates it.
+    # Variants are deferred to the cluster; the composite returns empty.
+    assert result.variants == ()
+    assert result.toolchain_drvs == frozenset()
     assert result.common_dep_drvs == ()
-    assert isinstance(result.toolchain_drvs, frozenset)
-    assert len(result.toolchain_drvs) == 4
+    # Toolchain specs come from _crossToolchainsMeta and are populated.
+    assert len(result.toolchain_specs) == 3
 
-    # Three nix-eval flavours — meta, drvPaths, toolchains. Find the
-    # ``flake#attr`` token in each argv (with --apply present, the
-    # attr is no longer at argv[-1]; the lambda string is).
+    # Only the toolchains attr is forced (no _meta/_drvPaths walk).
     eval_attrs = set()
     for argv in calls:
         target = next((tok for tok in argv if "#" in tok), None)
         if target is not None:
             eval_attrs.add(target.split("#", 1)[1])
-    assert "_meta.x86_64-linux" in eval_attrs
-    assert any(a.startswith("_drvPaths.x86_64-linux") for a in eval_attrs)
     assert "_crossToolchainsMeta.x86_64-linux" in eval_attrs
 
 
@@ -442,7 +423,6 @@ def test_preflight_filter_pipes_through():
         archs=["x86_64"],
         run_subprocess=runner,
     )
-    assert all(v["pkg"] == "hello" and v["arch"] == "x86_64" for v in result.variants)
     assert all(arch == "x86_64" for arch, _ in result.toolchain_specs)
 
 
@@ -499,74 +479,25 @@ def _wide_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
     return responses
 
 
-def test_enumerate_variants_sample_caps_per_group():
+def test_enumerate_variants_pre_samples_at_submit_time():
+    """Submit-time pre-sampling: the wire manifest carries the already-
+    sampled suffix subset (not the full 12) and signals to the worker
+    via ``sample_size=0`` that no re-sampling is needed. Without this,
+    a 150k-variant matrix overflows the ClusterMutation SSH tunnel."""
     runner, _ = _make_run_subprocess(_wide_responses())
-    variants, _drvs = enumerate_variants(
+    result = enumerate_variants(
         ".",
         "x86_64-linux",
         sample_size=2,
         sample_seed="alpha",
         run_subprocess=runner,
     )
-    # 2 opts × 2 sample = 4 variants total (one (compiler, arch, opt) group per opt).
-    assert len(variants) == 4
-    # Two per opt group.
-    by_opt: dict[str, list] = {}
-    for v in variants:
-        opt = v["label"].split("-")[3]  # hello-x86_64-gcc15-<opt>-...
-        by_opt.setdefault(opt, []).append(v)
-    assert {"O0", "O2"} == set(by_opt)
-    assert all(len(group) == 2 for group in by_opt.values())
-
-
-def test_enumerate_variants_sample_zero_returns_full():
-    runner, _ = _make_run_subprocess(_wide_responses())
-    variants, _ = enumerate_variants(
-        ".",
-        "x86_64-linux",
-        sample_size=0,
-        run_subprocess=runner,
-    )
-    # 6 (flag, hardening) × 2 opts = 12 variants.
-    assert len(variants) == 12
-
-
-def test_enumerate_variants_sample_seed_deterministic():
-    """Same seed → identical variant set; different seed → different set."""
-    runner1, _ = _make_run_subprocess(_wide_responses())
-    runner2, _ = _make_run_subprocess(_wide_responses())
-    runner3, _ = _make_run_subprocess(_wide_responses())
-    a, _ = enumerate_variants(
-        ".", "x86_64-linux",
-        sample_size=2, sample_seed="alpha",
-        run_subprocess=runner1,
-    )
-    b, _ = enumerate_variants(
-        ".", "x86_64-linux",
-        sample_size=2, sample_seed="alpha",
-        run_subprocess=runner2,
-    )
-    c, _ = enumerate_variants(
-        ".", "x86_64-linux",
-        sample_size=2, sample_seed="beta",
-        run_subprocess=runner3,
-    )
-    labels_a = {v["label"] for v in a}
-    labels_b = {v["label"] for v in b}
-    labels_c = {v["label"] for v in c}
-    assert labels_a == labels_b
-    assert labels_a != labels_c
-
-
-def test_enumerate_variants_sample_larger_than_group_keeps_all():
-    """When sample_size exceeds group size, no variants are dropped."""
-    runner, _ = _make_run_subprocess(_wide_responses())
-    variants, _ = enumerate_variants(
-        ".", "x86_64-linux",
-        sample_size=999,
-        run_subprocess=runner,
-    )
-    assert len(variants) == 12
+    # Worker re-sampling disabled — suffixes are the final subset.
+    assert result["hello"]["sample_size"] == 0
+    assert result["hello"]["sample_seed"] == "alpha"
+    # Sampling is per (compiler, opt) group: 1 compiler x 2 opts = 2
+    # groups, sample_size=2 each → 4 suffixes total.
+    assert len(result["hello"]["suffixes_by_arch"]["x86_64"]) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -754,16 +685,16 @@ def test_build_toolchains_locally_stops_at_first_failure():
 
 
 
-def test_enumerate_variants_defer_to_phase0_returns_metadata_only():
-    """``defer_to_phase0=True`` returns per-binary metadata without
-    forcing drv instantiation."""
+def test_enumerate_variants_returns_metadata_only():
+    """``enumerate_variants`` returns per-binary metadata without
+    forcing drv instantiation; the slow ``nix-eval-jobs`` work is
+    deferred to matrix_eval workers on secondaries."""
     runner, calls = _make_run_subprocess(_all_responses())
     result = enumerate_variants(
         ".",
         "x86_64-linux",
         sample_size=3,
         sample_seed="alpha",
-        defer_to_phase0=True,
         run_subprocess=runner,
     )
     # Return shape: dict[pkg, metadata_dict].
@@ -772,11 +703,13 @@ def test_enumerate_variants_defer_to_phase0_returns_metadata_only():
 
     hello = result["hello"]
     assert sorted(hello["archs"]) == ["aarch64", "x86_64"]
-    assert hello["sample_size"] == 3
+    # Submit-time pre-sampling already ran; sample_size=0 signals to
+    # the worker that the carried suffix list is the final subset.
+    assert hello["sample_size"] == 0
     assert hello["sample_seed"] == "alpha"
     assert hello["tier"] == 1
-    # Suffixes per arch listed; NOT yet sampled (worker re-samples
-    # deterministically with the same seed).
+    # Only 2 candidates exist for hello/x86_64 (one per opt group);
+    # sample_size=3 keeps all of them (min(sample, len)).
     assert hello["suffixes_by_arch"]["x86_64"] == [
         "gcc15-O0-baseline-unhardened",
         "gcc15-O2-baseline-unhardened",
@@ -797,47 +730,28 @@ def test_enumerate_variants_defer_to_phase0_returns_metadata_only():
     for argv in calls:
         if argv and pathlib.Path(argv[0]).name == "nix-eval-jobs":
             raise AssertionError(
-                f"nix-eval-jobs spawned in deferred mode: {argv}"
+                f"nix-eval-jobs spawned: {argv}"
             )
         for tok in argv:
             if "#_drvPaths." in tok:
                 raise AssertionError(
-                    f"_drvPaths eval triggered in deferred mode: {tok}"
+                    f"_drvPaths eval triggered: {tok}"
                 )
 
 
-def test_enumerate_variants_defer_to_phase0_honours_filters():
-    """``packages`` / ``archs`` filters still apply in deferred mode."""
+def test_enumerate_variants_honours_filters():
+    """``packages`` / ``archs`` filters narrow the per-binary metadata."""
     runner, _ = _make_run_subprocess(_all_responses())
     result = enumerate_variants(
         ".",
         "x86_64-linux",
         packages=["hello"],
         archs=["x86_64"],
-        defer_to_phase0=True,
         run_subprocess=runner,
     )
     assert set(result.keys()) == {"hello"}
     assert result["hello"]["archs"] == ["x86_64"]
     assert "aarch64" not in result["hello"]["suffixes_by_arch"]
-
-
-def test_enumerate_variants_legacy_mode_unchanged():
-    """Regression: ``defer_to_phase0=False`` (default) returns the
-    legacy ``(variants, toolchain_drvs)`` shape."""
-    runner, _ = _make_run_subprocess(_all_responses())
-    legacy = enumerate_variants(
-        ".",
-        "x86_64-linux",
-        run_subprocess=runner,
-    )
-    # Tuple of (variants, drv_set) — not a dict.
-    assert isinstance(legacy, tuple)
-    assert len(legacy) == 2
-    variants, drv_set = legacy
-    assert len(variants) == 4
-    assert isinstance(drv_set, frozenset)
-    assert len(drv_set) == 4
 
 
 # ---------------------------------------------------------------------------

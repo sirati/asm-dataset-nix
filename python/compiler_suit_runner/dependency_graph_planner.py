@@ -1,0 +1,630 @@
+"""Adapter from ``template_graph.streaming.plan_from_tree_streaming`` to
+phase-4 task descriptors.
+
+Replaces the legacy ``phase1_planner.py`` refcount-and-walk model with a
+direct translation of the streaming planner's classified template graph.
+
+The streaming planner emits, per ``(template_id, arch)`` cell:
+
+  * a ``VariantArray`` whose ``variants`` lists the (compiler-opt)
+    labels covered (e.g. ``["gcc15-O0", "gcc15-O2", ...]``);
+  * a per-node hash row ``hashes[node_id][variant_index]`` carrying the
+    ``(hash, name)`` ident of the drv that occupies that role in that
+    variant;
+  * a classification per node — ``"common_dep"`` or
+    ``"variant_specific"`` — produced by the calibration-pair
+    invariants pass.
+
+Every ``common_dep`` node deduplicates one shared sub-derivation across
+all the array's variants; we emit one ``build_common_dep`` descriptor
+per such node. Every variant becomes one ``build_variant`` descriptor
+whose ``depends_on`` references the common_dep task_ids it actually
+covers plus the toolchain task_ids advertised by the caller.
+
+Decoupling notes
+----------------
+
+This module emits **descriptors**, not pre-built
+``manifest_gen.ManifestHeader`` instances, for two reasons:
+
+  1. ``manifest_gen`` is mid-rename (``phase2_common_dep`` →
+     ``build_common_dep`` and ``phase3_variant`` → ``build_variant``).
+     Descriptors let the integration site convert in either taxonomy
+     without churning this module twice.
+  2. The descriptor shape matches the ``primary_handle.spawn_tasks``
+     contract one-to-one, so the wiring layer is a trivial loop with no
+     hidden mapping logic.
+
+The module does NOT import ``template_graph`` at module load: the
+caller passes the streaming result as a plain dict (the same shape
+``plan_from_tree_streaming`` returns, but also tolerant of a
+JSON-roundtripped form produced by ``dependency_graph_worker``'s
+``_dependency_graph.json``). This keeps unit tests dependency-free
+and lets the worker either pickle dataclasses or serialise to JSON
+without dragging the adapter into either choice.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import pathlib
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, Optional
+
+
+__all__ = [
+    "DependencyGraphCycleError",
+    "Phase4Descriptor",
+    "BinaryPlanInput",
+    "convert_toolchain_drvs",
+    "plan_phase4_for_binary",
+    "plan_phase4_from_graph",
+]
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class DependencyGraphCycleError(Exception):
+    """Raised when walking the streaming planner's template graph
+    encounters a cycle.
+
+    Nix drv graphs are DAGs by construction, so this is a defensive
+    guard rather than an expected control flow path. Surfacing the
+    cycle as a typed exception lets the watcher layer treat it as a
+    hard, non-retryable error (the matrix output is corrupt and no
+    amount of redispatch will fix it).
+    """
+
+
+# ---------------------------------------------------------------------------
+# Public descriptor types
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class Phase4Descriptor:
+    """One phase-4 task description in a manifest-gen-agnostic shape.
+
+    ``kind`` is either ``"build_common_dep"`` or ``"build_variant"``;
+    integration code maps these to the current ``manifest_gen``
+    constructor names. ``payload`` carries the worker-visible
+    arguments; ``depends_on`` is the tuple of task_ids whose completion
+    gates this task.
+    """
+
+    kind: str
+    task_id: str
+    name: str
+    payload: dict
+    depends_on: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class BinaryPlanInput:
+    """Per-binary inputs for :func:`plan_phase4_for_binary`.
+
+    ``streaming_result`` is the dict returned by
+    ``template_graph.streaming.plan_from_tree_streaming`` (or a
+    JSON-roundtripped equivalent) for THIS binary's sum-drv.
+
+    ``variant_lookup`` maps ``(arch, variant_label)`` — where
+    ``variant_label`` is what the streaming planner stores in
+    ``VariantArray.variants`` (e.g. ``"gcc15-O2"``) — to the full
+    variant descriptor (a ``VariantSpec``-shaped Mapping). The
+    descriptor supplies the variant's drv path, output directory
+    metadata, compiler ids and so on — i.e. everything the build
+    worker needs that isn't visible in the streaming graph itself.
+    Missing labels are skipped with no error (caller may legitimately
+    drop variants between graph generation and planning).
+
+    ``toolchain_task_ids`` maps a toolchain drv identifier
+    (``"<hash>-<name>"`` — the format returned by
+    :func:`convert_toolchain_drvs`) to its phase-1 ``build_compilers``
+    task_id. Variants whose template touches that toolchain get the
+    id wired into their ``depends_on``. Empty mapping is fine
+    (variants then have only common-dep deps).
+    """
+
+    binary: str
+    streaming_result: Mapping[str, Any]
+    variant_lookup: Mapping[tuple[str, str], Mapping[str, Any]]
+    toolchain_task_ids: Mapping[str, str] = dataclasses.field(
+        default_factory=dict
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shape translation: (hash, name) tuples ↔ "<hash>-<name>" strings
+# ---------------------------------------------------------------------------
+
+
+def _coerce_ident(raw: Any) -> Optional[tuple[str, str]]:
+    """Normalise a single toolchain ident entry to ``(hash, name)``.
+
+    Accepts:
+      * ``(hash, name)`` tuples (native streaming output);
+      * ``[hash, name]`` lists (JSON-roundtripped form);
+      * ``"<hash>-<name>"`` strings (legacy refcount form).
+
+    Returns ``None`` for anything else so the caller can decide whether
+    to log + skip vs raise.
+    """
+    if isinstance(raw, tuple) and len(raw) == 2:
+        h, n = raw
+        if isinstance(h, str) and isinstance(n, str):
+            return h, n
+        return None
+    if isinstance(raw, list) and len(raw) == 2:
+        h, n = raw
+        if isinstance(h, str) and isinstance(n, str):
+            return h, n
+        return None
+    if isinstance(raw, str):
+        # ``<hash>-<name>`` — split on first dash. The hash is a
+        # nixbase32 32-char fixed-length prefix, so any earlier dash
+        # would corrupt; rely on it being well-formed at the caller.
+        if "-" in raw:
+            h, n = raw.split("-", 1)
+            return h, n
+        return None
+    return None
+
+
+def _ident_to_str(ident: tuple[str, str]) -> str:
+    """Join ``(hash, name)`` into the legacy ``"<hash>-<name>"`` shape."""
+    return f"{ident[0]}-{ident[1]}"
+
+
+def convert_toolchain_drvs(raw: Iterable[Any]) -> set[str]:
+    """Translate the streaming planner's ``set[(hash, name)]`` shape
+    into the legacy ``set[str]`` shape expected by
+    ``manifest_gen``-era code.
+
+    Entries that fail to coerce are dropped (the caller's contract is
+    "best-effort conversion" — a malformed entry shouldn't sink the
+    whole plan; the upstream invariant checker will already have
+    surfaced the malformation elsewhere if it matters).
+    """
+    out: set[str] = set()
+    for entry in raw:
+        ident = _coerce_ident(entry)
+        if ident is None:
+            continue
+        out.add(_ident_to_str(ident))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Helpers: reading the streaming dict's dataclass-or-dict cells
+# ---------------------------------------------------------------------------
+
+
+def _attr_or_key(obj: Any, name: str, default: Any = None) -> Any:
+    """Read ``obj.name`` (dataclass) or ``obj[name]`` (dict)."""
+    if obj is None:
+        return default
+    if hasattr(obj, name):
+        return getattr(obj, name)
+    if isinstance(obj, Mapping):
+        return obj.get(name, default)
+    return default
+
+
+def _template_nodes(template: Any) -> list[Any]:
+    """Return ``template.nodes`` as a sequence; accepts dataclass or dict."""
+    nodes = _attr_or_key(template, "nodes", []) or []
+    return list(nodes)
+
+
+def _node_field(node: Any, name: str, default: Any = None) -> Any:
+    return _attr_or_key(node, name, default)
+
+
+def _variant_array_fields(arr: Any) -> tuple[int, str, list[str], list[list]]:
+    """Return ``(template_id, arch, variants, hashes)`` from a
+    VariantArray dataclass or its JSON dict form."""
+    template_id = _attr_or_key(arr, "template_id", 0)
+    arch = _attr_or_key(arr, "arch", "")
+    variants = list(_attr_or_key(arr, "variants", []) or [])
+    hashes_raw = _attr_or_key(arr, "hashes", []) or []
+    hashes: list[list] = [list(row) if row is not None else [] for row in hashes_raw]
+    return int(template_id), str(arch), variants, hashes
+
+
+def _iter_variant_arrays(
+    variant_arrays: Any,
+) -> Iterable[tuple[tuple[int, str], Any]]:
+    """Yield ``((template_id, arch), VariantArray)`` pairs.
+
+    The streaming planner returns a dict keyed by ``(int, str)``
+    tuples. JSON roundtripping can stringify those keys (e.g.
+    ``"3|x86_64"``); we accept either by inspecting the key shape.
+    """
+    if isinstance(variant_arrays, Mapping):
+        for key, arr in variant_arrays.items():
+            if isinstance(key, tuple) and len(key) == 2:
+                yield (int(key[0]), str(key[1])), arr
+            elif isinstance(key, str) and "|" in key:
+                tid_s, arch = key.split("|", 1)
+                yield (int(tid_s), arch), arr
+            else:
+                # Caller passed an unparseable key — surface as
+                # zero/empty so downstream still works deterministically
+                # rather than crashing the whole plan over one bad
+                # cell.
+                yield (0, str(key)), arr
+
+
+def _iter_classifications(
+    raw: Any,
+) -> Iterable[tuple[tuple[int, str], dict[int, str]]]:
+    """Same key-shape tolerance as :func:`_iter_variant_arrays`,
+    yielding ``((template_id, arch), {node_id: classification})``.
+
+    Node-id keys may be int (native) or str (JSON-roundtripped); we
+    coerce to int.
+    """
+    if not isinstance(raw, Mapping):
+        return
+    for key, inner in raw.items():
+        if isinstance(key, tuple) and len(key) == 2:
+            tid, arch = int(key[0]), str(key[1])
+        elif isinstance(key, str) and "|" in key:
+            tid_s, arch = key.split("|", 1)
+            tid = int(tid_s)
+        else:
+            tid = 0
+            arch = str(key)
+        normalised: dict[int, str] = {}
+        if isinstance(inner, Mapping):
+            for nid, cls in inner.items():
+                try:
+                    normalised[int(nid)] = str(cls)
+                except (TypeError, ValueError):
+                    continue
+        yield (tid, arch), normalised
+
+
+# ---------------------------------------------------------------------------
+# Cycle-detection walk over the template graph
+# ---------------------------------------------------------------------------
+
+
+def _check_no_cycles(templates: Sequence[Any]) -> None:
+    """Walk every template's ``nodes`` array via ``child_ids`` and raise
+    :class:`DependencyGraphCycleError` if a back-edge to a node still
+    on the current DFS stack is observed.
+
+    Templates are conceptually DAGs in nix, but the streaming planner
+    may register multiple template instances and a malformed input
+    could in principle smuggle a cycle in. Cost is linear in
+    ``sum(len(nodes))`` so the guard is cheap even at production
+    matrix sizes.
+    """
+    for tmpl_id, template in enumerate(templates):
+        nodes = _template_nodes(template)
+        n = len(nodes)
+        if n == 0:
+            continue
+        WHITE, GREY, BLACK = 0, 1, 2
+        color = [WHITE] * n
+        # Iterative DFS so deep templates don't blow the recursion
+        # limit; the production matrix can have thousands of nodes
+        # per template under stage-2 stdenv expansion.
+        for start in range(n):
+            if color[start] != WHITE:
+                continue
+            stack: list[tuple[int, list[int]]] = [
+                (start, list(_node_field(nodes[start], "child_ids", []) or []))
+            ]
+            color[start] = GREY
+            while stack:
+                node_id, pending = stack[-1]
+                if not pending:
+                    color[node_id] = BLACK
+                    stack.pop()
+                    continue
+                child = pending.pop()
+                if not isinstance(child, int):
+                    # Skip non-int child entries silently — the
+                    # streaming planner never emits these but a
+                    # malformed JSON roundtrip could.
+                    continue
+                if child < 0 or child >= n:
+                    continue
+                if color[child] == GREY:
+                    raise DependencyGraphCycleError(
+                        f"cycle detected in template #{tmpl_id} at "
+                        f"node {child} (re-entered while still on the "
+                        f"DFS stack starting at node {start})"
+                    )
+                if color[child] == BLACK:
+                    continue
+                color[child] = GREY
+                stack.append((
+                    child,
+                    list(_node_field(nodes[child], "child_ids", []) or []),
+                ))
+
+
+# ---------------------------------------------------------------------------
+# common-dep / variant descriptor minting
+# ---------------------------------------------------------------------------
+
+
+def _common_dep_task_id(binary: str, arch: str, ident_str: str) -> str:
+    """Stable per-binary task id. Matches the legacy
+    ``common_dep__<base>`` shape from :mod:`manifest_gen` but adds
+    binary + arch prefixes so two binaries with the same shared dep
+    drv (rare — shared deps are mostly per-binary stdenv slices) don't
+    collide on task_id."""
+    return f"build_common_dep__{binary}__{arch}__{ident_str}"
+
+
+def _variant_task_id(binary: str, sys_name: str, label: str) -> str:
+    return f"build_variant__{sys_name}__{binary}__{label}"
+
+
+def _common_dep_descriptor(
+    *,
+    binary: str,
+    arch: str,
+    sys_name: str,
+    node_id: int,
+    node_name: str,
+    ident_str: str,
+) -> Phase4Descriptor:
+    """Build a ``build_common_dep`` descriptor for one shared-dep node."""
+    task_id = _common_dep_task_id(binary, arch, ident_str)
+    return Phase4Descriptor(
+        kind="build_common_dep",
+        task_id=task_id,
+        name=f"build_common_dep__{binary}__{arch}__{node_name}",
+        payload={
+            "sys": sys_name,
+            "binary": binary,
+            "arch": arch,
+            "node_name": node_name,
+            "node_id": node_id,
+            "ident": ident_str,
+            # ``attr`` is the worker-facing input; for common-dep
+            # builds we point at the ident-derived drv path (the build
+            # worker reconstructs the full ``/nix/store/<ident>.drv``
+            # prefix). Keeping the bare ident is forward-compatible
+            # with both classic ``nix build <drv>`` and the
+            # archive-import path used after matrix_eval.
+            "attr": ident_str,
+        },
+        depends_on=(),
+    )
+
+
+def _variant_descriptor(
+    *,
+    binary: str,
+    arch: str,
+    sys_name: str,
+    label: str,
+    variant_spec: Mapping[str, Any],
+    depends_on: Sequence[str],
+) -> Phase4Descriptor:
+    """Build a ``build_variant`` descriptor for one matrix variant.
+
+    Payload mirrors the legacy ``make_variant_header`` shape so the
+    integration site can hand-roll a ``ManifestHeader`` with no
+    field-by-field reconstruction. We do NOT call ``manifest_gen`` at
+    all — see module docstring for the decoupling rationale.
+    """
+    payload = {
+        "sys": sys_name,
+        "pkg": variant_spec.get("pkg", binary),
+        "arch": arch,
+        "label": label,
+        "drv": variant_spec.get("drv", ""),
+        "variant_dir": variant_spec.get("variant_dir", ""),
+        "metadata_name": variant_spec.get("metadata_name", ""),
+        "compiler_id": variant_spec.get("compiler_id", ""),
+        "compiler_family": variant_spec.get("compiler_family", ""),
+        "compiler_version": variant_spec.get("compiler_version", ""),
+        "optimization": variant_spec.get("optimization", ""),
+        "flag_set": variant_spec.get("flag_set", ""),
+        "hardening": variant_spec.get("hardening", ""),
+        "sanitizer": variant_spec.get("sanitizer", ""),
+        "march": variant_spec.get("march", ""),
+        "tier": variant_spec.get("tier", 0),
+    }
+    task_id = _variant_task_id(binary, sys_name, label)
+    # Deterministic ordering of deps so observers comparing manifests
+    # across runs see stable diffs.
+    return Phase4Descriptor(
+        kind="build_variant",
+        task_id=task_id,
+        name=f"build_variant__{binary}__{label}",
+        payload=payload,
+        depends_on=tuple(sorted(set(depends_on))),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public entry points
+# ---------------------------------------------------------------------------
+
+
+def plan_phase4_for_binary(
+    binary: str,
+    streaming_result: Mapping[str, Any],
+    variant_lookup: Mapping[tuple[str, str], Mapping[str, Any]],
+    *,
+    sys_name: str = "x86_64-linux",
+    toolchain_task_ids: Mapping[str, str] = (),  # type: ignore[assignment]
+) -> list[Phase4Descriptor]:
+    """Translate one binary's streaming planner output into phase-4
+    descriptors.
+
+    Returns descriptors in a stable order: every
+    ``build_common_dep`` first (sorted by ``(arch, node_name, ident)``),
+    then every ``build_variant`` (sorted by ``(arch, label)``). This
+    mirrors the legacy phase-1 planner's emit ordering so the framework
+    matcher and any human reading the spawn log get a deterministic
+    view.
+
+    Raises :class:`DependencyGraphCycleError` if the streaming result's
+    templates contain a cycle (defensive guard — see module docstring).
+
+    ``toolchain_task_ids`` defaults to an empty mapping; explicit empty
+    is allowed via ``{}``.
+    """
+    if not isinstance(toolchain_task_ids, Mapping):
+        toolchain_task_ids = dict(toolchain_task_ids)  # type: ignore[arg-type]
+
+    templates = list(streaming_result.get("templates", []) or [])
+    variant_arrays = streaming_result.get("variant_arrays", {}) or {}
+    classifications = streaming_result.get("common_deps_per_arch_template", {})
+
+    _check_no_cycles(templates)
+
+    classification_map: dict[tuple[int, str], dict[int, str]] = dict(
+        _iter_classifications(classifications)
+    )
+
+    common_dep_descriptors: list[Phase4Descriptor] = []
+    variant_descriptors: list[Phase4Descriptor] = []
+
+    # Visit each (template_id, arch) cell, mint common-dep descriptors
+    # for nodes classified as common_dep, then mint a variant
+    # descriptor per label. depends_on for a variant accumulates the
+    # ids of every common-dep cell that fires in this template +
+    # every toolchain whose ident appears in the cell's hashes.
+    for (tmpl_id, arch), arr in _iter_variant_arrays(variant_arrays):
+        if tmpl_id < 0 or tmpl_id >= len(templates):
+            continue
+        template = templates[tmpl_id]
+        nodes = _template_nodes(template)
+        _tid, _arch, variants, hashes = _variant_array_fields(arr)
+        classes = classification_map.get((tmpl_id, arch), {})
+
+        per_variant_dep_ids: list[set[str]] = [set() for _ in variants]
+
+        for node_id, node in enumerate(nodes):
+            is_toolchain = bool(_node_field(node, "is_toolchain", False))
+            cls = classes.get(node_id)
+            row = hashes[node_id] if node_id < len(hashes) else []
+            if is_toolchain:
+                # Toolchains are wired in by the caller via
+                # toolchain_task_ids. Their idents appear in the row
+                # only if the streaming planner happened to record
+                # them; the cowalk usually short-circuits and leaves
+                # the row empty for is_toolchain nodes. Probe both.
+                for variant_idx, cell in enumerate(row):
+                    ident = _coerce_ident(cell)
+                    if ident is None:
+                        continue
+                    task_id = toolchain_task_ids.get(_ident_to_str(ident))
+                    if task_id:
+                        per_variant_dep_ids[variant_idx].add(task_id)
+                continue
+            if cls != "common_dep":
+                # variant_specific (or unclassified) nodes are
+                # subsumed into their variant's own build — no
+                # dedicated common_dep task is minted.
+                continue
+            # All variants share the same hash at a common_dep node;
+            # take the first non-None as the representative.
+            representative: Optional[tuple[str, str]] = None
+            for cell in row:
+                ident = _coerce_ident(cell)
+                if ident is not None:
+                    representative = ident
+                    break
+            if representative is None:
+                # Classified as common_dep but no hashes — skip; the
+                # streaming planner's invariant checker should have
+                # already raised if this is a real shape error.
+                continue
+            ident_str = _ident_to_str(representative)
+            node_name = str(_node_field(node, "name", f"node_{node_id}"))
+            descriptor = _common_dep_descriptor(
+                binary=binary,
+                arch=arch,
+                sys_name=sys_name,
+                node_id=node_id,
+                node_name=node_name,
+                ident_str=ident_str,
+            )
+            common_dep_descriptors.append(descriptor)
+            for variant_idx in range(len(variants)):
+                per_variant_dep_ids[variant_idx].add(descriptor.task_id)
+
+        # Mint a variant descriptor per label. Variants without a
+        # lookup entry are skipped — the caller's matrix may have
+        # filtered them out between graph generation and planning.
+        for variant_idx, label in enumerate(variants):
+            spec = variant_lookup.get((arch, label))
+            if spec is None:
+                continue
+            descriptor = _variant_descriptor(
+                binary=binary,
+                arch=arch,
+                sys_name=sys_name,
+                label=label,
+                variant_spec=spec,
+                depends_on=per_variant_dep_ids[variant_idx],
+            )
+            variant_descriptors.append(descriptor)
+
+    common_dep_descriptors.sort(key=lambda d: (d.payload["arch"], d.payload["node_name"], d.payload["ident"]))
+    variant_descriptors.sort(key=lambda d: (d.payload["arch"], d.payload["label"]))
+    return common_dep_descriptors + variant_descriptors
+
+
+def plan_phase4_from_graph(
+    inputs: Iterable[BinaryPlanInput],
+    *,
+    sys_name: str = "x86_64-linux",
+) -> list[Phase4Descriptor]:
+    """Translate a sequence of per-binary streaming results into a
+    single ordered phase-4 descriptor list.
+
+    Each :class:`BinaryPlanInput` is processed independently via
+    :func:`plan_phase4_for_binary`; the results are concatenated in
+    binary-name order so the framework's spawn log is stable across
+    runs. Cycle detection runs per-binary (the first cycle raises,
+    later binaries are not visited).
+    """
+    descriptors: list[Phase4Descriptor] = []
+    for inp in sorted(inputs, key=lambda i: i.binary):
+        descriptors.extend(
+            plan_phase4_for_binary(
+                inp.binary,
+                inp.streaming_result,
+                inp.variant_lookup,
+                sys_name=sys_name,
+                toolchain_task_ids=inp.toolchain_task_ids,
+            )
+        )
+    return descriptors
+
+
+# ---------------------------------------------------------------------------
+# Convenience for tests + callers: derive a label key from a drv path
+# ---------------------------------------------------------------------------
+
+
+def variant_label_key(drv_path_or_name: str) -> str:
+    """Strip the ``/nix/store/<hash>-`` prefix and ``.drv`` suffix.
+
+    Useful for callers that have raw drv paths and want to build the
+    ``(arch, label)`` lookup key without re-parsing the variant
+    filename themselves. Mirrors the post-hash naming the streaming
+    planner uses for ``VariantArray.variants``.
+    """
+    name = pathlib.Path(drv_path_or_name).name
+    if name.endswith(".drv"):
+        name = name[:-4]
+    if "-" in name and len(name.split("-", 1)[0]) == 32:
+        # Looks like a nix store basename; strip the leading hash.
+        name = name.split("-", 1)[1]
+    return name

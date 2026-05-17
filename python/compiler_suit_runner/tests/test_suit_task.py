@@ -5,9 +5,13 @@ Today's tests cover the Phase 0 → Phase 1 quiesce watcher
 Older topology / lifecycle tests live in
 :mod:`tests.test_suit_task_topology`.
 
-``phase1_planner.plan_phase1`` and ``read_phase0_manifests`` are
-patched with :class:`unittest.mock.MagicMock` so no ``nix`` binary is
-invoked and the only IO is the stub's JSON dump.
+The legacy ``phase1_planner`` module that the watcher used to invoke
+on quiesce has been deleted; the replacement
+``dependency_graph_planner`` will be wired in a follow-up commit, so
+the watcher's ``_fire`` is currently a no-op stub. These tests cover
+the bookkeeping side (``expected``/``completed``/``fired``) and the
+``_spawn_tasks`` JSON-dump path that tests still drive directly with
+synthetic header lists.
 """
 
 from __future__ import annotations
@@ -125,15 +129,11 @@ def test_watcher_noops_for_non_phase0_task(
         out_dir=tmp_path / "out",
         toolchain_task_ids={},
     )
-    with mock.patch(
-        "compiler_suit_runner.suit_task.phase1_planner.plan_phase1"
-    ) as plan_mock:
-        w.on_task_completed("toolchain__gcc15__x86_64")
-        w.on_task_completed("")  # empty id — defensive guard
-        w.on_task_completed("merge__singleton")
+    w.on_task_completed("toolchain__gcc15__x86_64")
+    w.on_task_completed("")  # empty id — defensive guard
+    w.on_task_completed("merge__singleton")
     assert w.completed == frozenset()
     assert w.fired is False
-    plan_mock.assert_not_called()
 
 
 def test_watcher_records_phase0_completion(
@@ -148,26 +148,22 @@ def test_watcher_records_phase0_completion(
         out_dir=tmp_path / "out",
         toolchain_task_ids={},
     )
-    with mock.patch(
-        "compiler_suit_runner.suit_task.phase1_planner.plan_phase1"
-    ) as plan_mock:
-        w.on_task_completed(hello)
+    w.on_task_completed(hello)
     assert w.completed == frozenset({hello})
     assert w.fired is False
-    plan_mock.assert_not_called()
 
 
-def test_watcher_fires_plan_phase1_when_complete(
+def test_watcher_fires_when_complete(
     tmp_path: pathlib.Path,
 ) -> None:
-    """When the completed set covers the expected set, plan_phase1 is
-    invoked exactly once with the loaded manifests, toolchain map, and
-    spawn_tasks stub."""
+    """When the completed set covers the expected set, ``fired`` flips
+    to True. The legacy ``phase1_planner.plan_phase1`` invocation has
+    been removed pending the ``dependency_graph_planner`` rewrite; the
+    watcher's ``_fire`` is currently a no-op stub that only logs."""
     hello = phase0_eval_task_id("hello")
     out_dir = tmp_path / "out"
     toolchain_drv = "/nix/store/c-gcc15.drv"
     toolchain_id = toolchain_task_id(_SYS, "x86_64", "gcc15")
-    fake_manifests = {"hello": {"binary": "hello", "variants": []}}
 
     w = _Phase0QuiesceWatcher(
         expected_task_ids={hello},
@@ -175,29 +171,14 @@ def test_watcher_fires_plan_phase1_when_complete(
         toolchain_task_ids={toolchain_drv: toolchain_id},
         sys_name=_SYS,
     )
-    with mock.patch(
-        "compiler_suit_runner.suit_task.phase1_planner.plan_phase1"
-    ) as plan_mock, mock.patch(
-        "compiler_suit_runner.suit_task.phase1_planner"
-        ".read_phase0_manifests",
-        return_value=fake_manifests,
-    ) as read_mock:
-        w.on_task_completed(hello)
+    w.on_task_completed(hello)
     assert w.fired is True
-    read_mock.assert_called_once_with(out_dir)
-    plan_mock.assert_called_once()
-    args, kwargs = plan_mock.call_args
-    # Positional: phase0_manifests, toolchain_task_ids, spawn_tasks
-    assert args[0] == fake_manifests
-    assert args[1] == {toolchain_drv: toolchain_id}
-    assert callable(args[2])
-    assert kwargs.get("sys_name") == _SYS
 
 
 def test_watcher_is_idempotent_on_duplicate_completion(
     tmp_path: pathlib.Path,
 ) -> None:
-    """The same task_id arriving twice does not fire plan_phase1 twice
+    """The same task_id arriving twice does not flip ``fired`` twice
     and does not double-count toward expected."""
     hello = phase0_eval_task_id("hello")
     busybox = phase0_eval_task_id("busybox")
@@ -206,25 +187,16 @@ def test_watcher_is_idempotent_on_duplicate_completion(
         out_dir=tmp_path / "out",
         toolchain_task_ids={},
     )
-    with mock.patch(
-        "compiler_suit_runner.suit_task.phase1_planner.plan_phase1"
-    ) as plan_mock, mock.patch(
-        "compiler_suit_runner.suit_task.phase1_planner"
-        ".read_phase0_manifests",
-        return_value={},
-    ):
-        w.on_task_completed(hello)
-        w.on_task_completed(hello)  # duplicate
-        assert w.completed == frozenset({hello})
-        assert w.fired is False
-        plan_mock.assert_not_called()
-        w.on_task_completed(busybox)
-        assert w.fired is True
-        plan_mock.assert_called_once()
-        # Another stray completion after firing is a no-op.
-        w.on_task_completed(busybox)
-        w.on_task_completed(hello)
-        plan_mock.assert_called_once()
+    w.on_task_completed(hello)
+    w.on_task_completed(hello)  # duplicate
+    assert w.completed == frozenset({hello})
+    assert w.fired is False
+    w.on_task_completed(busybox)
+    assert w.fired is True
+    # Another stray completion after firing is a no-op.
+    w.on_task_completed(busybox)
+    w.on_task_completed(hello)
+    assert w.fired is True
 
 
 def test_spawn_tasks_no_handle_writes_phase1_graph_and_logs_count(
@@ -479,26 +451,20 @@ def test_spawn_tasks_swallows_handle_exception(
     )
 
 
-def test_watcher_swallows_plan_phase1_exception(
+def test_watcher_fire_does_not_raise(
     tmp_path: pathlib.Path,
 ) -> None:
-    """plan_phase1 raising must not propagate into the framework's
-    task-completion thread; the watcher logs + degrades."""
+    """The watcher's ``_fire`` is currently a no-op stub. It must not
+    raise out into the framework's task-completion thread. Once the
+    replacement ``dependency_graph_planner`` is wired, this test will
+    grow assertions for planner-failure → log + degrade behaviour."""
     hello = phase0_eval_task_id("hello")
     w = _Phase0QuiesceWatcher(
         expected_task_ids={hello},
         out_dir=tmp_path / "out",
         toolchain_task_ids={},
     )
-    with mock.patch(
-        "compiler_suit_runner.suit_task.phase1_planner.plan_phase1",
-        side_effect=RuntimeError("boom"),
-    ), mock.patch(
-        "compiler_suit_runner.suit_task.phase1_planner"
-        ".read_phase0_manifests",
-        return_value={},
-    ):
-        w.on_task_completed(hello)  # must not raise
+    w.on_task_completed(hello)  # must not raise
     assert w.fired is True
 
 
@@ -1292,18 +1258,12 @@ def test_task_completed_listener_forwards_to_watcher(
     listener(None, True, None)
     assert watcher.completed == frozenset()
 
-    # Matching task_id → registered; with one expected task, fires
-    # plan_phase1.
-    with mock.patch(
-        "compiler_suit_runner.suit_task.phase1_planner.plan_phase1"
-    ) as plan_mock, mock.patch(
-        "compiler_suit_runner.suit_task.phase1_planner"
-        ".read_phase0_manifests",
-        return_value={},
-    ):
-        listener(hello, True, None)
+    # Matching task_id → registered; with one expected task, the
+    # watcher's ``fired`` flag flips. (The legacy planner invocation
+    # has been stubbed out pending the dependency_graph_planner
+    # rewrite — this test only covers the bookkeeping today.)
+    listener(hello, True, None)
     assert watcher.fired is True
-    plan_mock.assert_called_once()
 
 
 def test_task_completed_listener_noop_without_watcher(
@@ -1391,9 +1351,17 @@ def test_phase_specs_returns_phase0_and_phase_build() -> None:
     assert set(by_id.keys()) == {"phase0", "phase_build"}
 
 
-def test_phase_specs_phase0_routes_to_eval_worker() -> None:
+def test_phase_specs_phase0_routes_to_build_worker() -> None:
     """phase0 has a single ``eval`` type pointing at
-    ``compiler_suit_runner.workers.eval_worker``."""
+    ``compiler_suit_runner.workers.build_worker``.
+
+    The framework binds ONE ``worker_module`` per secondary pool
+    (first registered wins), so every task — phase0_eval +
+    phase_build.* — must funnel through ``build_worker.main``.
+    Its ``handle`` closure dispatches phase0_eval payloads to
+    :func:`eval_worker.run_eval_task` and build manifests to
+    :func:`build_worker.build_worker`.
+    """
     pytest.importorskip("dynamic_runner.task_protocol")
     from compiler_suit_runner.suit_task import _phase_specs
     specs = _phase_specs(build_max_concurrent=None)
@@ -1402,8 +1370,23 @@ def test_phase_specs_phase0_routes_to_eval_worker() -> None:
     assert phase0.types[0].type_id == "eval"
     assert (
         phase0.types[0].worker_module
-        == "compiler_suit_runner.workers.eval_worker"
+        == "compiler_suit_runner.workers.build_worker"
     )
+
+
+def test_phase_specs_all_types_share_single_worker_module() -> None:
+    """Sanity: every TaskTypeSpec across all phases binds to the
+    SAME worker_module string. The framework's secondary pool only
+    spawns one worker module — if any spec disagrees the framework
+    silently picks the first and other types arrive at the wrong
+    dispatcher (the bug second smoke run discovered)."""
+    pytest.importorskip("dynamic_runner.task_protocol")
+    from compiler_suit_runner.suit_task import _phase_specs
+    specs = _phase_specs(build_max_concurrent=None)
+    modules = {
+        t.worker_module for spec in specs for t in spec.types
+    }
+    assert modules == {"compiler_suit_runner.workers.build_worker"}
 
 
 def test_phase_specs_phase_build_depends_on_phase0() -> None:

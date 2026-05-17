@@ -1,0 +1,6 @@
+# insecure-binaries probe summary
+# 951 pass / 0 fail
+
+dcraw       pass= 317  fail=   0
+quickjs     pass= 317  fail=   0
+wasm3       pass= 317  fail=   0

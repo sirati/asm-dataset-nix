@@ -1138,6 +1138,17 @@ def main() -> int:
         ),
     )
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--phase0-out-dir",
+        type=str,
+        default=None,
+        help=(
+            "Shared bind-mounted directory for phase0_eval resume"
+            " markers. Marker is written to"
+            " ``<phase0-out-dir>/<binary>/manifest.json``. Required"
+            " for phase0_eval tasks; ignored by build/toolchain types."
+        ),
+    )
     args, _ = parser.parse_known_args()
 
     # Route the worker subprocess's stdlib-logging output to a file so
@@ -1183,10 +1194,141 @@ def main() -> int:
         signing_public_key=args.signing_public_key or "",
     )
 
+    # ------------------------------------------------------------------
+    # Phase 0 eval plumbing
+    #
+    # The framework picks a single ``worker_module`` per secondary's pool
+    # (the first registered one in :func:`_phase_specs` wins), so every
+    # task — phase0_eval, toolchain, toolchain_validate, common_dep, and
+    # variant — funnels through this unified entry point. The handle
+    # closure below sniffs ``task.payload`` to decide which dispatch
+    # path to take:
+    #
+    #   * phase0_eval payloads carry a ``binary`` + ``attr`` top-level
+    #     pair (matches ``manifest_gen.make_phase0_eval_header``);
+    #     dispatched to :func:`eval_worker.run_eval_task`.
+    #   * everything else is a build manifest;
+    #     dispatched to :func:`build_worker` (this module).
+    #
+    # The BroadcastSender is constructed up-front so the eval branch can
+    # use it without paying init cost per-task. It is daemon-thread
+    # backed and idle if never used — cheap to leave running for the
+    # lifetime of the worker subprocess.
+    # ``BroadcastSender`` is fetched via attribute access (not a
+    # ``from … import``) so unit tests that monkeypatch
+    # ``compiler_suit_runner.peer_replication.BroadcastSender`` see
+    # the override; the late import keeps the module load cheap.
+    from compiler_suit_runner import (  # noqa: PLC0415
+        peer_replication as _peer_replication,
+    )
+    from compiler_suit_runner.workers import (  # noqa: PLC0415
+        eval_worker as _eval_worker,
+    )
+
+    BroadcastSender = _peer_replication.BroadcastSender
+
+    broadcast_sender: Optional[BroadcastSender] = None
+    if args.shared_fs:
+        shared_fs_path = pathlib.Path(args.shared_fs)
+        self_sid = args.secondary_id or ""
+
+        def _peer_url_provider() -> list[str]:
+            # Re-fetch through the module each call so the
+            # gossip-dir reader picks up tests' monkeypatched override
+            # and so peers that joined after process start are seen.
+            return _eval_worker.read_peer_push_urls(shared_fs_path, self_sid)
+
+        broadcast_sender = BroadcastSender(
+            self_peer_id=self_sid,
+            peer_url_provider=_peer_url_provider,
+            our_pubkey=args.signing_public_key or "",
+        )
+
     _handle_log = logging.getLogger("compiler_suit_runner.build_worker.handle")
 
+    def _extract_phase0_eval_payload(payload: object) -> Optional[dict]:
+        """Return the inner phase0_eval payload dict, or None if the
+        task is not a phase0_eval task.
+
+        The framework wraps the ``ManifestHeader`` into
+        ``TaskInfo.payload`` so ``task.payload`` is the header_dict
+        ``{item_class, name, size, payload: {...}}`` (see
+        :meth:`SuitTask._header_to_task_info`). The inner payload is
+        what :func:`eval_worker.run_eval_task` consumes; the
+        ``item_class == "phase0_eval"`` marker is the
+        unambiguous signal that this task targets the eval path.
+        """
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("item_class") != "phase0_eval":
+            return None
+        inner = payload.get("payload")
+        if not isinstance(inner, dict):
+            return None
+        # Defensive: the inner payload should carry ``binary`` + ``attr``
+        # + ``sys`` per :func:`manifest_gen.make_phase0_eval_header`.
+        if "binary" not in inner or "attr" not in inner:
+            return None
+        return inner
+
     def handle(task: Task) -> Optional[WorkerOutput]:
-        manifest_data = task.payload if isinstance(task.payload, dict) else None
+        payload = task.payload if isinstance(task.payload, dict) else None
+        # Phase 0 eval branch — sniff the wrapper header; if its
+        # ``item_class`` matches ``phase0_eval`` the inner payload is
+        # dispatched to :func:`eval_worker.run_eval_task` instead of
+        # the build path.
+        eval_payload = _extract_phase0_eval_payload(payload)
+        if eval_payload is not None:
+            if broadcast_sender is None:
+                # phase0_eval requires shared_fs for the peer-gossip
+                # directory (BroadcastSender peer URL lookups). Without
+                # it we can't honour the broadcast contract.
+                raise NonRecoverableError(
+                    "phase0_eval requires --shared-fs for peer gossip;"
+                    " refusing to proceed without it"
+                )
+            if not args.phase0_out_dir:
+                # phase0_eval marker dir must be passed explicitly —
+                # it's the bind-mounted shared output, distinct from
+                # the per-secondary scratch ``--shared-fs``.
+                raise NonRecoverableError(
+                    "phase0_eval requires --phase0-out-dir (shared"
+                    " bind-mounted marker dir); refusing to proceed"
+                    " without it"
+                )
+            out_dir = pathlib.Path(args.phase0_out_dir)
+            _handle_log.info(
+                "handle: dispatching phase0_eval task binary=%r archs=%r",
+                eval_payload.get("binary"), eval_payload.get("archs"),
+            )
+            try:
+                # Attribute lookup at call-time so tests can
+                # monkeypatch ``eval_worker.run_eval_task`` and have
+                # the build_worker subprocess pick up the stub.
+                _eval_worker.run_eval_task(
+                    eval_payload,
+                    out_dir=out_dir,
+                    broadcast_sender=broadcast_sender,
+                )
+            except RuntimeError as exc:
+                _handle_log.exception(
+                    "handle: run_eval_task raised RuntimeError"
+                    " (retry-eligible)"
+                )
+                raise NonRecoverableError(
+                    f"phase0_eval failed: {exc}"
+                ) from exc
+            except BaseException as exc:  # noqa: BLE001
+                _handle_log.exception(
+                    "handle: run_eval_task raised unexpectedly"
+                )
+                raise NonRecoverableError(
+                    f"phase0_eval crashed: {type(exc).__name__}: {exc}"
+                ) from exc
+            return WorkerOutput()
+
+        # Build manifest branch — original build_worker dispatch path.
+        manifest_data = payload
         manifest_path = (
             pathlib.Path(task.relative_path)
             if task.relative_path
@@ -1235,7 +1377,16 @@ def main() -> int:
                 ) from exc
         return WorkerOutput()
 
-    run(handle, args=args)
+    try:
+        run(handle, args=args)
+    finally:
+        # Daemon thread, but a clean stop drains in-flight broadcasts
+        # before the subprocess exits.
+        if broadcast_sender is not None:
+            try:
+                broadcast_sender.stop()
+            except Exception:  # noqa: BLE001
+                pass
     return 0
 
 

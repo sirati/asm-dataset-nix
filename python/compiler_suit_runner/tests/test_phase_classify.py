@@ -22,16 +22,6 @@ def _header(item_class: str, payload: dict | None = None) -> ManifestHeader:
     )
 
 
-def test_classify_phase1a_partition() -> None:
-    h = _header("phase1a_partition")
-    assert _classify(h) == ("phase1a", "partition", None)
-
-
-def test_classify_phase1b_merge() -> None:
-    h = _header("phase1b_merge")
-    assert _classify(h) == ("phase1b", "merge", None)
-
-
 def test_classify_phase2_toolchain_uses_compiler_arch_affinity() -> None:
     h = _header(
         "phase2_toolchain",

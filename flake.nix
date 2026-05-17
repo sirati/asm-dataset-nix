@@ -46,6 +46,32 @@
       # MIPS compiler-rt cross-compilation fixes (see lib/mips-clang-overlay.nix)
       compilerRtMipsOverlay = import ./lib/mips-clang-overlay.nix;
 
+      # Per-package allowlist for nixpkgs's `meta.insecure` gate. These
+      # three packages are flagged with known CVEs upstream but we
+      # include them in the corpus deliberately — the dataset's whole
+      # purpose is to exercise decompilers on real-world (vulnerable
+      # and otherwise) binaries, NOT to ship runnable software.
+      #
+      # `allowInsecurePredicate` (matches on `pkg.pname`) is preferred
+      # over `permittedInsecurePackages` (matches on full `<pname>-<ver>`)
+      # so version bumps in upstream nixpkgs don't silently re-block
+      # these. Each variant's `mkVariant.nix` rewrites
+      # `pname = "<orig>-variant"`, so the predicate strips the
+      # `-variant` suffix before checking against the base name —
+      # accepting both `pkgs.<bin>` (base pname) and the wrapped
+      # matrix derivation (`<bin>-variant`).
+      #
+      # Keep this list as small as possible — add an entry only when
+      # the failing combo is verified to be in `lib/packages.nix`.
+      allowedInsecureBasePnames = [ "dcraw" "quickjs" "wasm3" ];
+      allowInsecurePredicate =
+        pkg:
+        let
+          pname = pkg.pname or "";
+          stripped = nixpkgs.lib.removeSuffix "-variant" pname;
+        in
+        builtins.elem stripped allowedInsecureBasePnames;
+
       forAllSystems =
         f:
         nixpkgs.lib.genAttrs systems (
@@ -77,9 +103,19 @@
             };
             # Cross-compile pkgs — full overlay set including mips-clang
             # compiler-rt patches. Used for the matrix / crossToolchains.
+            # `allowInsecurePredicate` opens nixpkgs's `meta.insecure`
+            # gate for the three dcraw/quickjs/wasm3 packages we
+            # deliberately include in the corpus (see comment on
+            # `allowedInsecureBasePnames`). `config` propagates to
+            # `pkgsCross.<crossAttr>` automatically and to the manual
+            # `import pkgs.path` re-import in `lib/architectures.nix`
+            # via `pkgs.config`.
             pkgs = import nixpkgs {
               inherit system;
-              config.allowUnfree = true;
+              config = {
+                allowUnfree = true;
+                inherit allowInsecurePredicate;
+              };
               overlays = [
                 compilerRtMipsOverlay
                 dynamic-runner.overlays.default

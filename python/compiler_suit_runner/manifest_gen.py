@@ -41,7 +41,7 @@ import json
 import os
 import pathlib
 from collections.abc import Iterable
-from typing import Final, Literal, Optional
+from typing import Literal, Optional
 
 from compiler_suit_runner.partition import Shard, VariantSpec, split_into_shards
 
@@ -497,24 +497,16 @@ def write_manifest(
     return target
 
 
-# A manifest's JSON content is sub-kilobyte; reading 64 KiB is
-# generously safe and tolerates legacy sparse-padded files (older
-# write_manifest revisions ftruncate'd to a multi-GiB tail).
-_HEADER_READ_LIMIT_BYTES: Final[int] = 64 * 1024
-
-
 def read_manifest(path: pathlib.Path) -> ManifestHeader:
     """Inverse of :func:`write_manifest`.
 
-    Reads up to ``_HEADER_READ_LIMIT_BYTES`` and strips any trailing
-    NULs from legacy sparse-padded manifests before parsing.
+    Reads the whole file (phase0_eval manifests carry the full
+    per-binary suffix list and can run into the megabytes) and strips
+    any trailing NULs from legacy sparse-padded manifests before
+    parsing.
     """
     path = pathlib.Path(path)
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        head = os.read(fd, _HEADER_READ_LIMIT_BYTES)
-    finally:
-        os.close(fd)
+    head = path.read_bytes()
     # Strip any trailing NULs from legacy sparse-padded manifests so
     # json.loads sees only the document; harmless for current
     # non-padded files (no NULs to strip).
@@ -605,9 +597,8 @@ def emit_phase0_eval_manifests(
         }
 
     This shape is what :func:`compiler_suit_runner.preflight
-    .enumerate_variants` returns when invoked in
-    ``defer_to_phase0=True`` mode (see plan Part B, ``preflight.py``
-    split).
+    .enumerate_variants` returns (per-binary metadata for Phase 0
+    eval-workers; submitter never instantiates variant drvs).
 
     Each emitted header has ``task_depends_on=()`` for now. Once
     Phase -1 toolchain bootstrap tasks exist, this should reference
@@ -790,8 +781,7 @@ def emit_all_manifests(
         for drv, label in common_deps:
             headers.append(make_common_dep_header(drv, label))
 
-    # Phase 3 — variants. Inputs map keys by ``variant['label']``
-    # (matches compute_partition_locally's per_variant dict).
+    # Phase 3 — variants. Inputs map keys by ``variant['label']``.
     if "phase3_variant" in active_classes:
         inputs_by_label = per_variant_inputs or {}
         placements_by_outpath = toolchain_outpath_placements or {}

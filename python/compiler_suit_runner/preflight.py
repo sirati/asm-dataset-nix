@@ -75,17 +75,18 @@ class PreflightResult:
     phase-2 toolchain manifests.
 
     ``common_dep_drvs`` is left empty by this module: the populating
-    logic lives in phase 1b's merge worker (see
-    :mod:`compiler_suit_runner.workers.merge_worker`). It exists as a
-    field here so callers can pass a complete :class:`PreflightResult`
-    around regardless of whether the merge has run yet.
+    logic lives downstream (legacy partition/merge workers were
+    removed; the replacement dependency_graph planner will populate
+    this field once it lands). It exists as a field here so callers
+    can pass a complete :class:`PreflightResult` around regardless of
+    whether the downstream classifier has run yet.
 
     ``toolchain_drvs`` is the canonical set of nix drv paths for every
-    matrix variant's drv. The phase-1b classifier intersects this with
-    its frequency map to identify "this is a toolchain build, hoist it
-    to phase 2" vs "this is a common host dep we should pre-build".
-    For now we expose it as a frozenset so the merge worker can consume
-    it without reconstructing the set itself.
+    matrix variant's drv. The downstream classifier intersects this
+    with its frequency map to identify "this is a toolchain build,
+    hoist it to phase 2" vs "this is a common host dep we should
+    pre-build". For now we expose it as a frozenset so the consumer
+    can use it without reconstructing the set itself.
     """
 
     sys_name: str
@@ -563,6 +564,118 @@ def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# (pkg, arch) availability gate — pure consumer of the nix-side gate
+# ---------------------------------------------------------------------------
+#
+# Counterpart to ``pkgIsBuildableForTarget`` in ``lib/matrix.nix``. The nix
+# matrix returns an empty attrset for any (pkg, arch) cell whose underlying
+# nixpkgs derivation declares itself unavailable on the requested host
+# platform (``meta.available = false`` — combines
+# ``meta.platforms``/``meta.badPlatforms`` with ``meta.broken`` and
+# nixpkgs' insecure-allowlist check). Cells excluded for stdenv reasons
+# (e.g. nanopb-only-stdenvNoCC packages on archs where the override
+# wrapper isn't applicable) also come back empty.
+#
+# Rather than mirror the platform metadata in a separate Python table
+# (which would drift), this helper asks the nix matrix directly: a
+# (pkg, arch) is "supported" iff ``_meta.<sys>.<pkg>.<arch>`` has any
+# suffix attrs at all. The result is cached per (flake_ref, sys_name,
+# pkg, arch) so a sampler can probe thousands of tuples without
+# re-shelling out.
+
+
+_PKG_SUPPORTS_ARCH_CACHE: dict[tuple[str, str, str, str], bool] = {}
+
+
+def pkg_supports_arch(
+    pkg: str,
+    arch: str,
+    *,
+    flake_ref: str = ".",
+    sys_name: str = "x86_64-linux",
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> bool:
+    """Return ``True`` iff the matrix exposes any variants for ``(pkg, arch)``.
+
+    Mirrors the nix-side ``pkgIsBuildableForTarget`` gate (see
+    ``lib/matrix.nix``) by querying ``_meta.<sys>.<pkg>.<arch>`` and
+    checking whether its attribute-name list is non-empty. Cells that
+    nix dropped — because the underlying package's ``meta.available``
+    is ``false`` on that platform, or the package doesn't take a
+    ``stdenv`` argument — return ``False``.
+
+    Results are memoised so a Python sampler can call this once per
+    (pkg, arch) tuple without re-shelling out to nix. Cache key
+    includes ``flake_ref`` and ``sys_name`` so callers querying
+    different flakes / systems stay isolated.
+
+    Failures (no such pkg attr, nix eval crashes, missing flake) all
+    map to ``False`` — the caller's contract is "drop the tuple", and
+    a missing/broken cell is operationally equivalent to "unsupported".
+    """
+    key = (flake_ref, sys_name, pkg, arch)
+    cached = _PKG_SUPPORTS_ARCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    try:
+        attr_names = run_nix_eval(
+            flake_ref,
+            f"_meta.{sys_name}.{pkg}.{arch}",
+            run_subprocess=run_subprocess,
+            apply="m: builtins.attrNames m",
+        )
+    except RuntimeError:
+        _PKG_SUPPORTS_ARCH_CACHE[key] = False
+        return False
+
+    supported = isinstance(attr_names, list) and len(attr_names) > 0
+    _PKG_SUPPORTS_ARCH_CACHE[key] = supported
+    return supported
+
+
+def supported_archs_for_pkg(
+    pkg: str,
+    *,
+    flake_ref: str = ".",
+    sys_name: str = "x86_64-linux",
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> tuple[str, ...]:
+    """Return every arch label for which ``pkg`` has at least one variant.
+
+    Batched companion to :func:`pkg_supports_arch`: one ``nix eval``
+    asks for the per-arch attribute-name counts in a single call, then
+    populates the per-(pkg, arch) cache with the result so subsequent
+    point queries hit the cache.
+
+    Returns ``()`` if the pkg doesn't appear in ``_meta`` at all (eg
+    typo or pkg not in ``lib/packages.nix``); the per-(pkg, arch) cache
+    entries are still written so repeated calls don't re-shell out.
+    """
+    try:
+        per_arch_counts = run_nix_eval(
+            flake_ref,
+            f"_meta.{sys_name}.{pkg}",
+            run_subprocess=run_subprocess,
+            apply="m: builtins.mapAttrs (_: a: builtins.length (builtins.attrNames a)) m",
+        )
+    except RuntimeError:
+        return ()
+    if not isinstance(per_arch_counts, dict):
+        return ()
+    supported: list[str] = []
+    for arch, count in per_arch_counts.items():
+        if not isinstance(arch, str) or not isinstance(count, int):
+            continue
+        is_supported = count > 0
+        _PKG_SUPPORTS_ARCH_CACHE[(flake_ref, sys_name, pkg, arch)] = is_supported
+        if is_supported:
+            supported.append(arch)
+    supported.sort()
+    return tuple(supported)
+
+
 def _sample_suffix_attrs(
     suffix_attrs: dict,
     *,
@@ -614,24 +727,22 @@ def enumerate_variants(
     archs: Optional[list[str]] = None,
     sample_size: int = 0,
     sample_seed: str = "42",
-    defer_to_phase0: bool = False,
     run_subprocess: Optional[RunSubprocess] = None,
-):
-    """Enumerate every ``(pkg, arch, suffix)`` variant the matrix exposes.
+) -> dict[str, dict]:
+    """Enumerate every ``(pkg, arch, suffix)`` variant the matrix exposes,
+    returning per-binary metadata that the Phase 0 eval-worker uses to
+    drive its own ``nix-eval-jobs`` invocation.
 
     Filters by ``packages`` and ``archs`` if provided (each is an inclusion
     list — None means "all").
 
-    When ``sample_size > 0`` each ``(compiler, arch, optimization)`` group
-    is down-sampled to that many ``(flag, hardening)`` combinations using
-    a deterministic seeded RNG keyed on ``sample_seed`` plus the group
-    identity — so changing the seed reshuffles every group. The slow
-    ``_drvPaths`` eval is still scoped per ``(pkg, arch)``; sampling
-    happens against the meta layer (instant) before any drv lookups.
+    ``sample_size`` / ``sample_seed`` are echoed back in the per-binary
+    metadata so the Phase 0 eval-worker on a secondary re-applies the
+    deterministic sample with the same seed — the submitter never needs
+    to know the sampled subset and the slow drv-instantiation never runs
+    on the submit host. Suffixes are filtered against the support table
+    and the known-bad-combo list *before* being emitted.
 
-    When ``defer_to_phase0=True``, **skip the drv-instantiation step**
-    entirely and return only the per-binary metadata that a Phase 0
-    eval-worker needs to do the slow ``nix-eval-jobs`` work itself.
     The return shape is::
 
         {
@@ -644,17 +755,6 @@ def enumerate_variants(
           },
           ...
         }
-
-    Note: ``suffixes_by_arch`` lists suffixes *after* support-table and
-    known-bad-combo filtering but *before* sampling — the Phase 0 worker
-    re-applies the deterministic sample with the same ``sample_seed`` so
-    the submitter never needs to know the sampled subset.
-
-    With ``defer_to_phase0=False`` (default) the function behaves exactly
-    as before and returns ``(variants, toolchain_drvs)`` where
-    ``toolchain_drvs`` is the set of nix drv paths corresponding to the
-    variants. (The plan calls this the canonical set; phase 1b uses it
-    to filter "toolchain" from "common host dep" classification.)
     """
     pkg_filter = set(packages) if packages else None
     arch_filter = set(archs) if archs else None
@@ -708,181 +808,67 @@ def enumerate_variants(
             continue
         meta.setdefault(pkg, {})[arch] = cell
 
-    # Deferred Phase 0 mode: we have the per-(pkg, arch) meta but skip
-    # the drv-instantiation step entirely. The Phase 0 eval-worker on a
-    # secondary will do the slow ``nix-eval-jobs`` work itself, seeded
-    # with the same ``sample_seed`` so the resulting variant set is
-    # deterministic without the submitter ever forcing drv paths.
-    if defer_to_phase0:
-        from compiler_suit_runner.support_table import (  # noqa: PLC0415
-            is_supported,
-            load_support_table,
-        )
-        support = load_support_table()
-        out: dict[str, dict] = {}
-        for pkg, arch_attrs in sorted(meta.items()):
-            if pkg_filter is not None and pkg not in pkg_filter:
-                continue
-            if not isinstance(arch_attrs, dict):
-                continue
-            per_arch: dict[str, list[str]] = {}
-            for arch, suffix_attrs in sorted(arch_attrs.items()):
-                if arch_filter is not None and arch not in arch_filter:
-                    continue
-                if not isinstance(suffix_attrs, dict):
-                    continue
-                kept: list[str] = []
-                for suffix, meta_entry in sorted(suffix_attrs.items()):
-                    if not isinstance(meta_entry, dict):
-                        continue
-                    if not is_supported(
-                        support, meta_entry.get("compiler", ""), arch
-                    ):
-                        continue
-                    if is_known_bad_combo(meta_entry):
-                        continue
-                    kept.append(suffix)
-                if kept:
-                    per_arch[arch] = kept
-            if per_arch:
-                out[pkg] = {
-                    "archs": sorted(per_arch.keys()),
-                    "suffixes_by_arch": per_arch,
-                    "sample_size": sample_size,
-                    "sample_seed": sample_seed,
-                    "tier": _tier_from_pkg(pkg),
-                }
-        return out
-
-    # Scope the (slow, drv-instantiating) `_drvPaths` eval to just the
-    # (pkg, arch) combos the operator actually asked for. The full-matrix
-    # eval `_drvPaths.<sys>` touches every (compiler, arch) cell — including
-    # broken combos like gcc5+mips64el (nixpkgs-18.03 lacks
-    # platform.kernelArch for the triple) whose errors raise from
-    # `derivationStrict` and cannot be caught by `tryEval`. When the user
-    # filters with --packages / --archs, evaluating per-(pkg, arch) keeps
-    # the eval inside the requested scope, so unrelated broken cells stay
-    # untouched. With no filter we have to evaluate the whole system —
-    # callers asking for "everything" implicitly accept the broken-cell risk.
-    full_drvs: dict | None = None
-    if pkg_filter is None and arch_filter is None:
-        full_drvs = run_nix_eval(
-            flake_ref,
-            f"_drvPaths.{sys_name}",
-            run_subprocess=run_subprocess,
-        )
-        if not isinstance(full_drvs, dict):
-            raise RuntimeError(
-                f"_drvPaths.{sys_name} is not a JSON object "
-                f"(got {type(full_drvs).__name__})"
-            )
-
-    variants: list[VariantSpec] = []
-    drv_set: set[str] = set()
-
-    # Authoritative (compiler, arch) support matrix from table.md at
-    # the flake root. Used to drop combos marked FAIL/n/a *before*
-    # asking nix to evaluate ``_drvPaths`` — without this filter,
-    # forcing a broken cell can crash preflight with hard
-    # ``builtins.throw`` errors that escape ``tryEval`` (e.g.
-    # ``gcc5: cross-compiler not available in nixpkgs-18.03 for
-    # mips64el`` from ``lib/old-gcc-cross.nix``).
+    # We have the per-(pkg, arch) meta but skip the drv-instantiation
+    # step entirely. The matrix_eval worker on a secondary does the
+    # slow ``nix-eval-jobs`` work itself, seeded with the same
+    # ``sample_seed`` so the resulting variant set is deterministic
+    # without the submitter ever forcing drv paths.
     from compiler_suit_runner.support_table import (  # noqa: PLC0415
         is_supported,
         load_support_table,
     )
     support = load_support_table()
-
+    out: dict[str, dict] = {}
     for pkg, arch_attrs in sorted(meta.items()):
         if pkg_filter is not None and pkg not in pkg_filter:
             continue
         if not isinstance(arch_attrs, dict):
             continue
+        per_arch: dict[str, list[str]] = {}
         for arch, suffix_attrs in sorted(arch_attrs.items()):
             if arch_filter is not None and arch not in arch_filter:
                 continue
             if not isinstance(suffix_attrs, dict):
                 continue
-            # Drop variants whose (compiler, arch) is FAIL or n/a per
-            # table.md. The compiler axis is encoded in each meta
-            # entry's ``compiler`` field. Suffixes lacking the field
-            # (shouldn't happen on a well-formed matrix) are passed
-            # through and caught by other filters.
-            suffix_attrs = {
-                s: m
-                for s, m in suffix_attrs.items()
-                if not isinstance(m, dict)
-                or is_supported(support, m.get("compiler", ""), arch)
-            }
-            # Drop known-bad combinations BEFORE sampling so the
-            # operator's K-per-group budget isn't wasted on cells
-            # that will fail at build time anyway. See
-            # :func:`is_known_bad_combo` for the rule list.
-            suffix_attrs = {
-                s: m
-                for s, m in suffix_attrs.items()
-                if not (isinstance(m, dict) and is_known_bad_combo(m))
-            }
-            if sample_size > 0:
-                suffix_attrs = _sample_suffix_attrs(
-                    suffix_attrs,
+            kept_map: dict[str, dict] = {}
+            for suffix, meta_entry in sorted(suffix_attrs.items()):
+                if not isinstance(meta_entry, dict):
+                    continue
+                if not is_supported(
+                    support, meta_entry.get("compiler", ""), arch
+                ):
+                    continue
+                if is_known_bad_combo(meta_entry):
+                    continue
+                kept_map[suffix] = meta_entry
+            # Pre-apply sampling here so manifests stay small enough
+            # to transit the framework's ClusterMutation wire (a 8 MB
+            # suffix list for 150 k+ variants causes the SSH tunnel
+            # to reset before InitialAssignment arrives). The eval
+            # worker then uses the already-sampled list directly
+            # (variant_sample=None in payload → no re-sampling step).
+            if sample_size > 0 and sample_seed and kept_map:
+                kept_map = _sample_suffix_attrs(
+                    kept_map,
                     arch=arch,
                     sample_size=sample_size,
                     seed=sample_seed,
                 )
-            # Get drv paths for the kept suffixes. Three strategies:
-            #   - Sampled mode: single ``nix eval --apply`` that
-            #     pulls just the kept suffixes out of the lazy
-            #     ``_drvPaths.<sys>.<pkg>.<arch>`` attrset. Nix
-            #     evaluates only the requested attrs (lazy attrset
-            #     access) so the eval cost scales with O(num
-            #     compilers in the sample) — the shared cross-
-            #     toolchain closure dominates and only gets walked
-            #     once per compiler, not per variant.
-            #   - Full-matrix mode (no sampling, no top-level
-            #     ``_drvPaths.<sys>``): evaluate the full
-            #     per-(pkg, arch) attrset; nix forces every value.
-            #   - Top-level pre-evaluated: read from the cached
-            #     ``full_drvs`` dict.
-            if sample_size > 0 and suffix_attrs:
-                drvs_arch = _eval_drv_paths_for_suffixes(
-                    flake_ref,
-                    sys_name,
-                    pkg,
-                    arch,
-                    list(suffix_attrs),
-                    run_subprocess=run_subprocess,
-                )
-            elif full_drvs is None:
-                drvs_arch = run_nix_eval(
-                    flake_ref,
-                    f"_drvPaths.{sys_name}.{pkg}.{arch}",
-                    run_subprocess=run_subprocess,
-                )
-            else:
-                drvs_pkg = full_drvs.get(pkg)
-                drvs_arch = (
-                    drvs_pkg.get(arch) if isinstance(drvs_pkg, dict) else None
-                )
-            if not isinstance(drvs_arch, dict):
-                continue
-            for suffix, meta_entry in sorted(suffix_attrs.items()):
-                if not isinstance(meta_entry, dict):
-                    continue
-                drv = drvs_arch.get(suffix)
-                if not isinstance(drv, str) or not drv:
-                    continue
-                variant = _build_variant_spec(
-                    pkg=pkg,
-                    arch=arch,
-                    suffix=suffix,
-                    meta_entry=meta_entry,
-                    drv_path=drv,
-                )
-                variants.append(variant)
-                drv_set.add(drv)
-
-    return tuple(variants), frozenset(drv_set)
+            if kept_map:
+                per_arch[arch] = sorted(kept_map.keys())
+        if per_arch:
+            out[pkg] = {
+                "archs": sorted(per_arch.keys()),
+                "suffixes_by_arch": per_arch,
+                # Signal to eval_worker that no re-sampling is needed:
+                # suffixes are already the final sampled subset.
+                # eval_worker skips the _meta lookup + re-sampling
+                # step when sample_size is falsy.
+                "sample_size": 0,
+                "sample_seed": sample_seed,
+                "tier": _tier_from_pkg(pkg),
+            }
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1203,22 +1189,25 @@ def preflight(
     sample_seed: str = "42",
     run_subprocess: Optional[RunSubprocess] = None,
 ) -> PreflightResult:
-    """Composite call: variants + toolchains.
+    """Composite call: toolchain enumeration only.
 
-    See :func:`enumerate_variants` for the meaning of ``sample_size`` /
-    ``sample_seed``. ``common_dep_drvs`` is left empty here — phase 1b's
-    merge worker populates it on the cluster. The phase-2 manifests
-    therefore only cover toolchains until the merge runs.
+    Since distributed-eval is the only supported mode, the submitter
+    no longer instantiates variant drvs locally — Phase 0 eval-workers
+    on secondaries do that work. The returned :class:`PreflightResult`
+    therefore carries an empty ``variants`` tuple and an empty
+    ``toolchain_drvs`` set; only ``toolchain_specs`` (the
+    ``(arch, compiler)`` pairs the matrix considers valid) is populated.
+    ``common_dep_drvs`` is left empty here — the cluster's eval workers
+    populate it dynamically at runtime.
+
+    ``sample_size`` / ``sample_seed`` / ``packages`` / ``archs`` are
+    accepted for API compatibility (cli's ``preflight`` debug subcommand
+    forwards them) but are not consulted by this composite — they apply
+    only to per-binary metadata that the Phase 0 eval-worker generates.
+    Use :func:`enumerate_variants` directly to inspect the per-binary
+    metadata shape on the submitter.
     """
-    variants, toolchain_drvs = enumerate_variants(
-        flake_ref,
-        sys_name,
-        packages=packages,
-        archs=archs,
-        sample_size=sample_size,
-        sample_seed=sample_seed,
-        run_subprocess=run_subprocess,
-    )
+    del packages, sample_size, sample_seed  # accepted for API stability
     toolchain_specs = enumerate_toolchains(
         flake_ref,
         sys_name,
@@ -1227,10 +1216,10 @@ def preflight(
     )
     return PreflightResult(
         sys_name=sys_name,
-        variants=variants,
+        variants=(),
         toolchain_specs=toolchain_specs,
         common_dep_drvs=(),
-        toolchain_drvs=toolchain_drvs,
+        toolchain_drvs=frozenset(),
     )
 
 

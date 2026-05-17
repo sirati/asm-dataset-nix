@@ -225,7 +225,6 @@ let
   serialization = {
     high = [
       (pkg "msgpack-c" "msgpack-c")
-      (pkg "nanopb" "nanopb")
     ];
     med = [
       (pkg "flatbuffers" "flatbuffers")
@@ -311,7 +310,7 @@ let
   # ---------- Embedded VMs / interpreters ----------
   interpreters = {
     high = [
-      (pkg "tcc" "tcc")
+      (pkg "tinycc" "tcc")
       (pkg "duktape" "duktape")
       (pkg "quickjs" "quickjs")
       (pkg "mujs" "mujs")

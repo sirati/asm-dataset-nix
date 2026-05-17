@@ -26,8 +26,8 @@ auth boundary is the cluster pubkey header on the harmonia push
 side, not the in-store signature.
 
 Subprocess invocation is dependency-injected via ``run_subprocess``
-(same seam as :mod:`compiler_suit_runner.partition_local`) so tests
-stay hermetic.
+(same seam as :mod:`compiler_suit_runner.preflight`) so tests stay
+hermetic.
 """
 
 from __future__ import annotations
@@ -59,8 +59,7 @@ PRIMARY_CANDIDATE_ID = "submitter"
 
 
 # argv -> (stdout_bytes, stderr_bytes, returncode). Matches the seam
-# used in :mod:`compiler_suit_runner.partition_local` and
-# :mod:`compiler_suit_runner.preflight`.
+# used in :mod:`compiler_suit_runner.preflight`.
 RunSubprocess = Callable[[list[str]], tuple[bytes, bytes, int]]
 
 

@@ -79,9 +79,18 @@ let
   # for aarch64+clang3_5). Dropping at matrix-build time means the
   # framework never enumerates the combo and the dispatch never
   # wastes a worker on a known-impossible variant.
+  #
+  # Entry shape:
+  #   { major; minor; }        — exact (major, minor) match
+  #   { major; }    (no minor) — wildcard: matches any minor of that major
+  # The wildcard form is what we want for "the entire major release
+  # is broken on this target" (e.g. all of GCC 11.x on ppc32); the
+  # exact form is for surgical singletons (e.g. clang 3.5.2 alone).
   isVersionInBrokenList =
     cv: brokenList:
-    builtins.any (b: b.major == cv.major && b.minor == cv.minor) brokenList;
+    builtins.any (
+      b: b.major == cv.major && (!(b ? minor) || b.minor == cv.minor)
+    ) brokenList;
 
   isValidArchCombo =
     compiler: target:
@@ -146,6 +155,85 @@ let
       allowed = entry.archs or null;
     in
     allowed == null || builtins.elem target.label allowed;
+
+  # Generic matrix-side gate: a package can be variant-instantiated by
+  # ``mkVariant`` (which calls ``targetPkgs.${attr}.override { stdenv = …; }``)
+  # only if its underlying package function declares a ``stdenv`` parameter.
+  # ``stdenvNoCC``-only packages (e.g. ``nanopb``) survive into the matrix
+  # otherwise and throw ``unexpected argument 'stdenv'`` at build time.
+  #
+  # Introspection: nixpkgs' ``lib.makeOverridable`` wraps ``.override`` as a
+  # functor whose ``__functionArgs`` mirrors the underlying package lambda's
+  # formal parameters. ``pkg.override.__functionArgs ? stdenv`` is therefore
+  # the most direct, allocation-free probe — no need to actually invoke
+  # ``override`` or call ``overrideAttrs`` (both would force real evaluation).
+  # The whole probe is wrapped in ``tryEval`` so a malformed/legacy override
+  # mechanism on some obscure package can't take down the entire matrix.
+  pkgAcceptsStdenv =
+    targetPkgs: pkgDef:
+    if targetPkgs == null || !(targetPkgs ? ${pkgDef.attr}) then
+      false
+    else
+      let
+        probe = builtins.tryEval (
+          let
+            p = targetPkgs.${pkgDef.attr};
+          in
+          p ? override
+          && (p.override ? __functionArgs)
+          && (p.override.__functionArgs ? stdenv)
+        );
+      in
+      probe.success && probe.value;
+
+  # Per-(pkg, arch) platform-availability gate, complementary to
+  # ``pkgAcceptsStdenv``. Many nixpkgs packages declare a non-trivial
+  # ``meta.platforms`` allowlist or ``meta.badPlatforms`` denylist (e.g.
+  # ``guetzli`` ships SSE2 intrinsics unconditionally → x86-only;
+  # ``hyperscan`` is x86-only; ``rav1e`` rules out most cross targets).
+  # Others mark themselves ``meta.broken = true`` on hosts where their
+  # build is known not to land (``xed`` on aarch64 cross), or carry
+  # ``meta.insecure = true`` so nixpkgs refuses to evaluate them by
+  # default (``quickjs`` with active CVEs).
+  #
+  # nixpkgs collapses all three signals into a single boolean,
+  # ``pkg.meta.available``, computed in ``<nixpkgs>/lib/meta.nix`` by
+  # combining ``availableOn`` (platforms/badPlatforms vs the build's
+  # host platform) with ``broken`` and the insecure-allowlist check.
+  # ``stdenv.mkDerivation``'s "Refusing to evaluate package … because
+  # it is not available on the requested hostPlatform" error fires from
+  # exactly the same condition we check here, so using ``meta.available``
+  # mirrors the upstream gate one-to-one.
+  #
+  # The probe runs inside ``tryEval`` because a small number of legacy
+  # attrs throw from ``meta`` itself (broken assertions in old nixpkgs
+  # revisions or `requireFile`-style fetchers). The fallback ``false``
+  # keeps the rest of the matrix evaluable; a probe that can't determine
+  # availability is treated as "not available".
+  pkgSupportsPlatform =
+    targetPkgs: pkgDef:
+    if targetPkgs == null || !(targetPkgs ? ${pkgDef.attr}) then
+      false
+    else
+      let
+        probe = builtins.tryEval (
+          let
+            p = targetPkgs.${pkgDef.attr};
+          in
+          (p.meta.available or true)
+        );
+      in
+      probe.success && probe.value;
+
+  # Combined gate: both axes must hold for a (pkg, arch) cell to
+  # enumerate variants. Single source of truth used by both
+  # ``nestedMatrix`` (derivation-building) and ``metaMatrix`` (pure
+  # metadata) so they stay in lock-step — if any cell shows up empty
+  # in ``_meta``, the same cell will be empty in ``dataset``.
+  pkgIsBuildableForTarget =
+    targetPkgs: pkgDef:
+    pkgAcceptsStdenv targetPkgs pkgDef
+    && pkgSupportsPlatform targetPkgs pkgDef;
 
   # All (compiler, optLevel, flagSet, hardening, sanitizer, march)
   # tuples — compiler-only filtering happens here; arch filtering
@@ -296,8 +384,12 @@ let
       archName:
       let
         target = archDefs.targets.${archName};
+        targetPkgs' = archDefs.getPkgsForTarget pkgs target;
       in
-      builtins.listToAttrs (map (mkEntry pkgDef target) (combosForTarget target))
+      if !(pkgIsBuildableForTarget targetPkgs' pkgDef) then
+        { }
+      else
+        builtins.listToAttrs (map (mkEntry pkgDef target) (combosForTarget target))
     )
   );
 
@@ -311,13 +403,17 @@ let
       archName:
       let
         target = archDefs.targets.${archName};
+        targetPkgs' = archDefs.getPkgsForTarget pkgs target;
       in
-      builtins.listToAttrs (
-        map (combo: {
-          name = mkSuffix combo;
-          value = mkMeta pkgDef target combo;
-        }) (combosForTarget target)
-      )
+      if !(pkgIsBuildableForTarget targetPkgs' pkgDef) then
+        { }
+      else
+        builtins.listToAttrs (
+          map (combo: {
+            name = mkSuffix combo;
+            value = mkMeta pkgDef target combo;
+          }) (combosForTarget target)
+        )
     )
   );
 
