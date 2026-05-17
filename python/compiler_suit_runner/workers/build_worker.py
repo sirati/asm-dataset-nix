@@ -1140,10 +1140,10 @@ def main() -> int:
         type=str,
         default=None,
         help=(
-            "Shared bind-mounted directory for phase0_eval resume"
+            "Shared bind-mounted directory for matrix_eval resume"
             " markers. Marker is written to"
             " ``<phase0-out-dir>/<binary>/manifest.json``. Required"
-            " for phase0_eval tasks; ignored by build_common_dep /"
+            " for matrix_eval tasks; ignored by build_common_dep /"
             " build_variant / toolchain_validate types."
         ),
     )
@@ -1197,12 +1197,12 @@ def main() -> int:
     #
     # The framework picks a single ``worker_module`` per secondary's pool
     # (the first registered one in :func:`_phase_specs` wins), so every
-    # task — phase0_eval, toolchain_validate, build_common_dep, and
+    # task — matrix_eval, toolchain_validate, build_common_dep, and
     # build_variant — funnels through this unified entry point. The
     # handle closure below sniffs ``task.payload`` to decide which
     # dispatch path to take:
     #
-    #   * phase0_eval payloads carry a ``binary`` + ``attr`` top-level
+    #   * matrix_eval payloads carry a ``binary`` + ``attr`` top-level
     #     pair (matches ``manifest_gen.make_matrix_eval_header``);
     #     dispatched to :func:`eval_worker.run_eval_task`.
     #   * everything else is a build manifest;
@@ -1244,21 +1244,21 @@ def main() -> int:
 
     _handle_log = logging.getLogger("compiler_suit_runner.build_worker.handle")
 
-    def _extract_phase0_eval_payload(payload: object) -> Optional[dict]:
-        """Return the inner phase0_eval payload dict, or None if the
-        task is not a phase0_eval task.
+    def _extract_matrix_eval_payload(payload: object) -> Optional[dict]:
+        """Return the inner matrix_eval payload dict, or None if the
+        task is not a matrix_eval task.
 
         The framework wraps the ``ManifestHeader`` into
         ``TaskInfo.payload`` so ``task.payload`` is the header_dict
         ``{item_class, name, size, payload: {...}}`` (see
         :meth:`SuitTask._header_to_task_info`). The inner payload is
         what :func:`eval_worker.run_eval_task` consumes; the
-        ``item_class == "phase0_eval"`` marker is the
+        ``item_class == "matrix_eval"`` marker is the
         unambiguous signal that this task targets the eval path.
         """
         if not isinstance(payload, dict):
             return None
-        if payload.get("item_class") != "phase0_eval":
+        if payload.get("item_class") != "matrix_eval":
             return None
         inner = payload.get("payload")
         if not isinstance(inner, dict):
@@ -1272,31 +1272,31 @@ def main() -> int:
     def handle(task: Task) -> Optional[WorkerOutput]:
         payload = task.payload if isinstance(task.payload, dict) else None
         # Phase 0 eval branch — sniff the wrapper header; if its
-        # ``item_class`` matches ``phase0_eval`` the inner payload is
+        # ``item_class`` matches ``matrix_eval`` the inner payload is
         # dispatched to :func:`eval_worker.run_eval_task` instead of
         # the build path.
-        eval_payload = _extract_phase0_eval_payload(payload)
+        eval_payload = _extract_matrix_eval_payload(payload)
         if eval_payload is not None:
             if broadcast_sender is None:
-                # phase0_eval requires shared_fs for the peer-gossip
+                # matrix_eval requires shared_fs for the peer-gossip
                 # directory (BroadcastSender peer URL lookups). Without
                 # it we can't honour the broadcast contract.
                 raise NonRecoverableError(
-                    "phase0_eval requires --shared-fs for peer gossip;"
+                    "matrix_eval requires --shared-fs for peer gossip;"
                     " refusing to proceed without it"
                 )
             if not args.phase0_out_dir:
-                # phase0_eval marker dir must be passed explicitly —
+                # matrix_eval marker dir must be passed explicitly —
                 # it's the bind-mounted shared output, distinct from
                 # the per-secondary scratch ``--shared-fs``.
                 raise NonRecoverableError(
-                    "phase0_eval requires --phase0-out-dir (shared"
+                    "matrix_eval requires --phase0-out-dir (shared"
                     " bind-mounted marker dir); refusing to proceed"
                     " without it"
                 )
             out_dir = pathlib.Path(args.phase0_out_dir)
             _handle_log.info(
-                "handle: dispatching phase0_eval task binary=%r archs=%r",
+                "handle: dispatching matrix_eval task binary=%r archs=%r",
                 eval_payload.get("binary"), eval_payload.get("archs"),
             )
             try:
@@ -1314,14 +1314,14 @@ def main() -> int:
                     " (retry-eligible)"
                 )
                 raise NonRecoverableError(
-                    f"phase0_eval failed: {exc}"
+                    f"matrix_eval failed: {exc}"
                 ) from exc
             except BaseException as exc:  # noqa: BLE001
                 _handle_log.exception(
                     "handle: run_eval_task raised unexpectedly"
                 )
                 raise NonRecoverableError(
-                    f"phase0_eval crashed: {type(exc).__name__}: {exc}"
+                    f"matrix_eval crashed: {type(exc).__name__}: {exc}"
                 ) from exc
             return WorkerOutput()
 

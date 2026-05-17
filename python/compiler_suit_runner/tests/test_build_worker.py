@@ -940,7 +940,7 @@ def test_variant_prefetch_skipped_without_placement_plumbing(tmp_path):
 # Subprocess entry point — main + handle closure (unified dispatch)
 #
 # The framework picks ONE ``worker_module`` per secondary pool, so
-# ``build_worker.main`` must dispatch both phase0_eval payloads
+# ``build_worker.main`` must dispatch both matrix_eval payloads
 # (-> :func:`eval_worker.run_eval_task`) and the original build
 # manifests (-> :func:`build_worker.build_worker`). The handle closure
 # sniffs ``task.payload['item_class']`` to decide which branch fires.
@@ -967,7 +967,7 @@ def _run_build_worker_main_with_capture(
         def __init__(
             self,
             payload=None,
-            task_id: str = "phase0_eval__hello",
+            task_id: str = "matrix_eval__hello",
             relative_path: str = "",
             resolved_path: str = "",
         ) -> None:
@@ -1020,16 +1020,16 @@ def _run_build_worker_main_with_capture(
     return captured_handle, run_mock, sender_class_mock
 
 
-def _phase0_eval_wrapper_payload(
+def _matrix_eval_wrapper_payload(
     *,
     binary: str = "hello",
     sys_name: str = "x86_64-linux",
 ) -> dict:
     """Return a header_dict wrapper as :class:`SuitTask._header_to_task_info`
-    would emit — ``payload`` field is the inner phase0_eval data."""
+    would emit — ``payload`` field is the inner matrix_eval data."""
     return {
-        "item_class": "phase0_eval",
-        "name": f"phase0_eval__{binary}",
+        "item_class": "matrix_eval",
+        "name": f"matrix_eval__{binary}",
         "size": 1,
         "payload": {
             "binary": binary,
@@ -1041,10 +1041,10 @@ def _phase0_eval_wrapper_payload(
     }
 
 
-def test_main_handle_dispatches_phase0_eval_to_run_eval_task(
+def test_main_handle_dispatches_matrix_eval_to_run_eval_task(
     monkeypatch, tmp_path
 ):
-    """A task whose ``item_class == 'phase0_eval'`` is routed to
+    """A task whose ``item_class == 'matrix_eval'`` is routed to
     :func:`eval_worker.run_eval_task` with the inner payload, the
     shared-fs-derived out_dir, and the constructed BroadcastSender."""
     handle, _, sender_cls = _run_build_worker_main_with_capture(
@@ -1079,7 +1079,7 @@ def test_main_handle_dispatches_phase0_eval_to_run_eval_task(
     fake_task_cls = _sys.modules["dynamic_runner.worker"].Task
     fake_output_cls = _sys.modules["dynamic_runner.worker"].WorkerOutput
 
-    wrapper = _phase0_eval_wrapper_payload(binary="hello")
+    wrapper = _matrix_eval_wrapper_payload(binary="hello")
     task = fake_task_cls(payload=wrapper)
     output = handle(task)
     assert isinstance(output, fake_output_cls)
@@ -1092,7 +1092,7 @@ def test_main_handle_dispatches_phase0_eval_to_run_eval_task(
 def test_main_handle_dispatches_build_manifest_to_build_worker(
     monkeypatch, tmp_path
 ):
-    """A task whose payload is NOT a phase0_eval wrapper (e.g. a
+    """A task whose payload is NOT a matrix_eval wrapper (e.g. a
     toolchain manifest) is routed to the existing build_worker path,
     NOT to run_eval_task."""
     handle, _, _ = _run_build_worker_main_with_capture(
@@ -1135,7 +1135,7 @@ def test_main_handle_dispatches_build_manifest_to_build_worker(
     fake_output_cls = _sys.modules["dynamic_runner.worker"].WorkerOutput
 
     # A common-dep manifest wrapper (item_class is one of the build
-    # classes). The handle closure must NOT treat this as phase0_eval.
+    # classes). The handle closure must NOT treat this as matrix_eval.
     build_payload = {
         "item_class": ITEM_CLASS_BUILD_COMMON_DEP,
         "name": "cd",
@@ -1149,7 +1149,7 @@ def test_main_handle_dispatches_build_manifest_to_build_worker(
     assert build_called[0]["manifest_data"] == build_payload
 
 
-def test_main_handle_phase0_eval_runtime_error_becomes_non_recoverable(
+def test_main_handle_matrix_eval_runtime_error_becomes_non_recoverable(
     monkeypatch, tmp_path
 ):
     """When run_eval_task raises RuntimeError the handle re-raises as
@@ -1178,14 +1178,14 @@ def test_main_handle_phase0_eval_runtime_error_becomes_non_recoverable(
     Task = fake_mod.Task
     NonRecoverable = fake_mod.NonRecoverableError
     with pytest.raises(NonRecoverable) as exc_info:
-        handle(Task(payload=_phase0_eval_wrapper_payload()))
+        handle(Task(payload=_matrix_eval_wrapper_payload()))
     assert "nix-eval-jobs fell over" in str(exc_info.value)
 
 
-def test_main_handle_phase0_eval_without_phase0_out_dir_is_non_recoverable(
+def test_main_handle_matrix_eval_without_phase0_out_dir_is_non_recoverable(
     monkeypatch, tmp_path
 ):
-    """phase0_eval requires --phase0-out-dir (shared bind-mounted marker
+    """matrix_eval requires --phase0-out-dir (shared bind-mounted marker
     dir). Receiving the task without that flag — even with --shared-fs
     — is a structural misconfiguration -> NonRecoverableError."""
     handle, _, _ = _run_build_worker_main_with_capture(
@@ -1204,14 +1204,14 @@ def test_main_handle_phase0_eval_without_phase0_out_dir_is_non_recoverable(
     Task = fake_mod.Task
     NonRecoverable = fake_mod.NonRecoverableError
     with pytest.raises(NonRecoverable) as exc_info:
-        handle(Task(payload=_phase0_eval_wrapper_payload()))
+        handle(Task(payload=_matrix_eval_wrapper_payload()))
     assert "phase0-out-dir" in str(exc_info.value)
 
 
-def test_main_handle_phase0_eval_without_shared_fs_is_non_recoverable(
+def test_main_handle_matrix_eval_without_shared_fs_is_non_recoverable(
     monkeypatch, tmp_path
 ):
-    """phase0_eval requires --shared-fs (resume marker + peer gossip
+    """matrix_eval requires --shared-fs (resume marker + peer gossip
     both live under it). Receiving the task without that flag is a
     structural misconfiguration -> NonRecoverableError."""
     handle, _, sender_cls = _run_build_worker_main_with_capture(
@@ -1231,7 +1231,7 @@ def test_main_handle_phase0_eval_without_shared_fs_is_non_recoverable(
     Task = fake_mod.Task
     NonRecoverable = fake_mod.NonRecoverableError
     with pytest.raises(NonRecoverable) as exc_info:
-        handle(Task(payload=_phase0_eval_wrapper_payload()))
+        handle(Task(payload=_matrix_eval_wrapper_payload()))
     assert "shared-fs" in str(exc_info.value)
 
 
