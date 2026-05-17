@@ -479,10 +479,11 @@ def _wide_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
     return responses
 
 
-def test_enumerate_variants_sample_metadata_echoed():
-    """``sample_size`` and ``sample_seed`` survive into the per-binary
-    metadata so the Phase 0 worker can re-apply the same deterministic
-    sample on the secondary."""
+def test_enumerate_variants_pre_samples_at_submit_time():
+    """Submit-time pre-sampling: the wire manifest carries the already-
+    sampled suffix subset (not the full 12) and signals to the worker
+    via ``sample_size=0`` that no re-sampling is needed. Without this,
+    a 150k-variant matrix overflows the ClusterMutation SSH tunnel."""
     runner, _ = _make_run_subprocess(_wide_responses())
     result = enumerate_variants(
         ".",
@@ -491,12 +492,12 @@ def test_enumerate_variants_sample_metadata_echoed():
         sample_seed="alpha",
         run_subprocess=runner,
     )
-    assert result["hello"]["sample_size"] == 2
+    # Worker re-sampling disabled — suffixes are the final subset.
+    assert result["hello"]["sample_size"] == 0
     assert result["hello"]["sample_seed"] == "alpha"
-    # Suffixes are NOT sampled at submit time — the worker re-samples
-    # deterministically. All 12 (flag, hardening, opt) suffixes are
-    # carried through.
-    assert len(result["hello"]["suffixes_by_arch"]["x86_64"]) == 12
+    # Sampling is per (compiler, opt) group: 1 compiler x 2 opts = 2
+    # groups, sample_size=2 each → 4 suffixes total.
+    assert len(result["hello"]["suffixes_by_arch"]["x86_64"]) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -687,7 +688,7 @@ def test_build_toolchains_locally_stops_at_first_failure():
 def test_enumerate_variants_returns_metadata_only():
     """``enumerate_variants`` returns per-binary metadata without
     forcing drv instantiation; the slow ``nix-eval-jobs`` work is
-    deferred to Phase 0 eval-workers on secondaries."""
+    deferred to matrix_eval workers on secondaries."""
     runner, calls = _make_run_subprocess(_all_responses())
     result = enumerate_variants(
         ".",
@@ -702,11 +703,13 @@ def test_enumerate_variants_returns_metadata_only():
 
     hello = result["hello"]
     assert sorted(hello["archs"]) == ["aarch64", "x86_64"]
-    assert hello["sample_size"] == 3
+    # Submit-time pre-sampling already ran; sample_size=0 signals to
+    # the worker that the carried suffix list is the final subset.
+    assert hello["sample_size"] == 0
     assert hello["sample_seed"] == "alpha"
     assert hello["tier"] == 1
-    # Suffixes per arch listed; NOT yet sampled (worker re-samples
-    # deterministically with the same seed).
+    # Only 2 candidates exist for hello/x86_64 (one per opt group);
+    # sample_size=3 keeps all of them (min(sample, len)).
     assert hello["suffixes_by_arch"]["x86_64"] == [
         "gcc15-O0-baseline-unhardened",
         "gcc15-O2-baseline-unhardened",
