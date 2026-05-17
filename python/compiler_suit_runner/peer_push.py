@@ -388,7 +388,7 @@ class PeerPushServer(threading.Thread):
         )
         # Default record-self-has hook is a no-op; the suit_task
         # lifecycle wires it to ``peer_paths.record_self_has`` with
-        # ``item_class="phase0_eval_drv"`` so placement-map gossip
+        # ``item_class="matrix_eval_drv"`` so placement-map gossip
         # captures broadcast holders.
         bound_record_broadcast = record_broadcast_self_has or (
             lambda _p: None
