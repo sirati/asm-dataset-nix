@@ -781,8 +781,7 @@ def emit_all_manifests(
         for drv, label in common_deps:
             headers.append(make_common_dep_header(drv, label))
 
-    # Phase 3 — variants. Inputs map keys by ``variant['label']``
-    # (matches compute_partition_locally's per_variant dict).
+    # Phase 3 — variants. Inputs map keys by ``variant['label']``.
     if "phase3_variant" in active_classes:
         inputs_by_label = per_variant_inputs or {}
         placements_by_outpath = toolchain_outpath_placements or {}

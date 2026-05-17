@@ -46,9 +46,7 @@ from compiler_suit_runner.incremental_cache import (
     compute_input_hash,
 )
 from compiler_suit_runner.manifest_gen import emit_all_manifests
-from compiler_suit_runner.partition_local import (
-    eval_drv_outpaths,
-)
+from compiler_suit_runner.nix_drv_show import eval_drv_outpaths
 from compiler_suit_runner.preflight import (
     PreflightError,
     PreflightResult,
