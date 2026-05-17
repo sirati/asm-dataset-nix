@@ -75,17 +75,18 @@ class PreflightResult:
     phase-2 toolchain manifests.
 
     ``common_dep_drvs`` is left empty by this module: the populating
-    logic lives in phase 1b's merge worker (see
-    :mod:`compiler_suit_runner.workers.merge_worker`). It exists as a
-    field here so callers can pass a complete :class:`PreflightResult`
-    around regardless of whether the merge has run yet.
+    logic lives downstream (legacy partition/merge workers were
+    removed; the replacement dependency_graph planner will populate
+    this field once it lands). It exists as a field here so callers
+    can pass a complete :class:`PreflightResult` around regardless of
+    whether the downstream classifier has run yet.
 
     ``toolchain_drvs`` is the canonical set of nix drv paths for every
-    matrix variant's drv. The phase-1b classifier intersects this with
-    its frequency map to identify "this is a toolchain build, hoist it
-    to phase 2" vs "this is a common host dep we should pre-build".
-    For now we expose it as a frozenset so the merge worker can consume
-    it without reconstructing the set itself.
+    matrix variant's drv. The downstream classifier intersects this
+    with its frequency map to identify "this is a toolchain build,
+    hoist it to phase 2" vs "this is a common host dep we should
+    pre-build". For now we expose it as a frozenset so the consumer
+    can use it without reconstructing the set itself.
     """
 
     sys_name: str
