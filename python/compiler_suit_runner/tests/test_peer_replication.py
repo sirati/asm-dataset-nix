@@ -1425,13 +1425,13 @@ def test_broadcast_receiver_already_have_short_circuits(
         # Give the fan-out worker a tick to run; it should NOT.
         time.sleep(0.05)
         fan_out.assert_not_called()
-        # Placement record: phase0_eval_drv item class.
+        # Placement record: matrix_eval_drv item class.
         assert len(rec["records"]) == 1
         _shared, sid, outpath, drv, klass = rec["records"][0]
         assert sid == "me"
         assert outpath == "/nix/store/x.drv"
         assert drv == "/nix/store/x.drv"
-        assert klass == BROADCAST_ITEM_CLASS == "phase0_eval_drv"
+        assert klass == BROADCAST_ITEM_CLASS == "matrix_eval_drv"
     finally:
         recv.stop()
 
