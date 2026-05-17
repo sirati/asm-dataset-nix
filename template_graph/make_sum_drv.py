@@ -123,6 +123,52 @@ def _read_list_file(path: Path | None) -> list[str]:
     return out
 
 
+def _run_nix_instantiate(
+    expr: str,
+    *,
+    extra_nix_args: list[str] | None,
+    with_flakes: bool,
+) -> str:
+    """Write ``expr`` to a temp .nix file, run ``nix-instantiate``, return
+    the single .drv path it prints. Large matrices push past ARG_MAX when
+    passed via ``-E``, so we always go via a file.
+    """
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".nix", delete=False, encoding="utf-8"
+    ) as tf:
+        tf.write(expr)
+        expr_file = tf.name
+    try:
+        argv = ["nix-instantiate"]
+        if with_flakes:
+            argv += ["--extra-experimental-features", "flakes"]
+        argv.append(expr_file)
+        if extra_nix_args:
+            argv.extend(extra_nix_args)
+        proc = subprocess.run(argv, capture_output=True, check=False)
+    finally:
+        try:
+            os.unlink(expr_file)
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "nix-instantiate failed:\n"
+            + proc.stderr.decode("utf-8", errors="replace")
+            + "\n\nExpression was (truncated to 2000 chars):\n"
+            + expr[:2000]
+            + ("\n...[truncated]" if len(expr) > 2000 else "")
+        )
+    out = proc.stdout.decode("utf-8", errors="replace").strip()
+    lines = [l for l in out.splitlines() if l.strip()]
+    if len(lines) != 1:
+        raise RuntimeError(
+            f"expected one drv path from nix-instantiate, got {len(lines)}:\n"
+            + out
+        )
+    return lines[0].strip()
+
+
 def make_sum_drv(
     *,
     flake_ref: str,
@@ -163,46 +209,70 @@ def make_sum_drv(
         f"  system = {_q(system)};\n"
         f"}}\n"
     )
+    return _run_nix_instantiate(
+        expr, extra_nix_args=extra_nix_args, with_flakes=True,
+    )
 
-    # Large matrices push past ARG_MAX when the whole expression is
-    # passed via ``-E``. Write to a temp file and let nix-instantiate
-    # read it directly. The file is removed after the call.
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".nix", delete=False, encoding="utf-8"
-    ) as tf:
-        tf.write(expr)
-        expr_file = tf.name
-    try:
-        argv = [
-            "nix-instantiate",
-            "--extra-experimental-features",
-            "flakes",
-            expr_file,
-        ]
-        if extra_nix_args:
-            argv.extend(extra_nix_args)
-        proc = subprocess.run(argv, capture_output=True, check=False)
-    finally:
-        try:
-            os.unlink(expr_file)
-        except OSError:
-            pass
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "nix-instantiate failed:\n"
-            + proc.stderr.decode("utf-8", errors="replace")
-            + "\n\nExpression was (truncated to 2000 chars):\n"
-            + expr[:2000]
-            + ("\n...[truncated]" if len(expr) > 2000 else "")
+
+def _shallow_ref(drv_path: str) -> str:
+    """Render a single drv path as an ``appendContext``-wrapped empty
+    string carrying the drv's shallow ``out`` output context."""
+    return (
+        '(builtins.appendContext "" { '
+        + _q(drv_path)
+        + ' = { outputs = [ "out" ]; }; })'
+    )
+
+
+def _join_drvs(paths: list[str]) -> str:
+    return "[ " + " ".join(_shallow_ref(p) for p in paths) + " ]"
+
+
+def _join_matrix_drvs(matrix_drvs: dict[str, list[str]]) -> str:
+    items = []
+    for name, paths in matrix_drvs.items():
+        items.append(
+            "{ name = " + _q(name) + "; drvs = " + _join_drvs(paths) + "; }"
         )
-    drv_path = proc.stdout.decode("utf-8", errors="replace").strip()
-    lines = [l for l in drv_path.splitlines() if l.strip()]
-    if len(lines) != 1:
-        raise RuntimeError(
-            f"expected one drv path from nix-instantiate, got {len(lines)}:\n"
-            + drv_path
-        )
-    return lines[0].strip()
+    return "[ " + " ".join(items) + " ]"
+
+
+def make_sum_drv_from_paths(
+    *,
+    bash_path: str,
+    toolchain_drvs: list[str],
+    matrix_drvs: dict[str, list[str]],
+    root_name: str = "sum-root",
+    toolchains_name: str = "toolchains",
+    system: str = "x86_64-linux",
+    extra_nix_args: list[str] | None = None,
+) -> str:
+    """Path-based variant of :func:`make_sum_drv`: takes already-instantiated
+    raw store paths (toolchain + matrix .drvs + a bash store path) and
+    assembles the same layered sum-root via ``builtins.appendContext`` —
+    no flake eval, no re-instantiation of the inputs.
+    """
+    if not toolchain_drvs:
+        raise ValueError("at least one toolchain drv path is required")
+    if not matrix_drvs:
+        raise ValueError("at least one matrix is required")
+    for name, paths in matrix_drvs.items():
+        if not paths:
+            raise ValueError(f"matrix {name!r} has no drv paths")
+
+    expr = (
+        f"import {SUM_DRV_NIX} {{\n"
+        f"  bash = builtins.storePath {_q(bash_path)};\n"
+        f"  toolchains = {_join_drvs(toolchain_drvs)};\n"
+        f"  matrices = {_join_matrix_drvs(matrix_drvs)};\n"
+        f"  rootName = {_q(root_name)};\n"
+        f"  toolchainsName = {_q(toolchains_name)};\n"
+        f"  system = {_q(system)};\n"
+        f"}}\n"
+    )
+    return _run_nix_instantiate(
+        expr, extra_nix_args=extra_nix_args, with_flakes=False,
+    )
 
 
 def _parse_matrix_arg(arg: str) -> tuple[str, Path]:
