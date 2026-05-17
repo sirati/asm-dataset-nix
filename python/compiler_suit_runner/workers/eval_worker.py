@@ -78,8 +78,8 @@ from compiler_suit_runner.peer_replication import BroadcastSender
 
 # ``run_subprocess`` accepts argv (list[str]) and returns a tuple of
 # (stdout_bytes, stderr_bytes, returncode). Mirrors the
-# ``RunSubprocess`` callable shape in ``preflight.py`` /
-# ``workers/partition_worker.py`` so the same fakes can be reused.
+# ``RunSubprocess`` callable shape in ``preflight.py`` so the same
+# fakes can be reused.
 RunSubprocess = Callable[[list[str]], tuple[bytes, bytes, int]]
 
 

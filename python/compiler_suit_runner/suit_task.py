@@ -49,7 +49,6 @@ from compiler_suit_runner.holding_matcher import (
     UNFULFILLABLE_REASON_TEMPLATE,
     matcher as fulfillability_matcher,
 )
-from compiler_suit_runner import phase1_planner
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
     phase0_eval_task_id,
@@ -87,14 +86,6 @@ from compiler_suit_runner import peer_paths_fetch
 from compiler_suit_runner.workers.build_worker import (
     BuildWorkerEnv,
     build_worker,
-)
-from compiler_suit_runner.workers.merge_worker import (
-    MergeWorkerEnv,
-    merge_worker,
-)
-from compiler_suit_runner.workers.partition_worker import (
-    WorkerEnv as PartitionWorkerEnv,
-    partition_worker,
 )
 
 
@@ -168,10 +159,6 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
         # tag).
         binary = header.payload.get("binary", "?")
         return ("phase0", "eval", binary)
-    if item_class == "phase1a_partition":
-        return ("phase1a", "partition", None)
-    if item_class == "phase1b_merge":
-        return ("phase1b", "merge", None)
     # All build-shaped tasks (toolchain, common_dep, variant) share
     # the single ``phase_build`` phase. Nix's daemon serializes
     # shared dependencies via its build lock, so toolchain builds
@@ -284,9 +271,8 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
     are imported lazily here and only matter at run time.
 
     ``build_max_concurrent`` (when set) caps the global in-flight count
-    for the three build-heavy types (toolchain, common_dep, variant);
-    partition and merge are always uncapped (cheap, IO-bound). ``None``
-    leaves all types unconstrained.
+    for the three build-heavy types (toolchain, common_dep, variant).
+    ``None`` leaves all types unconstrained.
     """
     from dynamic_runner.task_protocol import (  # type: ignore[import-not-found]
         PhaseSpec,
@@ -556,11 +542,17 @@ class _Phase0QuiesceWatcher:
     ``on_run_start``. Each call to :meth:`on_task_completed` either
     ignores a non-phase-0 task_id or marks the matching phase-0 task
     as complete. Once the completed set covers the expected set, the
-    watcher fires :func:`phase1_planner.plan_phase1` exactly once and
-    hands the resulting :class:`ManifestHeader` list to ``_spawn_tasks``.
+    watcher's ``fired`` flag flips to True.
 
-    The real dispatch path translates each :class:`ManifestHeader` into
-    a framework ``TaskInfo`` and calls ``primary_handle.spawn_tasks``;
+    The planner-invocation flow used to call
+    ``phase1_planner.plan_phase1`` and then ``_spawn_tasks``. The
+    ``phase1_planner`` module has been deleted (superseded by the
+    template_graph streaming planner); the replacement
+    ``dependency_graph_planner`` will be wired in a follow-up commit.
+    Until then ``_fire`` is a no-op stub and ``_spawn_tasks`` is only
+    reachable from tests that call it directly. The dispatch path,
+    once re-wired, translates each :class:`ManifestHeader` into a
+    framework ``TaskInfo`` and calls ``primary_handle.spawn_tasks``;
     a ``_phase1_graph.json`` dump is written alongside (regardless of
     whether the primary_handle is bound) for offline inspection /
     debugging. When ``primary_handle`` is None (single-process tests,
@@ -650,44 +642,24 @@ class _Phase0QuiesceWatcher:
     # ── Plan invocation ────────────────────────────────────────────────
 
     def _fire(self) -> None:
-        """Re-read all phase-0 manifests and call ``plan_phase1``.
+        """Phase-0 quiesce reached; planner-invocation stubbed pending wiring.
 
-        Swallows planner exceptions and logs them: the framework's
-        task-completion thread should not raise out into the
-        scheduler. A planner failure leaves Phase 1 unscheduled (the
-        run will then stall on the build phase — operator-visible).
+        The old flow called ``phase1_planner.read_phase0_manifests`` +
+        ``phase1_planner.plan_phase1`` and then ``_spawn_tasks``. The
+        ``phase1_planner`` module has been deleted (template_graph
+        streaming planner supersedes the partition+merge shard model);
+        the replacement ``dependency_graph_planner`` will be wired in a
+        follow-up commit. Until then the watcher just logs that quiesce
+        was reached — Phase 1+ tasks are NOT spawned and the run will
+        stall at the build phase. Operator-visible by design while the
+        new planner is being landed.
         """
-        try:
-            phase0_manifests = phase1_planner.read_phase0_manifests(
-                self._out_dir
-            )
-        except Exception:  # noqa: BLE001 — log + degrade
-            self._logger.exception(
-                "_Phase0QuiesceWatcher: read_phase0_manifests failed"
-                " for %s; Phase 1 will not be scheduled",
-                self._out_dir,
-            )
-            return
-
         self._logger.info(
             "_Phase0QuiesceWatcher: all %d phase-0 tasks complete;"
-            " loaded %d manifests; calling plan_phase1",
+            " dependency_graph_planner not yet wired — Phase 1+ will"
+            " not be scheduled (placeholder pending follow-up)",
             len(self._expected),
-            len(phase0_manifests),
         )
-
-        try:
-            phase1_planner.plan_phase1(
-                phase0_manifests,
-                self._toolchain_task_ids,
-                self._spawn_tasks,
-                sys_name=self._sys_name,
-            )
-        except Exception:  # noqa: BLE001 — log + degrade
-            self._logger.exception(
-                "_Phase0QuiesceWatcher: plan_phase1 raised; Phase 1"
-                " not scheduled"
-            )
 
     # ── spawn_tasks dispatch ──────────────────────────────────────────
 
@@ -1122,14 +1094,6 @@ class SuitTask:
     # ── Worker-function injection seams (used by tests) ────────────────
 
     @property
-    def _partition_worker(self):
-        return partition_worker
-
-    @property
-    def _merge_worker(self):
-        return merge_worker
-
-    @property
     def _build_worker(self):
         return build_worker
 
@@ -1267,24 +1231,6 @@ class SuitTask:
             "--manifest-dir",
             str(self.config.manifest_dir),
         ]
-        if type_id == "partition":
-            return common + [
-                "--raw-partition-dir",
-                str(self.config.raw_partition_dir),
-                "--flake-ref",
-                self.config.flake_ref,
-            ]
-        if type_id == "merge":
-            return common + [
-                "--raw-partition-dir",
-                str(self.config.raw_partition_dir),
-                "--partition-dir",
-                str(self.config.partition_dir),
-                "--input-hash",
-                self.config.input_hash,
-                "--common-threshold",
-                str(self.config.common_threshold),
-            ]
         if type_id in {"eval", "toolchain", "toolchain_validate", "common_dep", "variant"}:
             argv = common + [
                 "--flake-ref",
@@ -2548,26 +2494,6 @@ class SuitTask:
     ) -> None:
         """Route to the right worker. May raise; caller swallows."""
         del header  # current workers re-read the manifest themselves
-        if item_class == "phase1a_partition":
-            env = PartitionWorkerEnv(
-                raw_partition_dir=self.config.raw_partition_dir,
-                flake_ref=self.config.flake_ref,
-            )
-            self._partition_worker(path, env)
-            return
-
-        if item_class == "phase1b_merge":
-            env = MergeWorkerEnv(
-                raw_partition_dir=self.config.raw_partition_dir,
-                partition_dir=self.config.partition_dir,
-                input_hash=self.config.input_hash,
-                variants=tuple(self.config.variants),
-                toolchain_drvs=frozenset(self.config.toolchain_drvs),
-                common_threshold=self.config.common_threshold,
-            )
-            self._merge_worker(path, env)
-            return
-
         if item_class in _PHASE2_BUILD_CLASSES or item_class == "phase3_variant":
             env = BuildWorkerEnv(
                 flake_ref=self.config.flake_ref,
