@@ -822,22 +822,35 @@ class _MatrixEvalQuiesceWatcher:
 
     def _import_matrix_eval_archives(self) -> None:
         """Run ``nix-store --import`` for every ``*.nix-archive`` under
-        :attr:`_out_dir`.
+        :attr:`_out_dir` AND the sibling ``_build_compilers/`` directory.
+
+        The matrix_eval archive carries the per-binary kept-variant
+        closure; the build_compilers archive carries each toolchain's
+        drv + output closure. The primary needs BOTH to walk the full
+        sum-drv graph at phase3 (the matrix_eval closure typically does
+        NOT include the toolchain.drv outputs — those land in
+        ``<shared_fs>/out/_build_compilers/`` via the build_compilers
+        worker's own ``export_closure`` call).
 
         Per-archive failures are logged but do NOT abort: the
         dependency_graph subprocess does its own import-or-skip pass
         per-binary and surfaces irrecoverable misses as a hard failure.
         """
-        if not self._out_dir.is_dir():
+        archives: list[pathlib.Path] = []
+        archives.extend(self._discover_archives_in(self._out_dir))
+        # ``<shared_fs>/out/_build_compilers/`` is a sibling of
+        # ``<shared_fs>/out/_matrix_eval/`` — both live under the same
+        # ``<shared_fs>/out/`` root.
+        build_compilers_dir = self._out_dir.parent / "_build_compilers"
+        archives.extend(self._discover_archives_in(build_compilers_dir))
+
+        if not archives:
             self._logger.warning(
-                "_MatrixEvalQuiesceWatcher: out_dir %s is missing; no"
-                " archives to import", self._out_dir,
+                "_MatrixEvalQuiesceWatcher: no archives to import under"
+                " %s or %s", self._out_dir, build_compilers_dir,
             )
             return
-        archives = sorted(
-            p for p in self._out_dir.iterdir()
-            if p.is_file() and p.suffix == ".nix-archive"
-        )
+
         for archive in archives:
             try:
                 with open(archive, "rb") as fh:
@@ -862,6 +875,29 @@ class _MatrixEvalQuiesceWatcher:
                     archive, proc.returncode,
                     proc.stderr.decode("utf-8", errors="replace")[:400],
                 )
+
+    def _discover_archives_in(
+        self, directory: pathlib.Path,
+    ) -> list[pathlib.Path]:
+        """Return sorted ``*.nix-archive`` files under ``directory``.
+
+        Returns an empty list when ``directory`` does not exist; absence
+        of either matrix_eval or build_compilers is a valid configuration
+        (e.g. ``--build-compilers`` not passed → no _build_compilers/
+        dir). Empty / missing directories are logged at debug level only
+        — the caller emits a higher-severity warning when BOTH are
+        empty.
+        """
+        if not directory.is_dir():
+            self._logger.debug(
+                "_MatrixEvalQuiesceWatcher: %s is not a directory; skipping"
+                " archive walk", directory,
+            )
+            return []
+        return sorted(
+            p for p in directory.iterdir()
+            if p.is_file() and p.suffix == ".nix-archive"
+        )
 
     def _invoke_dependency_graph_worker(self) -> None:
         """Run the dependency_graph worker as a subprocess.
