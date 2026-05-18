@@ -1,4 +1,4 @@
-"""End-to-end tests against ONE real root .drv (the sum-drv fixture).
+"""Algorithm probes against ONE real root .drv (the sum-drv fixture).
 
 Fixtures (``root_drv``, ``sum_structure``, ``hello_matrix``,
 ``non_recursing_drvs``) live in this directory's ``conftest.py``.
@@ -8,6 +8,10 @@ Structural probes on the sum-drv shape live in
 The bootstrap-chain hard-error assertions (real nixpkgs trips them
 by design) carry the variant labels in the error message, which is
 the algorithm's "hard error for now" debugging signal.
+
+Every test here needs a live nix store path resolved from the
+fixture; runs are skipped when ``nix`` is not on PATH or the
+sum-drv has been GC'd.
 """
 
 from __future__ import annotations
