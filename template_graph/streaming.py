@@ -10,7 +10,7 @@ calibration pair, drain that arch's buffer into the new variant array,
 and continue streaming. Subsequent variants of the same arch
 stream directly into the array (no further buffering).
 
-Reused from ``template_graph.core``:
+Reused from ``template_graph.graph``:
     Template, TemplateNode, VariantArray,
     find_or_register_template,
     TemplateGraphAssertError.
@@ -31,7 +31,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from template_graph.core import (
+from template_graph.graph import (
     Template,
     TemplateNode,
     VariantArray,
