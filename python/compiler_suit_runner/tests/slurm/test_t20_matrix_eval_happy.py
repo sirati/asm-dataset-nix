@@ -1,29 +1,31 @@
-"""End-to-end T20 smoke: ``--distributed-eval`` Phase-0 happy path.
+"""End-to-end T20 smoke: matrix_eval happy path on the slurm-test-env.
 
-T20 exercises the new distributed-eval pipeline end-to-end on the
-live slurm-test-env. The submitter dispatches with
-``--distributed-eval`` for three small, cross-compilable packages
-(``hello``, ``zlib``, ``busybox``) onto N=4 secondaries; the test
-asserts that the full multi-phase shape lands cleanly:
+T20 exercises the matrix_eval pipeline end-to-end on the live
+slurm-test-env. The submitter dispatches three small, cross-
+compilable packages (``hello``, ``zlib``, ``busybox``) onto N=4
+secondaries; the test asserts that the full multi-phase shape lands
+cleanly:
 
-* Phase -1 toolchain seeding kicks off the bootstrap (covered by the
-  standard 7 invariants — clean exit, no bind errors, no leaks).
-* Phase 0 emits one ``phase0_eval_<binary>`` manifest per binary
-  (exactly three), each task lands on a secondary, runs
+* Toolchain seeding kicks off the bootstrap (covered by the standard
+  7 invariants — clean exit, no bind errors, no leaks).
+* The submitter emits one ``matrix_eval__<binary>`` manifest per
+  binary (exactly three), each task lands on a secondary, runs
   :func:`compiler_suit_runner.workers.eval_worker.run_eval_task`, and
-  drops a resume marker at
-  ``<shared_fs>/out/<binary>/_phase0/manifest.json``.
-* After Phase 0 quiesces, the
-  :class:`compiler_suit_runner.suit_task._Phase0QuiesceWatcher` fires
-  ``plan_phase1``; the planner reads every Phase 0 marker and emits
-  the variant build manifests (``phase3_variant``) with
-  ``task_depends_on`` wired to the matching toolchain task ids.
+  publishes the kept-variant closure at
+  ``<matrix_eval_out_dir>/<binary>.nix-archive`` plus the sidecar
+  ``<binary>.nix-archive.json`` (the matrix-eval resume marker).
+* After matrix_eval quiesces, the
+  :class:`compiler_suit_runner.suit_task._MatrixEvalQuiesceWatcher`
+  shells out to ``workers.dependency_graph_worker`` and translates
+  the resulting descriptors into ``build_variant`` /
+  ``build_common_dep`` headers spawned via
+  ``primary_handle.spawn_tasks``.
 * Final ``<dataset_dir>/<pkg>/<variant_dir>/`` directories are
   populated for every variant the run produced.
 * The cluster's placement-map gossip files name at least one holder
   for every variant outpath (legacy ≥1 holder invariant — T11 owns
   the stricter K=3 cascade).
-* Every Phase 0 ``task done`` line in ``slurm_*.out`` carries
+* Every matrix_eval ``task done`` line in ``slurm_*.out`` carries
   ``success=true``.
 
 T20 is the canonical "does the new pipeline complete at all?"
@@ -33,9 +35,9 @@ whole run fits inside the 5-min budget the plan asks for. Per-row
 specifics belonging to other tests:
 
 * K=3 holder cascade — T11.
-* Phase-0 broadcast latency — T21.
-* Phase-0 resume after a partial-failure — T22.
-* Phase-1 common-dep dedup — T23.
+* matrix_eval drv-broadcast latency — T21.
+* matrix_eval resume after a partial-failure — T22.
+* dependency_graph common-dep dedup — T23.
 
 The cluster construction follows T07 / T11: a dedicated
 :class:`ClusterProbe` with an explicit ``identity_file`` (the slurm-
@@ -117,16 +119,16 @@ T20_PACKAGES: tuple[str, ...] = ("hello", "zlib", "busybox")
 # ``T20_TIMEOUT_S=<seconds>`` for particularly cold caches.
 DEFAULT_TIMEOUT_S = 600.0
 
-# Regex matching a phase 0 ``task done`` line in slurm_*.out. The
+# Regex matching a matrix_eval ``task done`` line in slurm_*.out. The
 # framework log shape is structured Rust output with ANSI escapes
 # stripped by ``invariants._read_text``; we anchor on the literal
-# ``task_type="phase0_eval"`` (or its ``Some(...)`` variant)
+# ``task_type="matrix_eval"`` (or its ``Some(...)`` variant)
 # alongside the ``success=`` field. The success-bool is captured in
 # a named group so the assertion can flag a ``success=false`` row
 # even when the task technically "completed".
-_PHASE0_TASK_DONE_RE = re.compile(
+_MATRIX_EVAL_TASK_DONE_RE = re.compile(
     r"task done.*?"
-    r"task_type=(?:Some\(\"phase0_eval\"\)|phase0_eval)"
+    r"task_type=(?:Some\(\"matrix_eval\"\)|matrix_eval)"
     r".*?success=(?P<success>true|false)"
 )
 
@@ -174,29 +176,47 @@ def _resolve_timeout() -> float:
         return DEFAULT_TIMEOUT_S
 
 
-def _read_phase0_marker(
+def _matrix_eval_out_dir(shared_fs: pathlib.Path) -> pathlib.Path:
+    """Resolve the matrix-eval output dir under ``shared_fs``.
+
+    Mirrors :func:`cli._build_config`: ``dataset_dir`` defaults to
+    ``<shared_fs>/dataset`` and ``matrix_eval_out_dir`` defaults to
+    ``<dataset_dir>/_matrix_eval`` on the submitter side.
+    """
+    return shared_fs / "dataset" / "_matrix_eval"
+
+
+def _read_matrix_eval_sidecar(
     shared_fs: pathlib.Path, binary: str,
 ) -> dict:
-    """Read ``<shared_fs>/out/<binary>/_phase0/manifest.json``.
+    """Read the matrix-eval sidecar JSON for ``binary``.
 
-    Returns the parsed JSON dict. Raises ``AssertionError`` (via the
-    caller's ``assert``) if the file is missing or unparseable — the
-    Phase 0 marker is the cluster-side gating signal for Phase 1, so
-    a missing marker means the whole pipeline aborted at Phase 0.
+    Returns the parsed dict. Raises ``AssertionError`` (via the
+    caller's ``assert``) if the archive or sidecar is missing or
+    unparseable — together they ARE the matrix-eval resume marker
+    (see ``workers.eval_worker.run_eval_task`` Step 0 short-circuit),
+    so a missing pair means the whole pipeline aborted before quiesce.
     """
-    marker = shared_fs / "out" / binary / "_phase0" / "manifest.json"
-    assert marker.is_file(), (
-        f"phase0 resume marker missing for {binary!r}: "
-        f"expected {marker} to exist (the Phase 0 quiesce signal "
-        f"is the file's presence; a missing file means the eval "
-        f"worker either never ran or crashed before writing)"
+    out_dir = _matrix_eval_out_dir(shared_fs)
+    archive = out_dir / f"{binary}.nix-archive"
+    sidecar = out_dir / f"{binary}.nix-archive.json"
+    assert archive.is_file(), (
+        f"matrix-eval archive missing for {binary!r}: "
+        f"expected {archive} to exist (presence of the archive is "
+        f"the _MatrixEvalQuiesceWatcher's quiesce signal; a missing "
+        f"file means the eval worker either never ran or crashed "
+        f"before writing)"
+    )
+    assert sidecar.is_file(), (
+        f"matrix-eval sidecar missing for {binary!r}: "
+        f"expected {sidecar} to exist alongside {archive.name}"
     )
     try:
-        with open(marker, "r", encoding="utf-8") as fh:
+        with open(sidecar, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
         raise AssertionError(
-            f"phase0 marker {marker} unparseable: {exc!r}"
+            f"matrix-eval sidecar {sidecar} unparseable: {exc!r}"
         ) from exc
 
 
@@ -230,15 +250,15 @@ def _collect_variant_holders(
     return dict(placements)
 
 
-def _scan_phase0_completion_logs(
+def _scan_matrix_eval_completion_logs(
     log_dir: pathlib.Path,
 ) -> list[tuple[pathlib.Path, str]]:
-    """Walk ``slurm_*.out`` files for phase0_eval task-done events.
+    """Walk ``slurm_*.out`` files for matrix_eval task-done events.
 
     Returns a list of ``(path, success_field)`` tuples. The caller
     asserts every ``success_field == "true"``; a ``"false"`` row is
-    the smoking gun that Phase 0 reported failure even though the
-    framework's clean-exit invariant passed.
+    the smoking gun that matrix_eval reported failure even though
+    the framework's clean-exit invariant passed.
     """
     out: list[tuple[pathlib.Path, str]] = []
     if not log_dir or not log_dir.is_dir():
@@ -248,51 +268,55 @@ def _scan_phase0_completion_logs(
     from compiler_suit_runner.tests.slurm.invariants import _read_text
     for log_path in sorted(log_dir.glob("slurm_*.out")):
         text = _read_text(log_path)
-        for match in _PHASE0_TASK_DONE_RE.finditer(text):
+        for match in _MATRIX_EVAL_TASK_DONE_RE.finditer(text):
             out.append((log_path, match.group("success")))
     return out
 
 
 @pytest.mark.slurm_live
-def test_t20_phase0_happy(
+def test_t20_matrix_eval_happy(
     cluster_probe: ClusterProbe,  # noqa: ARG001 -- fixture used for ordering
     slurm_log_root: pathlib.Path,  # noqa: ARG001 -- documented as fixture-driven
     fresh_run: Callable[..., RunResult],
     cleanup_cluster: None,  # noqa: ARG001 -- wired via the B2 cleanup harness
 ) -> None:
-    """``--distributed-eval`` end-to-end smoke for hello + zlib + busybox.
+    """matrix_eval end-to-end smoke for hello + zlib + busybox.
 
     Pre-flight: gateway reachable, ``squeue --me`` empty, sinfo lists
     at least :data:`MIN_IDLE_WORKERS` of the four expected workers
-    idle. We tolerate degraded ``N < 4`` runs (the Phase 0 pipeline
-    still exercises every code path).
+    idle. We tolerate degraded ``N < 4`` runs (the matrix_eval
+    pipeline still exercises every code path).
 
-    Dispatch: ``--distributed-eval`` + ``--variant-sample 1`` keeps
-    the workload tight (one variant per (binary, arch)) so the run
-    fits the 5-min plan budget; the ``--jobs`` count is reduced to
-    the available idle workers when fewer than four are idle.
+    Dispatch: ``--variant-sample 1`` keeps the workload tight (one
+    variant per (binary, arch)) so the run fits the 5-min plan
+    budget; the ``--jobs`` count is reduced to the available idle
+    workers when fewer than four are idle.
 
     Post-flight assertions:
 
     1. Standard 7-invariant audit with ``expected_failure_count=0``
        (covers clean exit, bind-error absence, manifest count,
        build-failure floor, and the three leak checks).
-    2. Exactly one ``phase0_eval__<binary>.json`` manifest per
+    2. Exactly one ``matrix_eval__<binary>.json`` manifest per
        binary in :attr:`RunArtifacts.manifests_dir`.
-    3. ``<shared_fs>/out/<binary>/_phase0/manifest.json`` exists and
-       parses cleanly for every binary; the marker carries a
-       non-empty ``variants`` list (the eval worker enumerated at
-       least one variant per binary).
-    4. Phase 1 fired: at least one ``phase3_variant`` manifest
-       exists in :attr:`RunArtifacts.manifests_dir`, and every such
-       manifest's ``task_depends_on`` references the toolchain
-       task_id naming convention (``toolchain__<arch>__<id>``).
+    3. The matrix-eval archive + sidecar pair
+       (``<matrix_eval_out_dir>/<binary>.nix-archive`` and
+       ``<binary>.nix-archive.json``) exists and parses cleanly for
+       every binary; the sidecar carries a non-empty ``variant_drvs``
+       list (the eval worker enumerated at least one variant per
+       binary).
+    4. dependency_graph fired: at least one ``build_variant``
+       manifest exists in :attr:`RunArtifacts.manifests_dir`, and
+       every such manifest's ``task_depends_on`` references the
+       toolchain task_id naming convention
+       (``toolchain__<arch>__<id>``).
     5. ``<dataset_dir>/<pkg>/<variant_dir>/`` is populated for every
-       (pkg, variant_dir) named in the phase3 manifests we emitted.
+       (pkg, variant_dir) named in the build_variant manifests we
+       emitted.
     6. Every variant outpath in the placement gossip files has at
        least one holder (legacy ``>= 1`` invariant; K=3 cascade is
        T11's job).
-    7. Every ``task done`` line tagged ``phase0_eval`` in the
+    7. Every ``task done`` line tagged ``matrix_eval`` in the
        secondary slurm_*.out files reports ``success=true``.
     """
     probe = _live_probe()
@@ -346,18 +370,17 @@ def test_t20_phase0_happy(
     #   canonical three-binary set.
     # * ``ssh_identity_file`` -- explicit key for the framework's
     #   gateway SSH (probe already has its own).
-    # * ``extra_args`` -- inject ``--distributed-eval`` to switch the
-    #   submitter to the Phase 0 / Phase 1 split flow (the flag is
-    #   the whole point of the test).
     # * ``archs`` -- left at the default ``("x86_64",)`` from
     #   ``default_invocation_for_smoke`` to stay inside the per-
     #   worker memory envelope (per ``run_helpers`` doc and project
     #   memory ``feedback_slurm_test_env_memory``).
+    #
+    # The matrix_eval / dependency_graph split is the only mode now;
+    # no extra CLI flag is required to engage it.
     invocation = dataclasses.replace(
         default_invocation_for_smoke(jobs=n_secondaries, workload="tiny"),
         packages=T20_PACKAGES,
         ssh_identity_file=pathlib.Path(LIVE_KEY_PATH),
-        extra_args=("--distributed-eval",),
     )
 
     timeout_s = _resolve_timeout()
@@ -420,88 +443,95 @@ def test_t20_phase0_happy(
         f"{manifests_dir} to exist"
     )
 
-    # Assertion (2): exactly one phase0_eval__<binary>.json per
+    # Assertion (2): exactly one matrix_eval__<binary>.json per
     # binary. The submitter's manifest_gen names them
-    # ``phase0_eval__{binary}`` (see
-    # ``manifest_gen.make_phase0_eval_header``).
+    # ``matrix_eval__{binary}`` (see
+    # ``manifest_gen.make_matrix_eval_header``).
     for binary in T20_PACKAGES:
-        expected_path = manifests_dir / f"phase0_eval__{binary}.json"
+        expected_path = manifests_dir / f"matrix_eval__{binary}.json"
         assert expected_path.is_file(), (
-            f"phase0_eval manifest missing for {binary!r}: "
+            f"matrix_eval manifest missing for {binary!r}: "
             f"expected {expected_path} ({detail})"
         )
 
-    phase0_manifests = sorted(manifests_dir.glob("phase0_eval__*.json"))
-    assert len(phase0_manifests) == len(T20_PACKAGES), (
-        f"expected exactly {len(T20_PACKAGES)} phase0_eval manifests, "
-        f"got {len(phase0_manifests)}: "
-        f"{[p.name for p in phase0_manifests]!r} ({detail})"
+    matrix_eval_manifests = sorted(
+        manifests_dir.glob("matrix_eval__*.json"),
+    )
+    assert len(matrix_eval_manifests) == len(T20_PACKAGES), (
+        f"expected exactly {len(T20_PACKAGES)} matrix_eval manifests, "
+        f"got {len(matrix_eval_manifests)}: "
+        f"{[p.name for p in matrix_eval_manifests]!r} ({detail})"
     )
 
-    # Assertion (3): Phase 0 resume marker per binary, with at least
-    # one variant in its ``variants`` list. The marker is the
-    # cluster-side Phase 1 gate; missing or empty here means the eval
-    # worker landed but produced no drvs (typically a flake-eval
-    # failure inside the secondary).
-    phase0_markers: dict[str, dict] = {}
+    # Assertion (3): matrix-eval archive + sidecar per binary, with
+    # at least one ``variant_drvs`` entry in the sidecar. The archive
+    # is the _MatrixEvalQuiesceWatcher's quiesce signal; missing or
+    # empty here means the eval worker landed but produced no drvs
+    # (typically a flake-eval failure inside the secondary).
+    sidecars: dict[str, dict] = {}
     for binary in T20_PACKAGES:
-        marker_data = _read_phase0_marker(invocation.shared_fs, binary)
-        variants = marker_data.get("variants")
-        assert isinstance(variants, list) and variants, (
-            f"phase0 marker for {binary!r} has empty/missing "
-            f"'variants': {marker_data!r} ({detail})"
+        sidecar_data = _read_matrix_eval_sidecar(
+            invocation.shared_fs, binary,
         )
-        phase0_markers[binary] = marker_data
+        variant_drvs = sidecar_data.get("variant_drvs")
+        assert isinstance(variant_drvs, list) and variant_drvs, (
+            f"matrix-eval sidecar for {binary!r} has empty/missing "
+            f"'variant_drvs': {sidecar_data!r} ({detail})"
+        )
+        sidecars[binary] = sidecar_data
 
-    # Assertion (4): Phase 1 fired and emitted phase3_variant build
+    # Assertion (4): dependency_graph fired and emitted build_variant
     # manifests with toolchain depends_on. The manifest filename for
-    # a phase3_variant is the variant label (see
-    # ``manifest_gen.make_variant_header``: ``name=label``); we read
-    # the JSON to find ``item_class == "phase3_variant"``.
-    phase3_manifests: list[tuple[pathlib.Path, dict]] = []
+    # a build_variant is ``build_variant__<sys>__<binary>__<label>``
+    # (see ``manifest_gen.make_build_variant_header``); we read the
+    # JSON to find ``item_class == "build_variant"``.
+    build_variant_manifests: list[tuple[pathlib.Path, dict]] = []
     for path in sorted(manifests_dir.glob("*.json")):
-        # Skip the obvious sidecars and the phase0/toolchain manifests
-        # we've already classified.
+        # Skip the obvious sidecars and the matrix_eval / toolchain
+        # manifests we've already classified.
         if path.name.startswith("_") or path.name.startswith("toolchain"):
             continue
-        if path.name.startswith("phase0_eval__"):
+        if path.name.startswith("matrix_eval__"):
             continue
-        if path.name.startswith("phase1") or path.name.startswith("common_dep"):
-            continue
-        if path.name.startswith("partition__") or path.name.startswith("merge"):
+        if (
+            path.name.startswith("common_dep__")
+            or path.name.startswith("build_common_dep__")
+            or path.name.startswith("build_compilers__")
+        ):
             continue
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 doc = json.load(fh)
         except (OSError, json.JSONDecodeError):
             continue
-        if doc.get("item_class") == "phase3_variant":
-            phase3_manifests.append((path, doc))
+        if doc.get("item_class") == "build_variant":
+            build_variant_manifests.append((path, doc))
 
-    assert phase3_manifests, (
-        "Phase 1 planner produced no phase3_variant manifests for "
-        f"{detail}; the quiesce watcher likely never fired (check the "
-        f"submitter stderr for 'plan_phase1' log lines). manifests_dir "
+    assert build_variant_manifests, (
+        "dependency_graph produced no build_variant manifests for "
+        f"{detail}; the _MatrixEvalQuiesceWatcher likely never fired "
+        f"(check the submitter stderr for "
+        f"'_MatrixEvalQuiesceWatcher' log lines). manifests_dir "
         f"= {manifests_dir}"
     )
 
-    for path, doc in phase3_manifests:
+    for path, doc in build_variant_manifests:
         depends = doc.get("task_depends_on") or []
         assert depends, (
-            f"phase3_variant manifest {path.name} has empty "
+            f"build_variant manifest {path.name} has empty "
             f"task_depends_on -- the planner did not wire its "
             f"toolchain dependency ({detail})"
         )
         # Toolchain task_ids are stamped as ``toolchain__<arch>__<id>``
         # by ``manifest_gen.toolchain_task_id``. At least one entry in
         # depends_on must follow that shape; the planner may add
-        # phase0_eval__<binary> as well (transitive provenance), but
-        # the toolchain dep is mandatory.
+        # build_common_dep__<...> as well (transitive provenance),
+        # but the toolchain dep is mandatory.
         toolchain_deps = [
             d for d in depends if isinstance(d, str) and d.startswith("toolchain__")
         ]
         assert toolchain_deps, (
-            f"phase3_variant manifest {path.name} has no "
+            f"build_variant manifest {path.name} has no "
             f"toolchain__* entry in task_depends_on={depends!r} "
             f"({detail})"
         )
@@ -514,7 +544,7 @@ def test_t20_phase0_happy(
         f"{dataset_dir} to be a directory"
     )
     missing_dataset_dirs: list[str] = []
-    for path, doc in phase3_manifests:
+    for path, doc in build_variant_manifests:
         payload = doc.get("payload") or {}
         pkg = payload.get("pkg")
         variant_dir = payload.get("variant_dir")
@@ -553,24 +583,24 @@ def test_t20_phase0_happy(
             f"{zero_holder[:5]!r}"
         )
 
-    # Assertion (7): every phase0_eval task-done line in the
+    # Assertion (7): every matrix_eval task-done line in the
     # secondary slurm_*.out files reports success=true. A
     # ``success=false`` row passes the clean-exit invariant (it's
-    # still a "task done" line) but indicates Phase 0 reported a
-    # logical failure — we want a hard fail on that case.
-    completion_rows = _scan_phase0_completion_logs(result.log_dir)
+    # still a "task done" line) but indicates matrix_eval reported
+    # a logical failure — we want a hard fail on that case.
+    completion_rows = _scan_matrix_eval_completion_logs(result.log_dir)
     assert completion_rows, (
-        f"no phase0_eval 'task done' lines found in slurm_*.out under "
-        f"{result.log_dir} ({detail}); the eval worker either never "
-        f"ran or the log shape changed -- inspect the framework log "
-        f"emitter"
+        f"no matrix_eval 'task done' lines found in slurm_*.out "
+        f"under {result.log_dir} ({detail}); the eval worker either "
+        f"never ran or the log shape changed -- inspect the "
+        f"framework log emitter"
     )
     bad_completions = [
         (path, val) for (path, val) in completion_rows if val != "true"
     ]
     assert not bad_completions, (
-        f"{len(bad_completions)} phase0_eval task done line(s) report "
-        f"success!=true for {detail}:\n  "
+        f"{len(bad_completions)} matrix_eval task done line(s) "
+        f"report success!=true for {detail}:\n  "
         + "\n  ".join(
             f"{p.name}: success={v!r}" for p, v in bad_completions[:5]
         )

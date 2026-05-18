@@ -1,21 +1,21 @@
-"""End-to-end T21 smoke: Phase 0 drv-broadcast latency on N=4 secondaries.
+"""End-to-end T21 smoke: matrix_eval drv-broadcast latency on N=4 secondaries.
 
-After each Phase 0 ``phase0_eval_<binary>`` task evaluates its variant
+After each ``matrix_eval__<binary>`` task evaluates its variant
 attribute set, the worker emits each produced ``.drv`` path through
 :class:`compiler_suit_runner.peer_replication.BroadcastSender` →
 ``/peer/path-broadcast-offer`` (originator at ``hop_count=0``). The
 broadcast endpoint dedupes by ``broadcast_id`` and fans each drv out
-to every other peer. By the time Phase 1 spawns build tasks for any
-variant, the corresponding drv MUST already be present on every
-secondary's local store -- otherwise the per-variant nix-build would
-hit a substituter miss and fall back to the slower
+to every other peer. By the time dependency_graph spawns build tasks
+for any variant, the corresponding drv MUST already be present on
+every secondary's local store -- otherwise the per-variant nix-build
+would hit a substituter miss and fall back to the slower
 ``substituter -> harmonia`` path.
 
 T21 verifies the **drv flood-fill** part of that contract. It is the
-companion of T20 (phase0 happy path) and the prerequisite for T23
-(common-dep dedup): if broadcasts aren't landing on every secondary,
-Phase 1 cannot pick a holder for the parent drv when it walks
-``inputDrvs`` to find common deps.
+companion of T20 (matrix_eval happy path) and the prerequisite for
+T23 (common-dep dedup): if broadcasts aren't landing on every
+secondary, the dependency_graph cannot pick a holder for the parent
+drv when it walks ``inputDrvs`` to find common deps.
 
 Assertions (in increasing strictness):
 
@@ -23,28 +23,27 @@ Assertions (in increasing strictness):
    manifest count, build-failure floor, no leaked containers /
    listener ports / processes) -- the broadcast layer must NOT
    regress T20's clean-exit guarantee.
-2. **Phase 0 manifests emitted**: at least one
-   ``phase0_eval__<binary>.json`` manifest is present, the marker
-   that the framework actually entered the distributed-eval path
-   (rather than falling back to in-primary eval).
-3. **Holder count per phase0_eval drv** -- PRIMARY signal:
-   for every distinct drv outpath emitted by a Phase 0 task,
+2. **matrix_eval manifests emitted**: at least one
+   ``matrix_eval__<binary>.json`` manifest is present, confirming
+   the framework actually entered the matrix_eval path.
+3. **Holder count per matrix_eval_drv** -- PRIMARY signal:
+   for every distinct drv outpath emitted by a matrix_eval task,
    ``len({secondary_id, ...})`` in the placement-map gossip
    files MUST equal ``n_secondaries`` (i.e. every secondary is a
-   holder). Records carry ``item_class == "phase0_eval_drv"``
+   holder). Records carry ``item_class == "matrix_eval_drv"``
    (mirroring ``workers.eval_worker``'s broadcast tag).
 4. **Log-scan fallback** -- SECONDARY signal, used when the
-   placement-map is silent for ``phase0_eval_drv`` (the receive-side
-   ``record_self_has`` plumbing for Phase 0 drvs is wired through
-   ``peer_replication`` and only writes a placement record on
-   successful substitute-into-local-store; a partial deployment can
-   leave the map empty while the broadcast accept logs still show
-   the cascade). Greps ``slurm_*.out`` for ``path-broadcast-offer``
-   accept events and asserts each emitted ``broadcast_id`` was
-   acknowledged by ``>= n_secondaries - 1`` distinct receivers
-   (sender does not ack itself).
+   placement-map is silent for ``matrix_eval_drv`` (the receive-side
+   ``record_self_has`` plumbing for matrix_eval drvs is wired
+   through ``peer_replication`` and only writes a placement record
+   on successful substitute-into-local-store; a partial deployment
+   can leave the map empty while the broadcast accept logs still
+   show the cascade). Greps ``slurm_*.out`` for
+   ``path-broadcast-offer`` accept events and asserts each emitted
+   ``broadcast_id`` was acknowledged by ``>= n_secondaries - 1``
+   distinct receivers (sender does not ack itself).
 5. **Latency** -- OPTIONAL: from first-emit timestamp on the
-   originating Phase 0 worker to last-accept timestamp on any
+   originating matrix_eval worker to last-accept timestamp on any
    receiver, ``< 2 s`` per broadcast. Log timestamps in this slurm-
    test-env are second-precision, so a sub-second cluster of events
    can collapse to ``0 s``; the check is therefore soft (logged but
@@ -53,17 +52,14 @@ Assertions (in increasing strictness):
 
 Dispatch shape (per Part B Verification T21):
 
-* ``--distributed-eval`` -- the broadcast path is gated behind this
-  flag (default OFF currently; will flip ON after T20/T21/T22/T23
-  go green per the plan's "How to ship Part B" sequence).
-* ``--jobs 4`` -- one secondary per Phase 0 task ``hello`` /
+* ``--jobs 4`` -- one secondary per matrix_eval task. ``hello`` /
   ``zlib`` will be assigned to two of the four secondaries.
 * ``--variant-sample 1`` -- minimise the per-binary variant fan-out
   so the broadcast volume stays in the 10s-of-drvs range; the
   contract is "every drv reaches every peer", not "high broadcast
   throughput".
 * ``--packages hello,zlib`` -- two distinct binaries so we get two
-  ``phase0_eval__<binary>.json`` manifests + each binary picks a
+  ``matrix_eval__<binary>.json`` manifests + each binary picks a
   different originator secondary. ``hello`` is the smoke-test
   default; ``zlib`` is a slightly larger no-test package
   (manifest_gen's "no_test" Tier-2 list) that exercises a different
@@ -76,8 +72,8 @@ Operational notes:
   count expectation to match the actual N. Below
   :data:`MIN_IDLE_WORKERS` we skip rather than mask an outage.
 * **Wall-clock cap**: 1500s default (override via
-  ``T21_TIMEOUT_S``). The distributed-eval path adds a Phase -1
-  drv flood + a Phase 0 per-binary eval round; the medium-sized
+  ``T21_TIMEOUT_S``). The matrix_eval path adds a toolchain
+  drv flood + a matrix_eval per-binary eval round; the medium-sized
   flake + two binaries fits comfortably even cache-cold.
 * **CPU pinning / memory budget**: same as T07 (``slurm_cpus_per_task=2``,
   ``--cores 2``, ``--max-memory 2G``) -- the slurm-test-env workers
@@ -147,9 +143,10 @@ DESIRED_N_SECONDARIES = 4
 # weakening the holder-count assertion further.
 MIN_IDLE_WORKERS = 3
 
-# Phase 0 packages. ``hello`` is the smoke default, ``zlib`` is a
-# Tier-2 no-test package that exercises a separate derivation graph;
-# together they produce two ``phase0_eval__<binary>.json`` manifests.
+# matrix_eval packages. ``hello`` is the smoke default, ``zlib`` is
+# a Tier-2 no-test package that exercises a separate derivation
+# graph; together they produce two ``matrix_eval__<binary>.json``
+# manifests.
 PACKAGES: tuple[str, ...] = ("hello", "zlib")
 
 # Per-variant sampling. Keep the per-binary drv count small so the
@@ -157,16 +154,17 @@ PACKAGES: tuple[str, ...] = ("hello", "zlib")
 # is unambiguous (one accept event per drv per peer).
 VARIANT_SAMPLE = 1
 
-# Default wall-clock cap; medium workload plus distributed-eval adds
-# a Phase -1 + Phase 0 round trip on top of the existing dispatch
-# latency. 1500s mirrors T07/T11.
+# Default wall-clock cap; medium workload plus matrix_eval adds a
+# toolchain seed + a matrix_eval per-binary round trip on top of the
+# existing dispatch latency. 1500s mirrors T07/T11.
 DEFAULT_TIMEOUT_S = 1500.0
 
-# Item class the broadcast sender tags Phase 0 drv emissions with.
-# Mirrors ``workers.eval_worker:_eval_jobs_for_arch -> enqueue_broadcast``
-# (``item_class="phase0_eval_drv"``); duplicated here as a literal so
-# this test doesn't pull eval_worker in just for the constant.
-PHASE0_DRV_ITEM_CLASS = "phase0_eval_drv"
+# Item class the broadcast sender tags matrix_eval drv emissions
+# with. Mirrors ``workers.eval_worker._eval_jobs_for_arch ->
+# enqueue_broadcast`` (``item_class="matrix_eval_drv"``); duplicated
+# here as a literal so this test doesn't pull eval_worker in just
+# for the constant.
+MATRIX_EVAL_DRV_ITEM_CLASS = "matrix_eval_drv"
 
 # Latency threshold for the optional soft check. Log timestamps in
 # slurm-test-env logs are second-precision so a sub-second cluster of
@@ -230,12 +228,12 @@ def _resolve_timeout() -> float:
         return DEFAULT_TIMEOUT_S
 
 
-def _collect_phase0_drv_holders(
+def _collect_matrix_eval_drv_holders(
     shared_fs: pathlib.Path,
 ) -> dict[str, set[str]]:
     """Aggregate placement files into ``{drv_outpath: {secondary_id, ...}}``.
 
-    Only records with ``item_class == "phase0_eval_drv"`` are
+    Only records with ``item_class == "matrix_eval_drv"`` are
     considered -- variant placements and toolchain placements (which
     use the K=3 cascade, not flood-fill) are out of scope for T21.
 
@@ -249,7 +247,7 @@ def _collect_phase0_drv_holders(
         return {}
     for paths_file in peers_dir.glob(f"{PATHS_FILE_PREFIX}*.jsonl"):
         for rec in parse_placement_records(paths_file):
-            if rec.get("item_class") != PHASE0_DRV_ITEM_CLASS:
+            if rec.get("item_class") != MATRIX_EVAL_DRV_ITEM_CLASS:
                 continue
             sid = rec.get("secondary_id")
             outpath = rec.get("outpath")
@@ -352,35 +350,35 @@ def _approx_seconds_between(ts_lo: str, ts_hi: str) -> float:
 
 
 @pytest.mark.slurm_live
-def test_t21_phase0_broadcast(
+def test_t21_matrix_eval_broadcast(
     cluster_probe: ClusterProbe,  # noqa: ARG001 -- fixture used for ordering
     slurm_log_root: pathlib.Path,  # noqa: ARG001 -- documented as fixture-driven
     fresh_run: Callable[..., RunResult],
     cleanup_cluster: None,  # noqa: ARG001 -- wired via the B2 cleanup harness
 ) -> None:
-    """N=4 secondaries, two Phase 0 binaries; assert drv flood-fill landed.
+    """N=4 secondaries, two matrix_eval binaries; assert drv flood-fill landed.
 
     Pre-flight: gateway reachable, ``squeue --me`` empty, sinfo lists
     at least :data:`MIN_IDLE_WORKERS` workers idle.
 
     Dispatch: medium workload via ``fresh_run`` (cache-cold both
-    sides), plus ``--distributed-eval`` so the Phase 0 path engages
-    and ``--packages hello,zlib`` so two ``phase0_eval__<binary>``
-    tasks materialise.
+    sides), plus ``--packages hello,zlib`` so two
+    ``matrix_eval__<binary>`` tasks materialise.
 
     Post-flight in order:
 
     1. Standard 7-invariant audit must pass with no failures.
-    2. Each Phase 0 binary produced a ``phase0_eval__<binary>.json``
-       manifest under the run's ``manifests/`` dir.
+    2. Each matrix_eval binary produced a
+       ``matrix_eval__<binary>.json`` manifest under the run's
+       ``manifests/`` dir.
     3. PRIMARY: placement-map records with ``item_class ==
-       "phase0_eval_drv"`` show every drv held by ``n_secondaries``
+       "matrix_eval_drv"`` show every drv held by ``n_secondaries``
        distinct peers. The placement records are written by the
        receive-side broadcast handler after the drv is substituted
        into the local store. If NO placement records exist for that
        item class we fall back to assertion 4 (log scan) instead --
        this keeps T21 useful while the receive-side
-       ``record_self_has`` for ``phase0_eval_drv`` is being wired
+       ``record_self_has`` for ``matrix_eval_drv`` is being wired
        up in parallel (the plan's Part B sequencing has the
        eval_worker landing before the receive-side placement
        recorder).
@@ -434,17 +432,16 @@ def test_t21_phase0_broadcast(
     # Compose the invocation. ``default_invocation_for_smoke(jobs=N,
     # workload="medium")`` already pins ``packages=("hello",)``,
     # ``--variant-sample 2``, ``--max-variants 10``, etc. We override:
-    #   * ``packages`` -- two binaries to fan Phase 0 across them.
+    #   * ``packages`` -- two binaries to fan matrix_eval across them.
     #   * ``variant_sample`` -- 1 to keep the per-binary drv set small.
     #   * ``ssh_identity_file`` -- so the framework's own SSH uses the
     #     explicit ephemeral key.
     #   * ``slurm_cpus_per_task=2`` -- matches the worker's CPUTot=2.
     #   * ``archs=("x86_64",)`` -- single-arch keeps the variant matrix
     #     inside the 3.5 GiB per-cgroup memory envelope.
-    #   * ``extra_args=("--distributed-eval",)`` -- engages the Phase 0
-    #     path under test. This is the whole point of T21 -- without
-    #     this flag the test would only exercise the legacy in-primary
-    #     eval and never trigger a broadcast.
+    #
+    # The matrix_eval drv-broadcast path is the only mode now; no
+    # extra CLI flag is required to engage it.
     invocation = dataclasses.replace(
         default_invocation_for_smoke(jobs=n_secondaries, workload="medium"),
         packages=PACKAGES,
@@ -452,7 +449,6 @@ def test_t21_phase0_broadcast(
         ssh_identity_file=pathlib.Path(LIVE_KEY_PATH),
         slurm_cpus_per_task=2,
         archs=("x86_64",),
-        extra_args=("--distributed-eval",),
     )
 
     timeout_s = _resolve_timeout()
@@ -503,27 +499,28 @@ def test_t21_phase0_broadcast(
         f"invariant(s) failed for {detail}:\n{_format_results(inv_results)}"
     )
 
-    # ----- Assertion 2: Phase 0 manifests emitted -------------------
+    # ----- Assertion 2: matrix_eval manifests emitted ---------------
     manifests_dir = artifacts.manifests_dir
-    phase0_manifests = sorted(
-        manifests_dir.glob("phase0_eval__*.json")
+    matrix_eval_manifests = sorted(
+        manifests_dir.glob("matrix_eval__*.json")
     )
-    assert phase0_manifests, (
-        f"no phase0_eval__<binary>.json manifests under {manifests_dir} "
-        f"for {detail}; --distributed-eval must produce at least one "
-        "Phase 0 manifest per package"
+    assert matrix_eval_manifests, (
+        f"no matrix_eval__<binary>.json manifests under "
+        f"{manifests_dir} for {detail}; the submitter must produce "
+        f"at least one matrix_eval manifest per package"
     )
     # Soft sanity: one manifest per package we asked for. We don't
     # hard-assert equality (a Tier-2 package could be filtered out by
     # the support table on a given arch / compiler combination), but
     # we do warn loudly if the count is below one-per-package.
-    if len(phase0_manifests) < len(PACKAGES):
-        # This becomes a hard fail only if NO Phase 0 manifests at all
-        # (already checked above); a partial set is informational.
+    if len(matrix_eval_manifests) < len(PACKAGES):
+        # This becomes a hard fail only if NO matrix_eval manifests
+        # at all (already checked above); a partial set is
+        # informational.
         pass
 
     # ----- Assertion 3 (primary): placement-map holder count --------
-    drv_holders = _collect_phase0_drv_holders(invocation.shared_fs)
+    drv_holders = _collect_matrix_eval_drv_holders(invocation.shared_fs)
 
     # ----- Assertion 4 (secondary): log-scan accept events ----------
     accept_events = _scan_broadcast_accepts(result.log_dir)
@@ -531,7 +528,7 @@ def test_t21_phase0_broadcast(
     # Of the two signals, the placement-map is the firmer one (records
     # land only after a successful local-store substitution + record_self_has).
     # If the receive-side recorder is not yet wired, the map will be
-    # empty for ``phase0_eval_drv`` -- in which case we fall back to
+    # empty for ``matrix_eval_drv`` -- in which case we fall back to
     # the log-scan as the assertion of record.
     if drv_holders:
         # Primary check: every drv has n_secondaries distinct holders.
@@ -545,15 +542,16 @@ def test_t21_phase0_broadcast(
             if len(holders) < n_secondaries
         ]
         assert not under_replicated, (
-            f"Phase 0 drv broadcast under-replicated for {detail}; "
-            f"{len(under_replicated)} drv(s) had < {n_secondaries} "
-            f"holders within the post-Phase-0 window:\n"
+            f"matrix_eval drv broadcast under-replicated for "
+            f"{detail}; {len(under_replicated)} drv(s) had "
+            f"< {n_secondaries} holders within the post-matrix_eval "
+            f"window:\n"
             + "\n".join(
                 f"  {op}: {h} (len={len(h)})"
                 for op, h in under_replicated
             )
             + (
-                "\nFull phase0_eval_drv placement map:\n"
+                "\nFull matrix_eval_drv placement map:\n"
                 + "\n".join(
                     f"  {op}: {sorted(h)}"
                     for op, h in drv_holders.items()
@@ -566,10 +564,10 @@ def test_t21_phase0_broadcast(
         # originator's log shows the emit, NOT an accept event;
         # accept events are written by receivers).
         assert accept_events, (
-            "no Phase 0 drv broadcasts visible in placement records "
-            "OR in secondary logs; --distributed-eval must trigger "
-            "BroadcastSender.enqueue_broadcast for each evaluated drv. "
-            f"({detail})"
+            "no matrix_eval drv broadcasts visible in placement "
+            "records OR in secondary logs; the matrix_eval worker "
+            "must trigger BroadcastSender.enqueue_broadcast for each "
+            f"evaluated drv. ({detail})"
         )
         min_distinct_accepts = max(1, n_secondaries - 1)
         under_broadcast = [
@@ -578,7 +576,7 @@ def test_t21_phase0_broadcast(
             if len({lp.name for lp in logs}) < min_distinct_accepts
         ]
         assert not under_broadcast, (
-            f"Phase 0 broadcast log-scan: {len(under_broadcast)} "
+            f"matrix_eval broadcast log-scan: {len(under_broadcast)} "
             f"broadcast_id(s) accepted by fewer than "
             f"{min_distinct_accepts} distinct secondary log file(s) "
             f"for {detail}:\n"
@@ -594,7 +592,7 @@ def test_t21_phase0_broadcast(
     # timestamps make a sub-second cluster collapse to 0 s, so we
     # only fail on >= SOFT_LATENCY_FAIL_S (5 s) which would be a
     # real stall. Captured as a soft check so a log-format quirk
-    # doesn't surface as a Phase 0 regression.
+    # doesn't surface as a matrix_eval regression.
     ts_per_bid = _scan_broadcast_event_timestamps(result.log_dir)
     stalled: list[tuple[str, float, str, str]] = []
     for bid, stamps in ts_per_bid.items():
@@ -605,8 +603,9 @@ def test_t21_phase0_broadcast(
         if delta >= SOFT_LATENCY_FAIL_S:
             stalled.append((bid, delta, stamps_sorted[0], stamps_sorted[-1]))
     assert not stalled, (
-        f"Phase 0 broadcast latency check: {len(stalled)} broadcast(s) "
-        f"took >= {SOFT_LATENCY_FAIL_S}s end-to-end for {detail}:\n"
+        f"matrix_eval broadcast latency check: {len(stalled)} "
+        f"broadcast(s) took >= {SOFT_LATENCY_FAIL_S}s end-to-end for "
+        f"{detail}:\n"
         + "\n".join(
             f"  {bid}: {delta:.1f}s ({lo} -> {hi})"
             for bid, delta, lo, hi in stalled

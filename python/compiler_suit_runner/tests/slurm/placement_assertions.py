@@ -7,9 +7,9 @@ transfers. This module bundles the file-only assertions a T-test
 needs to confirm the map is being populated and used:
 
 * :func:`assert_validate_manifests_emitted` — the primary's manifest
-  emission produced ``phase2_toolchain_validate`` items, not the
-  legacy ``phase2_toolchain`` build manifests. By default
-  ``--allow-toolchain-build`` is off, so any build manifest in
+  emission produced ``toolchain_validate`` items, not the
+  ``build_compilers`` build manifests. By default
+  ``--build-compilers`` is off, so any build manifest in
   ``manifests_dir`` is a regression.
 * :func:`assert_placement_files_present_and_nonempty` — at least
   one ``peers/_paths_<sid>.jsonl`` exists post-run with a parseable
@@ -72,10 +72,11 @@ _NIX_COPY_LINE_RE = re.compile(
 def assert_validate_manifests_emitted(artifacts: RunArtifacts) -> None:
     """Fail when the run emitted build-only toolchain manifests.
 
-    With ``--allow-toolchain-build`` off (the default), every
-    toolchain item must be a ``phase2_toolchain_validate`` JSON
-    file. The two filenames are disjoint:
-        ``toolchain__<arch>__<compiler>.json``  -> build
+    With ``--build-compilers`` off (the default), every
+    toolchain item must be a ``toolchain_validate`` JSON file. The
+    two filename shapes are disjoint:
+
+        ``build_compilers__<sys>__<arch>__<compiler>.json``  -> build
         ``toolchain_validate__<arch>__<compiler>.json`` -> validate
 
     We allow the validate set to be non-empty (the contract is
@@ -86,18 +87,18 @@ def assert_validate_manifests_emitted(artifacts: RunArtifacts) -> None:
     assert manifests_dir.is_dir(), (
         f"manifests_dir missing or not a directory: {manifests_dir}"
     )
-    build_manifests = sorted(manifests_dir.glob("toolchain__*.json"))
+    build_manifests = sorted(manifests_dir.glob("build_compilers__*.json"))
     validate_manifests = sorted(
         manifests_dir.glob("toolchain_validate__*.json"),
     )
     assert not build_manifests, (
-        "default --allow-toolchain-build=False must emit only "
-        f"phase2_toolchain_validate items, but found {len(build_manifests)} "
+        "default --build-compilers=False must emit only "
+        f"toolchain_validate items, but found {len(build_manifests)} "
         f"build-shaped manifest(s): "
         f"{[p.name for p in build_manifests[:5]]}..."
     )
     assert validate_manifests, (
-        "no phase2_toolchain_validate manifests under "
+        "no toolchain_validate manifests under "
         f"{manifests_dir}; the primary's emit_all_manifests "
         "must produce at least one validate item per toolchain"
     )
