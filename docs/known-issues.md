@@ -154,13 +154,28 @@ entirely.
 **Status**: Deferred from the Phase B/C/D taxonomy revamp (see
 `/home/sirati/.claude/plans/lively-beaming-summit.md`).
 
-**D.6 (SLURM T20-T23 in slurm-test-env)**: Operator-only verification.
-Requires `INSTANCE_ID=<tag> SSH_PORT=<port> nix run .#up` in
-`~/devel/python/dynamic_runner/slurm-test-env/` to bring up the local
-podman cluster, then `pytest python/compiler_suit_runner/tests/slurm/
--k "t20 or t21 or t22 or t23"`. The unit-test sweep is green (691
-pass) and the SLURM tests collect cleanly (206 collected); a real
-dispatch run is the next gating signal.
+**D.6 (SLURM T20-T23 in slurm-test-env)**: PARTIAL. The local cluster
+came up cleanly (`INSTANCE_ID=asm SSH_PORT=2244 nix run .#up` in
+`~/devel/python/dynamic_runner/slurm-test-env/`) and `srun --partition
+=debug -N1 hostname` worked. T20 invoked the new CLI through 42s of
+preflight then hit the documented `--build-compilers is off and 17
+toolchains missing locally` gate — exactly the new-taxonomy error
+text emitted from `cli.py:1112-1119` and a behavioural validation
+of the rename. To complete the end-to-end SLURM dispatch, the
+operator must either:
+- pre-build the 17 cross-toolchain wrappers required by `T20_PACKAGES
+  = ('hello', 'zlib', 'busybox')` × tiny workload arch set
+  (`nix build .#dataset.<sys>.<binary>.<arch>.<compiler>` for each
+  combo, ~hours of compute + tens of GiB), OR
+- modify `default_invocation_for_smoke` to inject `--build-compilers`
+  so the cluster builds the toolchains itself (intentional semantic
+  change for the test — not a Phase D verification step).
+
+The unit-test sweep is green (691 pass), the SLURM tests collect
+cleanly (206 collected), and the new submit path runs preflight +
+error-path code unchanged through 42s of real execution. The
+remaining gate is purely an operator-side toolchain pre-stage; not
+a code regression.
 
 **D.8 (cross-version fail-loud regression)**: Run a NEW submitter
 against a JSONL aggregate previously written by OLD code; confirm
