@@ -36,7 +36,7 @@ def _query_drv_tree(sum_drv: str) -> str:
     """``nix-store --query --tree <sum_drv>`` → decoded UTF-8 text."""
     proc = subprocess.run(  # noqa: S603 - argv constructed in-module
         ["nix-store", "--query", "--tree", sum_drv],
-        capture_output=True, check=False, shell=False,
+        capture_output=True, check=False,
     )
     if proc.returncode != 0:
         raise SystemExit(
