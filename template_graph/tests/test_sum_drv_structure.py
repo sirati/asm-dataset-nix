@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from template_graph.drv_io import DrvIoError, read_drv_record
-from template_graph.tests.conftest import _is_builder_noise, _wrapper_name
+from template_graph.tests.conftest import is_builder_noise, wrapper_name
 from template_graph.tests.dataset_naming import hello_name_extractor
 
 
@@ -22,7 +22,7 @@ def test_root_has_toolchains_and_at_least_one_matrix(
 ):
     rec = read_drv_record(root_drv)
     names = {
-        _wrapper_name(k) for k in rec["inputDrvs"] if not _is_builder_noise(k)
+        wrapper_name(k) for k in rec["inputDrvs"] if not is_builder_noise(k)
     }
     assert "toolchains" in names
     assert any(n.startswith("matrix-") for n in names), names
