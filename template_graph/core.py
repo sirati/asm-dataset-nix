@@ -29,8 +29,33 @@ per child.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Callable, Optional
+
+from template_graph.graph.template import (
+    Template,
+    TemplateGraphAssertError,
+    TemplateNode,
+    _shape_equal,
+    find_or_register_template,
+)
+from template_graph.graph.variant_array import VariantArray
+
+__all__ = [
+    "Template",
+    "TemplateNode",
+    "VariantArray",
+    "TemplateGraphAssertError",
+    "_shape_equal",
+    "find_or_register_template",
+    "Logger",
+    "GetRecord",
+    "NameExtractor",
+    "derivation_package_name",
+    "build_template_from_closure",
+    "cowalk_and_index",
+    "assert_arch_invariants",
+    "plan_phase1_graph",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -43,91 +68,6 @@ Logger = Callable[[str], None]
 
 def _noop_logger(_msg: str) -> None:
     return None
-
-
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class TemplateNode:
-    name: str
-    child_ids: list[int] = field(default_factory=list)
-    is_toolchain: bool = False
-    visit_flag: bool = False
-    # True if at calibration time we only saw this node on ONE side
-    # of the pair. Variants are allowed to have None at this position
-    # in arr.hashes (the variant simply doesn't include it).
-    optional: bool = False
-    # When a DAG-revisit reveals two distinct (hash, name) values at
-    # this role-position, the template node is split. Each resulting
-    # node carries a constraint:
-    #   ("triple", "<triple>") — must have this exact target triple
-    #   ("triple", None)       — must be native (no triple in name)
-    #   ("this-target", None)  — must match cowalking variant's arch triple
-    #   ("version", "<v>")     — must be this exact version
-    enforce: Optional[tuple[str, Optional[str]]] = None
-
-
-@dataclass
-class Template:
-    nodes: list[TemplateNode]
-    name_to_id: dict[str, int]
-    root_id: int
-    # Variant labels that locked this template's shape. Up to two
-    # entries: the variant whose closure was walked to build it +
-    # (if present) the next variant of the same arch group whose
-    # cowalk succeeded. Error messages cite both.
-    template_built_from: list[str] = field(default_factory=list)
-
-
-@dataclass
-class VariantArray:
-    template_id: int
-    arch: str
-    variants: list[str]
-    hashes: list[list[Optional[str]]]
-
-
-# ---------------------------------------------------------------------------
-# Error
-# ---------------------------------------------------------------------------
-
-
-class TemplateGraphAssertError(Exception):
-    """Hard-assert failure. Always carries anchor labels + failing label."""
-
-    def __init__(
-        self,
-        *,
-        kind: str,
-        message: str,
-        template_built_from: Optional[list[str]] = None,
-        failing_variant: Optional[str] = None,
-        node_name: Optional[str] = None,
-        details: Optional[dict] = None,
-    ) -> None:
-        parts = [f"[{kind}] {message}"]
-        anchors = list(template_built_from or [])
-        if anchors or failing_variant is not None:
-            parts.append(
-                "  template built from: "
-                + (", ".join(repr(v) for v in anchors) if anchors else "<none>")
-            )
-        if failing_variant is not None:
-            parts.append(f"  failing variant:     {failing_variant!r}")
-        if node_name is not None:
-            parts.append(f"  at node:             {node_name!r}")
-        if details:
-            for k, v in details.items():
-                parts.append(f"  {k}: {v!r}")
-        super().__init__("\n".join(parts))
-        self.kind = kind
-        self.template_built_from = anchors
-        self.failing_variant = failing_variant
-        self.node_name = node_name
-        self.details = dict(details or {})
 
 
 # ---------------------------------------------------------------------------
@@ -266,47 +206,6 @@ def build_template_from_closure(
         root_id=root_id,
         template_built_from=[built_from_label],
     )
-
-
-# ---------------------------------------------------------------------------
-# Template structural equality + find-or-register
-# ---------------------------------------------------------------------------
-
-
-def _shape_equal(a: Template, b: Template) -> bool:
-    if len(a.nodes) != len(b.nodes):
-        return False
-    mapping: dict[int, int] = {}
-
-    def _eq(an: int, bn: int) -> bool:
-        if an in mapping:
-            return mapping[an] == bn
-        mapping[an] = bn
-        na = a.nodes[an]
-        nb = b.nodes[bn]
-        if na.name != nb.name:
-            return False
-        if na.is_toolchain != nb.is_toolchain:
-            return False
-        if len(na.child_ids) != len(nb.child_ids):
-            return False
-        for ac, bc in zip(na.child_ids, nb.child_ids):
-            if not _eq(ac, bc):
-                return False
-        return True
-
-    return _eq(a.root_id, b.root_id)
-
-
-def find_or_register_template(
-    templates: list[Template], candidate: Template
-) -> tuple[int, bool]:
-    """Return (id, was_newly_registered)."""
-    for i, t in enumerate(templates):
-        if _shape_equal(t, candidate):
-            return i, False
-    templates.append(candidate)
-    return len(templates) - 1, True
 
 
 # ---------------------------------------------------------------------------
