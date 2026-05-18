@@ -1,38 +1,39 @@
 """Unit tests for :mod:`compiler_suit_runner.suit_task`.
 
-Today's tests cover the Phase 0 → Phase 1 quiesce watcher
-(``_Phase0QuiesceWatcher``) and its wiring into ``on_run_start``.
-Older topology / lifecycle tests live in
-:mod:`tests.test_suit_task_topology`.
+Today's tests cover the matrix_eval → build quiesce watcher
+(``_MatrixEvalQuiesceWatcher``) and its wiring into ``on_run_start``,
+plus the peer-lifecycle listener and the PrimaryHandle wrappers.
 
-The legacy ``phase1_planner`` module that the watcher used to invoke
-on quiesce has been deleted; the replacement
-``dependency_graph_planner`` will be wired in a follow-up commit, so
-the watcher's ``_fire`` is currently a no-op stub. These tests cover
-the bookkeeping side (``expected``/``completed``/``fired``) and the
-``_spawn_tasks`` JSON-dump path that tests still drive directly with
-synthetic header lists.
+The watcher's ``_fire`` runs the dependency_graph_worker as a
+subprocess and feeds its output into ``primary_handle.spawn_tasks``;
+the tests below substitute the subprocess + (optionally) the spawn
+handle so the bookkeeping side is testable hermetically.
 """
 
 from __future__ import annotations
 
+import dataclasses as _dataclasses
 import json
 import logging
 import pathlib
+import subprocess
 from unittest import mock
 
 import pytest
 
+from compiler_suit_runner.dependency_graph_planner import (
+    Phase4Descriptor,
+)
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
-    phase0_eval_task_id,
+    matrix_eval_task_id,
     toolchain_task_id,
     write_manifest,
 )
 from compiler_suit_runner.suit_task import (
     SuitTask,
     SuitTaskConfig,
-    _Phase0QuiesceWatcher,
+    _MatrixEvalQuiesceWatcher,
 )
 
 
@@ -50,8 +51,6 @@ def _make_config(tmp_path: pathlib.Path) -> SuitTaskConfig:
         sys_name=_SYS,
         shared_fs=tmp_path,
         manifest_dir=tmp_path / "manifests",
-        raw_partition_dir=tmp_path / "partition" / "raw",
-        partition_dir=tmp_path / "partition",
         dataset_dir=tmp_path / "dataset",
         peers_dir=tmp_path / "peers",
         run_id="r1",
@@ -60,10 +59,10 @@ def _make_config(tmp_path: pathlib.Path) -> SuitTaskConfig:
     )
 
 
-def _phase0_eval_header(binary: str) -> ManifestHeader:
+def _matrix_eval_header(binary: str) -> ManifestHeader:
     return ManifestHeader(
-        item_class="phase0_eval",
-        name=f"phase0_eval__{binary}",
+        item_class="matrix_eval",
+        name=f"matrix_eval__{binary}",
         size=0,
         payload={
             "binary": binary,
@@ -72,16 +71,16 @@ def _phase0_eval_header(binary: str) -> ManifestHeader:
             "suffixes": ["O0"],
             "attr": f"dataset.{_SYS}.{binary}",
         },
-        task_id=phase0_eval_task_id(binary),
+        task_id=matrix_eval_task_id(binary),
         task_depends_on=(),
     )
 
 
 def _toolchain_header(
-    arch: str, compiler_label: str, drv: str
+    arch: str, compiler_label: str, drv: str,
 ) -> ManifestHeader:
     return ManifestHeader(
-        item_class="phase2_toolchain_validate",
+        item_class="toolchain_validate",
         name=f"toolchain_validate__{arch}__{compiler_label}",
         size=0,
         payload={
@@ -98,17 +97,61 @@ def _toolchain_header(
     )
 
 
+def _common_dep_header(label: str, drv: str) -> ManifestHeader:
+    return ManifestHeader(
+        item_class="build_common_dep",
+        name=f"common_dep__{label}",
+        size=0,
+        payload={
+            "drv": drv,
+            "label": label,
+            "attr": drv,
+        },
+        task_id=f"build_common_dep__{pathlib.Path(drv).name}",
+    )
+
+
+def _variant_header(binary: str, label: str, compiler_id: str = "gcc15"):
+    return ManifestHeader(
+        item_class="build_variant",
+        name=label,
+        size=0,
+        payload={
+            "sys": _SYS,
+            "pkg": binary,
+            "arch": "x86_64",
+            "label": label,
+            "drv": f"/nix/store/v-{label}.drv",
+            "variant_dir": label,
+            "metadata_name": f"{label}.json",
+            "compiler_id": compiler_id,
+            "tier": 1,
+            "attr": f"dataset.{_SYS}.{binary}.x86_64.{label}",
+        },
+        task_id=f"build_variant__{_SYS}__{binary}__{label}",
+        task_depends_on=(toolchain_task_id(_SYS, "x86_64", compiler_id),),
+    )
+
+
+# A minimal subprocess.CompletedProcess stand-in for the watcher's
+# ``run_subprocess`` injection point.
+def _fake_completed(rc: int, stderr: bytes = b"") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(
+        args=[], returncode=rc, stdout=b"", stderr=stderr,
+    )
+
+
 # ---------------------------------------------------------------------------
-# _Phase0QuiesceWatcher unit tests
+# _MatrixEvalQuiesceWatcher bookkeeping
 # ---------------------------------------------------------------------------
 
 
 def test_watcher_initialises_with_expected_set(
     tmp_path: pathlib.Path,
 ) -> None:
-    expected = {phase0_eval_task_id("hello"),
-                phase0_eval_task_id("busybox")}
-    w = _Phase0QuiesceWatcher(
+    expected = {matrix_eval_task_id("hello"),
+                matrix_eval_task_id("busybox")}
+    w = _MatrixEvalQuiesceWatcher(
         expected_task_ids=expected,
         out_dir=tmp_path / "out",
         toolchain_task_ids={},
@@ -118,14 +161,14 @@ def test_watcher_initialises_with_expected_set(
     assert w.fired is False
 
 
-def test_watcher_noops_for_non_phase0_task(
+def test_watcher_noops_for_non_matrix_eval_task(
     tmp_path: pathlib.Path,
 ) -> None:
     """A toolchain (or any) task_id that is not in ``expected`` is
     ignored. The watcher coexists with other listeners on the same hook
     surface (K=3 replication, etc.) so it must not raise."""
-    w = _Phase0QuiesceWatcher(
-        expected_task_ids={phase0_eval_task_id("hello")},
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=tmp_path / "out",
         toolchain_task_ids={},
     )
@@ -136,14 +179,14 @@ def test_watcher_noops_for_non_phase0_task(
     assert w.fired is False
 
 
-def test_watcher_records_phase0_completion(
+def test_watcher_records_matrix_eval_completion(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A matching phase0 task moves into ``completed`` but doesn't
+    """A matching matrix_eval task moves into ``completed`` but doesn't
     fire until the set is full."""
-    hello = phase0_eval_task_id("hello")
-    busybox = phase0_eval_task_id("busybox")
-    w = _Phase0QuiesceWatcher(
+    hello = matrix_eval_task_id("hello")
+    busybox = matrix_eval_task_id("busybox")
+    w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={hello, busybox},
         out_dir=tmp_path / "out",
         toolchain_task_ids={},
@@ -157,19 +200,29 @@ def test_watcher_fires_when_complete(
     tmp_path: pathlib.Path,
 ) -> None:
     """When the completed set covers the expected set, ``fired`` flips
-    to True. The legacy ``phase1_planner.plan_phase1`` invocation has
-    been removed pending the ``dependency_graph_planner`` rewrite; the
-    watcher's ``_fire`` is currently a no-op stub that only logs."""
-    hello = phase0_eval_task_id("hello")
+    to True. The ``_fire`` flow runs the dependency_graph subprocess
+    (overridden here to a no-op) and writes the artefact dump alongside.
+    """
+    hello = matrix_eval_task_id("hello")
     out_dir = tmp_path / "out"
+    out_dir.mkdir()
     toolchain_drv = "/nix/store/c-gcc15.drv"
     toolchain_id = toolchain_task_id(_SYS, "x86_64", "gcc15")
 
-    w = _Phase0QuiesceWatcher(
+    # Pre-seed an empty dependency_graph.json so the read step is a no-op.
+    (out_dir / "_dependency_graph.json").write_text(
+        json.dumps({"phase4_descriptors": []}),
+        encoding="utf-8",
+    )
+
+    w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={hello},
         out_dir=out_dir,
         toolchain_task_ids={toolchain_drv: toolchain_id},
         sys_name=_SYS,
+        run_subprocess=lambda _argv: _fake_completed(0),
+        dependency_graph_command_override=["true"],
+        bash_path="/nix/store/fake-bash",
     )
     w.on_task_completed(hello)
     assert w.fired is True
@@ -180,12 +233,20 @@ def test_watcher_is_idempotent_on_duplicate_completion(
 ) -> None:
     """The same task_id arriving twice does not flip ``fired`` twice
     and does not double-count toward expected."""
-    hello = phase0_eval_task_id("hello")
-    busybox = phase0_eval_task_id("busybox")
-    w = _Phase0QuiesceWatcher(
+    hello = matrix_eval_task_id("hello")
+    busybox = matrix_eval_task_id("busybox")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "_dependency_graph.json").write_text(
+        json.dumps({"phase4_descriptors": []}), encoding="utf-8",
+    )
+    w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={hello, busybox},
-        out_dir=tmp_path / "out",
+        out_dir=out_dir,
         toolchain_task_ids={},
+        run_subprocess=lambda _argv: _fake_completed(0),
+        dependency_graph_command_override=["true"],
+        bash_path="/nix/store/fake-bash",
     )
     w.on_task_completed(hello)
     w.on_task_completed(hello)  # duplicate
@@ -199,54 +260,252 @@ def test_watcher_is_idempotent_on_duplicate_completion(
     assert w.fired is True
 
 
-def test_spawn_tasks_no_handle_writes_phase1_graph_and_logs_count(
+# ---------------------------------------------------------------------------
+# _fire: subprocess + spawn integration
+# ---------------------------------------------------------------------------
+
+
+def test_fire_invokes_dependency_graph_subprocess_and_spawns(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """With ``primary_handle=None`` the Q5 path falls back to writing
-    ``_phase1_graph.json`` and emits an INFO log explaining the
-    degradation."""
+    """Happy path: _fire runs the subprocess override, reads the
+    descriptor list from _dependency_graph.json, and feeds the
+    translated headers to primary_handle.spawn_tasks."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    # Seed a non-empty descriptor list on disk; the subprocess is a
+    # no-op so we control the input directly.
+    descriptors_payload = {
+        "phase4_descriptors": [
+            {
+                "kind": "build_common_dep",
+                "task_id": "build_common_dep__hello__x86_64__abc-glibc",
+                "name": "build_common_dep__hello__x86_64__glibc",
+                "payload": {
+                    "sys": _SYS,
+                    "binary": "hello",
+                    "arch": "x86_64",
+                    "ident": "abc-glibc",
+                    "node_name": "glibc",
+                    "node_id": 0,
+                    "attr": "abc-glibc",
+                },
+                "depends_on": [],
+            },
+            {
+                "kind": "build_variant",
+                "task_id": "build_variant__x86_64-linux__hello__hello-x86_64-gcc15-O2",
+                "name": "build_variant__hello__hello-x86_64-gcc15-O2",
+                "payload": {
+                    "sys": _SYS,
+                    "pkg": "hello",
+                    "arch": "x86_64",
+                    "label": "hello-x86_64-gcc15-O2",
+                    "compiler_id": "gcc15",
+                    "drv": "/nix/store/v.drv",
+                    "tier": 1,
+                },
+                "depends_on": [
+                    "build_common_dep__hello__x86_64__abc-glibc",
+                ],
+            },
+        ]
+    }
+    (out_dir / "_dependency_graph.json").write_text(
+        json.dumps(descriptors_payload), encoding="utf-8",
+    )
+
+    runs: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess:
+        runs.append(list(argv))
+        return _fake_completed(0)
+
+    handle = mock.MagicMock()
+    handle.spawn_tasks.return_value = []
+    logger = logging.getLogger("test_fire_happy")
+    hello = matrix_eval_task_id("hello")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+        primary_handle=handle,
+        sys_name=_SYS,
+        manifest_dir=tmp_path / "manifests",
+        run_subprocess=fake_run,
+        dependency_graph_command_override=["true"],
+        bash_path="/nix/store/fake-bash",
+        logger=logger,
+    )
+    with caplog.at_level(logging.INFO, logger="test_fire_happy"):
+        w.on_task_completed(hello)
+
+    # Subprocess was invoked exactly once.
+    assert runs == [["true"]]
+    # spawn_tasks was called with two TaskInfos.
+    handle.spawn_tasks.assert_called_once()
+    args, _ = handle.spawn_tasks.call_args
+    task_infos = list(args[0])
+    assert len(task_infos) == 2
+    assert any(
+        ti.task_id == "build_common_dep__hello__x86_64__abc-glibc"
+        for ti in task_infos
+    )
+    assert any(
+        ti.task_id
+        == "build_variant__x86_64-linux__hello__hello-x86_64-gcc15-O2"
+        for ti in task_infos
+    )
+
+
+def test_fire_logs_and_degrades_on_subprocess_failure(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-zero subprocess return code is logged; spawn_tasks is
+    never called."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    handle = mock.MagicMock()
+    logger = logging.getLogger("test_fire_subprocess_fail")
+    hello = matrix_eval_task_id("hello")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+        primary_handle=handle,
+        run_subprocess=lambda _argv: _fake_completed(
+            2, stderr=b"boom"
+        ),
+        dependency_graph_command_override=["false"],
+        bash_path="/nix/store/fake-bash",
+        logger=logger,
+    )
+    with caplog.at_level(logging.ERROR, logger="test_fire_subprocess_fail"):
+        w.on_task_completed(hello)
+    assert w.fired is True
+    handle.spawn_tasks.assert_not_called()
+    assert any(
+        "dependency_graph worker failed" in rec.message
+        and "boom" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_fire_logs_and_degrades_when_descriptors_missing(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If the descriptor file is missing after a (supposedly) ok
+    subprocess run, we log + skip spawn."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    # No _dependency_graph.json file.
+    handle = mock.MagicMock()
+    logger = logging.getLogger("test_fire_no_descriptors")
+    hello = matrix_eval_task_id("hello")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+        primary_handle=handle,
+        run_subprocess=lambda _argv: _fake_completed(0),
+        dependency_graph_command_override=["true"],
+        bash_path="/nix/store/fake-bash",
+        logger=logger,
+    )
+    with caplog.at_level(logging.ERROR, logger="test_fire_no_descriptors"):
+        w.on_task_completed(hello)
+    handle.spawn_tasks.assert_not_called()
+    assert any(
+        "cannot read" in rec.message and "_dependency_graph.json" in rec.message
+        for rec in caplog.records
+    )
+
+
+def test_fire_argv_includes_toolchain_drv_and_task_id_mappings(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The watcher assembles ``--toolchain-drv`` /
+    ``--toolchain-task-id`` flags per (drv, task_id) entry, in
+    sorted-drv order for determinism."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "_dependency_graph.json").write_text(
+        json.dumps({"phase4_descriptors": []}), encoding="utf-8",
+    )
+    runs: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess:
+        runs.append(list(argv))
+        return _fake_completed(0)
+
+    hello = matrix_eval_task_id("hello")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+        toolchain_task_ids={
+            "/nix/store/aa-gcc15.drv": "toolchain__lx__x86_64__gcc15",
+            "/nix/store/bb-clang20.drv": (
+                "toolchain__lx__x86_64__clang20"
+            ),
+        },
+        sys_name=_SYS,
+        manifest_dir=tmp_path / "manifests",
+        bash_path="/nix/store/fake-bash",
+        run_subprocess=fake_run,
+        # Do NOT pass dependency_graph_command_override — exercise the
+        # real argv assembly.
+    )
+    w.on_task_completed(hello)
+
+    assert len(runs) == 1
+    argv = runs[0]
+    # Hard-coded markers that must always be present.
+    assert "--matrix-eval-out-dir" in argv
+    assert "--bash-path" in argv
+    assert "/nix/store/fake-bash" in argv
+    assert "--sys-name" in argv and _SYS in argv
+    # Per-toolchain markers.
+    assert "/nix/store/aa-gcc15.drv" in argv
+    assert "/nix/store/bb-clang20.drv" in argv
+    assert "aa-gcc15=toolchain__lx__x86_64__gcc15" in argv
+    assert "bb-clang20=toolchain__lx__x86_64__clang20" in argv
+
+
+# ---------------------------------------------------------------------------
+# _spawn_tasks dispatch path (used by tests + _fire's translation step)
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_tasks_no_handle_writes_dependency_graph_and_logs_count(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With ``primary_handle=None`` the spawn path falls back to
+    writing ``_dependency_graph.json`` (the headers view) and emits
+    an INFO log explaining the degradation."""
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     logger = logging.getLogger("test_spawn_no_handle")
-    w = _Phase0QuiesceWatcher(
-        expected_task_ids={phase0_eval_task_id("hello")},
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=out_dir,
         toolchain_task_ids={},
         primary_handle=None,
         logger=logger,
     )
     headers = [
-        ManifestHeader(
-            item_class="phase2_common_dep",
-            name="common_dep__glibc",
-            size=0,
-            payload={"drv": "/nix/store/x-glibc.drv", "label": "glibc",
-                     "attr": "/nix/store/x-glibc.drv"},
-            task_id="common_dep__x-glibc",
-        ),
-        ManifestHeader(
-            item_class="phase3_variant",
-            name="variant__hello__x86_64__gcc15-O0",
-            size=0,
-            payload={
-                "pkg": "hello",
-                "compiler_id": "gcc15",
-                "arch": "x86_64",
-            },
-            task_id="variant__hello__abc",
-            task_depends_on=("common_dep__x-glibc",),
-        ),
+        _common_dep_header("glibc", "/nix/store/x-glibc.drv"),
+        _variant_header("hello", "hello-x86_64-gcc15-O0"),
     ]
     with caplog.at_level(logging.INFO, logger="test_spawn_no_handle"):
         w._spawn_tasks(headers)
-    graph_path = out_dir / "_phase1_graph.json"
+    graph_path = out_dir / "_dependency_graph.json"
     assert graph_path.is_file()
     parsed = json.loads(graph_path.read_text(encoding="utf-8"))
     assert isinstance(parsed, list)
     assert len(parsed) == 2
-    assert parsed[0]["item_class"] == "phase2_common_dep"
-    assert parsed[1]["item_class"] == "phase3_variant"
-    assert parsed[1]["task_depends_on"] == ["common_dep__x-glibc"]
+    assert parsed[0]["item_class"] == "build_common_dep"
+    assert parsed[1]["item_class"] == "build_variant"
+    assert parsed[1]["task_depends_on"]
     # INFO log line mentions the JSON-only fallback.
     assert any(
         "primary_handle unbound" in rec.message
@@ -258,57 +517,38 @@ def test_spawn_tasks_no_handle_creates_missing_out_dir(
     tmp_path: pathlib.Path,
 ) -> None:
     """The fallback path mkdirs ``out_dir`` if absent so the planner
-    can fire on a fresh shared-fs that hasn't seen Phase 0 output yet."""
+    can fire on a fresh shared-fs."""
     out_dir = tmp_path / "fresh-out"
     assert not out_dir.exists()
-    w = _Phase0QuiesceWatcher(
-        expected_task_ids={phase0_eval_task_id("hello")},
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=out_dir,
         toolchain_task_ids={},
         primary_handle=None,
     )
     w._spawn_tasks([])
-    assert (out_dir / "_phase1_graph.json").is_file()
+    assert (out_dir / "_dependency_graph.json").is_file()
 
 
 def test_spawn_tasks_with_handle_calls_primary_handle(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """When a primary_handle is bound, ``_spawn_tasks`` converts each
-    header into a TaskInfo and calls ``primary_handle.spawn_tasks(...)``;
-    the JSON dump is also written for offline inspection."""
+    header into a TaskInfo and calls ``primary_handle.spawn_tasks(...)``."""
     out_dir = tmp_path / "out"
     handle = mock.MagicMock()
-    handle.spawn_tasks.return_value = []  # empty errors list = full success
+    handle.spawn_tasks.return_value = []
     logger = logging.getLogger("test_spawn_with_handle")
-    w = _Phase0QuiesceWatcher(
-        expected_task_ids={phase0_eval_task_id("hello")},
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=out_dir,
         toolchain_task_ids={},
         primary_handle=handle,
         logger=logger,
     )
     headers = [
-        ManifestHeader(
-            item_class="phase2_common_dep",
-            name="common_dep__glibc",
-            size=0,
-            payload={"drv": "/nix/store/x-glibc.drv", "label": "glibc",
-                     "attr": "/nix/store/x-glibc.drv"},
-            task_id="common_dep__x-glibc",
-        ),
-        ManifestHeader(
-            item_class="phase3_variant",
-            name="variant__hello__x86_64__gcc15-O0",
-            size=0,
-            payload={
-                "pkg": "hello",
-                "compiler_id": "gcc15",
-                "arch": "x86_64",
-            },
-            task_id="variant__hello__abc",
-            task_depends_on=("common_dep__x-glibc",),
-        ),
+        _common_dep_header("glibc", "/nix/store/x-glibc.drv"),
+        _variant_header("hello", "hello-x86_64-gcc15-O0"),
     ]
     with caplog.at_level(logging.INFO, logger="test_spawn_with_handle"):
         w._spawn_tasks(headers)
@@ -316,15 +556,11 @@ def test_spawn_tasks_with_handle_calls_primary_handle(
     args, _ = handle.spawn_tasks.call_args
     task_infos = list(args[0])
     assert len(task_infos) == 2
-    # Identifier / payload of the first task carries the manifest data.
     ti0 = task_infos[0]
-    assert ti0.task_id == "common_dep__x-glibc"
-    assert ti0.payload["item_class"] == "phase2_common_dep"
+    assert ti0.payload["item_class"] == "build_common_dep"
     ti1 = task_infos[1]
-    assert ti1.task_id == "variant__hello__abc"
-    assert ti1.task_depends_on == ("common_dep__x-glibc",)
-    # The phase1_graph dump is written alongside.
-    assert (out_dir / "_phase1_graph.json").is_file()
+    assert ti1.payload["item_class"] == "build_variant"
+    assert (out_dir / "_dependency_graph.json").is_file()
     assert any(
         "spawn_tasks dispatched 2 task(s) with 0 error(s)" in rec.message
         for rec in caplog.records
@@ -341,23 +577,14 @@ def test_spawn_tasks_duplicate_task_hash_logs_warning(
         (0, {"kind": "duplicate_task_hash", "task_hash": "abc123"}),
     ]
     logger = logging.getLogger("test_spawn_dup")
-    w = _Phase0QuiesceWatcher(
-        expected_task_ids={phase0_eval_task_id("hello")},
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=tmp_path / "out",
         toolchain_task_ids={},
         primary_handle=handle,
         logger=logger,
     )
-    headers = [
-        ManifestHeader(
-            item_class="phase2_common_dep",
-            name="common_dep__glibc",
-            size=0,
-            payload={"drv": "/nix/store/x-glibc.drv", "label": "glibc",
-                     "attr": "/nix/store/x-glibc.drv"},
-            task_id="common_dep__x-glibc",
-        ),
-    ]
+    headers = [_common_dep_header("glibc", "/nix/store/x-glibc.drv")]
     with caplog.at_level(logging.WARNING, logger="test_spawn_dup"):
         w._spawn_tasks(headers)
     handle.spawn_tasks.assert_called_once()
@@ -386,27 +613,14 @@ def test_spawn_tasks_unknown_dependency_logs_warning(
         ),
     ]
     logger = logging.getLogger("test_spawn_unknown_dep")
-    w = _Phase0QuiesceWatcher(
-        expected_task_ids={phase0_eval_task_id("hello")},
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=tmp_path / "out",
         toolchain_task_ids={},
         primary_handle=handle,
         logger=logger,
     )
-    headers = [
-        ManifestHeader(
-            item_class="phase3_variant",
-            name="variant__hello__x86_64__gcc15-O0",
-            size=0,
-            payload={
-                "pkg": "hello",
-                "compiler_id": "gcc15",
-                "arch": "x86_64",
-            },
-            task_id="variant__hello__abc",
-            task_depends_on=("missing-dep-id",),
-        ),
-    ]
+    headers = [_variant_header("hello", "hello-x86_64-gcc15-O0")]
     with caplog.at_level(logging.WARNING, logger="test_spawn_unknown_dep"):
         w._spawn_tasks(headers)
     assert any(
@@ -422,27 +636,18 @@ def test_spawn_tasks_swallows_handle_exception(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """primary_handle.spawn_tasks raising must not propagate; we log
-    + degrade (Phase 1 stalls, which is operator-visible)."""
+    + degrade (build phase stalls, which is operator-visible)."""
     handle = mock.MagicMock()
     handle.spawn_tasks.side_effect = RuntimeError("boom")
     logger = logging.getLogger("test_spawn_handle_raises")
-    w = _Phase0QuiesceWatcher(
-        expected_task_ids={phase0_eval_task_id("hello")},
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=tmp_path / "out",
         toolchain_task_ids={},
         primary_handle=handle,
         logger=logger,
     )
-    headers = [
-        ManifestHeader(
-            item_class="phase2_common_dep",
-            name="common_dep__glibc",
-            size=0,
-            payload={"drv": "/nix/store/x-glibc.drv", "label": "glibc",
-                     "attr": "/nix/store/x-glibc.drv"},
-            task_id="common_dep__x-glibc",
-        ),
-    ]
+    headers = [_common_dep_header("glibc", "/nix/store/x-glibc.drv")]
     with caplog.at_level(logging.ERROR, logger="test_spawn_handle_raises"):
         w._spawn_tasks(headers)  # must not raise
     assert any(
@@ -451,25 +656,8 @@ def test_spawn_tasks_swallows_handle_exception(
     )
 
 
-def test_watcher_fire_does_not_raise(
-    tmp_path: pathlib.Path,
-) -> None:
-    """The watcher's ``_fire`` is currently a no-op stub. It must not
-    raise out into the framework's task-completion thread. Once the
-    replacement ``dependency_graph_planner`` is wired, this test will
-    grow assertions for planner-failure → log + degrade behaviour."""
-    hello = phase0_eval_task_id("hello")
-    w = _Phase0QuiesceWatcher(
-        expected_task_ids={hello},
-        out_dir=tmp_path / "out",
-        toolchain_task_ids={},
-    )
-    w.on_task_completed(hello)  # must not raise
-    assert w.fired is True
-
-
 # ---------------------------------------------------------------------------
-# SuitTask._build_phase0_watcher integration
+# SuitTask._build_matrix_eval_watcher integration
 # ---------------------------------------------------------------------------
 
 
@@ -482,51 +670,53 @@ def _seed_manifest_dir(
         write_manifest(config.manifest_dir, header)
 
 
-def test_build_phase0_watcher_returns_none_when_no_phase0(
+def test_build_matrix_eval_watcher_returns_none_when_no_matrix_eval(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Legacy / non-distributed runs have no phase0_eval manifests;
-    the watcher builder returns None and on_run_start skips wiring."""
+    """Without any matrix_eval manifests the builder returns None."""
     config = _make_config(tmp_path)
     _seed_manifest_dir(config, [
         _toolchain_header("x86_64", "gcc15", "/nix/store/x-gcc15.drv"),
     ])
     task = SuitTask(config)
-    assert task._build_phase0_watcher(output_dir=tmp_path / "out") is None
+    assert task._build_matrix_eval_watcher(
+        output_dir=tmp_path / "out",
+    ) is None
 
 
-def test_build_phase0_watcher_returns_none_when_manifest_dir_missing(
+def test_build_matrix_eval_watcher_returns_none_when_manifest_dir_missing(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Manifest dir absent → no watcher, no exception (pre-flight
-    hasn't run yet, or a stale invocation)."""
+    """Manifest dir absent → no watcher, no exception."""
     config = _make_config(tmp_path)
     # Don't create config.manifest_dir.
     task = SuitTask(config)
-    assert task._build_phase0_watcher(output_dir=tmp_path / "out") is None
+    assert task._build_matrix_eval_watcher(
+        output_dir=tmp_path / "out",
+    ) is None
 
 
-def test_build_phase0_watcher_collects_expected_and_toolchains(
+def test_build_matrix_eval_watcher_collects_expected_and_toolchains(
     tmp_path: pathlib.Path,
 ) -> None:
-    """With both phase0_eval and toolchain manifests on disk, the
-    watcher's expected set covers all phase 0 task_ids and the
+    """With both matrix_eval and toolchain manifests on disk, the
+    watcher's expected set covers all matrix_eval task_ids and the
     toolchain_task_ids map is keyed by drv path → task_id."""
     config = _make_config(tmp_path)
     gcc_drv = "/nix/store/cccccccccccccccccccccccccccccccc-gcc15.drv"
     clang_drv = "/nix/store/dddddddddddddddddddddddddddddddd-clang20.drv"
     _seed_manifest_dir(config, [
-        _phase0_eval_header("hello"),
-        _phase0_eval_header("busybox"),
+        _matrix_eval_header("hello"),
+        _matrix_eval_header("busybox"),
         _toolchain_header("x86_64", "gcc15", gcc_drv),
         _toolchain_header("x86_64", "clang20", clang_drv),
     ])
     task = SuitTask(config)
-    w = task._build_phase0_watcher(output_dir=tmp_path / "out")
+    w = task._build_matrix_eval_watcher(output_dir=tmp_path / "out")
     assert w is not None
     assert w.expected == frozenset({
-        phase0_eval_task_id("hello"),
-        phase0_eval_task_id("busybox"),
+        matrix_eval_task_id("hello"),
+        matrix_eval_task_id("busybox"),
     })
     assert w._toolchain_task_ids == {
         gcc_drv: toolchain_task_id(_SYS, "x86_64", "gcc15"),
@@ -534,34 +724,51 @@ def test_build_phase0_watcher_collects_expected_and_toolchains(
     }
     # out_dir falls through directly from the caller.
     assert w._out_dir == tmp_path / "out"
+    # manifest_dir was wired through.
+    assert w._manifest_dir == config.manifest_dir
 
 
-def test_build_phase0_watcher_falls_back_to_shared_fs_when_no_output_dir(
+def test_build_matrix_eval_watcher_falls_back_to_shared_fs(
     tmp_path: pathlib.Path,
 ) -> None:
-    """If the framework doesn't pass an output_dir (legacy/test path),
-    the watcher defaults to ``shared_fs / 'out'`` so paths match what
-    the workers write under."""
+    """If the framework doesn't pass an output_dir (legacy/test path)
+    and config.matrix_eval_out_dir is None, the watcher defaults to
+    ``shared_fs / 'out'``."""
     config = _make_config(tmp_path)
-    _seed_manifest_dir(config, [_phase0_eval_header("hello")])
+    _seed_manifest_dir(config, [_matrix_eval_header("hello")])
     task = SuitTask(config)
-    w = task._build_phase0_watcher(output_dir=None)
+    w = task._build_matrix_eval_watcher(output_dir=None)
     assert w is not None
     assert w._out_dir == config.shared_fs / "out"
 
 
+def test_build_matrix_eval_watcher_uses_config_matrix_eval_out_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``config.matrix_eval_out_dir`` (when set) takes precedence."""
+    explicit = tmp_path / "explicit-archive-dir"
+    base = _make_config(tmp_path)
+    config = _dataclasses.replace(base, matrix_eval_out_dir=explicit)
+    _seed_manifest_dir(config, [_matrix_eval_header("hello")])
+    task = SuitTask(config)
+    w = task._build_matrix_eval_watcher(output_dir=tmp_path / "other")
+    assert w is not None
+    assert w._out_dir == explicit
+
+
 # ---------------------------------------------------------------------------
-# Broadcast record_self_has callable assembly (T67)
+# Broadcast record_self_has callable assembly
 # ---------------------------------------------------------------------------
 
 
-def test_make_broadcast_record_self_has_invokes_record_with_phase0_class(
+def test_make_broadcast_record_self_has_invokes_record_with_matrix_eval_class(
     tmp_path: pathlib.Path,
 ) -> None:
     """The callable wired into PeerPushServer.record_broadcast_self_has
     must invoke peer_paths.record_self_has with item_class
-    ``phase0_eval_drv`` (the broadcast-receive tag) so placement-map
-    gossip distinguishes phase0 drvs from toolchain/variant holders."""
+    ``matrix_eval_drv`` (the broadcast-receive tag) so placement-map
+    gossip distinguishes matrix_eval drvs from toolchain/variant
+    holders."""
     config = _make_config(tmp_path)
     task = SuitTask(config)
 
@@ -589,14 +796,14 @@ def test_make_broadcast_record_self_has_invokes_record_with_phase0_class(
         cb = task._make_broadcast_record_self_has(
             fake_watcher, public_key="pk-test",
         )
-        cb("/nix/store/aaa-phase0.drv")
+        cb("/nix/store/aaa-matrix.drv")
 
     assert len(captured) == 1
     call = captured[0]
     assert call["my_secondary_id"] == "primary"
-    assert call["outpath"] == "/nix/store/aaa-phase0.drv"
-    assert call["drv_path"] == "/nix/store/aaa-phase0.drv"
-    assert call["item_class"] == "phase0_eval_drv"
+    assert call["outpath"] == "/nix/store/aaa-matrix.drv"
+    assert call["drv_path"] == "/nix/store/aaa-matrix.drv"
+    assert call["item_class"] == "matrix_eval_drv"
     assert call["our_pubkey"] == "pk-test"
     assert call["peers"] == []
     assert call["shared_fs"] == config.shared_fs
@@ -617,7 +824,6 @@ def test_make_broadcast_record_self_has_passes_live_peers(
         captured.append(list(peers) if peers is not None else None)
 
     fake_watcher = mock.MagicMock()
-    # Initially empty peer list.
     fake_watcher.peers = []
 
     with mock.patch(
@@ -627,9 +833,7 @@ def test_make_broadcast_record_self_has_passes_live_peers(
         cb = task._make_broadcast_record_self_has(
             fake_watcher, public_key="pk-test",
         )
-        # First call: empty peers.
         cb("/nix/store/x.drv")
-        # A peer joins after wire-up.
         fake_watcher.peers = ["peer-a-info"]
         cb("/nix/store/y.drv")
 
@@ -639,10 +843,8 @@ def test_make_broadcast_record_self_has_passes_live_peers(
 def test_make_broadcast_record_self_has_swallows_record_exceptions(
     tmp_path: pathlib.Path,
 ) -> None:
-    """If peer_paths.record_self_has raises (NFS hiccup, peer push
-    fan-out failure), the callable must not propagate — best-effort
-    gossip is part of the contract; the broadcast handshake response
-    is independent of placement-map success."""
+    """If peer_paths.record_self_has raises, the callable must not
+    propagate — best-effort gossip is part of the contract."""
     config = _make_config(tmp_path)
     task = SuitTask(config)
 
@@ -679,11 +881,9 @@ def test_push_url_to_substituter_url_strips_push_offset() -> None:
         _push_url_to_substituter_url("https://node-a:6500/")
         == "https://node-a:5500"
     )
-    # Garbage in, None out (caller falls back to raw URL → nix copy errors).
     assert _push_url_to_substituter_url("") is None
     assert _push_url_to_substituter_url("not-a-url") is None
     assert _push_url_to_substituter_url("http://hostnoport") is None
-    # Port too small to subtract PUSH_PORT_OFFSET.
     assert _push_url_to_substituter_url("http://x:500") is None
 
 
@@ -695,11 +895,8 @@ def test_on_run_start_wires_broadcast_receiver_into_push_server(
 
     1. ``task._broadcast_receiver`` is a :class:`BroadcastReceiver`.
     2. The :class:`PeerPushServer` was constructed with a callable
-       wired to the receiver's ``on_broadcast_offer`` (so a real
-       HTTP POST would route through the consumer).
+       wired to the receiver's ``on_broadcast_offer``.
     """
-    # Stand in for the signing key so the push code path runs without
-    # invoking the real ``nix-store --generate-binary-cache-key``.
     from compiler_suit_runner import peer_cache as _peer_cache
     from compiler_suit_runner.peer_replication import BroadcastReceiver
 
@@ -717,60 +914,28 @@ def test_on_run_start_wires_broadcast_receiver_into_push_server(
         lambda *a, **kw: fake_key,
     )
 
-    # Use a config that disables harmonia + cachix so on_run_start
-    # doesn't try to spawn external subprocesses.
     config = _make_config(tmp_path)
-    # Use a port low enough that push_port_for(port) stays in
-    # unprivileged-port range.
-    config = dataclasses_replace(config, harmonia_port=5005, enable_harmonia=False)
+    config = _dataclasses.replace(
+        config, harmonia_port=5005, enable_harmonia=False,
+    )
 
-    # Empty manifest dir → no phase0 watcher attached.
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
     config.shared_fs.mkdir(parents=True, exist_ok=True)
 
     task = SuitTask(config)
     try:
         task.on_run_start(output_dir=tmp_path / "out")
-        # The receiver must be wired (we only assert presence; the
-        # full behaviour is covered in test_peer_replication.py).
         assert isinstance(task._broadcast_receiver, BroadcastReceiver)
-        # The push server's bound handler holds a reference to the
-        # configured on_broadcast_offer callback; round-trip through
-        # the handler's class attr to confirm it is NOT the
-        # uninitialised default-reject lambda (returns False without
-        # touching the receiver).
         push_server = task._push_server
         assert push_server is not None
         handler_cls = push_server._handler_cls
-        callback = handler_cls.on_broadcast_offer
-        # The default callback returns False unconditionally; ours
-        # routes into the receiver which (with an empty url map and
-        # path-not-local) returns False after fetch failure attempts.
-        # Drive a synthetic offer through it.
-        result = callback(
-            "/nix/store/wire.drv", 1, "unknown-origin", "bid-wire", 0,
-        )
-        # The wired callback routes through the receiver, whose
-        # unknown-origin branch returns False. The DEFAULT no-op
-        # lambda would also return False — but we can verify a
-        # round-trip got into our receiver by passing self_peer_id
-        # as origin (which the receiver also rejects as "unknown"
-        # because self is filtered). To prove routing, instead patch
-        # the receiver's on_broadcast_offer.
-        del result  # not load-bearing
         called: list[tuple] = []
 
         def _spy(*args, **kw):
             called.append((args, kw))
             return True
 
-        # Swap the receiver method to verify the push handler routes
-        # to it. We rebind the staticmethod on the bound handler
-        # class — the same mechanism PeerPushServer uses.
         task._broadcast_receiver.on_broadcast_offer = _spy  # type: ignore[method-assign]
-        # The handler's class attribute was captured at construction
-        # time and closes over the on_run_start local; it dispatches
-        # through that local's broadcast_receiver. Call the wrapper.
         cb = handler_cls.on_broadcast_offer
         ok = cb("/nix/store/v.drv", 9, "origin", "bid-v", 0)
         assert ok is True
@@ -781,14 +946,8 @@ def test_on_run_start_wires_broadcast_receiver_into_push_server(
         task.on_run_end(success=True)
 
 
-# Local alias used by the test above so the import line stays compact.
-def dataclasses_replace(obj, /, **changes):
-    import dataclasses as _dc
-    return _dc.replace(obj, **changes)
-
-
 # ---------------------------------------------------------------------------
-# Q1+Q2+Q3+Q4 wire-in: _PeerLifecycleListener
+# _PeerLifecycleListener
 # ---------------------------------------------------------------------------
 
 
@@ -821,8 +980,6 @@ def test_listener_on_peer_removed_routes_to_repair_worker_with_cause(
         "peer-b", "OOMKilled",
     )
 
-    # mass_death_escalation routes too — the cause kind is forwarded
-    # so the operator can grep both signals from the repair log.
     repair.reset_mock()
     listener.on_peer_removed(
         "peer-c",
@@ -879,12 +1036,10 @@ def test_listener_swallows_repair_exception(
     repair.on_peer_removed.side_effect = RuntimeError("boom")
 
     listener = _PeerLifecycleListener(repair_worker=repair)
-    # Must not raise.
     with caplog.at_level(logging.ERROR):
         listener.on_peer_removed(
             "peer-x", {"kind": "fatal_error", "reason": "panic"},
         )
-    # The error log was emitted.
     assert any(
         "on_peer_removed raised" in rec.message
         for rec in caplog.records
@@ -898,11 +1053,9 @@ def test_listener_handles_missing_or_malformed_cause(
     repair = mock.MagicMock()
     listener = _PeerLifecycleListener(repair_worker=repair)
 
-    # None cause.
     listener.on_peer_removed("peer-a", None)  # type: ignore[arg-type]
     repair.on_peer_removed.assert_called_once_with("peer-a", "")
 
-    # Empty dict cause.
     repair.reset_mock()
     listener.on_peer_removed("peer-b", {})
     repair.on_peer_removed.assert_called_once_with("peer-b", "")
@@ -937,7 +1090,6 @@ def test_mark_task_unfulfillable_noop_without_handle(
     config = _make_config(tmp_path)
     task = SuitTask(config)
     task._primary_handle = None
-    # Must not raise.
     task._mark_task_unfulfillable("00ff", "any reason")
 
 
@@ -978,7 +1130,7 @@ def test_wire_primary_handle_applies_reinject_cap(
     """``wire_primary_handle`` invokes ``apply_unfulfillable_reinject_cap``
     when the config field is set."""
     config = _make_config(tmp_path)
-    config = dataclasses_replace(
+    config = _dataclasses.replace(
         config, unfulfillable_reinject_max_per_task=7,
     )
     task = SuitTask(config)
@@ -1013,8 +1165,7 @@ def test_fulfillability_matcher_is_holding_matcher_callable(
     tmp_path: pathlib.Path,
 ) -> None:
     """The ``_fulfillability_matcher`` attribute is the
-    :func:`holding_matcher.matcher` function — the value to pass to
-    ``RustPrimaryCoordinator(fulfillability_matcher=...)``."""
+    :func:`holding_matcher.matcher` function."""
     from compiler_suit_runner.holding_matcher import matcher
 
     config = _make_config(tmp_path)
@@ -1023,7 +1174,7 @@ def test_fulfillability_matcher_is_holding_matcher_callable(
 
 
 # ---------------------------------------------------------------------------
-# on_run_start integration: listener + matcher + ctx callables wired
+# on_run_start integration
 # ---------------------------------------------------------------------------
 
 
@@ -1032,8 +1183,7 @@ def test_on_run_start_constructs_peer_lifecycle_listener(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """After ``on_run_start`` the listener is constructed and bound to
-    the repair worker so the framework can pass it via
-    ``peer_lifecycle_listener=``."""
+    the repair worker."""
     from compiler_suit_runner import peer_cache as _peer_cache
 
     fake_key = _peer_cache.SigningKey(
@@ -1050,7 +1200,7 @@ def test_on_run_start_constructs_peer_lifecycle_listener(
     )
 
     config = _make_config(tmp_path)
-    config = dataclasses_replace(
+    config = _dataclasses.replace(
         config, harmonia_port=5010, enable_harmonia=False,
     )
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -1060,9 +1210,6 @@ def test_on_run_start_constructs_peer_lifecycle_listener(
     try:
         task.on_run_start(output_dir=tmp_path / "out")
         assert task._peer_lifecycle_listener is not None
-        # Routing test: drive on_peer_removed and verify the
-        # repair worker would be invoked. We swap in a fake repair so
-        # the real one's network calls don't fire.
         fake_repair = mock.MagicMock()
         task._peer_lifecycle_listener._repair = fake_repair
         task._peer_lifecycle_listener.on_peer_removed(
@@ -1080,8 +1227,7 @@ def test_on_run_start_builds_outpath_to_task_hash_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The outpath→task_hash dict is populated from toolchain manifest
-    payloads at on_run_start. Each toolchain manifest with an
-    ``outpath`` field and ``task_id`` contributes one entry."""
+    payloads at on_run_start."""
     from compiler_suit_runner import peer_cache as _peer_cache
     from compiler_suit_runner.manifest_gen import ManifestHeader, write_manifest
 
@@ -1099,13 +1245,12 @@ def test_on_run_start_builds_outpath_to_task_hash_lookup(
     )
 
     config = _make_config(tmp_path)
-    config = dataclasses_replace(
+    config = _dataclasses.replace(
         config, harmonia_port=5011, enable_harmonia=False,
     )
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
-    # Seed a toolchain manifest with an outpath.
     write_manifest(config.manifest_dir, ManifestHeader(
-        item_class="phase2_toolchain_validate",
+        item_class="toolchain_validate",
         name="toolchain_validate__x86_64__gcc15",
         size=0,
         payload={
@@ -1123,7 +1268,6 @@ def test_on_run_start_builds_outpath_to_task_hash_lookup(
     task = SuitTask(config)
     try:
         task.on_run_start(output_dir=tmp_path / "out")
-        # The dict carries an entry for the toolchain outpath.
         assert "/nix/store/bb-gcc15-out" in task._outpath_to_task_hash
     finally:
         task.on_run_end(success=True)
@@ -1135,11 +1279,7 @@ def test_replication_context_callables_route_through_self(
 ) -> None:
     """``ReplicationContext`` is constructed in ``on_run_start`` with
     its four PrimaryHandle callables pointing at the ``SuitTask``
-    instance methods that close over ``self._primary_handle``.
-
-    Driving the ctx callables (after wire_primary_handle) reaches the
-    mocked handle methods with the right bytes/list shapes.
-    """
+    instance methods."""
     from compiler_suit_runner import peer_cache as _peer_cache
 
     fake_key = _peer_cache.SigningKey(
@@ -1156,7 +1296,7 @@ def test_replication_context_callables_route_through_self(
     )
 
     config = _make_config(tmp_path)
-    config = dataclasses_replace(
+    config = _dataclasses.replace(
         config, harmonia_port=5012, enable_harmonia=False,
     )
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -1166,9 +1306,7 @@ def test_replication_context_callables_route_through_self(
     handle = mock.MagicMock()
     try:
         task.on_run_start(output_dir=tmp_path / "out")
-        # Wire the handle after on_run_start.
         task.wire_primary_handle(handle)
-        # Trigger each PrimaryHandle wrapper directly.
         task._mark_task_unfulfillable("aabb", "no holder")
         task._reinject_task("ccdd")
         task._update_preferred_secondaries("eeff", ["s1", "s2"])
@@ -1187,18 +1325,17 @@ def test_replication_context_callables_route_through_self(
 
 
 # ---------------------------------------------------------------------------
-# Q5 wire-in: on_run_start primary_handle kwarg + task_completed_listener
+# on_run_start primary_handle kwarg + task_completed_listener
 # ---------------------------------------------------------------------------
 
 
 def test_on_run_start_accepts_primary_handle_kwarg(
     tmp_path: pathlib.Path,
 ) -> None:
-    """The Q5 ``on_run_start`` signature accepts the ``primary_handle``
+    """The ``on_run_start`` signature accepts the ``primary_handle``
     kwarg and stores the value on the task."""
     config = _make_config(tmp_path)
     task = SuitTask(config)
-    # Manifest dir must exist (on_run_start scans it for phase0_eval).
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
     config.shared_fs.mkdir(parents=True, exist_ok=True)
     handle = mock.MagicMock()
@@ -1217,14 +1354,13 @@ def test_on_run_start_accepts_primary_handle_kwarg(
 def test_on_run_start_backward_compat_without_kwarg(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A caller that omits ``primary_handle`` (legacy single-process
-    CLI) still runs without raising; the attribute remains None."""
+    """A caller that omits ``primary_handle`` still runs without
+    raising; the attribute remains None."""
     config = _make_config(tmp_path)
     task = SuitTask(config)
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
     config.shared_fs.mkdir(parents=True, exist_ok=True)
     try:
-        # No primary_handle kwarg.
         task.on_run_start(output_dir=tmp_path / "out")
         assert task._primary_handle is None
     finally:
@@ -1235,33 +1371,35 @@ def test_task_completed_listener_forwards_to_watcher(
     tmp_path: pathlib.Path,
 ) -> None:
     """The ``task_completed_listener`` property returns a callable that
-    routes matching task_ids into the phase 0 watcher's
+    routes matching task_ids into the matrix_eval watcher's
     ``on_task_completed``; non-matching ids are NoOp."""
     config = _make_config(tmp_path)
     task = SuitTask(config)
 
-    hello = phase0_eval_task_id("hello")
-    watcher = _Phase0QuiesceWatcher(
-        expected_task_ids={hello},
-        out_dir=tmp_path / "out",
-        toolchain_task_ids={},
+    hello = matrix_eval_task_id("hello")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "_dependency_graph.json").write_text(
+        json.dumps({"phase4_descriptors": []}), encoding="utf-8",
     )
-    task._phase0_watcher = watcher
+    watcher = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+        run_subprocess=lambda _argv: _fake_completed(0),
+        dependency_graph_command_override=["true"],
+        bash_path="/nix/store/fake-bash",
+    )
+    task._matrix_eval_watcher = watcher
     listener = task.task_completed_listener
     assert callable(listener)
 
-    # Non-matching task_id → NoOp.
     listener("toolchain__gcc15__x86_64", True, None)
     assert watcher.completed == frozenset()
-    # Empty task_id → NoOp (also defensive against None).
     listener("", True, None)
     listener(None, True, None)
     assert watcher.completed == frozenset()
 
-    # Matching task_id → registered; with one expected task, the
-    # watcher's ``fired`` flag flips. (The legacy planner invocation
-    # has been stubbed out pending the dependency_graph_planner
-    # rewrite — this test only covers the bookkeeping today.)
     listener(hello, True, None)
     assert watcher.fired is True
 
@@ -1269,13 +1407,12 @@ def test_task_completed_listener_forwards_to_watcher(
 def test_task_completed_listener_noop_without_watcher(
     tmp_path: pathlib.Path,
 ) -> None:
-    """No watcher constructed (non-distributed-eval run) → the listener
-    callable still answers and silently no-ops on every call."""
+    """No watcher constructed → the listener callable still answers
+    and silently no-ops on every call."""
     config = _make_config(tmp_path)
     task = SuitTask(config)
-    assert task._phase0_watcher is None
+    assert task._matrix_eval_watcher is None
     listener = task.task_completed_listener
-    # Must not raise.
     listener("anything", True, None)
     listener("else", False, "recoverable")
 
@@ -1289,14 +1426,13 @@ def test_task_completed_listener_swallows_watcher_exception(
     task = SuitTask(config)
 
     fake_watcher = mock.MagicMock()
-    # ``expected`` is consulted before on_task_completed.
     fake_watcher.expected = frozenset({"task-x"})
     fake_watcher.on_task_completed.side_effect = RuntimeError("boom")
-    task._phase0_watcher = fake_watcher
+    task._matrix_eval_watcher = fake_watcher
 
     listener = task.task_completed_listener
     with caplog.at_level(logging.ERROR):
-        listener("task-x", True, None)  # must not raise
+        listener("task-x", True, None)
 
     assert any(
         "task_completed_listener: dispatch raised" in rec.message
@@ -1304,20 +1440,19 @@ def test_task_completed_listener_swallows_watcher_exception(
     )
 
 
-def test_build_phase0_watcher_threads_primary_handle(
+def test_build_matrix_eval_watcher_threads_primary_handle(
     tmp_path: pathlib.Path,
 ) -> None:
-    """``_build_phase0_watcher`` reads ``self._primary_handle`` and
-    threads it onto the constructed watcher so the spawn path can
-    drive ``primary_handle.spawn_tasks``."""
+    """``_build_matrix_eval_watcher`` reads ``self._primary_handle``
+    and threads it onto the constructed watcher."""
     config = _make_config(tmp_path)
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
-    write_manifest(config.manifest_dir, _phase0_eval_header("hello"))
+    write_manifest(config.manifest_dir, _matrix_eval_header("hello"))
     task = SuitTask(config)
     handle = mock.MagicMock()
     task._primary_handle = handle
 
-    w = task._build_phase0_watcher(output_dir=tmp_path / "out")
+    w = task._build_matrix_eval_watcher(output_dir=tmp_path / "out")
     assert w is not None
     assert w._primary_handle is handle
 
@@ -1330,56 +1465,48 @@ def test_task_completed_listener_attribute_signature(
     config = _make_config(tmp_path)
     task = SuitTask(config)
     listener = task.task_completed_listener
-    # All three positional args; must not raise even without a watcher.
     listener("some-task", False, "recoverable")
     listener("other-task", True, None)
     listener(None, True, None)
 
 
 # ---------------------------------------------------------------------------
-# _phase_specs (Phase 0 + phase_build topology)
+# _phase_specs topology
 # ---------------------------------------------------------------------------
 
 
-def test_phase_specs_returns_phase0_and_phase_build() -> None:
-    """``_phase_specs`` declares both phases so the framework can
-    schedule Phase 0 distributed-eval before Phase 1 build tasks."""
+def test_phase_specs_returns_three_phases() -> None:
+    """``_phase_specs`` declares build_compilers, matrix_eval, build —
+    the dependency_graph step is primary-only and not a framework
+    phase."""
     pytest.importorskip("dynamic_runner.task_protocol")
     from compiler_suit_runner.suit_task import _phase_specs
     specs = _phase_specs(build_max_concurrent=None)
     by_id = {s.phase_id: s for s in specs}
-    assert set(by_id.keys()) == {"phase0", "phase_build"}
+    assert set(by_id.keys()) == {
+        "build_compilers", "matrix_eval", "build",
+    }
 
 
-def test_phase_specs_phase0_routes_to_build_worker() -> None:
-    """phase0 has a single ``eval`` type pointing at
-    ``compiler_suit_runner.workers.build_worker``.
-
-    The framework binds ONE ``worker_module`` per secondary pool
-    (first registered wins), so every task — phase0_eval +
-    phase_build.* — must funnel through ``build_worker.main``.
-    Its ``handle`` closure dispatches phase0_eval payloads to
-    :func:`eval_worker.run_eval_task` and build manifests to
-    :func:`build_worker.build_worker`.
-    """
+def test_phase_specs_matrix_eval_routes_to_build_worker() -> None:
+    """matrix_eval has a single ``eval`` type pointing at
+    ``compiler_suit_runner.workers.build_worker`` (which sniffs the
+    item_class and dispatches to eval_worker.run_eval_task)."""
     pytest.importorskip("dynamic_runner.task_protocol")
     from compiler_suit_runner.suit_task import _phase_specs
     specs = _phase_specs(build_max_concurrent=None)
-    phase0 = next(s for s in specs if s.phase_id == "phase0")
-    assert len(phase0.types) == 1
-    assert phase0.types[0].type_id == "eval"
+    matrix_eval = next(s for s in specs if s.phase_id == "matrix_eval")
+    assert len(matrix_eval.types) == 1
+    assert matrix_eval.types[0].type_id == "eval"
     assert (
-        phase0.types[0].worker_module
+        matrix_eval.types[0].worker_module
         == "compiler_suit_runner.workers.build_worker"
     )
 
 
 def test_phase_specs_all_types_share_single_worker_module() -> None:
-    """Sanity: every TaskTypeSpec across all phases binds to the
-    SAME worker_module string. The framework's secondary pool only
-    spawns one worker module — if any spec disagrees the framework
-    silently picks the first and other types arrive at the wrong
-    dispatcher (the bug second smoke run discovered)."""
+    """Sanity: every TaskTypeSpec across all phases binds to the same
+    worker_module string."""
     pytest.importorskip("dynamic_runner.task_protocol")
     from compiler_suit_runner.suit_task import _phase_specs
     specs = _phase_specs(build_max_concurrent=None)
@@ -1389,24 +1516,29 @@ def test_phase_specs_all_types_share_single_worker_module() -> None:
     assert modules == {"compiler_suit_runner.workers.build_worker"}
 
 
-def test_phase_specs_phase_build_depends_on_phase0() -> None:
-    """phase_build declares ``depends_on=("phase0",)`` so the framework
-    drains phase0 before dispatching any toolchain / variant task."""
+def test_phase_specs_matrix_eval_depends_on_build_compilers() -> None:
     pytest.importorskip("dynamic_runner.task_protocol")
     from compiler_suit_runner.suit_task import _phase_specs
     specs = _phase_specs(build_max_concurrent=None)
-    phase_build = next(s for s in specs if s.phase_id == "phase_build")
-    assert phase_build.depends_on == ("phase0",)
+    matrix_eval = next(s for s in specs if s.phase_id == "matrix_eval")
+    assert matrix_eval.depends_on == ("build_compilers",)
 
 
-def test_phase_specs_phase_build_carries_all_four_build_types() -> None:
+def test_phase_specs_build_depends_on_matrix_eval() -> None:
     pytest.importorskip("dynamic_runner.task_protocol")
     from compiler_suit_runner.suit_task import _phase_specs
     specs = _phase_specs(build_max_concurrent=None)
-    phase_build = next(s for s in specs if s.phase_id == "phase_build")
-    type_ids = {t.type_id for t in phase_build.types}
+    build = next(s for s in specs if s.phase_id == "build")
+    assert build.depends_on == ("matrix_eval",)
+
+
+def test_phase_specs_build_carries_validate_common_dep_variant() -> None:
+    pytest.importorskip("dynamic_runner.task_protocol")
+    from compiler_suit_runner.suit_task import _phase_specs
+    specs = _phase_specs(build_max_concurrent=None)
+    build = next(s for s in specs if s.phase_id == "build")
+    type_ids = {t.type_id for t in build.types}
     assert type_ids == {
-        "toolchain",
         "toolchain_validate",
         "common_dep",
         "variant",

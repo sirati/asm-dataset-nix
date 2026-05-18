@@ -1054,7 +1054,7 @@ def test_main_handle_dispatches_matrix_eval_to_run_eval_task(
             "--flake-ref", ".",
             "--dataset-output-dir", str(tmp_path / "dataset"),
             "--shared-fs", str(tmp_path),
-            "--phase0-out-dir", str(tmp_path / "phase0"),
+            "--matrix-eval-out-dir", str(tmp_path / "phase0"),
             "--secondary-id", "sec1",
             "--signing-public-key", "k:abc",
         ],
@@ -1162,7 +1162,7 @@ def test_main_handle_matrix_eval_runtime_error_becomes_non_recoverable(
             "--flake-ref", ".",
             "--dataset-output-dir", str(tmp_path / "dataset"),
             "--shared-fs", str(tmp_path),
-            "--phase0-out-dir", str(tmp_path / "phase0"),
+            "--matrix-eval-out-dir", str(tmp_path / "phase0"),
         ],
     )
 
@@ -1182,12 +1182,13 @@ def test_main_handle_matrix_eval_runtime_error_becomes_non_recoverable(
     assert "nix-eval-jobs fell over" in str(exc_info.value)
 
 
-def test_main_handle_matrix_eval_without_phase0_out_dir_is_non_recoverable(
+def test_main_handle_matrix_eval_without_matrix_eval_out_dir_is_non_recoverable(
     monkeypatch, tmp_path
 ):
-    """matrix_eval requires --phase0-out-dir (shared bind-mounted marker
-    dir). Receiving the task without that flag — even with --shared-fs
-    — is a structural misconfiguration -> NonRecoverableError."""
+    """matrix_eval requires --matrix-eval-out-dir (shared bind-mounted
+    marker dir). Receiving the task without that flag — even with
+    --shared-fs — is a structural misconfiguration ->
+    NonRecoverableError."""
     handle, _, _ = _run_build_worker_main_with_capture(
         monkeypatch,
         [
@@ -1195,7 +1196,7 @@ def test_main_handle_matrix_eval_without_phase0_out_dir_is_non_recoverable(
             "--flake-ref", ".",
             "--dataset-output-dir", str(tmp_path / "dataset"),
             "--shared-fs", str(tmp_path),
-            # --phase0-out-dir OMITTED
+            # --matrix-eval-out-dir OMITTED
         ],
     )
 
@@ -1205,7 +1206,7 @@ def test_main_handle_matrix_eval_without_phase0_out_dir_is_non_recoverable(
     NonRecoverable = fake_mod.NonRecoverableError
     with pytest.raises(NonRecoverable) as exc_info:
         handle(Task(payload=_matrix_eval_wrapper_payload()))
-    assert "phase0-out-dir" in str(exc_info.value)
+    assert "matrix-eval-out-dir" in str(exc_info.value)
 
 
 def test_main_handle_matrix_eval_without_shared_fs_is_non_recoverable(
@@ -1246,7 +1247,7 @@ def test_main_stops_broadcast_sender_on_exit(monkeypatch, tmp_path):
             "--flake-ref", ".",
             "--dataset-output-dir", str(tmp_path / "dataset"),
             "--shared-fs", str(tmp_path),
-            "--phase0-out-dir", str(tmp_path / "phase0"),
+            "--matrix-eval-out-dir", str(tmp_path / "phase0"),
             "--secondary-id", "sec1",
         ],
     )

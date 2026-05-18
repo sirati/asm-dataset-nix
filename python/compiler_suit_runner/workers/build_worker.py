@@ -1136,13 +1136,13 @@ def main() -> int:
     )
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument(
-        "--phase0-out-dir",
+        "--matrix-eval-out-dir",
         type=str,
         default=None,
         help=(
             "Shared bind-mounted directory for matrix_eval resume"
             " markers. Marker is written to"
-            " ``<phase0-out-dir>/<binary>/manifest.json``. Required"
+            " ``<matrix-eval-out-dir>/<binary>/manifest.json``. Required"
             " for matrix_eval tasks; ignored by build_common_dep /"
             " build_variant / toolchain_validate types."
         ),
@@ -1285,16 +1285,16 @@ def main() -> int:
                     "matrix_eval requires --shared-fs for peer gossip;"
                     " refusing to proceed without it"
                 )
-            if not args.phase0_out_dir:
+            if not args.matrix_eval_out_dir:
                 # matrix_eval marker dir must be passed explicitly —
                 # it's the bind-mounted shared output, distinct from
                 # the per-secondary scratch ``--shared-fs``.
                 raise NonRecoverableError(
-                    "matrix_eval requires --phase0-out-dir (shared"
+                    "matrix_eval requires --matrix-eval-out-dir (shared"
                     " bind-mounted marker dir); refusing to proceed"
                     " without it"
                 )
-            out_dir = pathlib.Path(args.phase0_out_dir)
+            out_dir = pathlib.Path(args.matrix_eval_out_dir)
             _handle_log.info(
                 "handle: dispatching matrix_eval task binary=%r archs=%r",
                 eval_payload.get("binary"), eval_payload.get("archs"),
