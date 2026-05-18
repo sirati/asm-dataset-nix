@@ -47,6 +47,16 @@ from template_graph.tree_walker import (
     parse_variant_path,
     _parse_line,
 )
+# Role extraction lives in template_graph.parser.role; re-export the
+# public-facing helpers here so existing
+# ``from template_graph.streaming import drv_role`` callers keep working.
+# _TRIPLE_RE is also used below by _extract_triple / _extract_version.
+from template_graph.parser.role import (
+    _TRIPLE_RE,
+    _is_compiler_wrapper_role,
+    _is_stdenv_role,
+    drv_role,
+)
 
 
 def drv_name_full(name: str) -> str:
@@ -54,99 +64,6 @@ def drv_name_full(name: str) -> str:
     function so callers can switch in another extractor."""
     return name
 
-
-# Target triple/quad components. Order is canonical
-# <arch>-<vendor>-<os>-<abi>; the separator between components must be
-# consistent (here we accept all-dash or all-underscore — nixpkgs uses
-# dashes, but the latter shape appears in some upstream toolchain
-# names). Component vocabulary follows Rust/LLVM target naming.
-_TRIPLE_ARCH = (
-    r"aarch64(?:_be)?|"
-    r"arm(?:eb)?|"
-    r"armv[1-9](?:[a-z]+)?|"
-    r"avr|"
-    r"bpf(?:el|eb)|"
-    r"hexagon|"
-    r"i[3-6]86|"
-    r"loongarch64|"
-    r"m68k|"
-    r"mips(?:64)?(?:el)?|"
-    r"mipsisa(?:32|64)r6(?:el)?|"
-    r"msp430|"
-    r"nvptx(?:64)?|"
-    r"or1k|"
-    r"powerpc(?:64)?(?:le)?|"
-    r"riscv(?:32|64)|"
-    r"s390x?|"
-    r"sparc(?:64|el|v9)?|"
-    r"thumbv[1-9][a-z]*|"
-    r"wasm(?:32|64)|"
-    r"x86_64"
-)
-_TRIPLE_VENDOR = (
-    r"unknown|pc|apple|ibm|none|sun|nvidia|"
-    r"nintendo|fortanix|esp|sony"
-)
-_TRIPLE_OS = (
-    r"linux|darwin|ios|macos|tvos|watchos|"
-    r"freebsd|openbsd|netbsd|dragonfly|"
-    r"windows|redox|fuchsia|illumos|solaris|"
-    r"haiku|hermit|hurd|l4re|nto|wasi|"
-    r"vxworks|espidf|mingw32|none"
-)
-_TRIPLE_ABI = (
-    r"gnu(?:eabi(?:hf)?|abin32|abi64|abielfv[12](?:qb)?)?|"
-    r"musl(?:eabi(?:hf)?)?|"
-    r"msvc(?:llvm)?|"
-    r"eabi(?:hf)?|"
-    r"elf|ilp32|sgx|cuda|"
-    r"newlib|uclibc(?:eabi(?:hf)?)?|"
-    r"ohos"
-)
-# Nodes whose role-name matches this pattern are treated as terminals
-# during matrix-variant template construction: no descent, no hash
-# recording, but their raw-tree subtrees are siphoned off for separate
-# stdenv template construction later. Setup-hook divergence (e.g.
-# stage-2 stdenv pulling in ``separate-debug-info.sh`` while stage-1
-# doesn't) lives inside stdenv and shouldn't pollute matrix templates.
-# Role pattern for stdenv derivations only (post-hash, post-version,
-# .drv-bearing). Anchors to the *whole* role so false positives like
-# ``source-stdenv.sh`` (script, not drv) and
-# ``bootstrap-stage3-gcc-wrapper.drv`` (gcc-wrapper, not stdenv) are
-# rejected.
-_STDENV_RE = re.compile(
-    r"^(?:bootstrap-stage(?:[0-9]+|-xgcc)-)?"
-    r"stdenv(?:-linux(?:-boot)?)?\.drv$"
-)
-
-
-def _is_stdenv_role(role: str) -> bool:
-    return _STDENV_RE.search(role) is not None
-
-
-# Compiler-wrapper roles all collapse to a single unified
-# role so a node with both gcc-wrapper and clang-wrapper children
-# (e.g. netpbm's CC_FOR_BUILD pattern) groups as one slot. The role
-# also short-circuits to is_toolchain at allocation time.
-_UNIFIED_COMPILER_WRAPPER_ROLE = "wrapped-compiler-suit.drv"
-_COMPILER_WRAPPER_ROLE_RE = re.compile(
-    r"^(?:gcc|clang|cc|tcc|icc|gccgo|ldc)-wrapper\.drv$"
-)
-
-
-def _is_compiler_wrapper_role(role: str) -> bool:
-    return (
-        role == _UNIFIED_COMPILER_WRAPPER_ROLE
-        or _COMPILER_WRAPPER_ROLE_RE.match(role) is not None
-    )
-
-
-_TRIPLE_RE = re.compile(
-    rf"(?:^|-)(?:{_TRIPLE_ARCH})-(?:{_TRIPLE_VENDOR})"
-    rf"-(?:{_TRIPLE_OS})-(?:{_TRIPLE_ABI})"
-    rf"|(?:^|_)(?:{_TRIPLE_ARCH})_(?:{_TRIPLE_VENDOR})"
-    rf"_(?:{_TRIPLE_OS})_(?:{_TRIPLE_ABI})"
-)
 
 # Map our short arch keys (matching lib/architectures.nix) to the
 # canonical Nix target triple. x86_64 is native — no triple shows up
@@ -201,74 +118,6 @@ def _classify_revisit_diff(
     if s_tri == o_tri and s_ver != o_ver:
         return ("version", ("version", s_ver), ("version", o_ver))
     return None
-_QUALIFIER_RE = re.compile(
-    r"^(unstable|rc\d*|pre\d*|p\d+|alpha\d*|beta\d*|dev\d*)$"
-)
-_EXT_RE = re.compile(
-    r"\.(?P<e1>[a-z][a-z0-9]*)(?:\.(?P<e2>[a-z0-9]+))?$"
-)
-
-
-def _strip_version(body: str) -> str:
-    m = re.search(r"-\d", body)
-    if not m:
-        return body
-    start = m.start()
-    i = start + 1
-    while i < len(body):
-        c = body[i]
-        if c.isdigit() or c == ".":
-            i += 1
-            continue
-        if c == "-":
-            j = i + 1
-            while j < len(body) and body[j] not in "-.":
-                j += 1
-            chunk = body[i + 1 : j]
-            if chunk.isdigit() or _QUALIFIER_RE.match(chunk):
-                i = j
-                continue
-            break
-        if c.isalpha() and i + 1 < len(body) and body[i + 1].isdigit():
-            j = i + 1
-            while j < len(body) and body[j].isdigit():
-                j += 1
-            i = j
-            continue
-        break
-    return body[:start] + body[i:]
-
-
-def drv_role(name: str) -> str:
-    """Variant-axis-stripped name used for matching the same template
-    position across variants. ``name`` is the post-hash store-path
-    name (as produced by ``_parse_line``).
-
-    Strips: target triples, version segments. Retains extensions up to
-    2 levels, optional ``.<digits>`` and ``.drv``.
-    """
-    base = name
-    has_drv = base.endswith(".drv")
-    if has_drv:
-        base = base[:-4]
-    digit_suffix = ""
-    m = re.search(r"\.(\d+)$", base)
-    if m and re.search(r"\.[a-z][a-z0-9]*$", base[: m.start()]):
-        digit_suffix = m.group(0)
-        base = base[: m.start()]
-    ext = ""
-    m = _EXT_RE.search(base)
-    if m and not m.group("e1").isdigit():
-        ext = m.group(0)
-        base = base[: m.start()]
-    body = _TRIPLE_RE.sub("", base)
-    body = _strip_version(body)
-    body = re.sub(r"-{2,}", "-", body).strip("-")
-    suffix = ext + digit_suffix + (".drv" if has_drv else "")
-    role = body + suffix
-    if _COMPILER_WRAPPER_ROLE_RE.match(role):
-        return _UNIFIED_COMPILER_WRAPPER_ROLE
-    return role
 
 
 # ── RawTree: in-memory per-variant subtree ───────────────────────────
