@@ -1078,9 +1078,7 @@ class StreamPlanner:
         differing → variant_specific.
 
         Subsequent variants of this arch will be checked incrementally
-        by ``_cowalk_into_arr`` via ``assert_classification_after_cowalk``
-        — but for now the simple end-of-arch check in core's
-        ``assert_arch_invariants`` will do once a final pass is needed.
+        by ``_cowalk_into_arr`` via ``assert_classification_after_cowalk``.
         """
         out: dict[int, str] = {}
         for nid, node in enumerate(template.nodes):
