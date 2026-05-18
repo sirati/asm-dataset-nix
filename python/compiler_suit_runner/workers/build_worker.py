@@ -723,7 +723,7 @@ def _validate_toolchain(
                 f"toolchain {outpath} not in local store and"
                 " no peer in the placement map could serve it;"
                 " primary may not have realised it yet, or"
-                " --allow-toolchain-build is needed"
+                " --build-compilers is needed"
             ),
             outpath=outpath,
             drv=drv_str,

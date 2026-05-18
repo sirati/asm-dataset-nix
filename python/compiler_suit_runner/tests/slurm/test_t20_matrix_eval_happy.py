@@ -307,9 +307,10 @@ def test_t20_matrix_eval_happy(
        binary).
     4. dependency_graph fired: at least one ``build_variant``
        manifest exists in :attr:`RunArtifacts.manifests_dir`, and
-       every such manifest's ``task_depends_on`` references the
-       toolchain task_id naming convention
-       (``toolchain__<arch>__<id>``).
+       every such manifest's ``task_depends_on`` references a
+       toolchain task_id minted by either
+       ``build_compilers_task_id`` or ``toolchain_validate_task_id``
+       (one prefix per dispatch mode).
     5. ``<dataset_dir>/<pkg>/<variant_dir>/`` is populated for every
        (pkg, variant_dir) named in the build_variant manifests we
        emitted.
@@ -522,18 +523,23 @@ def test_t20_matrix_eval_happy(
             f"task_depends_on -- the planner did not wire its "
             f"toolchain dependency ({detail})"
         )
-        # Toolchain task_ids are stamped as ``toolchain__<arch>__<id>``
-        # by ``manifest_gen.toolchain_task_id``. At least one entry in
-        # depends_on must follow that shape; the planner may add
-        # build_common_dep__<...> as well (transitive provenance),
+        # Toolchain task_ids are stamped per-class by
+        # ``manifest_gen.{build_compilers,toolchain_validate}_task_id``
+        # as ``build_compilers__<sys>__<arch>__<compiler>`` (when
+        # --build-compilers is set) or ``toolchain_validate__<sys>__
+        # <arch>__<compiler>`` (default mode). At least one entry in
+        # depends_on must follow one of those shapes; the planner may
+        # add build_common_dep__<...> as well (transitive provenance),
         # but the toolchain dep is mandatory.
         toolchain_deps = [
-            d for d in depends if isinstance(d, str) and d.startswith("toolchain__")
+            d for d in depends
+            if isinstance(d, str)
+            and d.startswith(("build_compilers__", "toolchain_validate__"))
         ]
         assert toolchain_deps, (
             f"build_variant manifest {path.name} has no "
-            f"toolchain__* entry in task_depends_on={depends!r} "
-            f"({detail})"
+            f"build_compilers__* / toolchain_validate__* entry in "
+            f"task_depends_on={depends!r} ({detail})"
         )
 
     # Assertion (5): final dataset directories populated for every

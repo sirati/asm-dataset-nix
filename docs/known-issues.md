@@ -116,3 +116,33 @@ fp_compare_impl.inc:33:1: error: static assertion failed:
 
 This is a compiler-rt builtins issue specific to the N32 ABI on MIPS64,
 unrelated to the O32 struct stat fix above.
+
+---
+
+## `--max-variants` CLI flag is a no-op pending streaming planner cap
+
+**Status**: Deferred — flag accepted as a no-op; help text marked
+DEPRECATED.
+
+**Symptom**: Passing `--max-variants N` does not cap the variant set.
+The flag was a submit-time post-sample cap in the legacy partition
+pipeline; under the new dependency_graph + streaming planner pipeline
+the cap is supposed to be applied by the planner itself, but that
+plumbing has not landed yet.
+
+**Where**: `python/compiler_suit_runner/cli.py:325-337` (help text),
+`python/compiler_suit_runner/tests/slurm/run_helpers.py:410`
+(SLURM `default_invocation_for_smoke` still forwards
+`max_variants={1, 10, 50}` for the small/medium/large tiers).
+
+**Risk**: SLURM-test workloads on the medium tier (`max_variants=10`)
+or higher can now exceed the 3.5 GiB worker cgroup envelope (see
+project memory `feedback_slurm_test_env_memory.md` — the 4 GiB cgroup
+is the contract, not a target). Small-tier T20 (`max_variants=1`) and
+T23 (which overrides to 2) stay safe. T21 medium is the realistic
+exposure surface.
+
+**Resolution**: Wire the per-binary size cap into the streaming
+planner (`template_graph/streaming.py` + `dependency_graph_planner.py`).
+Once that lands, either reactivate the CLI flag's effect or drop it
+entirely.

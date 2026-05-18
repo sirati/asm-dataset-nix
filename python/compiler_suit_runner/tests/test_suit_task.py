@@ -273,7 +273,8 @@ def test_import_matrix_eval_archives_walks_both_dirs(
 
     Matrix-eval archives carry per-binary kept-variant closures; the
     build_compilers archives carry each toolchain's outputs. The primary
-    needs BOTH imported to walk the full sum-drv graph at phase3.
+    needs BOTH imported to walk the full sum-drv graph at the
+    dependency_graph step (before build_variant tasks fire).
     """
     out_root = tmp_path / "out"
     matrix_eval_dir = out_root / "_matrix_eval"
