@@ -17,7 +17,7 @@ from template_graph.core import (
     find_or_register_template,
 )
 from template_graph.streaming import StreamPlanner
-from template_graph.tests.test_streaming._fixtures import (
+from template_graph.tests.test_streaming.fixtures import (
     Node,
     feed,
     make_hash,

@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from template_graph.streaming import StreamPlanner
-from template_graph.tests.test_streaming._fixtures import (
+from template_graph.tests.test_streaming.fixtures import (
     Node,
     feed,
     make_hash,

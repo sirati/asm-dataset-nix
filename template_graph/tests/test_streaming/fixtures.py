@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from template_graph.streaming import StreamPlanner
+
 
 # 32 base32 chars. The streaming planner doesn't verify content; what
 # matters is that hashes are distinct across nodes that should differ
@@ -98,7 +100,7 @@ def render_tree(root: Node) -> str:
     return "\n".join(lines)
 
 
-def feed(planner, tree_text: str) -> None:
+def feed(planner: StreamPlanner, tree_text: str) -> None:
     """Feed every line of a rendered tree into a StreamPlanner."""
     for line in tree_text.splitlines():
         planner.feed_line(line)
