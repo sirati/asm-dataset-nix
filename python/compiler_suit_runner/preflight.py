@@ -1322,13 +1322,31 @@ def check_toolchains_locally(
     *,
     run_subprocess: Optional[RunSubprocess] = None,
 ) -> frozenset[str]:
-    """Return the subset of toolchain drvs not yet realised locally.
+    """Return the subset of toolchain drvs whose ``out`` is not realised
+    locally.
 
     For each drv path in ``toolchain_drvs``, runs
-    ``nix path-info <drv>^*`` (one invocation per drv) and treats a
-    non-zero exit as "outputs are missing". ``^*`` expands to every
-    output of the drv, so a partially-realised toolchain (e.g. ``lib``
-    present but ``out`` missing) is correctly flagged as missing.
+    ``nix path-info <drv>^out`` (one invocation per drv) and treats a
+    non-zero exit as "the ``out`` output is neither locally realised
+    nor available via a configured substituter".
+
+    ``^out`` (not ``^*``) is the right probe for cluster dispatch
+    readiness: secondaries fetch the toolchain's ``out`` via harmonia
+    federation (from the submitter or cache.nixos.org), and that is
+    the only output a variant build needs at compile time. Auxiliary
+    outputs (``info``, ``man``, ``debug``) are documentation / debug
+    data and may legitimately exist only in the binary cache, never
+    locally — requiring them locally would force the operator to
+    pre-fetch every doc tarball before dispatch, which is not the
+    documented operator workflow.
+
+    Substituter availability is intentionally accepted as "present"
+    because the cluster's secondaries can fetch via the same
+    substituter the submitter consults — so if ``nix path-info``
+    succeeds on the submitter (locally or via cache) the cluster will
+    succeed too. The only signal we want to gate on is "neither
+    local nor reachable via any configured substituter", which is the
+    actual failure mode for cluster dispatch.
 
     Returns a :class:`frozenset` so the caller can compare cheaply
     against the full toolchain set without re-allocating.
@@ -1343,7 +1361,7 @@ def check_toolchains_locally(
             "--extra-experimental-features",
             "nix-command flakes",
             "path-info",
-            f"{drv}^*",
+            f"{drv}^out",
         ]
         _stdout, _stderr, rc = runner(cmd)
         if rc != 0:

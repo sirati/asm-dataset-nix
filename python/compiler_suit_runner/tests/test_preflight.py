@@ -584,8 +584,12 @@ def test_filter_existing_handles_legacy_flat_layout(
 
 
 def test_check_toolchains_locally_returns_only_missing():
-    """``nix path-info <drv>^*`` returns 0 for realised, non-zero for
-    missing. The helper aggregates and returns the failing subset."""
+    """``nix path-info <drv>^out`` returns 0 when ``out`` is locally
+    realised or reachable via a substituter, non-zero otherwise. The
+    helper aggregates and returns the failing subset. ``^out`` (not
+    ``^*``) is the right probe — auxiliary outputs (info / man) may
+    legitimately exist only in the binary cache and aren't needed by
+    the cluster's build_worker."""
     realised = "/nix/store/aaa.drv"
     missing = "/nix/store/bbb.drv"
     calls: list[list[str]] = []
@@ -593,9 +597,8 @@ def test_check_toolchains_locally_returns_only_missing():
     def runner(argv):
         calls.append(list(argv))
         drv_arg = argv[-1]
-        # ``<drv>^*`` expands to every output; the helper feeds the
-        # full ``^*`` suffix.
-        assert drv_arg.endswith("^*"), drv_arg
+        # The helper probes the ``out`` output specifically.
+        assert drv_arg.endswith("^out"), drv_arg
         if drv_arg.startswith(realised):
             return b"valid\n", b"", 0
         return b"", b"path is not valid\n", 1
