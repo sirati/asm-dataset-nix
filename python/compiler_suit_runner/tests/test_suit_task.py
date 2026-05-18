@@ -261,6 +261,146 @@ def test_watcher_is_idempotent_on_duplicate_completion(
 
 
 # ---------------------------------------------------------------------------
+# _import_matrix_eval_archives: walks BOTH matrix_eval + build_compilers
+# ---------------------------------------------------------------------------
+
+
+def test_import_matrix_eval_archives_walks_both_dirs(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The watcher's archive importer walks ``_matrix_eval/`` AND its
+    sibling ``_build_compilers/`` directory.
+
+    Matrix-eval archives carry per-binary kept-variant closures; the
+    build_compilers archives carry each toolchain's outputs. The primary
+    needs BOTH imported to walk the full sum-drv graph at phase3.
+    """
+    out_root = tmp_path / "out"
+    matrix_eval_dir = out_root / "_matrix_eval"
+    build_compilers_dir = out_root / "_build_compilers"
+    matrix_eval_dir.mkdir(parents=True)
+    build_compilers_dir.mkdir(parents=True)
+
+    me_archive = matrix_eval_dir / "hello.nix-archive"
+    me_archive.write_bytes(b"NIX_EXPORT:hello-closure")
+    bc_archive_gcc = build_compilers_dir / "x86_64__gcc15.nix-archive"
+    bc_archive_gcc.write_bytes(b"NIX_EXPORT:gcc15-closure")
+    bc_archive_clang = build_compilers_dir / "x86_64__clang19.nix-archive"
+    bc_archive_clang.write_bytes(b"NIX_EXPORT:clang19-closure")
+
+    # Mix in non-archive files in both dirs — they MUST be ignored.
+    (matrix_eval_dir / "hello.nix-archive.json").write_text(
+        json.dumps({"variant_drvs": []}), encoding="utf-8",
+    )
+    (build_compilers_dir / "README.md").write_text("noise", encoding="utf-8")
+
+    imported: list[pathlib.Path] = []
+
+    def fake_subprocess_run(argv, *, stdin=None, stdout=None,
+                             stderr=None, check=False, **_kw):
+        # The watcher passes the open file as stdin; resolve its path
+        # via the fd's name attribute so we can assert on the source
+        # file regardless of dir walk order.
+        assert argv == ["nix-store", "--import"]
+        assert stdin is not None
+        path = pathlib.Path(stdin.name)
+        imported.append(path)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout=b"", stderr=b"",
+        )
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.subprocess.run",
+        fake_subprocess_run,
+    )
+
+    hello = matrix_eval_task_id("hello")
+    (matrix_eval_dir / "_dependency_graph.json").write_text(
+        json.dumps({"phase4_descriptors": []}), encoding="utf-8",
+    )
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=matrix_eval_dir,
+        toolchain_task_ids={},
+        run_subprocess=lambda _argv: _fake_completed(0),
+        dependency_graph_command_override=["true"],
+        bash_path="/nix/store/fake-bash",
+    )
+    w._import_matrix_eval_archives()
+
+    # All three archives imported; non-archive files skipped.
+    assert sorted(p.name for p in imported) == [
+        "hello.nix-archive",
+        "x86_64__clang19.nix-archive",
+        "x86_64__gcc15.nix-archive",
+    ]
+
+
+def test_import_matrix_eval_archives_handles_missing_build_compilers_dir(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_build_compilers/`` may be absent (e.g. --build-compilers not
+    passed). The watcher imports the matrix_eval archives anyway and
+    does NOT log a warning about the missing sibling at WARNING level
+    (it logs at DEBUG via _discover_archives_in)."""
+    out_root = tmp_path / "out"
+    matrix_eval_dir = out_root / "_matrix_eval"
+    matrix_eval_dir.mkdir(parents=True)
+    # No _build_compilers dir created — that's the scenario.
+
+    (matrix_eval_dir / "hello.nix-archive").write_bytes(b"NIX_EXPORT:x")
+
+    imported: list[str] = []
+
+    def fake_subprocess_run(argv, *, stdin=None, stdout=None,
+                             stderr=None, check=False, **_kw):
+        imported.append(pathlib.Path(stdin.name).name)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout=b"", stderr=b"",
+        )
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.subprocess.run",
+        fake_subprocess_run,
+    )
+
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={matrix_eval_task_id("hello")},
+        out_dir=matrix_eval_dir,
+        toolchain_task_ids={},
+        run_subprocess=lambda _argv: _fake_completed(0),
+        dependency_graph_command_override=["true"],
+        bash_path="/nix/store/fake-bash",
+    )
+    w._import_matrix_eval_archives()
+    assert imported == ["hello.nix-archive"]
+
+
+def test_import_matrix_eval_archives_logs_when_both_missing(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When neither directory yields archives, the watcher emits a
+    WARNING — operators can correlate against the empty out_dir."""
+    out_root = tmp_path / "out"
+    matrix_eval_dir = out_root / "_matrix_eval"
+    # Neither directory exists.
+
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={matrix_eval_task_id("hello")},
+        out_dir=matrix_eval_dir,
+        toolchain_task_ids={},
+        run_subprocess=lambda _argv: _fake_completed(0),
+        dependency_graph_command_override=["true"],
+        bash_path="/nix/store/fake-bash",
+    )
+    with caplog.at_level(logging.WARNING):
+        w._import_matrix_eval_archives()
+    assert any(
+        "no archives to import" in r.message for r in caplog.records
+    )
+
+
+# ---------------------------------------------------------------------------
 # _fire: subprocess + spawn integration
 # ---------------------------------------------------------------------------
 

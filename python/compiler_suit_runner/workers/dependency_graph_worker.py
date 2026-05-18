@@ -29,40 +29,33 @@ Worker flow per binary:
 Per-binary kept-drv discovery
 -----------------------------
 
-The phase-2 ``matrix_eval`` worker writes ``<binary>.nix-archive`` —
-a self-contained nix-store closure — but does NOT today emit a
-sidecar listing the ROOT (kept) drvs vs the transitive dependencies.
-The closure walk via ``nix-store --query --requisites`` would conflate
-the two.
+The phase-2 ``matrix_eval`` worker writes a self-contained
+``<binary>.nix-archive`` PLUS a sidecar JSON
+``<binary>.nix-archive.json`` that lists the ROOT (kept) drvs via
+``variant_drvs``. The closure walk via
+``nix-store --query --requisites`` would conflate roots with
+transitive dependencies, so the sidecar is the canonical source.
 
-To stay decoupled from B.1a's header-format choices, this worker
-supports three discovery modes (tried in order, first hit wins):
+Two discovery modes, tried in order (first hit wins):
 
-  * **Sidecar JSON** at ``<binary>.nix-archive.json`` containing a
-    top-level ``"variant_drvs"`` list of store paths. The simplest
-    contract; preferred for forward use.
+  * **Sidecar JSON** at ``<binary>.nix-archive.json`` — primary,
+    written by the matrix_eval worker alongside the archive (see
+    :mod:`workers.eval_worker._write_sidecar`). Contains
+    ``variant_drvs`` and optionally a ``variants`` list of
+    ``{label, drv, arch, suffix, ...}`` dicts for variant_lookup
+    population.
   * **Per-binary matrix_eval header** at
-    ``<manifest_dir>/matrix_eval__<binary>.json`` whose ``payload``
-    carries either ``variant_drvs`` or ``variants`` (list of
-    ``{label, drv, ...}`` dicts — mirrors the legacy phase0_eval
-    marker shape).
-  * **Heuristic archive scan**: parse the archive's tail-of-file
-    metadata. Last-resort path that depends on the nix archive
-    format and may need revisiting when nix-store evolves; the
-    worker logs a warning when it falls through to this mode so
-    operators know to ship a proper sidecar / header.
+    ``<manifest_dir>/matrix_eval__<binary>.json`` — DEFENSIVE.
+    Today's ``make_matrix_eval_header`` doesn't include
+    ``variant_drvs`` (the header is built at submit-time, before drvs
+    are realised) but a future iteration may; if so, the worker reads
+    it without source changes. Used only when the sidecar is missing
+    or has no kept drvs.
 
-Open coordination note for B.1a integrator
-------------------------------------------
-
-The post-B.1a ``make_matrix_eval_header`` should include
-``payload["variant_drvs"] = sorted(kept_drvs)`` so this worker's
-"per-binary matrix_eval header" mode is always available. The header
-is per-task (not per-archive) so it's the cleaner schema:
-matrix_eval worker computes the kept set, embeds it in the header,
-and the primary reads it back when planning. The sidecar fallback
-covers the case where the worker writes a header without that field
-(intermediate states during the rename rollout).
+The legacy ``phase0_eval__<binary>.json`` fallback was removed per
+A6's hard wire-protocol cutover — any pre-rename run leftover on disk
+is operator triage territory, not a code path the worker should keep
+alive.
 
 Cycle handling
 --------------
@@ -280,21 +273,25 @@ def _load_matrix_eval_header(
 ) -> Optional[dict]:
     """Read ``<manifest_dir>/matrix_eval__<binary>.json`` if present.
 
-    The post-B.1a header schema; falls back to the legacy
-    ``phase0_eval__<binary>.json`` name when the new file is absent so
-    intermediate rename states still resolve.
+    Defensive secondary discovery — the sidecar is the primary source
+    (see :func:`discover_kept_drvs`). Today's
+    :func:`manifest_gen.make_matrix_eval_header` doesn't include
+    ``variant_drvs`` (the header is built at submit-time, before drvs
+    are realised) so this path returns ``None`` in production unless a
+    future header iteration adds the field.
+
+    Legacy ``phase0_eval__<binary>.json`` fallback was removed per A6's
+    hard wire-protocol cutover.
     """
-    for stem in (f"matrix_eval__{binary}", f"phase0_eval__{binary}"):
-        path = manifest_dir / f"{stem}.json"
-        if not path.is_file():
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, json.JSONDecodeError):
-            continue
-        return data if isinstance(data, dict) else None
-    return None
+    path = manifest_dir / f"matrix_eval__{binary}.json"
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _extract_drvs_from_payload(payload: object) -> tuple[list[str], dict]:

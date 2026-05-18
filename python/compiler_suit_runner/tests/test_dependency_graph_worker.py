@@ -8,7 +8,7 @@ Coverage:
 
   * archive discovery (sorted, file-only, suffix filter);
   * sidecar JSON reader (present / missing / malformed);
-  * matrix_eval header reader (post-B.1a + legacy phase0_eval fallback);
+  * matrix_eval header reader (defensive secondary discovery);
   * kept-drv discovery precedence (sidecar > header > empty + warn);
   * import_archive happy + missing-file + subprocess-failure paths;
   * write_dependency_graph_json roundtrip (dataclass + dict descriptors);
@@ -166,9 +166,14 @@ class TestKeptDrvDiscovery:
         drvs, _lookup = dgw.discover_kept_drvs(archive, manifest_dir)
         assert drvs == ["/nix/store/aaa-hello-O0.drv"]
 
-    def test_legacy_phase0_eval_header_fallback(
+    def test_legacy_phase0_eval_header_ignored(
         self, tmp_path: pathlib.Path,
     ):
+        """Per A6's hard cutover, a leftover legacy
+        ``phase0_eval__<binary>.json`` is NOT consulted — only the new
+        ``matrix_eval__<binary>.json`` name is recognised. Operators
+        with pre-rename run state on disk must re-issue under the new
+        run_id namespace."""
         archive = tmp_path / "hello.nix-archive"
         archive.write_bytes(b"")
         manifest_dir = tmp_path / "manifests"
@@ -185,7 +190,7 @@ class TestKeptDrvDiscovery:
             json.dumps(header), encoding="utf-8",
         )
         drvs, _lookup = dgw.discover_kept_drvs(archive, manifest_dir)
-        assert drvs == ["/nix/store/legacy-hello.drv"]
+        assert drvs == []
 
     def test_no_source_returns_empty(
         self, tmp_path: pathlib.Path, caplog,

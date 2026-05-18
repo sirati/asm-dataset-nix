@@ -71,6 +71,14 @@ class _EvalJobsStub:
       ``--flake`` argument (form ``<attr>.<arch>``).
     * ``nix``: emits the JSON dict from ``meta_map[arch]`` for
       ``_meta.<sys>.<binary>.<arch>`` lookups.
+    * ``nix-store --query --requisites``: synthesises the closure as
+      ``[<drv>, <drv>-input] for drv in argv[3:]`` so the export step
+      has paths to act on. Override the synthesis by setting
+      ``requisites_for[<drv>] = [<closure>, ...]``.
+    * ``nix-store --export``: returns the synthetic byte payload
+      ``b"NIX_EXPORT:" + b",".join(argv[2:])`` so tests can decode
+      what closure was exported. Set ``export_fail=True`` to make this
+      arm return rc=1.
 
     Set ``fail_archs`` to make a given arch's nix-eval-jobs invocation
     return rc=1 with the supplied stderr; used to test error
@@ -83,10 +91,16 @@ class _EvalJobsStub:
         drv_map: Optional[dict[str, dict[str, str]]] = None,
         meta_map: Optional[dict[str, dict[str, dict]]] = None,
         fail_archs: Optional[dict[str, str]] = None,
+        requisites_for: Optional[dict[str, list[str]]] = None,
+        export_fail: bool = False,
+        requisites_fail: bool = False,
     ) -> None:
         self.drv_map = drv_map or {}
         self.meta_map = meta_map or {}
         self.fail_archs = fail_archs or {}
+        self.requisites_for = requisites_for or {}
+        self.export_fail = export_fail
+        self.requisites_fail = requisites_fail
         self.calls: list[list[str]] = []
 
     def __call__(self, argv: list[str]) -> tuple[bytes, bytes, int]:
@@ -113,6 +127,25 @@ class _EvalJobsStub:
                     json.dumps({"attr": suffix, "drvPath": drv})
                 )
             return ("\n".join(lines) + "\n").encode(), b"", 0
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            if self.requisites_fail:
+                return b"", b"requisites stub forced failure", 1
+            seeds = argv[3:]
+            closure: list[str] = []
+            for seed in seeds:
+                if seed in self.requisites_for:
+                    closure.extend(self.requisites_for[seed])
+                else:
+                    # Default: the drv itself + a synthesised input dep so
+                    # the export step always sees a non-trivial closure.
+                    closure.append(seed)
+                    closure.append(seed + "-input")
+            return ("\n".join(closure) + "\n").encode(), b"", 0
+        if argv[:2] == ["nix-store", "--export"]:
+            if self.export_fail:
+                return b"", b"export stub forced failure", 1
+            payload = b"NIX_EXPORT:" + ",".join(argv[2:]).encode()
+            return payload, b"", 0
         if argv and argv[0] == "nix":
             # nix eval --json <flake>#_meta.<sys>.<binary>.<arch>
             for piece in argv:
@@ -298,8 +331,10 @@ def test_run_eval_task_happy_path(tmp_path: pathlib.Path) -> None:
 
     Asserts: (1) nix-eval-jobs is called once per arch with the
     correct argv; (2) BroadcastSender.enqueue_broadcast is called
-    once per (arch × suffix); (3) the marker file is written;
-    (4) the return value matches the marker contents.
+    once per (arch × suffix); (3) the per-binary ``<binary>.nix-archive``
+    + sidecar are written; (4) the return value matches the sidecar
+    contents; (5) the legacy ``<binary>/manifest.json`` marker is NOT
+    emitted (hard cutover post-A3).
     """
     payload = _make_payload(
         archs=["x86_64", "aarch64"],
@@ -357,15 +392,53 @@ def test_run_eval_task_happy_path(tmp_path: pathlib.Path) -> None:
     # wait_for_completion: one call per broadcast id.
     assert sender.wait_for_completion.call_count == 4
 
-    # Marker file written, parses to the returned dict.
-    marker = tmp_path / "hello" / "manifest.json"
-    assert marker.exists()
-    with open(marker, "r", encoding="utf-8") as fh:
+    # nix-store --query --requisites called once with all kept drvs
+    # (sorted, deduped); nix-store --export called once with the
+    # synthesised closure.
+    req_calls = [
+        c for c in runner.calls
+        if c[:3] == ["nix-store", "--query", "--requisites"]
+    ]
+    assert len(req_calls) == 1
+    # Seeds are sorted (the worker sorts the kept drv set).
+    assert req_calls[0][3:] == [
+        "/nix/store/aaa-hello-x86_64-O0.drv",
+        "/nix/store/bbb-hello-x86_64-O2.drv",
+        "/nix/store/ccc-hello-aarch64-O0.drv",
+        "/nix/store/ddd-hello-aarch64-O2.drv",
+    ]
+    export_calls = [
+        c for c in runner.calls if c[:2] == ["nix-store", "--export"]
+    ]
+    assert len(export_calls) == 1
+    # Closure passed to --export is what the stub synthesised from the
+    # requisites argv (each seed → seed + seed-input).
+    assert "/nix/store/aaa-hello-x86_64-O0.drv" in export_calls[0]
+    assert "/nix/store/aaa-hello-x86_64-O0.drv-input" in export_calls[0]
+
+    # Archive written with the stub's synthetic export payload.
+    archive = tmp_path / "hello.nix-archive"
+    assert archive.exists()
+    assert archive.stat().st_size > 0
+    assert archive.read_bytes().startswith(b"NIX_EXPORT:")
+
+    # Sidecar written, parses to the returned dict.
+    sidecar = tmp_path / "hello.nix-archive.json"
+    assert sidecar.exists()
+    with open(sidecar, "r", encoding="utf-8") as fh:
         on_disk = json.load(fh)
     assert on_disk == result
     assert on_disk["binary"] == "hello"
     assert on_disk["sys"] == "x86_64-linux"
     assert on_disk["produced_at"] == 123.5
+    # variant_drvs is the sorted+deduped list — the dependency_graph
+    # worker's primary discovery path keys off this field.
+    assert on_disk["variant_drvs"] == [
+        "/nix/store/aaa-hello-x86_64-O0.drv",
+        "/nix/store/bbb-hello-x86_64-O2.drv",
+        "/nix/store/ccc-hello-aarch64-O0.drv",
+        "/nix/store/ddd-hello-aarch64-O2.drv",
+    ]
     assert len(on_disk["variants"]) == 4
     # Sorted by (arch, suffix) order in our stub.
     labels = sorted(v["label"] for v in on_disk["variants"])
@@ -383,6 +456,10 @@ def test_run_eval_task_happy_path(tmp_path: pathlib.Path) -> None:
         assert b["success_count"] == 2
         assert b["fail_count"] == 0
 
+    # Legacy per-binary manifest.json marker is NOT emitted (hard cutover).
+    assert not (tmp_path / "hello" / "manifest.json").exists()
+    assert not (tmp_path / "hello").exists()
+
 
 # ---------------------------------------------------------------------------
 # run_eval_task — resume short-circuit
@@ -390,25 +467,26 @@ def test_run_eval_task_happy_path(tmp_path: pathlib.Path) -> None:
 
 
 def test_run_eval_task_resume_short_circuits(tmp_path: pathlib.Path) -> None:
-    """If the marker exists, return its contents without calling
-    nix-eval-jobs or BroadcastSender.
+    """If the archive AND sidecar exist (non-empty archive), return the
+    sidecar contents without calling nix-eval-jobs or BroadcastSender
+    or nix-store. The archive presence is the matrix_eval-done signal.
     """
     payload = _make_payload()
-    marker_dir = tmp_path / "hello"
-    marker_dir.mkdir(parents=True)
+    archive = tmp_path / "hello.nix-archive"
+    sidecar = tmp_path / "hello.nix-archive.json"
+    archive.write_bytes(b"NIX_EXPORT:previous-run")
     pre_existing = {
         "binary": "hello",
         "sys": "x86_64-linux",
         "produced_at": 100.0,
+        "variant_drvs": ["/nix/store/aaa.drv"],
         "variants": [
             {"label": "hello__x86_64__O0", "drv": "/nix/store/aaa.drv",
              "arch": "x86_64", "suffix": "O0"},
         ],
         "broadcasts": [],
     }
-    (marker_dir / "manifest.json").write_text(
-        json.dumps(pre_existing), encoding="utf-8"
-    )
+    sidecar.write_text(json.dumps(pre_existing), encoding="utf-8")
 
     runner = _EvalJobsStub()
     sender = _make_broadcast_sender()
@@ -416,27 +494,57 @@ def test_run_eval_task_resume_short_circuits(tmp_path: pathlib.Path) -> None:
         payload, tmp_path, sender, run_subprocess=runner,
     )
 
-    # Returned contents match pre-existing marker.
+    # Returned contents match pre-existing sidecar.
     assert result == pre_existing
-    # No subprocess calls.
+    # No subprocess calls — no eval, no requisites query, no export.
     assert runner.calls == []
     # No broadcasts.
     sender.enqueue_broadcast.assert_not_called()
     sender.wait_for_completion.assert_not_called()
 
 
-def test_run_eval_task_corrupt_marker_falls_through(
+def test_run_eval_task_empty_archive_re_runs(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A malformed marker is treated as absent — re-eval rather than
-    permanently wedge.
+    """An empty archive file (zero bytes) doesn't satisfy the resume
+    check — we re-run rather than wedge on a half-written export.
     """
     payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
-    marker_dir = tmp_path / "hello"
-    marker_dir.mkdir(parents=True)
-    (marker_dir / "manifest.json").write_text(
-        "{not json}", encoding="utf-8"
+    archive = tmp_path / "hello.nix-archive"
+    archive.write_bytes(b"")  # empty
+    sidecar = tmp_path / "hello.nix-archive.json"
+    sidecar.write_text(
+        json.dumps({"binary": "hello", "variant_drvs": []}),
+        encoding="utf-8",
     )
+
+    runner = _EvalJobsStub(
+        drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
+    )
+    sender = _make_broadcast_sender()
+    result = run_eval_task(
+        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 42.0,
+    )
+    # nix-eval-jobs ran (resume short-circuit did not fire).
+    assert any(c and c[0] == "nix-eval-jobs" for c in runner.calls)
+    # Archive + sidecar rewritten via the export path.
+    assert archive.stat().st_size > 0
+    on_disk = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert on_disk == result
+    assert on_disk["produced_at"] == 42.0
+
+
+def test_run_eval_task_corrupt_sidecar_falls_through(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A malformed sidecar is treated as absent — re-eval rather than
+    permanently wedge on a half-written export.
+    """
+    payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
+    archive = tmp_path / "hello.nix-archive"
+    archive.write_bytes(b"NIX_EXPORT:partial")
+    sidecar = tmp_path / "hello.nix-archive.json"
+    sidecar.write_text("{not json}", encoding="utf-8")
 
     runner = _EvalJobsStub(
         drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}}
@@ -447,10 +555,8 @@ def test_run_eval_task_corrupt_marker_falls_through(
     )
     # nix-eval-jobs ran.
     assert any(c and c[0] == "nix-eval-jobs" for c in runner.calls)
-    # Marker was rewritten with valid JSON.
-    on_disk = json.loads(
-        (marker_dir / "manifest.json").read_text(encoding="utf-8")
-    )
+    # Sidecar was rewritten with valid JSON.
+    on_disk = json.loads(sidecar.read_text(encoding="utf-8"))
     assert on_disk == result
     assert on_disk["produced_at"] == 42.0
 
@@ -571,9 +677,9 @@ def test_run_eval_task_subprocess_failure_raises(
     assert "dataset.x86_64-linux.hello.x86_64" in msg
     assert "rc=1" in msg
     assert "eval-time OOM" in msg
-    # No marker on failure — re-execution must re-eval.
-    marker = tmp_path / "hello" / "manifest.json"
-    assert not marker.exists()
+    # No archive / sidecar on failure — re-execution must re-eval.
+    assert not (tmp_path / "hello.nix-archive").exists()
+    assert not (tmp_path / "hello.nix-archive.json").exists()
     # No broadcasts fired (we failed before the first arch's
     # drvs were extracted).
     sender.enqueue_broadcast.assert_not_called()
@@ -597,7 +703,7 @@ def test_run_eval_task_broadcast_timeout_recorded(
     tmp_path: pathlib.Path,
 ) -> None:
     """A broadcast timeout is non-fatal: we record ``status=timeout``
-    in the marker and continue. The flood-fill protocol is best-effort.
+    in the sidecar and continue. The flood-fill protocol is best-effort.
     """
     payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
     runner = _EvalJobsStub(
@@ -612,8 +718,86 @@ def test_run_eval_task_broadcast_timeout_recorded(
     )
     assert len(result["broadcasts"]) == 1
     assert result["broadcasts"][0]["status"] == "timeout"
-    # Marker still persisted.
-    assert (tmp_path / "hello" / "manifest.json").exists()
+    # Archive + sidecar still persisted.
+    assert (tmp_path / "hello.nix-archive").exists()
+    assert (tmp_path / "hello.nix-archive.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Archive export — failure + atomicity
+# ---------------------------------------------------------------------------
+
+
+def test_run_eval_task_requisites_failure_raises(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``nix-store --query --requisites`` returning rc=1 surfaces as
+    RuntimeError — retry-pass eligible. No archive on failure.
+    """
+    payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
+    runner = _EvalJobsStub(
+        drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
+        requisites_fail=True,
+    )
+    sender = _make_broadcast_sender()
+    with pytest.raises(RuntimeError, match="nix-store --query --requisites"):
+        run_eval_task(payload, tmp_path, sender, run_subprocess=runner)
+    assert not (tmp_path / "hello.nix-archive").exists()
+    assert not (tmp_path / "hello.nix-archive.json").exists()
+
+
+def test_run_eval_task_export_failure_raises_and_cleans_up(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``nix-store --export`` rc=1 surfaces as RuntimeError; the
+    temporary archive file is removed so re-execution sees a clean
+    out_dir.
+    """
+    payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
+    runner = _EvalJobsStub(
+        drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
+        export_fail=True,
+    )
+    sender = _make_broadcast_sender()
+    with pytest.raises(RuntimeError, match="nix-store --export"):
+        run_eval_task(payload, tmp_path, sender, run_subprocess=runner)
+    # No archive (export failed). No stale .tmp lingering either.
+    assert not (tmp_path / "hello.nix-archive").exists()
+    assert not (tmp_path / "hello.nix-archive.tmp").exists()
+    # Sidecar not written either (the export precedes the sidecar write).
+    assert not (tmp_path / "hello.nix-archive.json").exists()
+
+
+def test_run_eval_task_empty_kept_drvs_writes_empty_archive(
+    tmp_path: pathlib.Path,
+) -> None:
+    """All archs returning zero drvs produces an empty archive +
+    sidecar with ``variant_drvs=[]`` — a valid "binary has no
+    plannable variants" outcome the dependency_graph worker will
+    skip.
+    """
+    payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
+    # Empty drv map for the requested arch → arch_drvs ends up empty.
+    runner = _EvalJobsStub(drv_map={"x86_64": {}})
+    sender = _make_broadcast_sender()
+    result = run_eval_task(
+        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 1.0,
+    )
+    assert result["variant_drvs"] == []
+    assert result["variants"] == []
+    # Archive exists (zero bytes); sidecar exists with empty list.
+    archive = tmp_path / "hello.nix-archive"
+    sidecar = tmp_path / "hello.nix-archive.json"
+    assert archive.exists()
+    assert archive.stat().st_size == 0
+    on_disk = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert on_disk == result
+    # No requisites / export subprocesses fired (no kept drvs).
+    assert not any(
+        c[:3] == ["nix-store", "--query", "--requisites"]
+        for c in runner.calls
+    )
+    assert not any(c[:2] == ["nix-store", "--export"] for c in runner.calls)
 
 
 # ---------------------------------------------------------------------------
