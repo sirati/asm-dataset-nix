@@ -48,7 +48,7 @@ def _read_single_drv_path(path: Path) -> str:
         if line and not line.startswith("#"):
             return line
     pytest.skip(f"{path.name} contains no drv path")
-    raise AssertionError  # for the type-checker
+    assert False, "unreachable: pytest.skip is NoReturn"
 
 
 def is_builder_noise(drv_path: str) -> bool:
