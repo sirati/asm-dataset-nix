@@ -56,7 +56,7 @@ __all__ = [
     "ITEM_CLASS_TOOLCHAIN",
     "ITEM_CLASS_COMMON_DEP",
     "ITEM_CLASS_VARIANT",
-    "ITEM_CLASS_PHASE0_EVAL_DRV",
+    "ITEM_CLASS_MATRIX_EVAL_DRV",
     "paths_file_for",
     "record_self_has",
     "list_self_placements",
@@ -72,12 +72,12 @@ logger = logging.getLogger(__name__)
 ITEM_CLASS_TOOLCHAIN = "toolchain"
 ITEM_CLASS_COMMON_DEP = "common_dep"
 ITEM_CLASS_VARIANT = "variant"
-# Phase 0 distributed-eval drv flood-fill. Set by the broadcast
+# matrix_eval distributed-eval drv flood-fill. Set by the broadcast
 # receive path in :mod:`peer_push` when a ``/peer/path-broadcast-offer``
 # is accepted; matches the broadcast tag used by
 # :mod:`workers.eval_worker` so T21's holder-count assertion can
-# scope to phase-0-only records.
-ITEM_CLASS_PHASE0_EVAL_DRV = "phase0_eval_drv"
+# scope to matrix_eval-only records.
+ITEM_CLASS_MATRIX_EVAL_DRV = "matrix_eval_drv"
 
 
 @dataclasses.dataclass(frozen=True)

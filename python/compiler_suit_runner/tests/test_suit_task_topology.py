@@ -2,8 +2,14 @@
 
 The phase graph is what the dynamic_runner framework consumes to
 schedule the run; every dependency edge is load-bearing. These tests
-validate the four-phase ``phase1a -> phase1b -> phase2 -> phase3``
+validate the post-rename ``build_compilers -> matrix_eval -> build``
 topology end-to-end without spinning up the framework.
+
+The ``dependency_graph`` step (plan's phase 3) is intentionally NOT a
+framework PhaseSpec — it runs primary-only via
+:class:`_MatrixEvalQuiesceWatcher` invoking the dependency_graph
+worker as a subprocess. The test below pins that absence so a future
+revert doesn't silently turn it into a framework dispatch.
 """
 
 from __future__ import annotations
@@ -25,8 +31,6 @@ def _make_config(
         sys_name="x86_64-linux",
         shared_fs=tmp_path,
         manifest_dir=tmp_path / "manifests",
-        raw_partition_dir=tmp_path / "partition" / "raw",
-        partition_dir=tmp_path / "partition",
         dataset_dir=tmp_path / "dataset",
         peers_dir=tmp_path / "peers",
         run_id="r1",
@@ -47,63 +51,83 @@ def _phases(task: SuitTask):
     return {p.phase_id: p for p in task.get_phases()}
 
 
-def test_get_phases_returns_phase0_and_build(tmp_path: pathlib.Path) -> None:
-    """Two phases are declared: ``phase0`` (distributed eval) and
-    ``phase_build`` (all build-shaped tasks). ``phase_build`` depends
-    on ``phase0`` via the framework dependency edge so the eval flood
-    completes before any toolchain/variant build dispatches. Phase 1a
-    (partition) + 1b (merge) still run inline on the primary."""
+def test_get_phases_returns_build_compilers_matrix_eval_and_build(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Three phases are declared: ``build_compilers`` (optional, when
+    --build-compilers is on), ``matrix_eval`` (distributed eval),
+    ``build`` (per-binary common_dep + variant). ``matrix_eval``
+    depends on ``build_compilers`` and ``build`` depends on
+    ``matrix_eval`` via explicit framework edges. The
+    ``dependency_graph`` step is primary-only and not part of this
+    graph."""
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    assert set(phases.keys()) == {"phase0", "phase_build"}
+    assert set(phases.keys()) == {"build_compilers", "matrix_eval", "build"}
 
 
-def test_phase_build_depends_on_phase0(tmp_path: pathlib.Path) -> None:
+def test_dependency_graph_not_a_framework_phase(tmp_path: pathlib.Path) -> None:
+    """Pin the design decision: dependency_graph runs primary-only as
+    a subprocess; never appears as a PhaseSpec."""
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    assert phases["phase_build"].depends_on == ("phase0",)
-    assert phases["phase0"].depends_on == ()
+    assert "dependency_graph" not in phases
 
 
-def test_phase0_carries_eval_task_type(tmp_path: pathlib.Path) -> None:
-    """``phase0`` declares a single ``eval`` task type routed to
-    ``compiler_suit_runner.workers.eval_worker`` (the Phase 0
-    distributed-eval worker)."""
+def test_matrix_eval_depends_on_build_compilers(tmp_path: pathlib.Path) -> None:
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    types = phases["phase0"].types
+    assert phases["matrix_eval"].depends_on == ("build_compilers",)
+    assert phases["build_compilers"].depends_on == ()
+
+
+def test_build_depends_on_matrix_eval(tmp_path: pathlib.Path) -> None:
+    task = SuitTask(_make_config(tmp_path))
+    phases = _phases(task)
+    assert phases["build"].depends_on == ("matrix_eval",)
+
+
+def test_matrix_eval_phase_carries_eval_task_type(
+    tmp_path: pathlib.Path,
+) -> None:
+    """``matrix_eval`` declares a single ``eval`` task type routed to
+    ``compiler_suit_runner.workers.build_worker`` (the unified entry
+    that sniffs item_class and dispatches to the eval worker)."""
+    task = SuitTask(_make_config(tmp_path))
+    phases = _phases(task)
+    types = phases["matrix_eval"].types
     assert len(types) == 1
     assert types[0].type_id == "eval"
     assert (
         types[0].worker_module
-        == "compiler_suit_runner.workers.eval_worker"
+        == "compiler_suit_runner.workers.build_worker"
     )
 
 
-def test_phase1a_phase1b_no_longer_dispatched(tmp_path: pathlib.Path) -> None:
-    """Phase 1a (partition) + 1b (merge) used to dispatch to secondaries
-    but now run inline on the primary as part of job-list creation —
-    secondaries have empty /nix/stores and can't walk drv graphs."""
-    task = SuitTask(_make_config(tmp_path))
-    phases = _phases(task)
-    assert "phase1a" not in phases
-    assert "phase1b" not in phases
-
-
-def test_phase_build_carries_all_four_task_types(
+def test_build_compilers_phase_carries_one_task_type(
     tmp_path: pathlib.Path,
 ) -> None:
-    """All four build-shaped types (toolchain, toolchain_validate,
-    common_dep, variant) live in the single phase_build, all routed
-    to build_worker. ``toolchain_validate`` is the default fetch-only
-    counterpart to ``toolchain``; only one of the two is emitted per
-    submit, controlled by ``--allow-toolchain-build``."""
     task = SuitTask(_make_config(tmp_path))
     phases = _phases(task)
-    types = phases["phase_build"].types
+    types = phases["build_compilers"].types
+    assert len(types) == 1
+    assert types[0].type_id == "build_compilers"
+    assert (
+        types[0].worker_module
+        == "compiler_suit_runner.workers.build_worker"
+    )
+
+
+def test_build_phase_carries_validate_common_dep_variant_types(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The ``build`` phase carries toolchain_validate (rarely emitted),
+    common_dep, and variant types, all routed to build_worker."""
+    task = SuitTask(_make_config(tmp_path))
+    phases = _phases(task)
+    types = phases["build"].types
     type_ids = {t.type_id for t in types}
     assert type_ids == {
-        "toolchain",
         "toolchain_validate",
         "common_dep",
         "variant",
@@ -134,12 +158,12 @@ def test_build_max_concurrent_unset_leaves_types_uncapped(
             assert getattr(t, "max_concurrent", None) is None
 
 
-def test_build_max_concurrent_caps_only_build_types(
+def test_build_max_concurrent_caps_only_build_heavy_types(
     tmp_path: pathlib.Path,
 ) -> None:
     task = SuitTask(_make_config(tmp_path, build_max_concurrent=3))
     phases = _phases(task)
-    capped = {"toolchain", "common_dep", "variant"}
+    capped = {"build_compilers", "common_dep", "variant"}
     for phase in phases.values():
         for t in phase.types:
             cap = getattr(t, "max_concurrent", None)

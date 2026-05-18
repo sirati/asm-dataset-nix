@@ -1,7 +1,7 @@
-"""Phase 0 distributed-eval worker — one task per binary.
+"""Matrix-eval distributed-eval worker — one task per binary.
 
 Runs on a cluster secondary. Given a manifest payload built by
-:func:`compiler_suit_runner.manifest_gen.make_phase0_eval_header`, the
+:func:`compiler_suit_runner.manifest_gen.make_matrix_eval_header`, the
 worker:
 
 1. Resolves the per-(arch, suffix) drv set by invoking
@@ -16,10 +16,26 @@ worker:
    onward). Each receiver substitutes the drv into its local store
    so Phase 1+ tasks scheduled anywhere in the cluster can read the
    graph immediately.
-3. Writes a resume marker at ``<phase0_out_dir>/<binary>/manifest.json``
-   listing ``[{label, drv}, ...]`` so a re-execution after the task
-   was preempted short-circuits to the broadcast-already-happened
-   path.
+3. Exports the kept-variant closure to
+   ``<matrix_eval_out_dir>/<binary>.nix-archive`` via
+   ``nix-store --query --requisites`` + ``nix-store --export`` so the
+   primary's ``_MatrixEvalQuiesceWatcher`` + ``dependency_graph_worker``
+   can re-import the full drv graph into the primary's local store
+   without re-evaluating the flake. Writes a sidecar JSON
+   ``<binary>.nix-archive.json`` carrying ``{variant_drvs, binary,
+   variants, broadcasts, produced_at, sys}`` so the
+   ``dependency_graph_worker`` discovers the ROOT (kept) drvs vs the
+   transitive closure without parsing the archive itself.
+
+Resume marker
+-------------
+
+The archive + sidecar pair IS the resume marker. A short-circuit
+fires when both files exist and the archive is non-empty: re-execution
+returns the sidecar contents and skips eval + broadcast + export. The
+legacy ``<out_dir>/<binary>/manifest.json`` JSON marker is no longer
+emitted — the hard-cutover post-A3 design uses archive presence as the
+single source of truth.
 
 Error-type contract (framework integration)
 -------------------------------------------
@@ -73,6 +89,7 @@ import time
 from collections.abc import Callable
 from typing import Any, Optional
 
+from compiler_suit_runner.peer_paths import ITEM_CLASS_MATRIX_EVAL_DRV
 from compiler_suit_runner.peer_replication import BroadcastSender
 
 
@@ -83,7 +100,7 @@ from compiler_suit_runner.peer_replication import BroadcastSender
 RunSubprocess = Callable[[list[str]], tuple[bytes, bytes, int]]
 
 
-PHASE_0_ITEM_CLASS = "phase0_eval"
+MATRIX_EVAL_ITEM_CLASS = "matrix_eval"
 """Item class string this worker handles (matches manifest_gen)."""
 
 
@@ -167,8 +184,8 @@ def sample_suffix_attrs(
 
 
 def parse_payload(payload: dict) -> dict[str, Any]:
-    """Validate a phase0_eval payload (as produced by
-    :func:`manifest_gen.make_phase0_eval_header`) and return a
+    """Validate a matrix_eval payload (as produced by
+    :func:`manifest_gen.make_matrix_eval_header`) and return a
     normalised dict.
 
     Raises :class:`ValueError` on shape errors so callers (and tests)
@@ -176,7 +193,7 @@ def parse_payload(payload: dict) -> dict[str, Any]:
     """
     if not isinstance(payload, dict):
         raise ValueError(
-            f"phase0_eval payload must be a dict, got {type(payload).__name__}"
+            f"matrix_eval payload must be a dict, got {type(payload).__name__}"
         )
     binary = payload.get("binary")
     sys_name = payload.get("sys")
@@ -184,34 +201,34 @@ def parse_payload(payload: dict) -> dict[str, Any]:
     suffixes = payload.get("suffixes")
     attr = payload.get("attr")
     if not isinstance(binary, str) or not binary:
-        raise ValueError(f"phase0_eval payload: invalid 'binary' ({binary!r})")
+        raise ValueError(f"matrix_eval payload: invalid 'binary' ({binary!r})")
     if not isinstance(sys_name, str) or not sys_name:
-        raise ValueError(f"phase0_eval payload: invalid 'sys' ({sys_name!r})")
+        raise ValueError(f"matrix_eval payload: invalid 'sys' ({sys_name!r})")
     if not isinstance(archs, list) or not all(isinstance(a, str) for a in archs):
-        raise ValueError(f"phase0_eval payload: invalid 'archs' ({archs!r})")
+        raise ValueError(f"matrix_eval payload: invalid 'archs' ({archs!r})")
     if not isinstance(suffixes, list) or not all(
         isinstance(s, str) for s in suffixes
     ):
         raise ValueError(
-            f"phase0_eval payload: invalid 'suffixes' ({suffixes!r})"
+            f"matrix_eval payload: invalid 'suffixes' ({suffixes!r})"
         )
     if not isinstance(attr, str) or not attr:
-        raise ValueError(f"phase0_eval payload: invalid 'attr' ({attr!r})")
+        raise ValueError(f"matrix_eval payload: invalid 'attr' ({attr!r})")
     for s in suffixes:
         if not _SAFE_SUFFIX_RE.match(s):
             raise ValueError(
-                f"phase0_eval payload: unsafe suffix {s!r} — refusing to splice"
+                f"matrix_eval payload: unsafe suffix {s!r} — refusing to splice"
             )
 
     variant_sample = payload.get("variant_sample")
     if variant_sample is not None and not isinstance(variant_sample, int):
         raise ValueError(
-            f"phase0_eval payload: invalid 'variant_sample' ({variant_sample!r})"
+            f"matrix_eval payload: invalid 'variant_sample' ({variant_sample!r})"
         )
     variant_seed = payload.get("variant_seed")
     if variant_seed is not None and not isinstance(variant_seed, str):
         raise ValueError(
-            f"phase0_eval payload: invalid 'variant_seed' ({variant_seed!r})"
+            f"matrix_eval payload: invalid 'variant_seed' ({variant_seed!r})"
         )
 
     return {
@@ -362,29 +379,37 @@ def _drv_size(drv_path: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Resume marker
+# Archive + sidecar (resume marker for post-A3 hard-cutover format)
 # ---------------------------------------------------------------------------
 
 
-def _marker_path(out_dir: pathlib.Path, binary: str) -> pathlib.Path:
-    # out_dir is already the phase0-specific dir (e.g. _phase0 on host,
-    # /app/out-network/_phase0 in container), so no extra segment needed.
-    return out_dir / binary / "manifest.json"
+def _archive_path(out_dir: pathlib.Path, binary: str) -> pathlib.Path:
+    """Per-binary archive path under the matrix-eval output dir.
+
+    ``out_dir`` is the matrix-eval-specific dir (e.g. ``_matrix_eval``
+    on the host, ``/app/out-network/_matrix_eval`` in the container);
+    each binary's kept-variant closure lands at ``<out_dir>/<binary>.nix-archive``.
+    """
+    return out_dir / f"{binary}.nix-archive"
 
 
-def _read_marker(marker: pathlib.Path) -> Optional[dict]:
-    """Return the parsed marker dict, or ``None`` if absent / unreadable.
+def _sidecar_path(archive: pathlib.Path) -> pathlib.Path:
+    """Sidecar JSON path for a ``<binary>.nix-archive`` archive."""
+    return archive.with_suffix(archive.suffix + ".json")
 
-    A corrupt marker file is treated as absent: corruption is
-    visible from outside the runner (file on disk) and forcing a
-    re-eval is cheaper than blocking forever on a half-written
-    file. We do log via ``RuntimeError`` neither here — the
+
+def _read_sidecar(sidecar: pathlib.Path) -> Optional[dict]:
+    """Return the parsed sidecar dict, or ``None`` if absent / unreadable.
+
+    A corrupt sidecar is treated as absent: corruption is visible
+    from outside the runner (file on disk) and forcing a re-eval is
+    cheaper than blocking forever on a half-written file. The
     function's contract is "best effort".
     """
-    if not marker.exists():
+    if not sidecar.exists():
         return None
     try:
-        with open(marker, "r", encoding="utf-8") as fh:
+        with open(sidecar, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError):
         return None
@@ -393,18 +418,113 @@ def _read_marker(marker: pathlib.Path) -> Optional[dict]:
     return data
 
 
-def _write_marker(marker: pathlib.Path, payload: dict) -> None:
-    """Atomically write the resume marker.
+def _write_sidecar(sidecar: pathlib.Path, payload: dict) -> None:
+    """Atomically write the sidecar JSON.
 
     Uses tmp-then-rename within the same directory so a crash
-    mid-write never leaves a half-parsed marker on disk.
+    mid-write never leaves a half-parsed sidecar on disk.
     """
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    tmp = marker.with_suffix(marker.suffix + ".tmp")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
         fh.write("\n")
-    os.replace(tmp, marker)
+    os.replace(tmp, sidecar)
+
+
+def _export_kept_closure(
+    archive: pathlib.Path,
+    kept_drvs: list[str],
+    *,
+    run_subprocess: RunSubprocess,
+) -> None:
+    """Export the closure of ``kept_drvs`` into ``archive``.
+
+    Two subprocess invocations:
+
+      1. ``nix-store --query --requisites <kept_drvs...>`` to enumerate
+         every store path in the transitive closure.
+      2. ``nix-store --export <closure_paths...>`` whose stdout is the
+         self-contained archive byte stream we redirect to disk.
+
+    The archive is written atomically via ``.tmp`` + ``os.replace`` so a
+    crash mid-export never leaves a half-written file the primary would
+    mis-import.
+
+    Mirrors :func:`workers.build_compilers_worker.export_closure` but
+    in-module so eval_worker stays free of cross-worker imports and the
+    injected ``run_subprocess`` seam mirrors the rest of this module.
+
+    Raises :class:`RuntimeError` on any subprocess failure (retry-pass
+    eligible per the worker's error-type contract).
+    """
+    if not kept_drvs:
+        # No kept drvs ⇒ no archive. Still produce an empty file so the
+        # primary's archive presence-check resume marker stays consistent
+        # (zero variants is a valid outcome for a binary with all archs
+        # gated out by the support table).
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        tmp = archive.with_suffix(archive.suffix + ".tmp")
+        with open(tmp, "wb") as fh:
+            fh.write(b"")
+        os.replace(tmp, archive)
+        return
+
+    req_argv: list[str] = [
+        "nix-store",
+        "--query",
+        "--requisites",
+        *kept_drvs,
+    ]
+    req_stdout, req_stderr, req_rc = run_subprocess(req_argv)
+    if req_rc != 0:
+        raise RuntimeError(
+            f"nix-store --query --requisites failed (rc={req_rc}): "
+            + req_stderr.decode("utf-8", errors="replace").strip()
+        )
+
+    closure: list[str] = [
+        line.strip()
+        for line in req_stdout.decode("utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+    if not closure:
+        raise RuntimeError(
+            "nix-store --query --requisites returned no paths for "
+            f"kept_drvs={kept_drvs!r}"
+        )
+
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    tmp_archive = archive.with_suffix(archive.suffix + ".tmp")
+    if tmp_archive.exists():
+        try:
+            tmp_archive.unlink()
+        except OSError:
+            pass
+
+    export_argv: list[str] = [
+        "nix-store",
+        "--export",
+        *closure,
+    ]
+    exp_stdout, exp_stderr, exp_rc = run_subprocess(export_argv)
+    if exp_rc != 0:
+        try:
+            tmp_archive.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"nix-store --export failed (rc={exp_rc}): "
+            + exp_stderr.decode("utf-8", errors="replace").strip()
+        )
+    try:
+        with open(tmp_archive, "wb") as fh:
+            fh.write(exp_stdout)
+        os.replace(tmp_archive, archive)
+    except OSError as exc:
+        raise RuntimeError(
+            f"writing nix-store --export stdout to {archive!s} failed: {exc}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -422,29 +542,31 @@ def run_eval_task(
     broadcast_timeout: float = 10.0,
     now: Optional[Callable[[], float]] = None,
 ) -> dict:
-    """Phase 0 per-binary eval dispatch entry point.
+    """Matrix-eval per-binary eval dispatch entry point.
 
     See the module docstring for the protocol. The function returns
-    the marker dict (also persisted to
-    ``out_dir/<binary>/manifest.json``) on success.
+    the sidecar dict (also persisted to
+    ``out_dir/<binary>.nix-archive.json``) on success. The archive
+    itself lives at ``out_dir/<binary>.nix-archive``.
 
     Failure modes raise :class:`RuntimeError` — the framework worker
     harness then surfaces ``ErrorType::Errored`` to the primary,
     which charges the failure to the retry-pass budget. We
     deliberately do NOT raise ``Unfulfillable`` from this layer; a
-    secondary that cannot fulfil Phase 0 (e.g. permanently missing
-    toolchain) should signal that via Phase -1's task-dispatch
-    refusal, not by mutating a Phase 0 task's error type.
+    secondary that cannot fulfil matrix_eval (e.g. permanently missing
+    toolchain) should signal that via toolchain-validate's task-dispatch
+    refusal, not by mutating a matrix_eval task's error type.
 
     Parameters
     ----------
     payload :
-        The phase0_eval manifest payload (see
-        :func:`manifest_gen.make_phase0_eval_header`).
+        The matrix_eval manifest payload (see
+        :func:`manifest_gen.make_matrix_eval_header`).
     out_dir :
-        Phase0-specific output directory (the bind-mounted shared
-        path). The marker is written to
-        ``out_dir / <binary> / manifest.json``.
+        Matrix-eval-specific output directory (the bind-mounted shared
+        path). The archive is written to
+        ``out_dir / <binary>.nix-archive`` and the sidecar to
+        ``out_dir / <binary>.nix-archive.json``.
     broadcast_sender :
         :class:`peer_replication.BroadcastSender` instance owned by
         the worker process — lifecycle management (start/stop) is
@@ -476,18 +598,18 @@ def run_eval_task(
     variant_sample = parsed["variant_sample"]
     variant_seed = parsed["variant_seed"]
 
-    marker = _marker_path(out_dir, binary)
+    archive = _archive_path(out_dir, binary)
+    sidecar = _sidecar_path(archive)
 
-    # Step 0: resume short-circuit. If the marker exists we trust
-    # that some prior run of this task (perhaps on a different
-    # secondary that previously held it) already broadcast every
-    # drv to the cluster. Re-doing the broadcast is wasteful and
-    # the receiver-side dedup would no-op them anyway; but more
-    # importantly, the primary uses this marker as the Phase 1
-    # gating signal, so the contract is "marker present == phase
-    # 0 done".
-    existing = _read_marker(marker)
-    if existing is not None:
+    # Step 0: resume short-circuit. If both the archive (non-empty) and
+    # the sidecar are present we trust that some prior run of this task
+    # (perhaps on a different secondary that previously held it) already
+    # broadcast every drv to the cluster AND exported the kept-variant
+    # closure. The primary's _MatrixEvalQuiesceWatcher uses archive
+    # presence as the matrix_eval-quiesce signal, so the contract is
+    # "archive present == matrix_eval done".
+    existing = _read_sidecar(sidecar)
+    if existing is not None and archive.exists() and archive.stat().st_size > 0:
         return existing
 
     # Step 1: enumerate drvs per arch. Each arch is one
@@ -541,7 +663,7 @@ def run_eval_task(
             bid = broadcast_sender.enqueue_broadcast(
                 drv,
                 _drv_size(drv),
-                item_class="phase0_eval_drv",
+                item_class=ITEM_CLASS_MATRIX_EVAL_DRV,
             )
             broadcast_ids.append((label, bid))
 
@@ -565,24 +687,33 @@ def run_eval_task(
             entry["failed_peers"] = list(result.failed_peers)
         broadcast_results.append(entry)
 
-    # Step 4: persist the resume marker. Phase 1 gating reads this
-    # file to know the binary's eval is done. The marker is the
-    # complete picture (variants + broadcast outcomes) so a Phase 1
-    # planner re-run after partial failures can decide whether to
-    # request re-broadcasts.
-    marker_data: dict = {
+    # Step 4: export the kept-variant closure into the per-binary
+    # archive. The closure walks ``inputDrvs`` so the primary's
+    # ``nix-store --import`` makes the whole drv graph available
+    # locally without re-evaluating the flake.
+    kept_drvs: list[str] = sorted({v["drv"] for v in variants})
+    _export_kept_closure(archive, kept_drvs, run_subprocess=runner)
+
+    # Step 5: persist the sidecar JSON. The dependency_graph worker
+    # discovers the ROOT (kept) drvs via ``variant_drvs`` here; the
+    # primary's _MatrixEvalQuiesceWatcher uses archive-presence as the
+    # matrix_eval-quiesce gate. variants + broadcasts are kept for
+    # operator-visible diagnostics + variant_lookup population in the
+    # downstream planner.
+    sidecar_data: dict = {
         "binary": binary,
         "sys": sys_name,
         "produced_at": float(clock()),
+        "variant_drvs": kept_drvs,
         "variants": variants,
         "broadcasts": broadcast_results,
     }
-    _write_marker(marker, marker_data)
-    return marker_data
+    _write_sidecar(sidecar, sidecar_data)
+    return sidecar_data
 
 
 __all__ = [
-    "PHASE_0_ITEM_CLASS",
+    "MATRIX_EVAL_ITEM_CLASS",
     "RunSubprocess",
     "parse_payload",
     "read_peer_push_urls",
@@ -595,7 +726,7 @@ __all__ = [
 # Peer push URL enumeration (public helper)
 #
 # Exported so :func:`workers.build_worker.main` can construct a
-# :class:`BroadcastSender` configured to fan phase0_eval drv broadcasts
+# :class:`BroadcastSender` configured to fan matrix_eval drv broadcasts
 # out to the cluster. The unified build_worker entry point owns the
 # subprocess CLI shape now; ``eval_worker`` is a pure library module
 # (``run_eval_task`` + this helper).

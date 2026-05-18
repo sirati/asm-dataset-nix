@@ -215,17 +215,46 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--allow-toolchain-build",
+        "--build-compilers",
         action="store_true",
         default=False,
         help=(
-            "Permit secondaries to build cross-toolchains from source. "
-            "Default OFF: missing toolchains are surfaced as a "
-            "PreflightError at submit time; the operator runs them "
-            "locally first (or runs with this flag). With it ON the "
-            "primary builds any missing toolchain locally before "
-            "dispatch, and the existing phase2_toolchain item class "
-            "is emitted instead of phase2_toolchain_validate."
+            "Enable Phase 1 ``build_compilers`` dispatch: secondaries "
+            "build the cross-toolchains from source in-cluster and "
+            "publish the closures into ``/out-network/_build_compilers/``. "
+            "Default OFF: operators are expected to have every toolchain "
+            "output pre-realised in the submitter's local store; missing "
+            "toolchains are surfaced as a PreflightError at submit time. "
+            "When ON, the manifest emitter switches from the validate-"
+            "only ``toolchain_validate`` class to the building "
+            "``build_compilers`` class and the Phase 1 stage is added "
+            "to the submit-time stages list."
+        ),
+    )
+    parser.add_argument(
+        "--build-compiler-workers",
+        type=_non_negative_int,
+        default=1,
+        metavar="N",
+        help=(
+            "Per-secondary concurrency cap for the Phase 1 "
+            "``build_compilers`` worker (default: 1). Each toolchain "
+            "build forks ``nix build`` with its own parallel-compile "
+            "fanout, so the default of 1 keeps a single compile "
+            "in-flight per secondary while still spreading across the "
+            "cluster. Has effect only when ``--build-compilers`` is set."
+        ),
+    )
+    parser.add_argument(
+        "--debug-testbuild",
+        default=None,
+        metavar="BINARY",
+        help=(
+            "Enable the Phase 1.5 ``toolchain_validate`` step using "
+            "BINARY (e.g. ``--debug-testbuild hello``). After Phase 1 "
+            "completes the cluster builds BINARY against each toolchain "
+            "as a fail-fast sanity check. Default OFF (no validation). "
+            "Only meaningful in combination with ``--build-compilers``."
         ),
     )
     parser.add_argument(
@@ -270,16 +299,6 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--distributed-eval",
-        action="store_true",
-        default=False,
-        help=(
-            "No-op: distributed-eval is now the only supported mode. "
-            "The flag is accepted silently for backwards compatibility "
-            "and will be removed in a future release."
-        ),
-    )
-    parser.add_argument(
         "--variant-sample",
         type=int,
         default=2,
@@ -309,11 +328,11 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         metavar="N",
         help=(
-            "After sampling + skip-existing, hard-cap the variant set "
-            "at the first N entries. Useful for end-to-end smoke tests "
-            "(e.g. `--max-variants 1` builds exactly one phase-3 item). "
-            "Toolchain set is narrowed to only the compilers/archs the "
-            "kept variants actually depend on."
+            "DEPRECATED — currently a no-op. The dependency-graph "
+            "streaming planner picks its own size cap; this flag is "
+            "retained only so legacy invocations don't blow up the "
+            "argparse and will be removed (or wired into the streaming "
+            "planner's size cap) in a future phase."
         ),
     )
     parser.add_argument(
@@ -568,6 +587,8 @@ _CSR_FLAGS_WITH_VALUE: frozenset[str] = frozenset({
     "--max-variants",
     "--hash",
     "--replication-k",
+    "--build-compiler-workers",
+    "--debug-testbuild",
     # nargs="+" — may be followed by multiple values
     "--packages",
     "--archs",
@@ -581,9 +602,8 @@ _CSR_BOOL_FLAGS: frozenset[str] = frozenset({
     "--no-submitter-peer",
     "--enable-ssh-debug",
     "--no-task-depends",
-    "--allow-toolchain-build",
+    "--build-compilers",
     "--no-observer-as-holder",
-    "--distributed-eval",
 })
 _CSR_SUBCOMMANDS: frozenset[str] = frozenset({
     "submit", "secondary", "preflight", "clear-cache",
@@ -633,14 +653,16 @@ def _config_from_args(
     *,
     run_id: str,
     secondary_id: str,
-    input_hash: str,
-    toolchain_drvs: frozenset[str],
-    variants: tuple["VariantSpec", ...],
 ) -> SuitTaskConfig:
     """Translate the parsed argparse namespace into a SuitTaskConfig.
 
-    The shared FS subdirectories (manifests/, partition/, dataset/,
-    peers/) are derived from ``--shared-fs``.
+    The shared FS subdirectories (manifests/, dataset/, peers/) are
+    derived from ``--shared-fs``. Partition-era kwargs
+    (``raw_partition_dir``, ``partition_dir``, ``input_hash``,
+    ``toolchain_drvs``, ``variants``, ``common_threshold``) were dropped
+    in the phase-taxonomy refactor; matrix_eval workers no longer
+    materialise a partition tree and the per-binary outputs land in
+    ``matrix_eval_out_dir`` instead.
     """
     shared = pathlib.Path(args.shared_fs)
     # ``dataset_dir`` defaults to a subdir of shared_fs (the dispatcher
@@ -650,23 +672,22 @@ def _config_from_args(
     # (``/app/out-network``) so finished tarballs don't end up wedged
     # under the per-run log dir.
     dataset_dir = pathlib.Path(getattr(args, "dataset_dir", None) or shared / "dataset")
-    # phase0_out_dir: explicit override wins; fall back to
-    # <dataset_dir>/_phase0. On the submitter side this resolves to
-    # <shared_fs>/dataset/_phase0 (host view of the shared bind mount);
-    # on the secondary side the synthesised namespace passes the container
-    # view (/app/out-network/_phase0) via getattr.
-    _raw_phase0_out = getattr(args, "phase0_out_dir", None)
-    phase0_out_dir = (
-        pathlib.Path(_raw_phase0_out) if _raw_phase0_out is not None
-        else dataset_dir / "_phase0"
+    # matrix_eval_out_dir: explicit override wins; fall back to
+    # ``<dataset_dir>/_matrix_eval``. On the submitter side this
+    # resolves to ``<shared_fs>/dataset/_matrix_eval`` (host view of
+    # the shared bind mount); on the secondary side the synthesised
+    # namespace passes the container view
+    # (``/app/out-network/_matrix_eval``) via getattr.
+    _raw_me_out = getattr(args, "matrix_eval_out_dir", None)
+    matrix_eval_out_dir = (
+        pathlib.Path(_raw_me_out) if _raw_me_out is not None
+        else dataset_dir / "_matrix_eval"
     )
     return SuitTaskConfig(
         flake_ref=args.flake,
         sys_name=args.sys_name,
         shared_fs=shared,
         manifest_dir=shared / "manifests",
-        raw_partition_dir=shared / "partition" / "raw",
-        partition_dir=shared / "partition",
         dataset_dir=dataset_dir,
         peers_dir=shared / "peers",
         run_id=run_id,
@@ -674,10 +695,7 @@ def _config_from_args(
         hostname=socket.gethostname(),
         cachix_cache=args.cachix_cache,
         cachix_token_file=args.cachix_auth_token_file,
-        input_hash=input_hash,
-        toolchain_drvs=toolchain_drvs,
-        variants=variants,
-        phase0_out_dir=phase0_out_dir,
+        matrix_eval_out_dir=matrix_eval_out_dir,
         # Defaults the user is unlikely to override from the CLI; tests
         # build SuitTaskConfig directly when they need to tweak these.
         # Harmonia ON by default — it's the whole point of cluster
@@ -691,7 +709,7 @@ def _config_from_args(
         ssh_debug_port=getattr(args, "ssh_debug_port", 22222),
         build_max_concurrent=getattr(args, "build_max_concurrent", None),
         disable_task_deps=getattr(args, "no_task_depends", False),
-        allow_toolchain_build=getattr(args, "allow_toolchain_build", False),
+        allow_toolchain_build=getattr(args, "build_compilers", False),
         replication_k=getattr(args, "replication_k", 3),
         allow_observer_as_holder=getattr(
             args, "allow_observer_as_holder", True,
@@ -1008,19 +1026,20 @@ def cmd_submit(args: argparse.Namespace) -> int:
             tc_drvs = {}
 
     if cache_hit is None:
-        # Distributed-eval submit path: only enumerate toolchains
-        # locally and emit Phase -1 + Phase 0 manifests. The slow
-        # per-binary drv-instantiation is deferred to Phase 0 eval
-        # workers on secondaries (see ``workers/eval_worker.py``).
-        # Phase 1+ is spawned at runtime by the primary's quiesce
-        # watcher (``_Phase0QuiesceWatcher`` in suit_task.py).
-        log.info("running distributed-eval pre-flight (toolchains + per-binary metadata only)")
+        # Submit path: only enumerate toolchains locally and emit
+        # build_compilers (when --build-compilers) + matrix_eval
+        # manifests. The slow per-binary drv-instantiation is deferred
+        # to matrix_eval workers on secondaries (see
+        # ``workers/eval_worker.py``). Phase 3+ tasks (dependency_graph,
+        # build) are spawned at runtime by the primary's quiesce
+        # watcher (``_MatrixEvalQuiesceWatcher`` in suit_task.py).
+        log.info("running pre-flight (toolchains + per-binary metadata only)")
         try:
             tc_pairs, tc_drvs = enumerate_toolchains_only(
                 args.flake, args.sys_name, archs=args.archs,
             )
         except Exception:  # noqa: BLE001
-            log.exception("distributed-eval toolchain enumeration failed")
+            log.exception("toolchain enumeration failed")
             return 1
         try:
             per_binary_meta_raw = enumerate_variants(
@@ -1032,12 +1051,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 sample_seed=getattr(args, "variant_seed", "42") or "42",
             )
         except Exception:  # noqa: BLE001
-            log.exception("distributed-eval variant enumeration failed")
+            log.exception("variant enumeration failed")
             return 1
         if not isinstance(per_binary_meta_raw, dict):
             log.error(
-                "distributed-eval: enumerate_variants returned %r "
-                "instead of a dict; aborting",
+                "enumerate_variants returned %r instead of a dict; aborting",
                 type(per_binary_meta_raw).__name__,
             )
             return 1
@@ -1046,10 +1064,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # {arch: [...]}, "sample_size": ..., "sample_seed": ...}} shape
         # returned by enumerate_variants into the {binary: {"archs":
         # [...], "suffixes": [...], "variant_sample": ...,
-        # "variant_seed": ...}} shape that emit_phase0_eval_manifests /
+        # "variant_seed": ...}} shape that emit_matrix_eval_manifests /
         # eval_worker.parse_payload expect. ``suffixes`` is the union
-        # across archs because the Phase 0 worker re-applies per-(arch,
-        # compiler, opt) sampling with the same seed.
+        # across archs because the matrix_eval worker re-applies
+        # per-(arch, compiler, opt) sampling with the same seed.
         per_binary_metadata: dict[str, dict] = {}
         for pkg, meta in per_binary_meta_raw.items():
             if not isinstance(meta, dict):
@@ -1068,35 +1086,39 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "variant_seed": meta.get("sample_seed"),
             }
         log.info(
-            "distributed-eval: %d toolchains, %d binaries queued for Phase 0",
+            "submit pre-flight: %d toolchains, %d binaries queued for matrix_eval",
             len(tc_drvs), len(per_binary_metadata),
         )
 
-        # Local toolchain availability check (same contract as the
-        # legacy path: phase2_toolchain_validate requires the primary
-        # to actually have the outputs unless --allow-toolchain-build).
-        allow_tc_build = getattr(args, "allow_toolchain_build", False)
+        # Local toolchain availability check. Without ``--build-compilers``
+        # secondaries only validate; the primary must have every
+        # toolchain output realised before dispatch. With it on, the
+        # primary builds any missing toolchain locally as a fallback
+        # and the in-cluster ``build_compilers`` worker re-realises
+        # them on each secondary that wins a dispatched task.
+        build_compilers_on = bool(getattr(args, "build_compilers", False))
+        debug_testbuild = getattr(args, "debug_testbuild", None)
         tc_drv_set = frozenset(d for d in tc_drvs.values() if d)
         if tc_drv_set:
             try:
                 missing_tcs = check_toolchains_locally(tc_drv_set)
             except Exception:  # noqa: BLE001
                 log.exception(
-                    "distributed-eval: toolchain local-validity check failed"
+                    "toolchain local-validity check failed"
                 )
                 missing_tcs = tc_drv_set
             if missing_tcs:
-                if not allow_tc_build:
+                if not build_compilers_on:
                     log.error(
-                        "distributed-eval: %d/%d toolchains missing locally "
-                        "and --allow-toolchain-build is off",
+                        "submit pre-flight: %d/%d toolchains missing locally "
+                        "and --build-compilers is off",
                         len(missing_tcs), len(tc_drv_set),
                     )
                     for drv in sorted(missing_tcs):
                         log.error("  %s", drv)
                     return 1
                 log.warning(
-                    "distributed-eval: building %d missing toolchains locally",
+                    "submit pre-flight: building %d missing toolchains locally",
                     len(missing_tcs),
                 )
                 try:
@@ -1108,10 +1130,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     log.exception("local toolchain build failed")
                     return 1
 
-        # Resolve toolchain outpaths so phase2_toolchain_validate
-        # manifests carry ``payload.outpath``. Without this the
-        # build_worker's validate path fails immediately with
-        # "manifest missing 'payload.outpath'".
+        # Resolve toolchain outpaths so toolchain_validate manifests
+        # carry ``payload.outpath``. Without this the build_worker's
+        # validate path fails immediately with "manifest missing
+        # 'payload.outpath'".
         dist_eval_drv_outpaths: Optional[dict[str, str]] = None
         if tc_drvs:
             try:
@@ -1120,19 +1142,32 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 )
                 dist_eval_drv_outpaths = dict(tc_outpaths) if tc_outpaths else {}
                 log.info(
-                    "distributed-eval: toolchain outpath eval: %d/%d resolved",
+                    "submit pre-flight: toolchain outpath eval: %d/%d resolved",
                     len(dist_eval_drv_outpaths), len(tc_drvs),
                 )
             except Exception:  # noqa: BLE001
                 log.exception(
-                    "distributed-eval: toolchain outpath eval failed;"
+                    "submit pre-flight: toolchain outpath eval failed;"
                     " validate manifests will be missing payload.outpath"
                 )
                 dist_eval_drv_outpaths = {}
 
-        # Emit only Phase -1 (toolchain) + Phase 0 (per-binary eval)
-        # manifests. Phase 1+ is spawned dynamically by the primary's
-        # quiesce watcher after every phase0_eval task completes.
+        # Stages literal: matrix_eval is always emitted; build_compilers
+        # is added when --build-compilers is on. ``--debug-testbuild
+        # <binary>`` would additionally inject Phase 1.5
+        # ``toolchain_validate`` headers between build_compilers and
+        # matrix_eval, but emit_all_manifests currently picks
+        # build_compilers OR toolchain_validate per the
+        # ``allow_toolchain_build`` arg — so the debug-testbuild flow
+        # needs a manifest_gen extension before both classes can be
+        # emitted simultaneously. The flag is captured here and threaded
+        # forward; the validate emission itself is a follow-up.
+        stages: list[str] = ["matrix_eval"]
+        if build_compilers_on:
+            stages = ["build_compilers", "matrix_eval"]
+        if debug_testbuild and "build_compilers" not in stages:
+            stages.insert(0, "build_compilers")
+
         try:
             emit_all_manifests(
                 target_dir=manifest_dir,
@@ -1142,13 +1177,13 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 common_deps=(),
                 num_workers=num_workers,
                 toolchain_drvs=tc_drvs,
-                allow_toolchain_build=allow_tc_build,
+                allow_toolchain_build=build_compilers_on,
                 per_binary_metadata=per_binary_metadata,
                 drv_outpaths=dist_eval_drv_outpaths,
-                stages=["phase_minus1", "phase0"],
+                stages=stages,
             )
         except Exception:  # noqa: BLE001
-            log.exception("distributed-eval manifest emission failed")
+            log.exception("submit pre-flight: manifest emission failed")
             return 1
 
         # Expose the toolchain outpaths to the submitter-peer placement
@@ -1170,17 +1205,16 @@ def cmd_submit(args: argparse.Namespace) -> int:
             toolchain_drvs=frozenset(tc_drv_set),
         )
 
-    # Build SuitTaskConfig.
-    toolchain_drvs = pre.toolchain_drvs if pre is not None else frozenset()
-    variants = tuple(pre.variants) if pre is not None else ()
-
+    # Build SuitTaskConfig. ``pre`` still carries the toolchain set
+    # (for the submitter placement block below + the cache.store
+    # roundtrip), but the SuitTaskConfig itself no longer holds
+    # ``input_hash`` / ``toolchain_drvs`` / ``variants`` — those moved
+    # to runtime-derived state on the SuitTask / dependency_graph
+    # planner after the phase-taxonomy refactor.
     config = _config_from_args(
         args,
         run_id=run_id,
         secondary_id="primary",
-        input_hash=input_hash,
-        toolchain_drvs=toolchain_drvs,
-        variants=variants,
     )
 
     rc = 0
@@ -1280,12 +1314,15 @@ def cmd_submit(args: argparse.Namespace) -> int:
                         placements.append((outpath, drv, "toolchain"))
                 if placements:
                     submitter.set_placements(placements)
-                # Phase -1 toolchain drv seed for the distributed-eval
-                # flow. The submitter's poll loop flushes this via
+                # Toolchain drv seed for the submitter-side bootstrap.
+                # The submitter's poll loop flushes this via
                 # SubmitterPeer.seed_toolchain_drvs exactly once after
                 # a non-submitter peer file appears on the gateway —
                 # so we don't need a synchronously-known
-                # ``first_secondary_url`` here.
+                # ``first_secondary_url`` here. Bootstrap only applies
+                # when --build-compilers is OFF; otherwise the in-
+                # cluster build_compilers worker re-realises the
+                # closures locally on each secondary.
                 tc_drv_set_for_seed = frozenset(
                     d for d in tc_drvs.values() if d
                 )
@@ -1332,8 +1369,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # surface (used by lifecycle / stats reporting) points at the
         # same location.
         config.dataset_dir.mkdir(parents=True, exist_ok=True)
-        if config.phase0_out_dir is not None:
-            config.phase0_out_dir.mkdir(parents=True, exist_ok=True)
+        if config.matrix_eval_out_dir is not None:
+            config.matrix_eval_out_dir.mkdir(parents=True, exist_ok=True)
         if "--output" not in forwarded and not any(
             t.startswith("--output=") for t in forwarded
         ):
@@ -1429,13 +1466,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
     if rc == 0 and input_hash and pre is not None and not args.no_cache:
         # On success, write the cache so future runs short-circuit.
         try:
-            partition_path = config.partition_dir / "partition.json"
+            # The IncrementalCache schema still wants a ``partition_path``
+            # slot; the partition/merge phases are gone, so we just plant
+            # a placeholder under the shared-fs root to keep the cache
+            # entry shape stable. Same for ``_meta.json`` — manifest_gen
+            # no longer writes a meta sidecar.
+            partition_path = shared_fs / "_partition_placeholder.json"
             meta_path = manifest_dir / "_meta.json"
-            # If a partition.json was never produced (single-process tests
-            # don't run phase 1b), synthesize a placeholder so the cache
-            # entry is still complete.
             if not partition_path.exists():
-                config.partition_dir.mkdir(parents=True, exist_ok=True)
                 partition_path.write_text("{}")
             if not meta_path.exists():
                 meta_path.write_text("{}")
@@ -1489,9 +1527,6 @@ def cmd_secondary(args: argparse.Namespace) -> int:
         args,
         run_id=run_id,
         secondary_id=secondary_id,
-        input_hash="",
-        toolchain_drvs=frozenset(),
-        variants=(),
     )
 
     task = SuitTask(config)
@@ -1687,10 +1722,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # from other consumers (e.g. asm-tokenizer) of the same
             # shared output dir on the gateway.
             dataset_dir=pathlib.Path("/app/out-tmp/dataset"),
-            # phase0 markers land on the shared bind mount so the
+            # matrix_eval archives land on the shared bind mount so the
             # primary's watcher can read them. /app/out-network is the
             # container view of <shared_fs>/dataset (host view).
-            phase0_out_dir=pathlib.Path("/app/out-network/_phase0"),
+            matrix_eval_out_dir=pathlib.Path("/app/out-network/_matrix_eval"),
             run_id=None,
             sys_name="x86_64-linux",
             packages=None,
