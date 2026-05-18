@@ -1,34 +1,38 @@
-"""End-to-end T22 reproducer: Phase 0 resume marker honoured after kill.
+"""End-to-end T22 reproducer: matrix_eval resume marker honoured after kill.
 
 Verifies the contract documented in
 :func:`compiler_suit_runner.workers.eval_worker.run_eval_task`: the
-per-binary resume marker at ``<shared_fs>/out/<binary>/_phase0/
-manifest.json`` short-circuits Step 0 of ``run_eval_task`` on every
-subsequent invocation, so a kill-then-resubmit run finishes the Phase 0
-fan-out in O(seconds) instead of the cache-cold ~minute it costs the
-first time round.
+per-binary resume marker (the archive +
+sidecar pair at ``<matrix_eval_out_dir>/<binary>.nix-archive`` and
+``<matrix_eval_out_dir>/<binary>.nix-archive.json``) short-circuits
+Step 0 of ``run_eval_task`` on every subsequent invocation, so a
+kill-then-resubmit run finishes the matrix_eval fan-out in O(seconds)
+instead of the cache-cold ~minute it costs the first time round.
 
 Test shape (matches the plan's Part B Verification T22 row):
 
-* Spawn a distributed-eval ``submit`` (``--distributed-eval --jobs 4
-  --variant-sample 1 --packages hello``) in the background. The single-
-  binary, single-variant shape keeps Phase 0 small enough that the
-  marker appears within tens of seconds even cache-cold, narrowing the
-  watch loop's wall-clock budget.
-* Watch ``<shared_fs>/out/hello/_phase0/manifest.json`` for arrival.
-  That file is the resume marker the framework reads from (see
-  :func:`eval_worker._marker_path`) — its presence ON the shared FS is
-  EXACTLY the boundary between "Phase 0 done" and "Phase 1 dispatch".
+* Spawn a ``submit`` (``--jobs 4 --variant-sample 1 --packages
+  hello``) in the background. The single-binary, single-variant
+  shape keeps matrix_eval small enough that the archive appears
+  within tens of seconds even cache-cold, narrowing the watch loop's
+  wall-clock budget.
+* Watch ``<matrix_eval_out_dir>/hello.nix-archive`` for arrival.
+  Together with its sidecar JSON, that archive IS the resume marker
+  the framework reads from (see :func:`eval_worker._archive_path`
+  and the Step 0 short-circuit in ``run_eval_task``) — its presence
+  on the shared FS is EXACTLY the matrix_eval-quiesce signal the
+  primary's :class:`_MatrixEvalQuiesceWatcher` keys off.
 * The moment it appears, SIGKILL the submitter process group (the
   framework's primary plus any helper subprocesses). This lands the
-  kill AT the Phase 0 → Phase 1 boundary by definition.
+  kill AT the matrix_eval → dependency_graph boundary by definition.
 * Drain the cluster (the killed primary cannot run its EXIT trap;
   cleanup_cluster handles the residual sbatch jobs).
 * Re-submit the same dispatch via ``fresh_run`` — the local
   incremental cache is wiped between calls but ``shared_fs`` is NOT,
-  so the on-disk marker persists into the re-submit. Assert the run
-  completes inside :data:`RESUME_TIMEOUT_S` (start with a generous
-  60 s; the plan suggests 30 s once we have a fresh-run baseline).
+  so the on-disk archive + sidecar persist into the re-submit.
+  Assert the run completes inside :data:`RESUME_TIMEOUT_S` (start
+  with a generous 60 s; the plan suggests 30 s once we have a
+  fresh-run baseline).
 * Run the standard 7-invariant audit against the re-submit.
 
 What this test does NOT assert (deferred, see plan):
@@ -45,19 +49,20 @@ existence trigger + SIGKILL on the submitter PID. There is no
 "kill at signal" hook in :mod:`run_helpers`; the
 :mod:`tests.slurm.reproducers.inject_failures` helpers are scoped to
 gateway-side scancel of a slurm jobid, not the host-side primary.
-Polling the on-disk marker is robust because the marker is a single
-atomic ``os.replace`` (see :func:`eval_worker._write_marker`).
+Polling the on-disk archive is robust because both archive write and
+sidecar write are single atomic operations (see
+:func:`eval_worker._export_kept_closure` and ``_write_sidecar``).
 
-KILL TIMING NOTE: this test races the framework. The marker appears
-AT the Phase 0 → Phase 1 boundary, but the primary's plan_phase1
-callback could still fire between marker-write and SIGKILL. The
-resume contract is symmetric — even if Phase 1 starts, the marker is
-still on disk for the next run to consume. If the kill latency
-proves consistently slow enough that Phase 1 makes meaningful
-progress, the test would silently stop exercising the resume path
-and turn into a "second clean dispatch" check. Operators should
-treat a re-submit wall-clock greater than the fresh-run baseline as
-a regression even if the test passes.
+KILL TIMING NOTE: this test races the framework. The archive appears
+AT the matrix_eval → dependency_graph boundary, but the primary's
+quiesce-watcher fire callback could still run between the write and
+SIGKILL. The resume contract is symmetric — even if dependency_graph
+starts, the archive is still on disk for the next run to consume. If
+the kill latency proves consistently slow enough that the build
+phase makes meaningful progress, the test would silently stop
+exercising the resume path and turn into a "second clean dispatch"
+check. Operators should treat a re-submit wall-clock greater than
+the fresh-run baseline as a regression even if the test passes.
 """
 
 from __future__ import annotations
@@ -112,21 +117,21 @@ N_SECONDARIES = 4
 MIN_IDLE_WORKERS = 3
 
 # Per-run binary list. Plan: ``--packages hello`` -> exactly one
-# binary, one Phase 0 marker to watch for.
+# binary, one matrix_eval archive to watch for.
 TARGET_BINARY = "hello"
 
-# Watch budget for the marker. The first ``nix-eval-jobs`` cold-cache
-# fan-out on the live cluster has been observed at ~60-90 s for
-# ``hello`` with one variant per arch. Give the watcher 300 s before
-# giving up; this is the test's "did the framework ever get to Phase
-# 0 done?" guard, not the resume budget.
+# Watch budget for the archive. The first ``nix-eval-jobs`` cold-
+# cache fan-out on the live cluster has been observed at ~60-90 s
+# for ``hello`` with one variant per arch. Give the watcher 300 s
+# before giving up; this is the test's "did the framework ever get
+# to matrix_eval done?" guard, not the resume budget.
 MARKER_WATCH_TIMEOUT_S = 300.0
 MARKER_POLL_INTERVAL_S = 0.5
 
 # Wall-clock budget for the FIRST submit. The kill watchdog should
 # fire well before this elapses; if it doesn't we bail out so a
 # stalled primary doesn't burn the whole CI budget. Generous because
-# Phase 0 on the cold cluster includes podman image pull on the
+# matrix_eval on the cold cluster includes podman image pull on the
 # first secondary per worker.
 FIRST_SUBMIT_TIMEOUT_S = 900.0
 
@@ -182,47 +187,65 @@ def _resolve_resume_timeout() -> float:
         return RESUME_TIMEOUT_S
 
 
-def _marker_path(shared_fs: pathlib.Path, binary: str) -> pathlib.Path:
-    """Resume marker path for ``binary`` under ``shared_fs``.
+def _matrix_eval_out_dir(shared_fs: pathlib.Path) -> pathlib.Path:
+    """Resolve the matrix-eval output dir under ``shared_fs``.
 
-    Mirrors :func:`eval_worker._marker_path` — kept local so the test
-    doesn't import the worker module just for one constant; a layout
-    change in the worker is visible here as a test-side string fix.
+    Mirrors :func:`cli._build_config`: ``matrix_eval_out_dir``
+    defaults to ``<shared_fs>/dataset/_matrix_eval``.
     """
-    return shared_fs / "out" / binary / "_phase0" / "manifest.json"
+    return shared_fs / "dataset" / "_matrix_eval"
+
+
+def _archive_path(shared_fs: pathlib.Path, binary: str) -> pathlib.Path:
+    """Archive path for ``binary`` -- the matrix-eval resume marker.
+
+    Mirrors :func:`eval_worker._archive_path` -- kept local so the
+    test doesn't import the worker module just for one constant; a
+    layout change in the worker is visible here as a test-side
+    string fix.
+    """
+    return _matrix_eval_out_dir(shared_fs) / f"{binary}.nix-archive"
+
+
+def _sidecar_path(shared_fs: pathlib.Path, binary: str) -> pathlib.Path:
+    """Sidecar JSON path for ``binary``'s matrix-eval archive."""
+    return _matrix_eval_out_dir(shared_fs) / f"{binary}.nix-archive.json"
 
 
 def _wait_for_marker(
-    marker: pathlib.Path,
+    archive: pathlib.Path,
+    sidecar: pathlib.Path,
     *,
     timeout_s: float = MARKER_WATCH_TIMEOUT_S,
     poll_interval_s: float = MARKER_POLL_INTERVAL_S,
 ) -> bool:
-    """Poll ``marker`` until it exists, with a deadline.
+    """Poll ``archive`` + ``sidecar`` until both exist, with a deadline.
 
-    Returns ``True`` on success, ``False`` on timeout. The marker is
-    written via ``os.replace`` (see :func:`eval_worker._write_marker`)
-    so once ``exists()`` returns True the file is complete.
+    Returns ``True`` on success, ``False`` on timeout. The resume
+    short-circuit in ``run_eval_task`` only fires when BOTH files are
+    present (see ``workers.eval_worker.run_eval_task`` Step 0), so
+    the test must wait for both to land before SIGKILL'ing the
+    submitter.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if marker.exists():
+        if archive.exists() and sidecar.exists():
             return True
         time.sleep(poll_interval_s)
-    return marker.exists()
+    return archive.exists() and sidecar.exists()
 
 
-def _read_marker_variants(marker: pathlib.Path) -> Optional[list[dict]]:
-    """Best-effort load of ``marker`` and extract its variant list.
+def _read_sidecar_variants(sidecar: pathlib.Path) -> Optional[list]:
+    """Best-effort load of ``sidecar`` and extract its variant_drvs list.
 
     Returns ``None`` on read / parse failure so the caller can surface
-    a unified message; a corrupt marker file is itself a regression
+    a unified message; a corrupt sidecar file is itself a regression
     worth flagging, but we don't crash the test thread.
     """
     import json
 
     try:
-        text = marker.read_text(encoding="utf-8")
+        text = sidecar.read_text(encoding="utf-8")
     except OSError:
         return None
     try:
@@ -231,10 +254,10 @@ def _read_marker_variants(marker: pathlib.Path) -> Optional[list[dict]]:
         return None
     if not isinstance(data, dict):
         return None
-    variants = data.get("variants")
-    if not isinstance(variants, list):
+    variant_drvs = data.get("variant_drvs")
+    if not isinstance(variant_drvs, list):
         return None
-    return variants
+    return variant_drvs
 
 
 def _spawn_submit_background(
@@ -314,32 +337,34 @@ def _drain_subprocess(
 
 
 @pytest.mark.slurm_live
-def test_t22_phase0_resume(
+def test_t22_matrix_eval_resume(
     cluster_probe: ClusterProbe,  # noqa: ARG001 — fixture used for ordering
     slurm_log_root: pathlib.Path,  # noqa: ARG001 — documented as fixture-driven
     fresh_run: Callable[..., RunResult],
     cleanup_cluster: Callable[..., object],
 ) -> None:
-    """Kill-then-resubmit: the resume marker short-circuits Phase 0.
+    """Kill-then-resubmit: the resume marker short-circuits matrix_eval.
 
     Pre-flight: gateway reachable, ``squeue --me`` empty, ≥
     :data:`MIN_IDLE_WORKERS` idle nodes. Dispatch one of:
 
-    1. Background ``submit`` with ``--distributed-eval --jobs 4
-       --variant-sample 1 --packages hello``.
-    2. Watch loop polls ``<shared_fs>/out/hello/_phase0/manifest.json``.
-       On arrival: SIGKILL the submitter process group, wait for it
-       to exit, then drain ``squeue`` so the killed sbatch jobs
-       don't pollute the re-submit's pre-flight.
-    3. Assert: marker exists and lists ≥ 1 variant entry.
+    1. Background ``submit`` with ``--jobs 4 --variant-sample 1
+       --packages hello``.
+    2. Watch loop polls
+       ``<matrix_eval_out_dir>/hello.nix-archive`` (+ its sidecar
+       JSON). On arrival: SIGKILL the submitter process group, wait
+       for it to exit, then drain ``squeue`` so the killed sbatch
+       jobs don't pollute the re-submit's pre-flight.
+    3. Assert: archive + sidecar exist and the sidecar lists ≥ 1
+       variant_drvs entry.
     4. Re-submit via ``fresh_run`` (cache wipe between, shared_fs
        preserved). Assert wall-time <
        :data:`RESUME_TIMEOUT_S`, run completes cleanly, standard
        7-invariant audit passes.
 
-    Failure surface: assertion messages call out the marker path, its
-    contents (or read error), the first-run wall + run_id, and the
-    re-submit wall + invariant detail. A regression where the
+    Failure surface: assertion messages call out the archive path,
+    its contents (or read error), the first-run wall + run_id, and
+    the re-submit wall + invariant detail. A regression where the
     re-submit re-runs ``nix-eval-jobs`` from scratch shows up as a
     wall-time blow-up; a regression where the marker isn't honoured
     shows up as an invariant failure (manifest count mismatch or
@@ -386,10 +411,9 @@ def test_t22_phase0_resume(
     # ---- compose invocation ------------------------------------------
     # ``default_invocation_for_smoke(jobs=N, workload="tiny")`` already
     # pins ``packages=("hello",)``, ``--variant-sample 1``, etc — the
-    # exact "single binary, single variant" shape T22 wants. We layer
-    # ``--distributed-eval`` on via ``extra_args`` because the test
-    # slice's ``RunInvocation`` does not (yet) carry a boolean for
-    # it; this is consistent with T11's ``--replication-k`` knob.
+    # exact "single binary, single variant" shape T22 wants. The
+    # matrix_eval / dependency_graph split is the only mode now; no
+    # extra CLI flag is required to engage it.
     base_invocation = default_invocation_for_smoke(
         jobs=n_secondaries, workload="tiny",
     )
@@ -398,23 +422,24 @@ def test_t22_phase0_resume(
         ssh_identity_file=pathlib.Path(LIVE_KEY_PATH),
         slurm_cpus_per_task=2,
         archs=("x86_64",),
-        extra_args=("--distributed-eval",),
     )
 
     shared_fs = invocation.shared_fs
-    marker = _marker_path(shared_fs, TARGET_BINARY)
+    archive = _archive_path(shared_fs, TARGET_BINARY)
+    sidecar = _sidecar_path(shared_fs, TARGET_BINARY)
 
-    # ---- first submit: background, kill at Phase 0 → Phase 1 ---------
+    # ---- first submit: background, kill at matrix_eval boundary ------
     # Spawn directly via Popen so we can SIGKILL the process group
-    # the moment the marker lands. ``fresh_run`` would block until
-    # exit, defeating the watch loop.
+    # the moment the archive + sidecar land. ``fresh_run`` would
+    # block until exit, defeating the watch loop.
     argv = invocation.to_argv()
     started_first = time.monotonic()
     proc, _, _ = _spawn_submit_background(argv)
 
     try:
         marker_seen = _wait_for_marker(
-            marker,
+            archive,
+            sidecar,
             timeout_s=MARKER_WATCH_TIMEOUT_S,
             poll_interval_s=MARKER_POLL_INTERVAL_S,
         )
@@ -422,14 +447,15 @@ def test_t22_phase0_resume(
 
         # Submitter must still be alive when we kill it — a clean exit
         # before the marker appears would mean the framework never
-        # got to Phase 0, which is a separate (T20-class) failure
+        # got to matrix_eval, which is a separate (T20-class) failure
         # mode and should be surfaced as such.
         if proc.poll() is not None and not marker_seen:
             stdout_tail, stderr_tail = _drain_subprocess(proc, timeout_s=2.0)
             pytest.fail(
-                f"submitter exited before Phase 0 marker appeared: "
-                f"exit={proc.returncode} wall={first_wall:.1f}s "
-                f"marker={marker} (still missing).\n"
+                f"submitter exited before matrix_eval marker "
+                f"appeared: exit={proc.returncode} "
+                f"wall={first_wall:.1f}s archive={archive} "
+                f"sidecar={sidecar} (still missing).\n"
                 f"stderr tail:\n{stderr_tail[-2000:]}"
             )
 
@@ -439,13 +465,14 @@ def test_t22_phase0_resume(
             _kill_submit(proc)
             _drain_subprocess(proc, timeout_s=10.0)
             pytest.fail(
-                f"Phase 0 resume marker did not appear at {marker} "
-                f"within {MARKER_WATCH_TIMEOUT_S:.0f}s of submit start "
-                f"(wall={first_wall:.1f}s); either Phase 0 is failing "
-                "or the marker layout changed."
+                f"matrix_eval resume marker did not appear at "
+                f"archive={archive} + sidecar={sidecar} within "
+                f"{MARKER_WATCH_TIMEOUT_S:.0f}s of submit start "
+                f"(wall={first_wall:.1f}s); either matrix_eval is "
+                "failing or the archive layout changed."
             )
 
-        # Marker is on disk — kill at the boundary.
+        # Archive + sidecar on disk — kill at the boundary.
         _kill_submit(proc)
         first_stdout, first_stderr = _drain_subprocess(proc, timeout_s=15.0)
     finally:
@@ -457,20 +484,26 @@ def test_t22_phase0_resume(
     first_detail = (
         f"first_wall={first_wall:.1f}s "
         f"first_exit={proc.returncode} "
-        f"marker={marker!s}"
+        f"archive={archive!s} "
+        f"sidecar={sidecar!s}"
     )
 
     # ---- post-kill assertions on the marker --------------------------
-    assert marker.is_file(), (
-        f"resume marker disappeared between watch and assertion at "
-        f"{marker} ({first_detail}). stderr tail:\n"
+    assert archive.is_file(), (
+        f"resume archive disappeared between watch and assertion at "
+        f"{archive} ({first_detail}). stderr tail:\n"
         f"{first_stderr[-2000:]}"
     )
-    variants = _read_marker_variants(marker)
-    assert variants is not None and len(variants) >= 1, (
-        f"resume marker {marker} did not list ≥ 1 variant entry: "
-        f"variants={variants!r} ({first_detail}). stderr tail:\n"
+    assert sidecar.is_file(), (
+        f"resume sidecar disappeared between watch and assertion at "
+        f"{sidecar} ({first_detail}). stderr tail:\n"
         f"{first_stderr[-2000:]}"
+    )
+    variant_drvs = _read_sidecar_variants(sidecar)
+    assert variant_drvs is not None and len(variant_drvs) >= 1, (
+        f"resume sidecar {sidecar} did not list ≥ 1 variant_drvs "
+        f"entry: variant_drvs={variant_drvs!r} ({first_detail}). "
+        f"stderr tail:\n{first_stderr[-2000:]}"
     )
 
     # Resolve the killed run's id (best-effort) for the failure message.
@@ -498,9 +531,10 @@ def test_t22_phase0_resume(
     )
 
     # ---- re-submit ---------------------------------------------------
-    # Same invocation -> same shared_fs -> the on-disk marker is
-    # consumed by Step 0 of run_eval_task. The dispatch budget is the
-    # plan's resume threshold; we treat exceedance as a regression.
+    # Same invocation -> same shared_fs -> the on-disk archive +
+    # sidecar are consumed by Step 0 of run_eval_task. The dispatch
+    # budget is the plan's resume threshold; we treat exceedance as
+    # a regression.
     resume_timeout_s = _resolve_resume_timeout()
     started_resume = time.monotonic()
     result = fresh_run(invocation, timeout_s=resume_timeout_s * 4)
@@ -536,9 +570,9 @@ def test_t22_phase0_resume(
     )
 
     # ---- standard 7-invariant audit on the re-submit -----------------
-    # The re-submit completes Phase 0 fast (resume) but still runs
-    # Phase 1 (variant builds) end-to-end; the full audit therefore
-    # applies unchanged.
+    # The re-submit completes matrix_eval fast (resume) but still
+    # runs the build phase (variant builds) end-to-end; the full
+    # audit therefore applies unchanged.
     drained = wait_squeue_empty(probe, timeout_s=300.0)
     assert drained, (
         f"squeue --me did not drain within 300s after the re-submit "
@@ -561,11 +595,17 @@ def test_t22_phase0_resume(
         f"{_format_results(inv_results)}"
     )
 
-    # The marker MUST still exist post-resume — the worker's Step 0
-    # short-circuit returns the existing marker dict; it does not
-    # rewrite it. A missing marker here would mean some cleanup path
-    # is racing the resume.
-    assert marker.is_file(), (
-        f"resume marker {marker} disappeared after a clean re-submit "
-        f"({detail}); a cleanup race deleted the resume signal."
+    # The archive + sidecar MUST still exist post-resume — the
+    # worker's Step 0 short-circuit returns the existing sidecar
+    # dict; it does not rewrite either file. A missing pair here
+    # would mean some cleanup path is racing the resume.
+    assert archive.is_file(), (
+        f"resume archive {archive} disappeared after a clean "
+        f"re-submit ({detail}); a cleanup race deleted the resume "
+        f"signal."
+    )
+    assert sidecar.is_file(), (
+        f"resume sidecar {sidecar} disappeared after a clean "
+        f"re-submit ({detail}); a cleanup race deleted the resume "
+        f"signal."
     )

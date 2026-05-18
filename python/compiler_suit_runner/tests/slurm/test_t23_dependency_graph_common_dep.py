@@ -1,53 +1,46 @@
-"""End-to-end T23 smoke: Phase 1 common-dep dedup on the slurm-test-env.
+"""End-to-end T23 smoke: dependency_graph common-dep dedup on the slurm-test-env.
 
-T23 verifies that the Phase 1 planner's graph-synthesis pass actually
-collapses shared inputs across ≥ 2 variant drvs into a single
-``phase2_common_dep`` task, and that every variant header listing that
-input ends up with the common dep's ``task_id`` in its
+T23 verifies that the dependency_graph worker's graph-synthesis pass
+actually collapses shared inputs across ≥ 2 variant drvs into a
+single ``build_common_dep`` task, and that every variant header
+listing that input ends up with the common dep's ``task_id`` in its
 ``task_depends_on``. Without this dedup, every variant would rebuild
 glibc / cross-toolchain runtime libs from source, which defeats the
-whole point of moving eval out to Phase 0.
+whole point of moving eval into matrix_eval.
 
-The signal we assert against is the Q5 stub: at Phase 0 quiesce, the
-``_Phase0QuiesceWatcher._spawn_tasks_stub`` (see
-``suit_task.py`` line ~459) serialises the planner's
-:class:`ManifestHeader` list to ``<out_dir>/_phase1_graph.json`` and
-emits an INFO line with the count. Reading that file post-run gives
-the test full visibility into the synthesised DAG without needing the
-framework's still-unshipped ``primary.spawn_tasks`` API (Q5).
+The signal we assert against is the watcher's on-disk dump: at
+matrix_eval quiesce, ``_MatrixEvalQuiesceWatcher._dump_dependency_graph``
+(see ``suit_task.py``) serialises the synthesised
+:class:`ManifestHeader` list to
+``<matrix_eval_out_dir>/_dependency_graph.json``. Reading that file
+post-run gives the test full visibility into the synthesised DAG
+independent of whether ``primary_handle.spawn_tasks`` actually fired
+(the dump is unconditional; the spawn is gated on a bound
+primary_handle).
 
 What this test asserts:
 
 * Run completes cleanly (standard 7-invariant audit;
   ``expected_failure_count=0``).
-* ``_phase1_graph.json`` exists in the shared-fs output directory
-  (looked up under the candidates the watcher may have used —
-  framework-supplied ``output_dir`` or fallback ``shared_fs/out``).
+* ``_dependency_graph.json`` exists under
+  ``<matrix_eval_out_dir>`` (defaults to
+  ``<shared_fs>/dataset/_matrix_eval``).
 * The JSON is a list of header dicts; at least one entry has
-  ``item_class == "phase2_common_dep"``.
-* At least one of those common-dep ``task_id`` values is referenced by
-  ≥ 2 ``phase3_variant`` headers' ``task_depends_on`` arrays — the dedup
-  contract.
+  ``item_class == "build_common_dep"``.
+* At least one of those common-dep ``task_id`` values is referenced
+  by ≥ 2 ``build_variant`` headers' ``task_depends_on`` arrays —
+  the dedup contract.
 
 Workload shape: ``--packages hello --archs x86_64 --variant-sample 2``
 so we get two variants of the same package (e.g. hello-x86_64-O0 +
 hello-x86_64-O2). They share glibc + the gcc15 toolchain outputs at
 minimum, so the refcount ≥ 2 condition is satisfied trivially. The
-toolchain drv set is excluded from common-dep emission (see
-``phase1_planner.plan_phase1``), but glibc / runtime helpers remain.
-
-Forward-compat note on ``--distributed-eval``: the CLI flag (plan task
-#57) is part of the Part B Phase 0 wiring and may not be merged in
-every worktree this test is imported under. We pass it via
-``extra_args`` so import-time still succeeds when the flag is absent;
-at runtime the framework will reject the unknown flag and the test
-will fail loudly with the argparse error in ``stderr`` — exactly the
-behaviour we want for a forward-compat shim. Once #57 is merged + on
-this branch, the flag is recognised and Phase 0 actually fires.
+toolchain drv set is excluded from common-dep emission (see the
+dependency_graph planner), but glibc / runtime helpers remain.
 
 Builds on T07's N=4 shape: same probe construction, same WORKERS
-list, same invocation modulo ``--distributed-eval`` and the
-single-package + ``--variant-sample 2`` knobs.
+list, same invocation modulo the single-package +
+``--variant-sample 2`` knobs.
 """
 
 from __future__ import annotations
@@ -99,8 +92,8 @@ DESIRED_N_SECONDARIES = 4
 # builds). We tolerate one missing worker -- the planner still fires.
 MIN_IDLE_WORKERS = 3
 
-# Default wall-clock cap. Phase 0 eval + Phase 1 planning + the small
-# variant build set fits comfortably in 1500s; phase0 distributed-eval
+# Default wall-clock cap. matrix_eval + dependency_graph planning +
+# the small variant build set fits comfortably in 1500s; matrix_eval
 # is the dominant new cost.
 DEFAULT_TIMEOUT_S = 1500.0
 
@@ -140,23 +133,23 @@ def _candidate_graph_paths(
     shared_fs: pathlib.Path,
     log_dir: Optional[pathlib.Path],
 ) -> list[pathlib.Path]:
-    """Return every plausible location for ``_phase1_graph.json``.
+    """Return every plausible location for ``_dependency_graph.json``.
 
-    The watcher writes to whichever ``output_dir`` the framework
-    handed ``on_run_start``; if that's ``None`` the fallback is
-    ``config.shared_fs / 'out'`` (see ``suit_task._build_phase0_watcher``).
-    The framework-supplied path on a real run lands under either
-    ``shared_fs/dataset`` (the dataset/output mount) or the per-run
-    ``log_dir`` itself. We probe all three so the test stays robust
-    to wiring changes in the framework's output_dir contract.
+    The watcher writes to the configured ``matrix_eval_out_dir`` —
+    which defaults to ``<shared_fs>/dataset/_matrix_eval`` per
+    :func:`cli._build_config`. Older worktrees / framework-supplied
+    output_dir overrides may land the file elsewhere under
+    ``shared_fs``; we probe a small set of candidates and fall back
+    to a recursive scan so the test stays robust to wiring changes.
     """
     candidates: list[pathlib.Path] = [
-        shared_fs / "out" / "_phase1_graph.json",
-        shared_fs / "dataset" / "_phase1_graph.json",
-        shared_fs / "_phase1_graph.json",
+        shared_fs / "dataset" / "_matrix_eval" / "_dependency_graph.json",
+        shared_fs / "dataset" / "_dependency_graph.json",
+        shared_fs / "out" / "_dependency_graph.json",
+        shared_fs / "_dependency_graph.json",
     ]
     if log_dir is not None:
-        candidates.append(log_dir / "_phase1_graph.json")
+        candidates.append(log_dir / "_dependency_graph.json")
     return candidates
 
 
@@ -173,18 +166,18 @@ def _find_graph_file(
     # candidate list and the framework's actual output_dir shows up
     # here rather than as an opaque AssertionError.
     if shared_fs.is_dir():
-        for hit in shared_fs.rglob("_phase1_graph.json"):
+        for hit in shared_fs.rglob("_dependency_graph.json"):
             return hit
     return None
 
 
 def _parse_graph(path: pathlib.Path) -> list[dict[str, Any]]:
-    """Decode ``_phase1_graph.json`` into the header-dict list.
+    """Decode ``_dependency_graph.json`` into the header-dict list.
 
-    The Q5 stub serialises each :class:`ManifestHeader` as a JSON
-    object with ``item_class``, ``name``, ``size``, ``payload``,
-    ``task_id`` and ``task_depends_on`` (a list of strings). See
-    ``_spawn_tasks_stub`` in ``suit_task.py``. We tolerate a corrupt
+    :meth:`_MatrixEvalQuiesceWatcher._dump_dependency_graph`
+    serialises each :class:`ManifestHeader` as a JSON object with
+    ``item_class``, ``name``, ``size``, ``payload``, ``task_id`` and
+    ``task_depends_on`` (a list of strings). We tolerate a corrupt
     or empty file by raising AssertionError directly -- that surfaces
     the real failure (planner emitted nothing) rather than a generic
     JSONDecodeError.
@@ -210,31 +203,33 @@ def _parse_graph(path: pathlib.Path) -> list[dict[str, Any]]:
 
 
 @pytest.mark.slurm_live
-def test_t23_phase1_common_dep_dedup(
+def test_t23_dependency_graph_common_dep_dedup(
     cluster_probe: ClusterProbe,  # noqa: ARG001 -- ordering only
     slurm_log_root: pathlib.Path,  # noqa: ARG001 -- fixture-driven
     fresh_run: Callable[..., RunResult],
     cleanup_cluster: None,  # noqa: ARG001 -- B2 cleanup harness
 ) -> None:
-    """Phase 1 emits exactly one common_dep per shared input across variants.
+    """dependency_graph emits exactly one common_dep per shared input across variants.
 
     Pre-flight: same gate as T07 (gateway reachable, ``squeue --me``
-    empty, ≥ :data:`MIN_IDLE_WORKERS` workers idle). T23 tolerates the
-    degraded N=3 path -- the planner runs on a single promoted primary
-    so worker count only affects how many phase 0 / phase 2 builds run
-    in parallel, not the dedup contract itself.
+    empty, ≥ :data:`MIN_IDLE_WORKERS` workers idle). T23 tolerates
+    the degraded N=3 path -- the dependency_graph subprocess runs on
+    a single promoted primary so worker count only affects how many
+    matrix_eval / variant builds run in parallel, not the dedup
+    contract itself.
 
     Dispatch: two variants of one package
-    (``--packages hello --variant-sample 2 --archs x86_64``) plus
-    ``--distributed-eval`` to engage Phase 0 + Phase 1 (see module
-    docstring on forward-compat).
+    (``--packages hello --variant-sample 2 --archs x86_64``). The
+    matrix_eval + dependency_graph split is the only mode now; no
+    extra CLI flag is required to engage it.
 
-    Post-flight: standard 7-invariant audit, then locate the planner's
-    ``_phase1_graph.json`` under the shared FS, parse it, and assert:
+    Post-flight: standard 7-invariant audit, then locate the
+    watcher's ``_dependency_graph.json`` under the shared FS, parse
+    it, and assert:
 
-    * ≥ 1 ``phase2_common_dep`` task was emitted.
+    * ≥ 1 ``build_common_dep`` task was emitted.
     * At least one common-dep ``task_id`` is referenced by ≥ 2
-      ``phase3_variant`` headers' ``task_depends_on`` -- which is the
+      ``build_variant`` headers' ``task_depends_on`` -- which is the
       contract: a shared input becomes one task that multiple
       variants depend on.
 
@@ -287,15 +282,15 @@ def test_t23_phase1_common_dep_dedup(
     # * ``slurm_cpus_per_task`` -- 2 to match the test-env's CPUTot=2.
     # * ``max_variants`` -- 2 to keep the variant set tight (two
     #   variants is the minimum for refcount ≥ 2 dedup).
-    # * ``extra_args`` -- ``--distributed-eval`` to engage Phase 0 +
-    #   Phase 1 graph synthesis (see module docstring forward-compat).
+    #
+    # The matrix_eval / dependency_graph split is the only mode now;
+    # no extra CLI flag is required to engage it.
     invocation = dataclasses.replace(
         default_invocation_for_smoke(jobs=n_secondaries, workload="medium"),
         ssh_identity_file=pathlib.Path(LIVE_KEY_PATH),
         slurm_cpus_per_task=2,
         archs=("x86_64",),
         max_variants=2,
-        extra_args=("--distributed-eval",),
     )
 
     timeout_s = _resolve_timeout()
@@ -346,19 +341,20 @@ def test_t23_phase1_common_dep_dedup(
     )
 
     # ------------------------------------------------------------------
-    # T23 core assertions: Phase 1 graph + common-dep dedup contract.
+    # T23 core assertions: dependency_graph dump + common-dep dedup
+    # contract.
     # ------------------------------------------------------------------
     graph_path = _find_graph_file(invocation.shared_fs, result.log_dir)
     assert graph_path is not None, (
-        f"_phase1_graph.json not found under {invocation.shared_fs!s}; "
-        f"checked candidates: "
+        f"_dependency_graph.json not found under "
+        f"{invocation.shared_fs!s}; checked candidates: "
         + ", ".join(
             str(c) for c in _candidate_graph_paths(
                 invocation.shared_fs, result.log_dir,
             )
         )
-        + f" ({detail}). Did the Phase 0 quiesce watcher fire? "
-        f"Check log_dir for a 'spawn_tasks stub received' INFO line."
+        + f" ({detail}). Did the _MatrixEvalQuiesceWatcher fire? "
+        f"Check log_dir for '_MatrixEvalQuiesceWatcher' INFO lines."
     )
 
     headers = _parse_graph(graph_path)
@@ -366,16 +362,16 @@ def test_t23_phase1_common_dep_dedup(
     common_deps = [
         h for h in headers
         if isinstance(h, dict)
-        and h.get("item_class") == "phase2_common_dep"
+        and h.get("item_class") == "build_common_dep"
     ]
     variants = [
         h for h in headers
         if isinstance(h, dict)
-        and h.get("item_class") == "phase3_variant"
+        and h.get("item_class") == "build_variant"
     ]
 
     assert common_deps, (
-        f"Phase 1 emitted zero phase2_common_dep tasks "
+        f"dependency_graph emitted zero build_common_dep tasks "
         f"for graph at {graph_path!s} ({detail}); "
         f"headers ({len(headers)}): "
         + ", ".join(
@@ -417,9 +413,9 @@ def test_t23_phase1_common_dep_dedup(
         (cd_id, count) for cd_id, count in ref_counts.items() if count >= 2
     ]
     assert shared_common_deps, (
-        f"Phase 1 dedup contract violated for graph at {graph_path!s} "
-        f"({detail}); no phase2_common_dep task_id is referenced by ≥ 2 "
-        f"phase3_variant headers' task_depends_on. "
+        f"dependency_graph dedup contract violated for graph at "
+        f"{graph_path!s} ({detail}); no build_common_dep task_id is "
+        f"referenced by ≥ 2 build_variant headers' task_depends_on. "
         f"\n  common_deps emitted ({len(common_deps)}): "
         + ", ".join(common_dep_ids)
         + f"\n  ref_counts across variants: {dict(ref_counts)!r}"

@@ -281,7 +281,7 @@ def test_t03_clean_medium(
     # ------------------------------------------------------------------
     # Placement-map plumbing (cluster-wide ``dict[outpath, set[sid]]``).
     # These assertions exercise the targeted-fetch refactor:
-    #   * manifests should be ``phase2_toolchain_validate`` (no build-on-
+    #   * manifests should be ``toolchain_validate`` (no build-on-
     #     secondaries) — only path-info + nix-copy from a peer.
     #   * the on-disk gossip ``peers/_paths_<sid>.jsonl`` files should
     #     exist post-run and reference the toolchain outpaths.

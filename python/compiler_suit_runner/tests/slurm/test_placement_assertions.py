@@ -52,7 +52,7 @@ def _write_validate_manifest(
 ) -> pathlib.Path:
     p = manifests_dir / f"toolchain_validate__{arch}__{compiler}.json"
     p.write_text(json.dumps({
-        "item_class": "phase2_toolchain_validate",
+        "item_class": "toolchain_validate",
         "name": f"toolchain_validate__{arch}__{compiler}",
         "size": 0,
         "payload": {
@@ -69,10 +69,10 @@ def _write_build_manifest(
     arch: str,
     compiler: str,
 ) -> pathlib.Path:
-    p = manifests_dir / f"toolchain__{arch}__{compiler}.json"
+    p = manifests_dir / f"build_compilers__{arch}__{compiler}.json"
     p.write_text(json.dumps({
-        "item_class": "phase2_toolchain",
-        "name": f"toolchain__{arch}__{compiler}",
+        "item_class": "build_compilers",
+        "name": f"build_compilers__{arch}__{compiler}",
         "size": 0,
         "payload": {"attr": "x"},
     }))
@@ -105,7 +105,7 @@ def test_validate_manifests_emitted_passes(run_layout):
 
 def test_validate_manifests_emitted_fails_when_build_present(run_layout):
     """Even a single build manifest is a regression — the operator
-    didn't pass ``--allow-toolchain-build``, so build manifests must
+    didn't pass ``--build-compilers``, so build manifests must
     not be on disk."""
     run_dir, shared_fs, manifests_dir, _peers_dir = run_layout
     _write_validate_manifest(
@@ -115,14 +115,14 @@ def test_validate_manifests_emitted_fails_when_build_present(run_layout):
     )
     _write_build_manifest(manifests_dir, "armv7l", "gcc11")
     artifacts = RunArtifacts.from_dir(run_dir, shared_fs=shared_fs)
-    with pytest.raises(AssertionError, match="phase2_toolchain_validate"):
+    with pytest.raises(AssertionError, match="toolchain_validate"):
         assert_validate_manifests_emitted(artifacts)
 
 
 def test_validate_manifests_emitted_fails_when_none_present(run_layout):
     run_dir, shared_fs, _manifests_dir, _peers_dir = run_layout
     artifacts = RunArtifacts.from_dir(run_dir, shared_fs=shared_fs)
-    with pytest.raises(AssertionError, match="no phase2_toolchain_validate"):
+    with pytest.raises(AssertionError, match="no toolchain_validate"):
         assert_validate_manifests_emitted(artifacts)
 
 
@@ -132,7 +132,7 @@ def test_validate_manifests_emitted_fails_when_outpath_missing(run_layout):
     run_dir, shared_fs, manifests_dir, _peers_dir = run_layout
     p = manifests_dir / "toolchain_validate__aarch64__gcc15.json"
     p.write_text(json.dumps({
-        "item_class": "phase2_toolchain_validate",
+        "item_class": "toolchain_validate",
         "name": "x",
         "size": 0,
         "payload": {"drv": "/nix/store/tc.drv"},  # no outpath

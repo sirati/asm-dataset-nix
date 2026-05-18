@@ -144,15 +144,15 @@ def resolve_broken_drv_path(
 # ---------------------------------------------------------------------------
 
 
-_VARIANT_ITEM_CLASS: str = "phase3_variant"
+_VARIANT_ITEM_CLASS: str = "build_variant"
 """``item_class`` of the manifests we want to repoint at the broken drv.
 
-The tiny invocation produces exactly one phase-3 variant manifest
-(plus phase-2 toolchain + common-dep manifests). Mutating only the
-phase-3 manifest forces the secondary to dispatch the broken build
-during the variant phase (the phase the upstream hang lives in)
-without disturbing the toolchain bring-up that the framework needs
-to function before phase-3 even starts.
+The tiny invocation produces exactly one build_variant manifest
+(plus toolchain_validate + build_common_dep manifests). Mutating
+only the build_variant manifest forces the secondary to dispatch
+the broken build during the variant phase (the phase the upstream
+hang lives in) without disturbing the toolchain bring-up that the
+framework needs to function before variants even start.
 """
 
 
@@ -177,9 +177,9 @@ def mutate_manifests_in_place(
 ) -> ManifestMutationResult:
     """Rewrite every variant manifest's ``payload.drv`` to ``broken_drv``.
 
-    Walks ``<manifests_dir>/*.json`` (non-recursive — phase-2
-    toolchains and common-deps live in the same flat directory). Every
-    manifest with ``item_class == phase3_variant`` is rewritten:
+    Walks ``<manifests_dir>/*.json`` (non-recursive — toolchain
+    and common-dep manifests live in the same flat directory). Every
+    manifest with ``item_class == build_variant`` is rewritten:
 
     * ``payload.drv`` -> ``broken_drv``;
     * ``payload.attr`` -> ``broken_drv`` (so the secondary's build_worker
