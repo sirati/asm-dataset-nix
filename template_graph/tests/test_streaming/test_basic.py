@@ -11,7 +11,11 @@ constructed via ``_fixtures.py``; no nix subprocess or real
 
 from __future__ import annotations
 
-from template_graph.core import find_or_register_template
+from template_graph.core import (
+    Template,
+    TemplateNode,
+    find_or_register_template,
+)
 from template_graph.streaming import StreamPlanner
 from template_graph.tests.test_streaming._fixtures import (
     Node,
@@ -71,7 +75,7 @@ def test_single_binary_single_variant_smoke():
     assert planner.violations == []
 
 
-def test_two_binaries_shared_common_dep():
+def test_two_binaries_arch_indep_deps_first_visit_only():
     """Two binaries (hello, goodbye) each have a matrix-direct-child
     source drv tarball + a variant subtree. Per the planner's
     design, the matrix-direct-child non-variant drv goes into
@@ -79,11 +83,13 @@ def test_two_binaries_shared_common_dep():
     template, so the shared dep surfaces there for the binary that
     first sees it (subsequent visits are nix-store backrefs).
 
-    On the template-dedup side: although the two binaries produce
-    *distinct* variant-root names (the matrix entry point bakes the
-    binary name into its role), ``find_or_register_template``
-    correctly returns the existing template_id for any
-    structurally-equal candidate — exercised directly below.
+    Cross-binary template dedup is NOT exercised at the variant-root
+    level here: the matrix entry point bakes the binary name into
+    its role, so each binary's variant root has a distinct name and
+    `_shape_equal` correctly returns False between them. The
+    `find_or_register_template` re-use path is exercised by building
+    a structurally-equal-but-distinct-object Template and confirming
+    the lookup returns the existing id rather than appending.
     """
     shared_src = Node(hash=make_hash(99), name="zlib-1.3.tar.gz.drv")
 
@@ -132,12 +138,29 @@ def test_two_binaries_shared_common_dep():
     assert planner.violations == []
 
     # find_or_register_template re-uses an existing id for a
-    # structurally-equal candidate. Build the dedup case directly:
-    # take the first template and re-submit a structural duplicate.
+    # structurally-equal candidate. Build a NEW Template object that
+    # mirrors templates[0] node-for-node so _shape_equal must walk
+    # the structure (no object-identity short-circuit) and confirm
+    # the lookup returns the existing id rather than appending.
     templates = result["templates"]
     assert templates, "expected at least one template"
     original = templates[0]
-    tid, was_new = find_or_register_template(templates, original)
+    duplicate_nodes = [
+        TemplateNode(
+            name=n.name,
+            child_ids=list(n.child_ids),
+            is_toolchain=n.is_toolchain,
+        )
+        for n in original.nodes
+    ]
+    duplicate = Template(
+        nodes=duplicate_nodes,
+        name_to_id=dict(original.name_to_id),
+        root_id=original.root_id,
+        template_built_from=list(original.template_built_from),
+    )
+    assert duplicate is not original
+    tid, was_new = find_or_register_template(templates, duplicate)
     assert tid == 0 and was_new is False, (
         f"find_or_register_template should match by shape; "
         f"got tid={tid} was_new={was_new}"
