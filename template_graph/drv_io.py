@@ -56,7 +56,7 @@ def read_drv_record(
 
     Any fields the algorithm doesn't need are dropped — we keep the
     in-flight record tiny because we may walk thousands of drvs in
-    one ``plan_phase1_graph`` run.
+    one planner run.
     """
     argv = ["nix", "derivation", "show", drv_path]
     stdout, stderr, rc = run_subprocess(argv)
