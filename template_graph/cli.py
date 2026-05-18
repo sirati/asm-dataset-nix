@@ -21,6 +21,11 @@ takes a flat list of toolchain drv paths, one per line. ``--bash-path``
 is the realised bash store path the sum-root references for its
 builder context.
 
+Input-loading helpers (variants/toolchain parsing, ``--binary``
+derivation, streaming-label derivation) live in
+``template_graph.cli_io``. Sum-root assembly + ``nix-store --query
+--tree`` live in ``template_graph.cli_sumdrv``.
+
 Caveats vs. legacy:
 
   * The variants-file ``<label>`` value is purely descriptive: the
@@ -38,118 +43,22 @@ Caveats vs. legacy:
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from pathlib import Path
 
+from .cli_io import (
+    _derive_binary,
+    _derive_streaming_label,
+    _load_toolchain_drvs,
+    _load_variants,
+)
+from .cli_sumdrv import _build_sum_drv, _query_drv_tree
 from .core import TemplateGraphAssertError
-from .make_sum_drv import make_sum_drv_from_paths
 from .streaming import plan_from_tree_streaming
-from .tree_walker import parse_variant_path, TreeWalkError, _VARIANT_SUFFIX
 
 
 def _stderr_logger(msg: str) -> None:
     print(msg, file=sys.stderr)
-
-
-def _noop_logger(_msg: str) -> None:
-    return None
-
-
-def _read_text_lines(path: Path) -> list[str]:
-    out: list[str] = []
-    for raw in path.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        out.append(line)
-    return out
-
-
-def _load_toolchain_drvs(path: Path | None) -> list[str]:
-    if path is None:
-        return []
-    return list(_read_text_lines(path))
-
-
-def _load_variants(path: Path) -> dict[str, str]:
-    """Return ``{label: drv_path}``."""
-    out: dict[str, str] = {}
-    for line in _read_text_lines(path):
-        if "\t" not in line:
-            raise SystemExit(f"variants file line lacks TAB: {line!r}")
-        label, drv = line.split("\t", 1)
-        out[label.strip()] = drv.strip()
-    return out
-
-
-def _derive_binary(label_to_drv: dict[str, str], override: str | None) -> str:
-    """Pick the matrix binary name. Prefer ``--binary`` override; else
-    parse it out of the first variant drv name. Streaming wraps the
-    variants in ``matrix-<binary>``; the binary derived from each
-    variant drv MUST agree (the streaming planner asserts this).
-    """
-    if override:
-        return override
-    if not label_to_drv:
-        raise SystemExit("no variants given; cannot derive --binary")
-    first_drv = next(iter(label_to_drv.values()))
-    base = first_drv.rsplit("/", 1)[-1]
-    body = base.split("-", 1)[-1]  # strip leading hash
-    try:
-        binary, _arch, _comp, _opt = parse_variant_path(body)
-    except TreeWalkError as exc:
-        raise SystemExit(
-            f"cannot derive --binary from {first_drv!r}: {exc}. "
-            f"Pass --binary explicitly."
-        ) from exc
-    return binary
-
-
-def _build_sum_drv(
-    *,
-    binary: str,
-    bash_path: str,
-    toolchain_drvs: list[str],
-    variant_drvs: list[str],
-) -> str:
-    """Assemble a sum-root .drv via ``make_sum_drv_from_paths``."""
-    if not toolchain_drvs:
-        raise SystemExit("--toolchain-drvs must list at least one drv")
-    if not variant_drvs:
-        raise SystemExit("variants file produced no drv paths")
-    return make_sum_drv_from_paths(
-        bash_path=bash_path,
-        toolchain_drvs=toolchain_drvs,
-        matrix_drvs={f"matrix-{binary}": variant_drvs},
-    )
-
-
-def _query_drv_tree(sum_drv: str) -> str:
-    """``nix-store --query --tree <sum_drv>`` → decoded UTF-8 text."""
-    proc = subprocess.run(  # noqa: S603 - argv constructed in-module
-        ["nix-store", "--query", "--tree", sum_drv],
-        capture_output=True, check=False, shell=False,
-    )
-    if proc.returncode != 0:
-        raise SystemExit(
-            f"nix-store --query --tree {sum_drv} failed "
-            f"(rc={proc.returncode}): "
-            + proc.stderr.decode("utf-8", errors="replace").strip()
-        )
-    return proc.stdout.decode("utf-8", errors="replace")
-
-
-def _derive_streaming_label(drv_path: str) -> str:
-    """Reproduce the streaming planner's ``f"{comp}-{opt}"`` label."""
-    base = drv_path.rsplit("/", 1)[-1]
-    body = base.split("-", 1)[-1]
-    if not body.endswith(_VARIANT_SUFFIX):
-        raise SystemExit(
-            f"drv {drv_path!r} doesn't look like a variant entry-point"
-        )
-    _binary, _arch, comp, opt = parse_variant_path(body)
-    return f"{comp}-{opt}"
 
 
 def _print_run_summary(result: dict) -> None:
