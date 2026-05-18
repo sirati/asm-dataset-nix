@@ -92,7 +92,7 @@ DEFAULT_BROADCAST_MAX_HOP = 8
 # (:mod:`workers.eval_worker`) writes via
 # :func:`peer_paths.record_self_has` so the cluster-wide placement map
 # is uniform across origin + flood-fill recipients.
-BROADCAST_ITEM_CLASS = "phase0_eval_drv"
+BROADCAST_ITEM_CLASS = "matrix_eval_drv"
 
 
 # ---------------------------------------------------------------------------

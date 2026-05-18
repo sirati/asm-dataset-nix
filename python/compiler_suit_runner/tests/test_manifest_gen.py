@@ -12,18 +12,16 @@ from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
     ManifestSet,
     emit_all_manifests,
-    emit_phase0_eval_manifests,
-    make_common_dep_header,
-    make_merge_header,
-    make_partition_shard_header,
-    make_phase0_eval_header,
-    make_toolchain_header,
+    emit_matrix_eval_manifests,
+    make_build_common_dep_header,
+    make_build_compilers_header,
+    make_build_variant_header,
+    make_matrix_eval_header,
     make_toolchain_validate_header,
-    make_variant_header,
     read_manifest,
     write_manifest,
 )
-from compiler_suit_runner.partition import Shard, VariantSpec
+from compiler_suit_runner.partition import VariantSpec
 
 
 # ---------------------------------------------------------------------------
@@ -62,42 +60,12 @@ def _variant(
 # Header constructors
 
 
-def test_partition_shard_header_encodes_phase():
-    variants = (
-        _variant("hello", "x86_64", "O0"),
-        _variant("hello", "x86_64", "O2"),
-        _variant("hello", "x86_64", "O3"),
-    )
-    shard = Shard(pkg="hello", arch="x86_64", variants=variants)
-    header = make_partition_shard_header(shard)
-
-    assert header.item_class == "phase1a_partition"
-    assert header.name == "hello__x86_64"
-    assert header.size == 0
-    assert header.payload["pkg"] == "hello"
-    assert header.payload["arch"] == "x86_64"
-    assert len(header.payload["variants"]) == 3
-    # variants payload is plain dict-shaped (JSON-friendly).
-    for v in header.payload["variants"]:
-        assert isinstance(v, dict)
-        assert v["pkg"] == "hello"
-        assert v["arch"] == "x86_64"
-
-
-def test_merge_header():
-    h = make_merge_header()
-    assert h.item_class == "phase1b_merge"
-    assert h.name == "phase1b_merge"
-    assert h.payload == {}
-    assert h.size == 0
-
-
-def test_toolchain_header_without_drv():
-    h = make_toolchain_header(
+def test_build_compilers_header_without_drv():
+    h = make_build_compilers_header(
         "x86_64-linux", "aarch64", "gcc14"
     )
-    assert h.item_class == "phase2_toolchain"
-    assert h.name == "toolchain__aarch64__gcc14"
+    assert h.item_class == "build_compilers"
+    assert h.name == "build_compilers__aarch64__gcc14"
     assert h.payload == {
         "sys": "x86_64-linux",
         "arch": "aarch64",
@@ -108,8 +76,8 @@ def test_toolchain_header_without_drv():
     assert h.size == 0
 
 
-def test_toolchain_header_with_drv():
-    h = make_toolchain_header(
+def test_build_compilers_header_with_drv():
+    h = make_build_compilers_header(
         "x86_64-linux", "armv7l", "gcc11", drv="/nix/store/tc.drv"
     )
     assert h.payload["drv"] == "/nix/store/tc.drv"
@@ -118,9 +86,9 @@ def test_toolchain_header_with_drv():
     )
 
 
-def test_common_dep_header():
-    h = make_common_dep_header("/nix/store/glibc-x.drv", "glibc")
-    assert h.item_class == "phase2_common_dep"
+def test_build_common_dep_header():
+    h = make_build_common_dep_header("/nix/store/glibc-x.drv", "glibc")
+    assert h.item_class == "build_common_dep"
     assert h.name == "common_dep__glibc"
     assert h.payload == {
         "drv": "/nix/store/glibc-x.drv",
@@ -130,10 +98,10 @@ def test_common_dep_header():
     assert h.size == 0
 
 
-def test_variant_header_payload():
+def test_build_variant_header_payload():
     v = _variant("hello", "x86_64", "O2", tier=1)
-    h = make_variant_header(v, "x86_64-linux")
-    assert h.item_class == "phase3_variant"
+    h = make_build_variant_header(v, "x86_64-linux")
+    assert h.item_class == "build_variant"
     assert h.name == v["label"]
     assert h.size == 0
     assert h.payload["sys"] == "x86_64-linux"
@@ -151,23 +119,23 @@ def test_variant_header_payload():
     assert "preferred_secondaries" not in h.payload
 
 
-def test_variant_header_preferred_secondaries_emitted_sorted():
+def test_build_variant_header_preferred_secondaries_emitted_sorted():
     """When ``preferred_secondaries`` is non-empty, it is emitted in
     the payload sorted (deterministic manifest diffs)."""
     v = _variant("hello", "x86_64", "O2")
-    h = make_variant_header(
+    h = make_build_variant_header(
         v, "x86_64-linux",
         preferred_secondaries=["sec-b", "sec-a", "sec-c"],
     )
     assert h.payload["preferred_secondaries"] == ["sec-a", "sec-b", "sec-c"]
 
 
-def test_variant_header_preferred_secondaries_omitted_when_empty():
+def test_build_variant_header_preferred_secondaries_omitted_when_empty():
     """Empty / None preferred_secondaries -> no payload key (keeps
     legacy manifests byte-identical)."""
     v = _variant("hello", "x86_64", "O2")
     for empty in (None, []):
-        h = make_variant_header(
+        h = make_build_variant_header(
             v, "x86_64-linux", preferred_secondaries=empty,
         )
         assert "preferred_secondaries" not in h.payload
@@ -198,7 +166,7 @@ def test_emit_all_manifests_threads_toolchain_placements_to_variants(
         toolchain_outpath_placements={tc_outpath: ["sec-1", "sec-2"]},
     )
     variant_headers = [
-        h for h in result.headers if h.item_class == "phase3_variant"
+        h for h in result.headers if h.item_class == "build_variant"
     ]
     assert len(variant_headers) == 1
     assert variant_headers[0].payload["preferred_secondaries"] == [
@@ -220,7 +188,7 @@ def test_emit_all_manifests_omits_preferred_secondaries_when_no_placement(
         common_deps=[],
     )
     variant_headers = [
-        h for h in result.headers if h.item_class == "phase3_variant"
+        h for h in result.headers if h.item_class == "build_variant"
     ]
     assert len(variant_headers) == 1
     assert "preferred_secondaries" not in variant_headers[0].payload
@@ -233,9 +201,9 @@ def test_emit_all_manifests_omits_preferred_secondaries_when_no_placement(
 def test_write_manifest_writes_compact_json_file(
     tmp_path: pathlib.Path,
 ):
-    h = make_merge_header()
+    h = make_build_common_dep_header("/nix/store/glibc.drv", "glibc")
     written = write_manifest(tmp_path, h)
-    assert written == tmp_path / "phase1b_merge.json"
+    assert written == tmp_path / "common_dep__glibc.json"
     # The on-disk file is the JSON document only — no longer padded
     # to ``h.size`` (see the dispatch hot-path note in
     # manifest_gen.write_manifest).
@@ -249,16 +217,14 @@ def test_write_manifest_writes_compact_json_file(
 
 def test_write_manifest_creates_target_dir(tmp_path: pathlib.Path):
     nested = tmp_path / "a" / "b" / "c"
-    h = make_merge_header()
+    h = make_build_common_dep_header("/nix/store/glibc.drv", "glibc")
     written = write_manifest(nested, h)
     assert written.parent == nested
     assert nested.exists()
 
 
 def test_write_manifest_no_tmp_leftovers(tmp_path: pathlib.Path):
-    h = make_partition_shard_header(
-        Shard(pkg="hello", arch="x86_64", variants=())
-    )
+    h = make_build_common_dep_header("/nix/store/zlib.drv", "zlib")
     write_manifest(tmp_path, h)
     leftovers = list(tmp_path.glob("*.tmp"))
     assert leftovers == []
@@ -266,12 +232,12 @@ def test_write_manifest_no_tmp_leftovers(tmp_path: pathlib.Path):
 
 def test_write_manifest_payload_round_trip(tmp_path: pathlib.Path):
     v = _variant("sqlite", "x86_64", "O2", tier=2)
-    h = make_variant_header(v, "x86_64-linux")
+    h = make_build_variant_header(v, "x86_64-linux")
     write_manifest(tmp_path, h)
     loaded = read_manifest(tmp_path / f"{v['label']}.json")
     assert loaded.payload == h.payload
     assert loaded.size == h.size
-    assert loaded.item_class == "phase3_variant"
+    assert loaded.item_class == "build_variant"
 
 
 def test_read_manifest_handles_legacy_sparse_padded_file(
@@ -281,7 +247,7 @@ def test_read_manifest_handles_legacy_sparse_padded_file(
     # (sparse zero-fill) to a multi-GiB tail. New write_manifest
     # doesn't, but read_manifest must still load legacy files —
     # synthesise the layout and confirm parse.
-    h = make_merge_header()
+    h = make_build_common_dep_header("/nix/store/glibc.drv", "glibc")
     target = write_manifest(tmp_path, h)
     legacy_size = 2 * 1024 * 1024 * 1024  # 2 GiB sparse tail
     fd = os.open(target, os.O_RDWR)
@@ -308,7 +274,7 @@ def test_read_manifest_rejects_missing_field(tmp_path: pathlib.Path):
     target.write_text(
         json.dumps(
             {
-                "item_class": "phase1b_merge",
+                "item_class": "build_common_dep",
                 "name": "x",
                 "size": 100,
                 # payload missing
@@ -366,16 +332,13 @@ def test_emit_all_manifests_full_shape(tmp_path: pathlib.Path):
     assert result.target_dir == tmp_path
 
     grouped = result.by_class
-    # Phase 1a + 1b are now computed inline on the primary (job-list
-    # creation) and don't emit dispatch manifests. Phase 0 not
-    # requested in this fixture (no per_binary_metadata passed) so
-    # zero phase0_eval headers either.
-    assert len(grouped["phase0_eval"]) == 0
-    assert len(grouped["phase1a_partition"]) == 0
-    assert len(grouped["phase1b_merge"]) == 0
-    assert len(grouped["phase2_toolchain"]) == 4
-    assert len(grouped["phase2_common_dep"]) == 2
-    assert len(grouped["phase3_variant"]) == 12
+    # matrix_eval not requested in this fixture (no per_binary_metadata
+    # passed) so zero matrix_eval headers; toolchain falls back to the
+    # build_compilers class because no resolved drvs were supplied.
+    assert len(grouped["matrix_eval"]) == 0
+    assert len(grouped["build_compilers"]) == 4
+    assert len(grouped["build_common_dep"]) == 2
+    assert len(grouped["build_variant"]) == 12
 
     # Every header has a corresponding file; on-disk size is just the
     # JSON document (the framework's pre-flight hashing pass reads
@@ -401,11 +364,10 @@ def test_emit_all_manifests_iteration_order(tmp_path: pathlib.Path):
         common_deps=common_deps,
     )
     classes = [h.item_class for h in result.headers]
-    # Phase 1a + 1b no longer dispatched; remaining phases keep order.
     expected_order = [
-        "phase2_toolchain",
-        "phase2_common_dep",
-        "phase3_variant",
+        "build_compilers",
+        "build_common_dep",
+        "build_variant",
     ]
     seen_order: list[str] = []
     for c in classes:
@@ -424,12 +386,11 @@ def test_emit_all_manifests_empty_inputs(tmp_path: pathlib.Path):
         common_deps=[],
     )
     grouped = result.by_class
-    assert grouped["phase0_eval"] == ()
-    assert grouped["phase1a_partition"] == ()
-    assert grouped["phase1b_merge"] == ()
-    assert grouped["phase2_toolchain"] == ()
-    assert grouped["phase2_common_dep"] == ()
-    assert grouped["phase3_variant"] == ()
+    assert grouped["matrix_eval"] == ()
+    assert grouped["build_compilers"] == ()
+    assert grouped["toolchain_validate"] == ()
+    assert grouped["build_common_dep"] == ()
+    assert grouped["build_variant"] == ()
 
 
 def test_manifest_set_by_class_includes_all_known_classes(
@@ -446,13 +407,11 @@ def test_manifest_set_by_class_includes_all_known_classes(
     )
     grouped = result.by_class
     expected_keys = {
-        "phase0_eval",
-        "phase1a_partition",
-        "phase1b_merge",
-        "phase2_toolchain",
-        "phase2_toolchain_validate",
-        "phase2_common_dep",
-        "phase3_variant",
+        "matrix_eval",
+        "build_compilers",
+        "toolchain_validate",
+        "build_common_dep",
+        "build_variant",
     }
     assert set(grouped.keys()) == expected_keys
     for value in grouped.values():
@@ -473,7 +432,7 @@ def test_emit_all_manifests_target_dir_created(tmp_path: pathlib.Path):
 
 
 # ---------------------------------------------------------------------------
-# Validate-vs-build switch (``--allow-toolchain-build`` plumbing)
+# Validate-vs-build switch (``--build-compilers`` plumbing)
 # ---------------------------------------------------------------------------
 
 
@@ -483,7 +442,7 @@ def test_toolchain_validate_header_payload():
         drv="/nix/store/tc.drv",
         outpath="/nix/store/tc-out",
     )
-    assert h.item_class == "phase2_toolchain_validate"
+    assert h.item_class == "toolchain_validate"
     assert h.name == "toolchain_validate__aarch64__gcc14"
     assert h.payload["drv"] == "/nix/store/tc.drv"
     assert h.payload["outpath"] == "/nix/store/tc-out"
@@ -505,7 +464,7 @@ def test_emit_all_manifests_default_emits_validate_class(
 ):
     """With ``allow_toolchain_build`` off (default) and a resolved drv
     + outpath available, the toolchain slot must emit
-    ``phase2_toolchain_validate`` — that's the no-build-on-secondaries
+    ``toolchain_validate`` — that's the no-build-on-secondaries
     contract."""
     toolchain_specs = [("x86_64", "gcc15")]
     tc_drv = "/nix/store/tc15.drv"
@@ -519,9 +478,9 @@ def test_emit_all_manifests_default_emits_validate_class(
         drv_outpaths={tc_drv: "/nix/store/tc15-out"},
     )
     grouped = result.by_class
-    assert len(grouped["phase2_toolchain"]) == 0
-    assert len(grouped["phase2_toolchain_validate"]) == 1
-    header = grouped["phase2_toolchain_validate"][0]
+    assert len(grouped["build_compilers"]) == 0
+    assert len(grouped["toolchain_validate"]) == 1
+    header = grouped["toolchain_validate"][0]
     assert header.payload["drv"] == tc_drv
     assert header.payload["outpath"] == "/nix/store/tc15-out"
     assert (tmp_path / f"{header.name}.json").exists()
@@ -532,8 +491,11 @@ def test_emit_all_manifests_opt_in_emits_build_class(
 ):
     """With ``allow_toolchain_build=True`` the operator has explicitly
     opted into secondaries building toolchains locally — emit the
-    legacy ``phase2_toolchain`` class so the build worker dispatches
-    the nix-build path."""
+    ``build_compilers`` class so the build worker dispatches the
+    nix-build path. When the legacy ``stages=None`` default is used
+    the ``toolchain_validate`` stage is also active, so a drv-resolved
+    spec also emits a validate header alongside (see
+    `--build-compilers --debug-testbuild` operator flow)."""
     result = emit_all_manifests(
         target_dir=tmp_path,
         sys_name="x86_64-linux",
@@ -544,8 +506,8 @@ def test_emit_all_manifests_opt_in_emits_build_class(
         allow_toolchain_build=True,
     )
     grouped = result.by_class
-    assert len(grouped["phase2_toolchain"]) == 1
-    assert len(grouped["phase2_toolchain_validate"]) == 0
+    assert len(grouped["build_compilers"]) == 1
+    assert len(grouped["toolchain_validate"]) == 1
 
 
 def test_emit_all_manifests_falls_back_to_build_when_drv_missing(
@@ -565,16 +527,16 @@ def test_emit_all_manifests_falls_back_to_build_when_drv_missing(
         # No toolchain_drvs at all → drv lookup returns None.
     )
     grouped = result.by_class
-    assert len(grouped["phase2_toolchain"]) == 1
-    assert len(grouped["phase2_toolchain_validate"]) == 0
+    assert len(grouped["build_compilers"]) == 1
+    assert len(grouped["toolchain_validate"]) == 0
 
 
-def test_variant_header_embeds_input_drvs_and_outpaths():
-    """``make_variant_header`` carries the placement-map plumbing for
-    the secondary's pre-fetch loop: input_drvs (sorted) +
+def test_build_variant_header_embeds_input_drvs_and_outpaths():
+    """``make_build_variant_header`` carries the placement-map plumbing
+    for the secondary's pre-fetch loop: input_drvs (sorted) +
     input_outpaths (per-drv mapping)."""
     v = _variant("hello", "x86_64", "O2")
-    h = make_variant_header(
+    h = make_build_variant_header(
         v, "x86_64-linux",
         input_drvs=frozenset({
             "/nix/store/d1.drv",
@@ -598,22 +560,22 @@ def test_variant_header_embeds_input_drvs_and_outpaths():
     }
 
 
-def test_variant_header_without_placement_kwargs_omits_fields():
+def test_build_variant_header_without_placement_kwargs_omits_fields():
     """When no input_drvs / drv_outpaths are passed (single-process
     flows, cached-preflight restore), the variant payload stays at
     the legacy shape so older workers still parse it cleanly."""
     v = _variant("hello", "x86_64", "O2")
-    h = make_variant_header(v, "x86_64-linux")
+    h = make_build_variant_header(v, "x86_64-linux")
     assert "input_drvs" not in h.payload
     assert "input_outpaths" not in h.payload
 
 
 # ---------------------------------------------------------------------------
-# Phase 0 distributed-eval manifests
+# matrix_eval (distributed-eval) manifests
 # ---------------------------------------------------------------------------
 
 
-def _phase0_metadata() -> dict[str, dict]:
+def _matrix_eval_metadata() -> dict[str, dict]:
     return {
         "hello": {
             "archs": ["x86_64", "aarch64"],
@@ -630,8 +592,8 @@ def _phase0_metadata() -> dict[str, dict]:
     }
 
 
-def test_phase0_eval_header_payload_shape():
-    h = make_phase0_eval_header(
+def test_matrix_eval_header_payload_shape():
+    h = make_matrix_eval_header(
         "hello",
         "x86_64-linux",
         archs=["x86_64", "aarch64"],
@@ -639,11 +601,11 @@ def test_phase0_eval_header_payload_shape():
         variant_sample=64,
         variant_seed="abc123",
     )
-    assert h.item_class == "phase0_eval"
-    assert h.name == "phase0_eval__hello"
+    assert h.item_class == "matrix_eval"
+    assert h.name == "matrix_eval__hello"
     assert h.size == 0
-    assert h.task_id == "phase0_eval__hello"
-    # Empty depends_on for now — Phase -1 toolchain wiring is a TODO.
+    assert h.task_id == "matrix_eval__hello"
+    # Empty depends_on for now — build_compilers wiring is a TODO.
     assert h.task_depends_on == ()
     assert h.payload["binary"] == "hello"
     assert h.payload["sys"] == "x86_64-linux"
@@ -654,8 +616,8 @@ def test_phase0_eval_header_payload_shape():
     assert h.payload["attr"] == "dataset.x86_64-linux.hello"
 
 
-def test_phase0_eval_header_omits_optional_fields():
-    h = make_phase0_eval_header(
+def test_matrix_eval_header_omits_optional_fields():
+    h = make_matrix_eval_header(
         "zlib",
         "x86_64-linux",
         archs=["x86_64"],
@@ -665,16 +627,16 @@ def test_phase0_eval_header_omits_optional_fields():
     assert "variant_seed" not in h.payload
 
 
-def test_emit_phase0_eval_manifests_one_per_binary():
-    metadata = _phase0_metadata()
-    headers = emit_phase0_eval_manifests(metadata, sys_name="x86_64-linux")
+def test_emit_matrix_eval_manifests_one_per_binary():
+    metadata = _matrix_eval_metadata()
+    headers = emit_matrix_eval_manifests(metadata, sys_name="x86_64-linux")
     assert len(headers) == 2
     # Deterministic ordering — sorted by binary.
     names = [h.name for h in headers]
-    assert names == ["phase0_eval__busybox", "phase0_eval__hello"]
+    assert names == ["matrix_eval__busybox", "matrix_eval__hello"]
     for h in headers:
-        assert h.item_class == "phase0_eval"
-        # Empty depends_on — TODO: wire Phase -1 toolchain task hashes.
+        assert h.item_class == "matrix_eval"
+        # Empty depends_on — TODO: wire build_compilers task hashes.
         assert h.task_depends_on == ()
         assert isinstance(h.payload, dict)
         assert "binary" in h.payload
@@ -682,8 +644,8 @@ def test_emit_phase0_eval_manifests_one_per_binary():
         assert "suffixes" in h.payload
 
 
-def test_emit_phase0_eval_manifests_empty():
-    headers = emit_phase0_eval_manifests({}, sys_name="x86_64-linux")
+def test_emit_matrix_eval_manifests_empty():
+    headers = emit_matrix_eval_manifests({}, sys_name="x86_64-linux")
     assert headers == []
 
 
@@ -691,15 +653,16 @@ def test_emit_phase0_eval_manifests_empty():
 # Stage-filtered emission
 
 
-def test_emit_all_manifests_stages_phase_minus1_and_phase0(
+def test_emit_all_manifests_stages_build_compilers_and_matrix_eval(
     tmp_path: pathlib.Path,
 ):
-    """Submit-time slice: emit only Phase -1 (toolchains) + Phase 0
-    (per-binary eval). Phase 1 build manifests stay out — those land
-    later via Q5 ``primary.spawn_tasks``.
+    """Submit-time slice: emit only build_compilers (toolchains) +
+    matrix_eval (per-binary eval). ``build`` stage manifests stay out —
+    those land later via ``primary.spawn_tasks`` from the
+    dependency_graph planner.
     """
     variants, toolchain_specs, common_deps = _build_full_input()
-    metadata = _phase0_metadata()
+    metadata = _matrix_eval_metadata()
     result = emit_all_manifests(
         target_dir=tmp_path,
         sys_name="x86_64-linux",
@@ -707,24 +670,22 @@ def test_emit_all_manifests_stages_phase_minus1_and_phase0(
         toolchain_specs=toolchain_specs,
         common_deps=common_deps,
         per_binary_metadata=metadata,
-        stages=["phase_minus1", "phase0"],
+        stages=["build_compilers", "matrix_eval"],
     )
     grouped = result.by_class
-    assert len(grouped["phase0_eval"]) == 2
-    assert len(grouped["phase2_toolchain"]) == 4
-    # Phase 1 classes must be empty.
-    assert grouped["phase1a_partition"] == ()
-    assert grouped["phase1b_merge"] == ()
-    assert grouped["phase2_common_dep"] == ()
-    assert grouped["phase3_variant"] == ()
+    assert len(grouped["matrix_eval"]) == 2
+    assert len(grouped["build_compilers"]) == 4
+    # build stage classes must be empty.
+    assert grouped["build_common_dep"] == ()
+    assert grouped["build_variant"] == ()
 
 
-def test_emit_all_manifests_stages_phase1_only(tmp_path: pathlib.Path):
-    """Phase 1 slice: emit only common_dep + variant build records.
-    Phase 0 + toolchain bootstrap stays out.
+def test_emit_all_manifests_stages_build_only(tmp_path: pathlib.Path):
+    """build slice: emit only common_dep + variant build records.
+    matrix_eval + toolchain bootstrap stays out.
     """
     variants, toolchain_specs, common_deps = _build_full_input()
-    metadata = _phase0_metadata()
+    metadata = _matrix_eval_metadata()
     result = emit_all_manifests(
         target_dir=tmp_path,
         sys_name="x86_64-linux",
@@ -732,13 +693,32 @@ def test_emit_all_manifests_stages_phase1_only(tmp_path: pathlib.Path):
         toolchain_specs=toolchain_specs,
         common_deps=common_deps,
         per_binary_metadata=metadata,
-        stages=["phase1"],
+        stages=["build"],
     )
     grouped = result.by_class
-    assert grouped["phase0_eval"] == ()
-    assert grouped["phase2_toolchain"] == ()
-    assert len(grouped["phase2_common_dep"]) == 2
-    assert len(grouped["phase3_variant"]) == 12
+    assert grouped["matrix_eval"] == ()
+    assert grouped["build_compilers"] == ()
+    assert grouped["toolchain_validate"] == ()
+    assert len(grouped["build_common_dep"]) == 2
+    assert len(grouped["build_variant"]) == 12
+
+
+def test_emit_all_manifests_stages_dependency_graph_emits_nothing(
+    tmp_path: pathlib.Path,
+):
+    """The dependency_graph stage is primary-only; no dispatch
+    manifests come out of it. Requesting it via ``stages`` must be
+    accepted (not raise) but produce no headers."""
+    variants, toolchain_specs, common_deps = _build_full_input()
+    result = emit_all_manifests(
+        target_dir=tmp_path,
+        sys_name="x86_64-linux",
+        variants=variants,
+        toolchain_specs=toolchain_specs,
+        common_deps=common_deps,
+        stages=["dependency_graph"],
+    )
+    assert result.headers == ()
 
 
 def test_emit_all_manifests_stages_none_matches_legacy(
@@ -746,7 +726,7 @@ def test_emit_all_manifests_stages_none_matches_legacy(
 ):
     """Regression guard: stages=None must keep the legacy behaviour
     (every class emitted as long as inputs are present). Without
-    ``per_binary_metadata`` no phase0_eval headers should appear —
+    ``per_binary_metadata`` no matrix_eval headers should appear —
     matches today's monolithic flow.
     """
     variants, toolchain_specs, common_deps = _build_full_input()
@@ -758,25 +738,21 @@ def test_emit_all_manifests_stages_none_matches_legacy(
         common_deps=common_deps,
     )
     grouped = result.by_class
-    # Phase 1a + 1b stay out — they're never emitted by this function.
-    assert grouped["phase1a_partition"] == ()
-    assert grouped["phase1b_merge"] == ()
-    # Everything else mirrors test_emit_all_manifests_full_shape.
-    assert len(grouped["phase2_toolchain"]) == 4
-    assert len(grouped["phase2_common_dep"]) == 2
-    assert len(grouped["phase3_variant"]) == 12
-    # No phase0_eval headers without per_binary_metadata.
-    assert grouped["phase0_eval"] == ()
+    assert len(grouped["build_compilers"]) == 4
+    assert len(grouped["build_common_dep"]) == 2
+    assert len(grouped["build_variant"]) == 12
+    # No matrix_eval headers without per_binary_metadata.
+    assert grouped["matrix_eval"] == ()
 
 
-def test_emit_all_manifests_stages_none_with_metadata_emits_phase0(
+def test_emit_all_manifests_stages_none_with_metadata_emits_matrix_eval(
     tmp_path: pathlib.Path,
 ):
     """When stages=None (legacy) AND ``per_binary_metadata`` is
-    populated, phase0_eval still emits — legacy behaviour is "emit
+    populated, matrix_eval still emits — legacy behaviour is "emit
     everything you have inputs for"."""
     variants, toolchain_specs, common_deps = _build_full_input()
-    metadata = _phase0_metadata()
+    metadata = _matrix_eval_metadata()
     result = emit_all_manifests(
         target_dir=tmp_path,
         sys_name="x86_64-linux",
@@ -786,10 +762,10 @@ def test_emit_all_manifests_stages_none_with_metadata_emits_phase0(
         per_binary_metadata=metadata,
     )
     grouped = result.by_class
-    assert len(grouped["phase0_eval"]) == 2
-    assert len(grouped["phase2_toolchain"]) == 4
-    assert len(grouped["phase2_common_dep"]) == 2
-    assert len(grouped["phase3_variant"]) == 12
+    assert len(grouped["matrix_eval"]) == 2
+    assert len(grouped["build_compilers"]) == 4
+    assert len(grouped["build_common_dep"]) == 2
+    assert len(grouped["build_variant"]) == 12
 
 
 def test_emit_all_manifests_stages_unknown_raises(tmp_path: pathlib.Path):
@@ -804,10 +780,10 @@ def test_emit_all_manifests_stages_unknown_raises(tmp_path: pathlib.Path):
         )
 
 
-def test_emit_all_manifests_phase0_writes_files(tmp_path: pathlib.Path):
-    """Phase 0 emission writes one JSON file per binary that
+def test_emit_all_manifests_matrix_eval_writes_files(tmp_path: pathlib.Path):
+    """matrix_eval emission writes one JSON file per binary that
     round-trips via read_manifest."""
-    metadata = _phase0_metadata()
+    metadata = _matrix_eval_metadata()
     result = emit_all_manifests(
         target_dir=tmp_path,
         sys_name="x86_64-linux",
@@ -815,7 +791,7 @@ def test_emit_all_manifests_phase0_writes_files(tmp_path: pathlib.Path):
         toolchain_specs=[],
         common_deps=[],
         per_binary_metadata=metadata,
-        stages=["phase0"],
+        stages=["matrix_eval"],
     )
     for header in result.headers:
         path = tmp_path / f"{header.name}.json"

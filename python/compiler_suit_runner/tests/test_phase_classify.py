@@ -22,39 +22,59 @@ def _header(item_class: str, payload: dict | None = None) -> ManifestHeader:
     )
 
 
-def test_classify_phase2_toolchain_uses_compiler_arch_affinity() -> None:
+def test_classify_matrix_eval_uses_binary_affinity() -> None:
+    h = _header("matrix_eval", payload={"binary": "hello"})
+    assert _classify(h) == ("matrix_eval", "eval", "hello")
+
+
+def test_classify_matrix_eval_unknown_payload() -> None:
+    h = _header("matrix_eval", payload={})
+    assert _classify(h) == ("matrix_eval", "eval", "?")
+
+
+def test_classify_build_compilers_uses_compiler_arch_affinity() -> None:
     h = _header(
-        "phase2_toolchain",
+        "build_compilers",
         payload={"compiler_label": "gcc15", "arch": "aarch64"},
     )
-    assert _classify(h) == ("phase_build", "toolchain", "gcc15-aarch64")
+    assert _classify(h) == (
+        "build_compilers", "build_compilers", "gcc15-aarch64",
+    )
 
 
-def test_classify_phase2_toolchain_unknown_payload() -> None:
+def test_classify_build_compilers_unknown_payload() -> None:
     """Affinity falls back to the literal '?' marker, never raises."""
-    h = _header("phase2_toolchain", payload={})
-    assert _classify(h) == ("phase_build", "toolchain", "?-?")
+    h = _header("build_compilers", payload={})
+    assert _classify(h) == ("build_compilers", "build_compilers", "?-?")
 
 
-def test_classify_phase2_common_dep() -> None:
+def test_classify_toolchain_validate_uses_compiler_arch_affinity() -> None:
     h = _header(
-        "phase2_common_dep",
+        "toolchain_validate",
+        payload={"compiler_label": "gcc15", "arch": "x86_64"},
+    )
+    assert _classify(h) == ("build", "toolchain_validate", "gcc15-x86_64")
+
+
+def test_classify_build_common_dep() -> None:
+    h = _header(
+        "build_common_dep",
         payload={"drv": "/nix/store/glibc.drv", "label": "glibc"},
     )
-    assert _classify(h) == ("phase_build", "common_dep", None)
+    assert _classify(h) == ("build", "common_dep", None)
 
 
-def test_classify_phase3_variant_uses_compiler_id_arch_affinity() -> None:
+def test_classify_build_variant_uses_compiler_id_arch_affinity() -> None:
     h = _header(
-        "phase3_variant",
+        "build_variant",
         payload={"compiler_id": "gcc15", "arch": "x86_64", "pkg": "hello"},
     )
-    assert _classify(h) == ("phase_build", "variant", "gcc15-x86_64")
+    assert _classify(h) == ("build", "variant", "gcc15-x86_64")
 
 
-def test_classify_phase3_variant_unknown_payload() -> None:
-    h = _header("phase3_variant", payload={})
-    assert _classify(h) == ("phase_build", "variant", "?-?")
+def test_classify_build_variant_unknown_payload() -> None:
+    h = _header("build_variant", payload={})
+    assert _classify(h) == ("build", "variant", "?-?")
 
 
 def test_classify_unknown_item_class_raises() -> None:

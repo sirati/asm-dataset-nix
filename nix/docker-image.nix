@@ -260,9 +260,9 @@ let
     # on. See ``compiler_suit_runner.cli.cmd_secondary`` for the
     # runtime side.
     pkgs.strace
-    # Required by ``eval_worker.run_eval_task`` (Phase 0 distributed-eval).
+    # Required by ``eval_worker.run_eval_task`` (matrix_eval phase).
     # The eval worker calls ``nix-eval-jobs`` to enumerate derivation
-    # paths for each (binary, arch) shard. Without this the phase0_eval
+    # paths for each (binary, arch) shard. Without this the matrix_eval
     # task crashes immediately with FileNotFoundError.
     pkgs.nix-eval-jobs
   ];

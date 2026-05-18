@@ -16,9 +16,9 @@ import tempfile
 import pytest
 
 from compiler_suit_runner.manifest_gen import (
-    make_common_dep_header,
-    make_toolchain_header,
-    make_variant_header,
+    make_build_common_dep_header,
+    make_build_compilers_header,
+    make_build_variant_header,
     write_manifest,
 )
 from compiler_suit_runner.partition import VariantSpec
@@ -87,8 +87,6 @@ def _make_config(tmp_path: pathlib.Path) -> SuitTaskConfig:
         sys_name="x86_64-linux",
         shared_fs=tmp_path,
         manifest_dir=tmp_path / "manifests",
-        raw_partition_dir=tmp_path / "partition" / "raw",
-        partition_dir=tmp_path / "partition",
         dataset_dir=tmp_path / "dataset",
         peers_dir=tmp_path / "peers",
         run_id="r1",
@@ -133,22 +131,24 @@ def test_discover_items_classifies_each_manifest(tmp_path: pathlib.Path) -> None
     config = _make_config(tmp_path)
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
 
-    # Legacy phase1a_partition / phase1b_merge manifests were emitted
-    # by the partition/merge workers (now deleted); writing them here
-    # would just be skipped with a "unknown item_class" warning. The
-    # toolchain / common_dep / variant headers cover the live
-    # classification paths exercised by discover_items today.
+    # build_compilers + build_common_dep + build_variant headers
+    # cover the build-phase classification paths exercised by
+    # discover_items today; matrix_eval headers land in their own
+    # phase and would clutter the per-phase assertions below.
     write_manifest(
         config.manifest_dir,
-        make_toolchain_header("x86_64-linux", "x86_64", "gcc15"),
+        make_build_compilers_header("x86_64-linux", "x86_64", "gcc15"),
     )
     write_manifest(
         config.manifest_dir,
-        make_common_dep_header("/nix/store/glibc.drv", "glibc"),
+        make_build_common_dep_header("/nix/store/glibc.drv", "glibc"),
     )
     write_manifest(
         config.manifest_dir,
-        make_variant_header(_variant("hello", "x86_64"), "x86_64-linux"),
+        make_build_variant_header(
+            _variant("hello", "x86_64"), "x86_64-linux",
+            toolchain_task_id="build_compilers__x86_64-linux__x86_64__gcc15",
+        ),
     )
 
     task = SuitTask(config)
@@ -157,26 +157,27 @@ def test_discover_items_classifies_each_manifest(tmp_path: pathlib.Path) -> None
     for item in items:
         by_phase.setdefault(item.phase_id, []).append(item)
 
-    assert set(by_phase.keys()) == {"phase_build"}
+    assert set(by_phase.keys()) == {"build_compilers", "build"}
 
-    build_types = {item.type_id for item in by_phase["phase_build"]}
-    assert build_types == {"toolchain", "common_dep", "variant"}
-    toolchain = next(
-        item for item in by_phase["phase_build"] if item.type_id == "toolchain"
+    build_types = {item.type_id for item in by_phase["build"]}
+    assert build_types == {"common_dep", "variant"}
+    build_compilers = next(
+        item for item in by_phase["build_compilers"]
+        if item.type_id == "build_compilers"
     )
-    assert toolchain.affinity_id == "gcc15-x86_64"
+    assert build_compilers.affinity_id == "gcc15-x86_64"
     common_dep = next(
-        item for item in by_phase["phase_build"] if item.type_id == "common_dep"
+        item for item in by_phase["build"] if item.type_id == "common_dep"
     )
     assert common_dep.affinity_id is None
 
     variant = next(
-        item for item in by_phase["phase_build"] if item.type_id == "variant"
+        item for item in by_phase["build"] if item.type_id == "variant"
     )
     assert variant.affinity_id == "gcc15-x86_64"
     # TaskInfo.payload now carries the full ManifestHeader dict so
     # workers can read it directly off the comm fd via FR-3.
-    assert variant.payload["item_class"] == "phase3_variant"
+    assert variant.payload["item_class"] == "build_variant"
     assert variant.payload["payload"]["pkg"] == "hello"
 
 
@@ -185,7 +186,7 @@ def test_discover_items_yields_size_from_manifest(tmp_path: pathlib.Path) -> Non
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
     write_manifest(
         config.manifest_dir,
-        make_common_dep_header("/nix/store/glibc.drv", "glibc"),
+        make_build_common_dep_header("/nix/store/glibc.drv", "glibc"),
     )
     task = SuitTask(config)
     items = list(task.discover_items())
@@ -203,7 +204,7 @@ def test_discover_items_skips_unreadable_manifests(
     # One good manifest...
     write_manifest(
         config.manifest_dir,
-        make_common_dep_header("/nix/store/glibc.drv", "glibc"),
+        make_build_common_dep_header("/nix/store/glibc.drv", "glibc"),
     )
     # ...and one corrupt one (junk text in a .json file).
     bad = config.manifest_dir / "bad.json"
@@ -231,7 +232,7 @@ def test_discover_items_skips_dotfiles_and_underscored(
     config.manifest_dir.mkdir(parents=True, exist_ok=True)
     write_manifest(
         config.manifest_dir,
-        make_common_dep_header("/nix/store/glibc.drv", "glibc"),
+        make_build_common_dep_header("/nix/store/glibc.drv", "glibc"),
     )
     (config.manifest_dir / ".hidden.json").write_text("{}")
     (config.manifest_dir / "_meta.json").write_text("{}")
@@ -257,11 +258,14 @@ def test_discover_items_strips_task_depends_on_when_disabled(
 
     write_manifest(
         config.manifest_dir,
-        make_toolchain_header("x86_64-linux", "x86_64", "gcc15"),
+        make_build_compilers_header("x86_64-linux", "x86_64", "gcc15"),
     )
     write_manifest(
         config.manifest_dir,
-        make_variant_header(_variant("hello", "x86_64"), "x86_64-linux"),
+        make_build_variant_header(
+            _variant("hello", "x86_64"), "x86_64-linux",
+            toolchain_task_id="build_compilers__x86_64-linux__x86_64__gcc15",
+        ),
     )
 
     items = list(SuitTask(config).discover_items())

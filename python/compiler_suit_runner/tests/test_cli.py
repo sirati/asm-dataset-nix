@@ -92,30 +92,111 @@ def test_build_parser_clear_cache_accepts_hash():
     assert args.hash == "abc"
 
 
-def test_build_parser_submit_allow_toolchain_build_defaults_false(
+def test_build_parser_submit_build_compilers_defaults_false(
     tmp_path: pathlib.Path,
 ):
-    """The new ``--allow-toolchain-build`` flag must default to False —
-    that's the whole point of the no-build-on-secondaries refactor.
-    Anyone flipping the default trips this test."""
+    """The ``--build-compilers`` flag (post-rename successor to
+    ``--allow-toolchain-build``) must default to False — that's the
+    whole point of the no-build-on-secondaries default. Anyone flipping
+    the default trips this test."""
     parser = build_parser()
     args = parser.parse_args(
         ["submit", "--shared-fs", str(tmp_path),
          "--multi-computer", "single-process"],
     )
-    assert getattr(args, "allow_toolchain_build", None) is False
+    assert getattr(args, "build_compilers", None) is False
 
 
-def test_build_parser_submit_allow_toolchain_build_can_be_set(
+def test_build_parser_submit_build_compilers_can_be_set(
     tmp_path: pathlib.Path,
 ):
     parser = build_parser()
     args = parser.parse_args(
         ["submit", "--shared-fs", str(tmp_path),
          "--multi-computer", "single-process",
-         "--allow-toolchain-build"],
+         "--build-compilers"],
     )
-    assert args.allow_toolchain_build is True
+    assert args.build_compilers is True
+
+
+def test_build_parser_submit_build_compiler_workers_defaults_to_one(
+    tmp_path: pathlib.Path,
+):
+    """``--build-compiler-workers`` defaults to 1 — single in-flight
+    toolchain build per secondary."""
+    parser = build_parser()
+    args = parser.parse_args(
+        ["submit", "--shared-fs", str(tmp_path),
+         "--multi-computer", "single-process"],
+    )
+    assert args.build_compiler_workers == 1
+
+
+def test_build_parser_submit_build_compiler_workers_parses_int(
+    tmp_path: pathlib.Path,
+):
+    parser = build_parser()
+    args = parser.parse_args(
+        ["submit", "--shared-fs", str(tmp_path),
+         "--multi-computer", "single-process",
+         "--build-compiler-workers", "4"],
+    )
+    assert args.build_compiler_workers == 4
+
+
+def test_build_parser_submit_debug_testbuild_defaults_none(
+    tmp_path: pathlib.Path,
+):
+    """``--debug-testbuild`` defaults to None — no phase-1.5
+    toolchain_validate emitted."""
+    parser = build_parser()
+    args = parser.parse_args(
+        ["submit", "--shared-fs", str(tmp_path),
+         "--multi-computer", "single-process"],
+    )
+    assert args.debug_testbuild is None
+
+
+def test_build_parser_submit_debug_testbuild_accepts_binary(
+    tmp_path: pathlib.Path,
+):
+    parser = build_parser()
+    args = parser.parse_args(
+        ["submit", "--shared-fs", str(tmp_path),
+         "--multi-computer", "single-process",
+         "--debug-testbuild", "hello"],
+    )
+    assert args.debug_testbuild == "hello"
+
+
+def test_build_parser_submit_distributed_eval_flag_removed(
+    tmp_path: pathlib.Path,
+):
+    """``--distributed-eval`` was hard-deleted (distributed eval is the
+    only mode now). Argparse must reject any leftover invocation rather
+    than silently accept it as a no-op."""
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["submit", "--shared-fs", str(tmp_path),
+             "--multi-computer", "single-process",
+             "--distributed-eval"],
+        )
+
+
+def test_build_parser_submit_allow_toolchain_build_flag_removed(
+    tmp_path: pathlib.Path,
+):
+    """``--allow-toolchain-build`` was hard-cut over to
+    ``--build-compilers``; argparse must reject the old name so stale
+    operator scripts surface the breakage loudly."""
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["submit", "--shared-fs", str(tmp_path),
+             "--multi-computer", "single-process",
+             "--allow-toolchain-build"],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -278,12 +359,12 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
     """Wire up stubs so cmd_submit can run without real nix or the
     SuitTask side-effects.
 
-    cmd_submit now drives the distributed-eval flow:
+    cmd_submit drives the submit-time pre-flight:
     ``enumerate_toolchains_only`` + ``enumerate_variants`` (per-binary
-    metadata) + ``emit_all_manifests``. The legacy preflight composite
+    metadata) + ``emit_all_manifests``. The legacy composite preflight
     is no longer wired into cmd_submit; ``preflight_calls`` here counts
-    the distributed-path toolchain enumeration as a proxy for "pre-flight
-    ran" so the existing test contracts remain meaningful.
+    the toolchain enumeration as a proxy for "pre-flight ran" so the
+    existing test contracts remain meaningful.
     """
 
     state: dict[str, list] = {
@@ -582,11 +663,12 @@ def test_serialize_then_restore_preflight_roundtrip(tmp_path: pathlib.Path):
 
     # The toolchain manifest must carry the realised drv path so the
     # SLURM-side build worker doesn't fall back to flake-attr lookup
-    # (which fails — secondaries have no flake.nix in /app). The default
-    # (--allow-toolchain-build off) emits ``toolchain_validate__*.json``;
-    # opting in to local builds emits ``toolchain__*.json``. Both carry
-    # the drv path, which is what this regression test guards.
-    tc_files = list(target_dir.glob("toolchain__*.json")) + list(
+    # (which fails — secondaries have no flake.nix in /app). The
+    # default (--build-compilers off) emits
+    # ``toolchain_validate__*.json``; opting in to in-cluster builds
+    # emits ``build_compilers__*.json``. Both carry the drv path,
+    # which is what this regression test guards.
+    tc_files = list(target_dir.glob("build_compilers__*.json")) + list(
         target_dir.glob("toolchain_validate__*.json")
     )
     assert len(tc_files) == 1
@@ -710,9 +792,6 @@ def test_unfulfillable_reinject_plumbs_into_suit_task_config(
         args,
         run_id="r1",
         secondary_id="primary",
-        input_hash="h",
-        toolchain_drvs=frozenset(),
-        variants=(),
     )
     assert config.unfulfillable_reinject_max_per_task == 7
 
@@ -734,9 +813,6 @@ def test_unfulfillable_reinject_default_plumbs_none_into_config(
         args,
         run_id="r1",
         secondary_id="primary",
-        input_hash="h",
-        toolchain_drvs=frozenset(),
-        variants=(),
     )
     assert config.unfulfillable_reinject_max_per_task is None
 
@@ -778,8 +854,6 @@ def test_apply_unfulfillable_reinject_cap_calls_setter_when_set(
         sys_name="x86_64-linux",
         shared_fs=tmp_path,
         manifest_dir=tmp_path / "m",
-        raw_partition_dir=tmp_path / "p" / "raw",
-        partition_dir=tmp_path / "p",
         dataset_dir=tmp_path / "d",
         peers_dir=tmp_path / "peers",
         run_id="r1",
@@ -807,8 +881,6 @@ def test_apply_unfulfillable_reinject_cap_skips_when_none(
         sys_name="x86_64-linux",
         shared_fs=tmp_path,
         manifest_dir=tmp_path / "m",
-        raw_partition_dir=tmp_path / "p" / "raw",
-        partition_dir=tmp_path / "p",
         dataset_dir=tmp_path / "d",
         peers_dir=tmp_path / "peers",
         run_id="r1",
@@ -836,8 +908,6 @@ def test_apply_unfulfillable_reinject_cap_accepts_zero(
         sys_name="x86_64-linux",
         shared_fs=tmp_path,
         manifest_dir=tmp_path / "m",
-        raw_partition_dir=tmp_path / "p" / "raw",
-        partition_dir=tmp_path / "p",
         dataset_dir=tmp_path / "d",
         peers_dir=tmp_path / "peers",
         run_id="r1",
@@ -865,8 +935,6 @@ def test_apply_unfulfillable_reinject_cap_handles_missing_setter(
         sys_name="x86_64-linux",
         shared_fs=tmp_path,
         manifest_dir=tmp_path / "m",
-        raw_partition_dir=tmp_path / "p" / "raw",
-        partition_dir=tmp_path / "p",
         dataset_dir=tmp_path / "d",
         peers_dir=tmp_path / "peers",
         run_id="r1",

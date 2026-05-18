@@ -388,7 +388,7 @@ def test_enumerate_toolchains_unknown_arch_returns_empty():
 
 def test_preflight_returns_toolchains_only():
     """Composite now returns toolchains-only: variants and toolchain_drvs
-    are populated by Phase 0 eval-workers on secondaries, not by the
+    are populated by matrix_eval workers on secondaries, not by the
     submitter."""
     runner, calls = _make_run_subprocess(_all_responses())
     result = preflight(
