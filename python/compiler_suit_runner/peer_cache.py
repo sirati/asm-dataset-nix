@@ -1532,9 +1532,9 @@ class SubmitterPeer:
     def set_pending_toolchain_seed_drvs(
         self, drv_set: Iterable[str],
     ) -> None:
-        """Buffer the Phase -1 toolchain drv set for deferred seeding.
+        """Buffer the toolchain drv set for deferred seeding.
 
-        Called by the cli's ``--distributed-eval`` submit path before
+        Called by the cli's submit path before
         (or after) :meth:`start`. The :meth:`_poll_loop` calls
         :meth:`seed_toolchain_drvs` exactly once after both the
         submitter peer file is published AND a non-submitter peer
