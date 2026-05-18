@@ -27,7 +27,7 @@ from compiler_suit_runner.dependency_graph_planner import (
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
     matrix_eval_task_id,
-    toolchain_task_id,
+    build_compilers_task_id,
     write_manifest,
 )
 from compiler_suit_runner.suit_task import (
@@ -93,7 +93,7 @@ def _toolchain_header(
             "drv": drv,
             "validate_only": True,
         },
-        task_id=toolchain_task_id(_SYS, arch, compiler_label),
+        task_id=build_compilers_task_id(_SYS, arch, compiler_label),
     )
 
 
@@ -129,7 +129,7 @@ def _variant_header(binary: str, label: str, compiler_id: str = "gcc15"):
             "attr": f"dataset.{_SYS}.{binary}.x86_64.{label}",
         },
         task_id=f"build_variant__{_SYS}__{binary}__{label}",
-        task_depends_on=(toolchain_task_id(_SYS, "x86_64", compiler_id),),
+        task_depends_on=(build_compilers_task_id(_SYS, "x86_64", compiler_id),),
     )
 
 
@@ -207,7 +207,7 @@ def test_watcher_fires_when_complete(
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     toolchain_drv = "/nix/store/c-gcc15.drv"
-    toolchain_id = toolchain_task_id(_SYS, "x86_64", "gcc15")
+    toolchain_id = build_compilers_task_id(_SYS, "x86_64", "gcc15")
 
     # Pre-seed an empty dependency_graph.json so the read step is a no-op.
     (out_dir / "_dependency_graph.json").write_text(
@@ -719,8 +719,8 @@ def test_build_matrix_eval_watcher_collects_expected_and_toolchains(
         matrix_eval_task_id("busybox"),
     })
     assert w._toolchain_task_ids == {
-        gcc_drv: toolchain_task_id(_SYS, "x86_64", "gcc15"),
-        clang_drv: toolchain_task_id(_SYS, "x86_64", "clang20"),
+        gcc_drv: build_compilers_task_id(_SYS, "x86_64", "gcc15"),
+        clang_drv: build_compilers_task_id(_SYS, "x86_64", "clang20"),
     }
     # out_dir falls through directly from the caller.
     assert w._out_dir == tmp_path / "out"
@@ -1262,7 +1262,7 @@ def test_on_run_start_builds_outpath_to_task_hash_lookup(
             "outpath": "/nix/store/bb-gcc15-out",
             "validate_only": True,
         },
-        task_id=toolchain_task_id(_SYS, "x86_64", "gcc15"),
+        task_id=build_compilers_task_id(_SYS, "x86_64", "gcc15"),
     ))
 
     task = SuitTask(config)

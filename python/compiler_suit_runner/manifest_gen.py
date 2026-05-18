@@ -147,9 +147,19 @@ class ManifestHeader:
 # operators recognise. Charset is double-underscore-separated ASCII.
 
 
-def toolchain_task_id(sys_name: str, arch: str, compiler_label: str) -> str:
-    """Stable id for a build_compilers / toolchain_validate task."""
-    return f"toolchain__{sys_name}__{arch}__{compiler_label}"
+def build_compilers_task_id(sys_name: str, arch: str, compiler_label: str) -> str:
+    """Stable id for a build_compilers task."""
+    return f"build_compilers__{sys_name}__{arch}__{compiler_label}"
+
+
+def toolchain_validate_task_id(sys_name: str, arch: str, compiler_label: str) -> str:
+    """Stable id for a toolchain_validate task. Distinct from
+    :func:`build_compilers_task_id` because both classes can fire on
+    the same ``(arch, compiler_label)`` when the operator passes
+    ``--build-compilers --debug-testbuild &lt;binary&gt;``; the framework
+    rejects duplicate task ids.
+    """
+    return f"toolchain_validate__{sys_name}__{arch}__{compiler_label}"
 
 
 def common_dep_task_id(drv: str) -> str:
@@ -263,7 +273,7 @@ def make_build_compilers_header(
         name=f"build_compilers__{arch}__{compiler_label}",
         size=0,
         payload=payload,
-        task_id=toolchain_task_id(sys_name, arch, compiler_label),
+        task_id=build_compilers_task_id(sys_name, arch, compiler_label),
     )
 
 
@@ -308,7 +318,7 @@ def make_toolchain_validate_header(
         name=f"toolchain_validate__{arch}__{compiler_label}",
         size=0,
         payload=payload,
-        task_id=toolchain_task_id(sys_name, arch, compiler_label),
+        task_id=toolchain_validate_task_id(sys_name, arch, compiler_label),
     )
 
 
@@ -350,6 +360,7 @@ def make_build_variant_header(
     input_drvs: Optional[frozenset[str]] = None,
     drv_outpaths: Optional[dict[str, str]] = None,
     preferred_secondaries: Optional[list[str]] = None,
+    toolchain_task_id: Optional[str] = None,
 ) -> ManifestHeader:
     """Build a build_variant manifest.
 
@@ -422,7 +433,7 @@ def make_build_variant_header(
         size=0,
         payload=payload,
         task_id=variant_task_id(variant, sys_name),
-        task_depends_on=(toolchain_task_id(sys_name, arch, compiler_id),),
+        task_depends_on=(toolchain_task_id,) if toolchain_task_id else (),
     )
 
 
@@ -763,12 +774,27 @@ def emit_all_manifests(
                 tc_outpath = outpaths_map.get(tc_drv)
                 if tc_outpath:
                     preferred = placements_by_outpath.get(tc_outpath) or None
+            # Depend on whichever toolchain class was emitted for the
+            # same (arch, compiler). Prefer build_compilers (the
+            # realising task) over toolchain_validate (sanity probe);
+            # when neither stage is active the operator pre-staged the
+            # toolchain and the variant has no submit-time dep to wait on.
+            tc_task_id: Optional[str] = None
+            if "build_compilers" in active_classes:
+                tc_task_id = build_compilers_task_id(
+                    sys_name, variant["arch"], variant["compiler_id"],
+                )
+            elif "toolchain_validate" in active_classes:
+                tc_task_id = toolchain_validate_task_id(
+                    sys_name, variant["arch"], variant["compiler_id"],
+                )
             headers.append(
                 make_build_variant_header(
                     variant, sys_name,
                     input_drvs=inputs_by_label.get(variant["label"]),
                     drv_outpaths=outpaths_map if outpaths_map else None,
                     preferred_secondaries=preferred,
+                    toolchain_task_id=tc_task_id,
                 )
             )
 

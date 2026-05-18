@@ -147,6 +147,7 @@ def test_discover_items_classifies_each_manifest(tmp_path: pathlib.Path) -> None
         config.manifest_dir,
         make_build_variant_header(
             _variant("hello", "x86_64"), "x86_64-linux",
+            toolchain_task_id="build_compilers__x86_64-linux__x86_64__gcc15",
         ),
     )
 
@@ -263,6 +264,7 @@ def test_discover_items_strips_task_depends_on_when_disabled(
         config.manifest_dir,
         make_build_variant_header(
             _variant("hello", "x86_64"), "x86_64-linux",
+            toolchain_task_id="build_compilers__x86_64-linux__x86_64__gcc15",
         ),
     )
 

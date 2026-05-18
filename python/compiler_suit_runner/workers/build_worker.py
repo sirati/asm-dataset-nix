@@ -1220,6 +1220,7 @@ def main() -> int:
         peer_replication as _peer_replication,
     )
     from compiler_suit_runner.workers import (  # noqa: PLC0415
+        build_compilers_worker as _build_compilers_worker,
         eval_worker as _eval_worker,
     )
 
@@ -1269,8 +1270,57 @@ def main() -> int:
             return None
         return inner
 
+    def _extract_class_payload(
+        payload: object, item_class: str
+    ) -> Optional[dict]:
+        """Return the inner payload dict if the wrapper ``item_class``
+        matches; otherwise None. Used by the build_compilers branch
+        below."""
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("item_class") != item_class:
+            return None
+        inner = payload.get("payload")
+        return inner if isinstance(inner, dict) else None
+
     def handle(task: Task) -> Optional[WorkerOutput]:
         payload = task.payload if isinstance(task.payload, dict) else None
+        # build_compilers branch — phase1 toolchain build. Owned by
+        # build_compilers_worker; we delegate so the framework's single
+        # ``worker_module`` per PhaseSpec stays satisfied.
+        bc_payload = _extract_class_payload(payload, "build_compilers")
+        if bc_payload is not None:
+            bc_env = _build_compilers_worker.BuildCompilersEnv(
+                flake_ref=args.flake_ref,
+                out_network=(
+                    pathlib.Path(args.shared_fs) / "out"
+                    if args.shared_fs
+                    else pathlib.Path("/app/out-network")
+                ),
+                substituters_file=(
+                    pathlib.Path(args.substituters_file)
+                    if args.substituters_file
+                    else None
+                ),
+                shared_fs=(
+                    pathlib.Path(args.shared_fs)
+                    if args.shared_fs
+                    else None
+                ),
+                secondary_id=args.secondary_id or "",
+            )
+            bc_name = (
+                payload.get("name") if isinstance(payload, dict) else None
+            ) or "<unknown>"
+            result = _build_compilers_worker.run_build_compilers_task(
+                bc_payload, bc_env, name=bc_name,
+            )
+            if not result.success:
+                raise NonRecoverableError(
+                    f"build_compilers failed: {result.error or 'unknown'}"
+                )
+            return WorkerOutput()
+
         # Phase 0 eval branch — sniff the wrapper header; if its
         # ``item_class`` matches ``matrix_eval`` the inner payload is
         # dispatched to :func:`eval_worker.run_eval_task` instead of
