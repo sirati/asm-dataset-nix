@@ -14,7 +14,7 @@ from pathlib import Path
 from .tree_walker import (
     parse_variant_path,
     TreeWalkError,
-    _VARIANT_SUFFIX,
+    VARIANT_SUFFIX,
 )
 
 
@@ -72,7 +72,7 @@ def _derive_streaming_label(drv_path: str) -> str:
     """Reproduce the streaming planner's ``f"{comp}-{opt}"`` label."""
     base = drv_path.rsplit("/", 1)[-1]
     body = base.split("-", 1)[-1]
-    if not body.endswith(_VARIANT_SUFFIX):
+    if not body.endswith(VARIANT_SUFFIX):
         raise SystemExit(
             f"drv {drv_path!r} doesn't look like a variant entry-point"
         )

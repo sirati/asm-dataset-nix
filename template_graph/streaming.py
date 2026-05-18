@@ -43,7 +43,7 @@ from template_graph.tree_walker import (
     TreeWalkError,
     _MATRIX_RE,
     _TOOLCHAINS_RE,
-    _VARIANT_SUFFIX,
+    VARIANT_SUFFIX,
     parse_variant_path,
     _parse_line,
 )
@@ -461,7 +461,7 @@ class StreamPlanner:
     ) -> None:
         ident = (drv_hash, drv_name)
         if depth == 2:
-            if drv_name.endswith(_VARIANT_SUFFIX):
+            if drv_name.endswith(VARIANT_SUFFIX):
                 if is_backref:
                     raise TreeWalkError(
                         f"variant entry-point {drv_name} at matrix depth 2 "

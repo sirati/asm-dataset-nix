@@ -5,7 +5,7 @@ output line-by-line; this module supplies the per-line decoder
 (``_parse_line``), the variant-filename parser
 (``parse_variant_path``), the shared regexes / constants for the
 sum-tree shape (``_MATRIX_RE``, ``_TOOLCHAINS_RE``,
-``_VARIANT_SUFFIX``), and the error type (``TreeWalkError``).
+``VARIANT_SUFFIX``), and the error type (``TreeWalkError``).
 
 The two-phase walker (``walk`` + ``plan_from_tree`` +
 ``bucket_variants``) has been retired in favour of the single-pass
@@ -27,7 +27,7 @@ _CONNECTOR_SEGS = ("├───", "└───")
 
 # Variant filename suffix from `lib/mkVariant.nix`. Stable enough to be
 # the matrix-level entry-point marker.
-_VARIANT_SUFFIX = "-elf-folder.drv"
+VARIANT_SUFFIX = "-elf-folder.drv"
 # Regexes match the post-hash drv_name (no hash prefix anymore).
 _MATRIX_RE = re.compile(r"^matrix-(?P<binary>[a-zA-Z0-9_+\-.]+)\.drv$")
 _TOOLCHAINS_RE = re.compile(r"^toolchains\.drv$")
