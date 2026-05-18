@@ -492,7 +492,10 @@ def test_emit_all_manifests_opt_in_emits_build_class(
     """With ``allow_toolchain_build=True`` the operator has explicitly
     opted into secondaries building toolchains locally — emit the
     ``build_compilers`` class so the build worker dispatches the
-    nix-build path."""
+    nix-build path. When the legacy ``stages=None`` default is used
+    the ``toolchain_validate`` stage is also active, so a drv-resolved
+    spec also emits a validate header alongside (see
+    `--build-compilers --debug-testbuild` operator flow)."""
     result = emit_all_manifests(
         target_dir=tmp_path,
         sys_name="x86_64-linux",
@@ -504,7 +507,7 @@ def test_emit_all_manifests_opt_in_emits_build_class(
     )
     grouped = result.by_class
     assert len(grouped["build_compilers"]) == 1
-    assert len(grouped["toolchain_validate"]) == 0
+    assert len(grouped["toolchain_validate"]) == 1
 
 
 def test_emit_all_manifests_falls_back_to_build_when_drv_missing(

@@ -722,31 +722,29 @@ def emit_all_manifests(
     outpaths_map = drv_outpaths or {}
     for arch, compiler_label in toolchain_specs:
         drv = tc_drvs.get((arch, compiler_label))
-        if allow_toolchain_build or not drv:
-            # Fall back to the build header when either:
-            #  - the operator opted in via --build-compilers, or
-            #  - we don't have a resolved drv path (validate-only
-            #    can't fetch by-outpath without the drv → outpath
-            #    mapping). The latter typically means
-            #    eval_toolchain_drvs failed on the primary; logging
-            #    here would be noisy because emit_all_manifests is
-            #    also called from cached-preflight restoration. The
-            #    CLI's primary-side toolchain check is the loud
-            #    "no drv resolved" signal.
-            if "build_compilers" in active_classes:
-                headers.append(
-                    make_build_compilers_header(
-                        sys_name, arch, compiler_label, drv=drv,
-                    )
+        # build_compilers and toolchain_validate are independent
+        # classes. Both can fire on the same (arch, compiler) when
+        # both stages are active (e.g. --build-compilers
+        # --debug-testbuild hello: build the toolchain fresh AND
+        # validate it). Emit build_compilers when (a) the operator
+        # opted in or (b) no drv was resolved (validate needs the
+        # drv→outpath mapping). Emit toolchain_validate whenever a
+        # drv is available.
+        if "build_compilers" in active_classes and (
+            allow_toolchain_build or not drv
+        ):
+            headers.append(
+                make_build_compilers_header(
+                    sys_name, arch, compiler_label, drv=drv,
                 )
-        else:
-            if "toolchain_validate" in active_classes:
-                headers.append(
-                    make_toolchain_validate_header(
-                        sys_name, arch, compiler_label, drv,
-                        outpath=outpaths_map.get(drv),
-                    )
+            )
+        if "toolchain_validate" in active_classes and drv:
+            headers.append(
+                make_toolchain_validate_header(
+                    sys_name, arch, compiler_label, drv,
+                    outpath=outpaths_map.get(drv),
                 )
+            )
     if "build_common_dep" in active_classes:
         for drv, label in common_deps:
             headers.append(make_build_common_dep_header(drv, label))
