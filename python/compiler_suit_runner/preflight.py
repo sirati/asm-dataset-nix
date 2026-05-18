@@ -730,14 +730,14 @@ def enumerate_variants(
     run_subprocess: Optional[RunSubprocess] = None,
 ) -> dict[str, dict]:
     """Enumerate every ``(pkg, arch, suffix)`` variant the matrix exposes,
-    returning per-binary metadata that the Phase 0 eval-worker uses to
+    returning per-binary metadata that the matrix_eval worker uses to
     drive its own ``nix-eval-jobs`` invocation.
 
     Filters by ``packages`` and ``archs`` if provided (each is an inclusion
     list — None means "all").
 
     ``sample_size`` / ``sample_seed`` are echoed back in the per-binary
-    metadata so the Phase 0 eval-worker on a secondary re-applies the
+    metadata so the matrix_eval worker on a secondary re-applies the
     deterministic sample with the same seed — the submitter never needs
     to know the sampled subset and the slow drv-instantiation never runs
     on the submit host. Suffixes are filtered against the support table
@@ -1066,7 +1066,7 @@ def enumerate_toolchains_only(
     Resolves the (arch, compiler) toolchain set and their drv paths
     without touching any variant matrix data. This is the fast surface
     Phase -1 bootstrap uses to seed the cluster with toolchain drvs
-    before Phase 0 eval-tasks fire on secondaries.
+    before matrix_eval tasks fire on secondaries.
 
     Returns ``(pairs, drv_paths)`` where ``pairs`` is the sorted
     ``(arch, compiler)`` tuple list and ``drv_paths`` maps each pair to
@@ -1192,7 +1192,7 @@ def preflight(
     """Composite call: toolchain enumeration only.
 
     Since distributed-eval is the only supported mode, the submitter
-    no longer instantiates variant drvs locally — Phase 0 eval-workers
+    no longer instantiates variant drvs locally — matrix_eval workers
     on secondaries do that work. The returned :class:`PreflightResult`
     therefore carries an empty ``variants`` tuple and an empty
     ``toolchain_drvs`` set; only ``toolchain_specs`` (the
@@ -1203,7 +1203,7 @@ def preflight(
     ``sample_size`` / ``sample_seed`` / ``packages`` / ``archs`` are
     accepted for API compatibility (cli's ``preflight`` debug subcommand
     forwards them) but are not consulted by this composite — they apply
-    only to per-binary metadata that the Phase 0 eval-worker generates.
+    only to per-binary metadata that the matrix_eval worker generates.
     Use :func:`enumerate_variants` directly to inspect the per-binary
     metadata shape on the submitter.
     """
