@@ -61,10 +61,6 @@ def _stderr_logger(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def _noop_logger(_msg: str) -> None:
-    return None
-
-
 def _print_run_summary(result: dict) -> None:
     print(f"templates: {len(result['templates'])}")
     for key, arr in result["variant_arrays"].items():
