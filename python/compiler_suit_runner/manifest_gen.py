@@ -156,18 +156,24 @@ def common_dep_task_id(drv: str) -> str:
     """Stable id for a build_common_dep task. Uses the drv's
     short hash (the ``hash-name`` segment of the store path) so two
     common deps with the same human-readable label but different
-    derivations don't collide.
+    derivations don't collide. The ``build_common_dep__`` prefix
+    matches the post-rename phase4 task taxonomy (see
+    :mod:`dependency_graph_planner` for the binary/arch-scoped variant
+    used by the primary-side spawn path).
     """
     base = pathlib.Path(drv).name
-    return f"common_dep__{base}"
+    return f"build_common_dep__{base}"
 
 
 def variant_task_id(variant: VariantSpec, sys_name: str) -> str:
-    """Stable id for a build_variant task. Uses the full variant
-    label (already unique per dispatch — encodes pkg, arch, compiler,
-    every flag axis) so it round-trips identifiably in logs.
+    """Stable id for a build_variant task. Embeds the binary (``pkg``)
+    in the id alongside ``sys_name`` and the full variant label so the
+    namespacing matches the dependency_graph_planner's
+    ``build_variant__<sys>__<binary>__<label>`` shape one-to-one. The
+    label already encodes arch + compiler + every flag axis so the
+    overall id is unique per dispatch.
     """
-    return f"variant__{sys_name}__{variant['label']}"
+    return f"build_variant__{sys_name}__{variant['pkg']}__{variant['label']}"
 
 
 def matrix_eval_task_id(binary: str) -> str:

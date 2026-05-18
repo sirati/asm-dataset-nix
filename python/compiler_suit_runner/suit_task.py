@@ -1,22 +1,45 @@
 """The single ``TaskDefinition`` that orchestrates the compiler-suit run.
 
-The dynamic_runner framework now exposes phases as first-class
+The dynamic_runner framework exposes phases as first-class
 :class:`PhaseSpec` (with declared dependencies) and per-phase task
 types as :class:`TaskTypeSpec`. :class:`SuitTask` implements that
-Protocol:
+Protocol under the new phase taxonomy:
 
-1. **Topology** (:meth:`get_phases`) declares the four phases
-   ``phase1a → phase1b → phase2 → phase3`` and their per-phase
-   :class:`TaskTypeSpec`\\ s; each type binds a worker module and a
-   per-type memory estimator.
+* ``matrix_eval`` (phase 2 in the plan) — distributed eval workers, one
+  task per binary; produces ``<binary>.nix-archive`` per-binary
+  closures plus the kept-drv set the dependency_graph worker walks.
+* ``build_compilers`` (phase 1, optional) — distributed cross-toolchain
+  build workers; one task per (arch, compiler). PhaseSpec is always
+  registered so the framework's dispatch surface is uniform; the CLI
+  gate (``--build-compilers``) decides whether any manifests are
+  actually emitted.
+* ``dependency_graph`` (phase 3) — primary-only worker invoked by
+  :class:`_MatrixEvalQuiesceWatcher` as a subprocess once every
+  ``matrix_eval`` task has quiesced. No framework PhaseSpec — the
+  watcher runs the subprocess inline and the descriptors it produces
+  are spawned as phase-4 work via ``primary_handle.spawn_tasks``. See
+  ``_MatrixEvalQuiesceWatcher._fire`` for the full hand-off.
+* ``build`` (phase 4) — distributed ``build_common_dep`` +
+  ``build_variant`` workers; ``toolchain_validate`` shares the same
+  dispatch (rarely emitted, gated by ``--debug-testbuild``).
+
+Responsibilities:
+
+1. **Topology** (:meth:`get_phases`) declares the ``matrix_eval``,
+   ``build_compilers`` and ``build`` framework phases. The
+   ``dependency_graph`` step is primary-only; it runs from the
+   :class:`_MatrixEvalQuiesceWatcher` (which lives on the primary's
+   completion-event thread) so we keep it out of the framework
+   PhaseSpec graph entirely — primary-affined PhaseSpec support is
+   not part of the dynamic-runner contract today.
 2. **Item discovery** (:meth:`discover_items`) scans the manifest
    directory written by :mod:`compiler_suit_runner.manifest_gen` and
    yields one :class:`TaskInfo` per manifest, classifying each by
    ``item_class`` to ``(phase_id, type_id, affinity_id)``.
-3. **Per-type plumbing** (:meth:`estimate_memory` plus per-type
-   estimators, :meth:`build_worker_command_args`,
+3. **Per-type plumbing** (:meth:`estimate_memory`,
+   :meth:`build_worker_command_args`,
    :meth:`get_output_filename_pattern`) wires manifests onto the
-   subprocess workers added in 8.4.
+   subprocess workers.
 4. **Lifecycle hooks** (:meth:`on_run_start`, :meth:`on_run_end`,
    :meth:`on_phase_start`, :meth:`on_phase_end`) own setup / teardown
    of the peer-cache machinery (signing key, peer announcement,
@@ -32,9 +55,13 @@ deployments go through the framework's worker protocol.
 from __future__ import annotations
 
 import dataclasses
+import functools
+import json
 import logging
 import os
 import pathlib
+import subprocess
+import sys
 import threading
 from argparse import ArgumentParser, Namespace
 from collections.abc import Callable, Iterable
@@ -51,8 +78,12 @@ from compiler_suit_runner.holding_matcher import (
 )
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
-    phase0_eval_task_id,
+    matrix_eval_task_id,
     read_manifest,
+)
+from compiler_suit_runner.dependency_graph_planner import (
+    headers_from_descriptors,
+    load_descriptors_from_json,
 )
 from compiler_suit_runner.peer_cache import (
     SUBSTITUTERS_FILENAME,
@@ -135,9 +166,9 @@ def _push_url_to_substituter_url(push_url: str) -> Optional[str]:
     return f"{scheme}://{host}:{harmonia_port}"
 
 
-# Item classes that route through the build worker.
-_PHASE2_BUILD_CLASSES: frozenset[str] = frozenset(
-    {"phase2_toolchain", "phase2_toolchain_validate", "phase2_common_dep"}
+# Item classes that route through the build worker (post-rename).
+_BUILD_DISPATCH_CLASSES: frozenset[str] = frozenset(
+    {"toolchain_validate", "build_common_dep", "build_variant"}
 )
 
 
@@ -146,44 +177,37 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
 
     The mapping is the single source of truth for which dynamic_runner
     phase / type / affinity bucket each consumer ``item_class`` lands
-    in. ``affinity_id`` is non-None for the two compiler-bound types
-    (phase-2 toolchains and phase-3 variants) so the framework
-    co-locates a toolchain build and the variants that depend on it
-    onto the same worker for kernel page-cache reuse.
+    in. ``affinity_id`` is non-None for the compiler-bound types
+    (``build_compilers``, ``toolchain_validate`` and ``build_variant``)
+    so the framework co-locates a compiler build and the variants that
+    depend on it onto the same worker for kernel page-cache reuse.
     """
     item_class = header.item_class
-    if item_class == "phase0_eval":
-        # Phase 0 distributed-eval: one task per binary. Pinned by
-        # binary so we get a stable affinity bucket per package
-        # (handy for log grepping; framework just treats it as a
-        # tag).
+    if item_class == "matrix_eval":
+        # Distributed eval: one task per binary. Pinned by binary so
+        # we get a stable affinity bucket per package (handy for log
+        # grepping; framework just treats it as a tag).
         binary = header.payload.get("binary", "?")
-        return ("phase0", "eval", binary)
-    # All build-shaped tasks (toolchain, common_dep, variant) share
-    # the single ``phase_build`` phase. Nix's daemon serializes
-    # shared dependencies via its build lock, so toolchain builds
-    # complete-or-substitute before their dependent variants finish
-    # their own build call — no explicit phase ordering needed.
-    if item_class == "phase2_toolchain":
+        return ("matrix_eval", "eval", binary)
+    if item_class == "build_compilers":
         compiler = header.payload.get("compiler_label", "?")
         arch = header.payload.get("arch", "?")
-        return ("phase_build", "toolchain", f"{compiler}-{arch}")
-    if item_class == "phase2_toolchain_validate":
-        # Validate-only items use a dedicated type_id so the
-        # build_worker can branch on it (fetch-from-peer instead of
-        # nix-build) without having to inspect the manifest payload.
-        # Affinity follows the build variant for cache reuse: the
-        # secondary that pulls a toolchain is the natural candidate
-        # to pick up the variants that depend on it.
+        return ("build_compilers", "build_compilers", f"{compiler}-{arch}")
+    # All remaining build-shaped tasks share the single ``build``
+    # phase. Nix's daemon serializes shared dependencies via its
+    # build lock, so toolchain validates / common deps land before
+    # their dependent variants without explicit per-class phase
+    # ordering.
+    if item_class == "toolchain_validate":
         compiler = header.payload.get("compiler_label", "?")
         arch = header.payload.get("arch", "?")
-        return ("phase_build", "toolchain_validate", f"{compiler}-{arch}")
-    if item_class == "phase2_common_dep":
-        return ("phase_build", "common_dep", None)
-    if item_class == "phase3_variant":
+        return ("build", "toolchain_validate", f"{compiler}-{arch}")
+    if item_class == "build_common_dep":
+        return ("build", "common_dep", None)
+    if item_class == "build_variant":
         compiler = header.payload.get("compiler_id", "?")
         arch = header.payload.get("arch", "?")
-        return ("phase_build", "variant", f"{compiler}-{arch}")
+        return ("build", "variant", f"{compiler}-{arch}")
     raise ValueError(f"unknown item_class {item_class!r}")
 
 
@@ -271,8 +295,35 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
     are imported lazily here and only matter at run time.
 
     ``build_max_concurrent`` (when set) caps the global in-flight count
-    for the three build-heavy types (toolchain, common_dep, variant).
+    for the build-heavy types (build_compilers, common_dep, variant).
     ``None`` leaves all types unconstrained.
+
+    The phase graph declared here:
+
+    * ``build_compilers`` — distributed cross-toolchain build workers.
+      Always registered; emits zero tasks unless ``--build-compilers``
+      gates manifests at submit time.
+    * ``matrix_eval`` — distributed nix-eval-jobs workers; depends on
+      ``build_compilers`` so toolchain outputs are available before
+      eval walks the dataset attrs.
+    * ``build`` — distributed common_dep + variant workers (plus the
+      rarely-emitted toolchain_validate type); depends on
+      ``matrix_eval`` because the kept-drv set + dependency_graph plan
+      come out of that phase.
+
+    The ``dependency_graph`` step (phase 3 in the plan) is NOT
+    declared as a framework PhaseSpec: it is primary-only and runs
+    inline from :class:`_MatrixEvalQuiesceWatcher._fire` as a
+    subprocess invocation of ``workers.dependency_graph_worker``,
+    feeding its descriptor list straight into
+    ``primary_handle.spawn_tasks`` for the ``build`` phase. The
+    rationale: dynamic_runner's PhaseSpec contract today doesn't
+    expose a "primary-affined" type marker, and dispatching the
+    template-graph walk through the secondary pool would force the
+    whole closure across the wire. Running it as a primary-side
+    subprocess keeps the artefact paths local and lets the watcher
+    own the spawn-tasks fan-out where the constraint "task creation
+    can only be done by the manager (primary)" already holds.
     """
     from dynamic_runner.task_protocol import (  # type: ignore[import-not-found]
         PhaseSpec,
@@ -289,66 +340,45 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
     if build_max_concurrent is not None:
         build_kwargs["max_concurrent"] = build_max_concurrent
 
-    # Single phase: toolchain + common_dep + variant all dispatched
-    # together. Nix's daemon naturally serializes shared dependencies
-    # via its build lock — when worker A starts a variant whose
-    # toolchain isn't built yet, the nix-build call walks the drv
-    # graph, builds (or substitutes) the toolchain, then the variant.
-    # Worker B picking up the toolchain task at the same time hits
-    # the same daemon lock and either waits or substitutes the
-    # finished result. With harmonia federation between secondaries,
-    # the first toolchain build is amortized across the fleet.
-    #
-    # The artificial phase-2 → phase-3 boundary used to gate variants
-    # on all toolchains finishing first, which created a stall in
-    # the dispatch pipeline (no continuous tarball production until
-    # every toolchain was done) and a known cascade trigger when
-    # secondaries idled at the boundary. Collapsing to one phase
-    # lets the workload flow continuously: toolchains finish, their
-    # downstream variants unblock via the nix dep graph, tarballs
-    # emerge as soon as their full closure is realized.
     # ``toolchain_validate`` is uncapped: the work is a path-info
     # probe + at most one ``nix copy`` per item, so the build-heavy
     # cap (which targets nix-build oversubscription) doesn't apply.
-    # Keeping it uncapped also avoids starving phase-3 variants
+    # Keeping it uncapped also avoids starving phase-4 variants
     # behind the validate phase when the same cap is configured low
     # for compile-throttling.
-    # ``phase0`` precedes ``phase_build`` via an explicit ``depends_on``
-    # edge: the framework's phase scheduler computes ordering from the
-    # dependency graph, not from tuple order. Phase 0 eval workers must
-    # complete (and the ``_Phase0QuiesceWatcher`` on the consumer side
-    # must spawn the phase 1 build tasks via primary_handle.spawn_tasks)
-    # before any phase_build task can dispatch. When ``--distributed-eval``
-    # is OFF the phase0 type set is simply empty for this run; the
-    # framework treats an empty phase as immediately-drained.
     return (
         PhaseSpec(
-            phase_id="phase0",
+            phase_id="build_compilers",
             types=(
                 TaskTypeSpec(
-                    type_id="eval",
+                    type_id="build_compilers",
                     # Unified entry: the framework picks ONE
                     # ``worker_module`` for the whole secondary pool
                     # (the first registered one wins), so every task
-                    # type — phase0_eval, toolchain, common_dep,
-                    # variant — funnels through ``build_worker.main``.
+                    # type funnels through ``build_worker.main``.
                     # Its ``handle`` closure sniffs ``task.payload``
-                    # (``item_class == "phase0_eval"``) and dispatches
-                    # to :func:`eval_worker.run_eval_task` for eval
-                    # tasks, otherwise to the build path.
+                    # and dispatches matrix_eval to the eval worker,
+                    # build_compilers to the build_compilers worker,
+                    # and everything else to the build path.
+                    worker_module="compiler_suit_runner.workers.build_worker",
+                    **build_kwargs,
+                ),
+            ),
+        ),
+        PhaseSpec(
+            phase_id="matrix_eval",
+            depends_on=("build_compilers",),
+            types=(
+                TaskTypeSpec(
+                    type_id="eval",
                     worker_module="compiler_suit_runner.workers.build_worker",
                 ),
             ),
         ),
         PhaseSpec(
-            phase_id="phase_build",
-            depends_on=("phase0",),
+            phase_id="build",
+            depends_on=("matrix_eval",),
             types=(
-                TaskTypeSpec(
-                    type_id="toolchain",
-                    worker_module="compiler_suit_runner.workers.build_worker",
-                    **build_kwargs,
-                ),
                 TaskTypeSpec(
                     type_id="toolchain_validate",
                     worker_module="compiler_suit_runner.workers.build_worker",
@@ -531,33 +561,91 @@ class _PeerLifecycleListener:
 
 
 # ---------------------------------------------------------------------------
-# Phase 0 quiesce watcher
+# matrix_eval quiesce watcher
 # ---------------------------------------------------------------------------
 
 
-class _Phase0QuiesceWatcher:
-    """Wait for every ``phase0_eval_<binary>`` task to complete, then plan.
+# Default subprocess runner: just ``subprocess.run`` with capture. Tests
+# substitute via the ``run_subprocess`` constructor kwarg.
+_SubprocessRunner = Callable[[list[str]], "subprocess.CompletedProcess[bytes]"]
+
+
+def _default_subprocess_runner(
+    argv: list[str],
+) -> "subprocess.CompletedProcess[bytes]":
+    return subprocess.run(  # noqa: S603 - argv constructed in-module
+        argv,
+        check=False,
+        capture_output=True,
+        shell=False,
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_bash_store_path() -> Optional[str]:
+    """Best-effort discovery of the realised ``bash`` store path.
+
+    The dependency_graph worker invocation needs a concrete bash store
+    path to thread into ``make_sum_drv_from_paths``. We resolve it once
+    per process via ``nix eval --raw nixpkgs#bash.outPath`` and cache
+    the result. Returns ``None`` on any failure — the caller logs +
+    surfaces the gap (the watcher refuses to run the dependency_graph
+    subprocess without it).
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 - argv is fixed
+            ["nix", "eval", "--raw", "nixpkgs#bash.outPath"],
+            check=False,
+            capture_output=True,
+            shell=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.decode("utf-8", errors="replace").strip()
+    return out or None
+
+
+class _MatrixEvalQuiesceWatcher:
+    """Wait for every ``matrix_eval__<binary>`` task to complete, then plan.
 
     The watcher is registered as a task-completion listener at
-    ``on_run_start``. Each call to :meth:`on_task_completed` either
-    ignores a non-phase-0 task_id or marks the matching phase-0 task
-    as complete. Once the completed set covers the expected set, the
-    watcher's ``fired`` flag flips to True.
+    :meth:`SuitTask.on_run_start`. Each call to :meth:`on_task_completed`
+    either ignores a non-matrix_eval task_id or marks the matching
+    matrix_eval task as complete. Once the completed set covers the
+    expected set, ``_fire`` runs:
 
-    The planner-invocation flow used to call
-    ``phase1_planner.plan_phase1`` and then ``_spawn_tasks``. The
-    ``phase1_planner`` module has been deleted (superseded by the
-    template_graph streaming planner); the replacement
-    ``dependency_graph_planner`` will be wired in a follow-up commit.
-    Until then ``_fire`` is a no-op stub and ``_spawn_tasks`` is only
-    reachable from tests that call it directly. The dispatch path,
-    once re-wired, translates each :class:`ManifestHeader` into a
-    framework ``TaskInfo`` and calls ``primary_handle.spawn_tasks``;
-    a ``_phase1_graph.json`` dump is written alongside (regardless of
-    whether the primary_handle is bound) for offline inspection /
-    debugging. When ``primary_handle`` is None (single-process tests,
-    framework-pin gap) the dispatch path degrades to the JSON-only
-    behavior.
+    1. Iterates ``<matrix_eval_out_dir>/*.nix-archive`` and runs
+       ``nix-store --import < <archive>`` for each (the kept-drv
+       closure produced by the eval worker becomes resolvable in the
+       primary's local store).
+    2. Invokes ``workers.dependency_graph_worker`` as a subprocess
+       (``python -m compiler_suit_runner.workers.dependency_graph_worker``)
+       with ``--matrix-eval-out-dir`` + ``--manifest-dir`` +
+       ``--bash-path`` + per-toolchain ``--toolchain-drv`` /
+       ``--toolchain-task-id`` flags. The subprocess writes
+       ``<matrix_eval_out_dir>/_dependency_graph.json``.
+    3. Reads that JSON via
+       :func:`dependency_graph_planner.load_descriptors_from_json`,
+       translates the :class:`Phase4Descriptor` list into
+       :class:`ManifestHeader` instances via
+       :func:`headers_from_descriptors`, and feeds the result to
+       :meth:`_spawn_tasks` which calls
+       ``primary_handle.spawn_tasks`` for the ``build`` phase.
+
+    Step 1's archive-import is skipped per-archive when ``nix path-info``
+    already finds the kept drvs locally (the dependency_graph worker
+    has the same fast-path; the watcher's import is a belt-and-braces
+    pre-population so the subprocess sees consistent state).
+
+    Step 2's subprocess invocation is opt-out via
+    ``dependency_graph_command_override`` (constructor kwarg used by
+    unit tests). When ``primary_handle`` is None (single-process
+    tests, framework-pin gap) ``_spawn_tasks`` degrades to writing
+    the dump-equivalent JSON (``_dependency_graph.json`` from the
+    worker — already on disk) and logging an INFO line.
 
     The watcher is NOT a framework task — it runs entirely in-process
     on whichever thread the framework's task-completion notification is
@@ -574,6 +662,11 @@ class _Phase0QuiesceWatcher:
         primary_handle: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
         sys_name: str = "x86_64-linux",
+        manifest_dir: Optional[pathlib.Path] = None,
+        flake_ref: str = ".",
+        run_subprocess: Optional[_SubprocessRunner] = None,
+        dependency_graph_command_override: Optional[list[str]] = None,
+        bash_path: Optional[str] = None,
     ) -> None:
         self._expected: frozenset[str] = frozenset(expected_task_ids)
         self._completed: set[str] = set()
@@ -581,6 +674,25 @@ class _Phase0QuiesceWatcher:
         self._toolchain_task_ids: dict[str, str] = dict(toolchain_task_ids)
         self._primary_handle = primary_handle
         self._sys_name = sys_name
+        self._manifest_dir = (
+            pathlib.Path(manifest_dir) if manifest_dir is not None else None
+        )
+        self._flake_ref = flake_ref
+        self._run_subprocess: _SubprocessRunner = (
+            run_subprocess or _default_subprocess_runner
+        )
+        # Tests can swap in a fixed ``argv`` to invoke; production runs
+        # build the argv from the watcher's state.
+        self._dependency_graph_command_override = (
+            list(dependency_graph_command_override)
+            if dependency_graph_command_override is not None
+            else None
+        )
+        # ``bash_path`` is the realised ``/nix/store/...-bash-X`` path
+        # the dependency_graph worker passes to make_sum_drv_from_paths.
+        # When None at construction time, ``_resolve_bash_store_path``
+        # is called lazily at fire time (and cached).
+        self._bash_path = bash_path
         self._fired: bool = False
         self._lock = threading.Lock()
         self._logger = logger or logging.getLogger(__name__)
@@ -607,16 +719,18 @@ class _Phase0QuiesceWatcher:
         """Process one task-completion notification.
 
         ``result`` is forwarded by the framework's hook (eventual API);
-        we don't currently inspect it because the Phase 0 worker writes
-        its manifest to ``phase0_out_dir/<binary>/manifest.json`` and
-        the planner re-reads them. The result slot is kept on the
-        signature so the framework's call site doesn't need a wrapper.
+        we don't currently inspect it because the matrix_eval worker
+        writes its archive to
+        ``<matrix_eval_out_dir>/<binary>.nix-archive`` and the
+        dependency_graph worker re-reads them. The result slot is
+        kept on the signature so the framework's call site doesn't
+        need a wrapper.
 
         No-op when:
 
-        * ``task_id`` is not a phase-0 task_id (e.g. a toolchain task
-          completion arrives — the watcher coexists with K=3 listeners
-          on the same hook).
+        * ``task_id`` is not a matrix_eval task_id (e.g. a toolchain
+          task completion arrives — the watcher coexists with K=3
+          listeners on the same hook).
         * The watcher has already fired (``self._fired``).
         * The task_id has already been marked complete (idempotent).
         """
@@ -632,46 +746,225 @@ class _Phase0QuiesceWatcher:
                 return
             self._completed.add(task_id)
             if self._completed < self._expected:
-                # Still waiting on more phase 0 tasks.
+                # Still waiting on more matrix_eval tasks.
                 return
             self._fired = True
             should_fire = True
         if should_fire:
-            self._fire()
+            try:
+                self._fire()
+            except Exception:  # noqa: BLE001 — never raise into framework
+                self._logger.exception(
+                    "_MatrixEvalQuiesceWatcher._fire raised; build phase"
+                    " will not be scheduled (operator-visible stall)"
+                )
 
     # ── Plan invocation ────────────────────────────────────────────────
 
     def _fire(self) -> None:
-        """Phase-0 quiesce reached; planner-invocation stubbed pending wiring.
+        """matrix_eval quiesce reached; run dependency_graph + spawn build tasks.
 
-        The old flow called ``phase1_planner.read_phase0_manifests`` +
-        ``phase1_planner.plan_phase1`` and then ``_spawn_tasks``. The
-        ``phase1_planner`` module has been deleted (template_graph
-        streaming planner supersedes the partition+merge shard model);
-        the replacement ``dependency_graph_planner`` will be wired in a
-        follow-up commit. Until then the watcher just logs that quiesce
-        was reached — Phase 1+ tasks are NOT spawned and the run will
-        stall at the build phase. Operator-visible by design while the
-        new planner is being landed.
+        Three steps, with per-step failure logged + degraded:
+
+        1. Best-effort archive pre-population. Each ``*.nix-archive``
+           under :attr:`_out_dir` is fed to ``nix-store --import`` so
+           the dependency_graph subprocess sees the kept-drv closure
+           in the primary's local store. Per-archive failures log +
+           continue; the subprocess will retry the import itself if a
+           kept-drv is still missing.
+        2. ``workers.dependency_graph_worker`` invocation. The
+           subprocess writes ``_dependency_graph.json`` (a list of
+           :class:`Phase4Descriptor` records) into :attr:`_out_dir`.
+           Exit-nonzero raises; without the planner output we cannot
+           spawn the build phase.
+        3. :func:`headers_from_descriptors` translation + ``_spawn_tasks``
+           hand-off into ``primary_handle.spawn_tasks``.
+
+        See module docstring for the rationale on running the
+        dependency_graph worker as a primary-side subprocess rather
+        than dispatching it through the framework's worker pool.
         """
         self._logger.info(
-            "_Phase0QuiesceWatcher: all %d phase-0 tasks complete;"
-            " dependency_graph_planner not yet wired — Phase 1+ will"
-            " not be scheduled (placeholder pending follow-up)",
+            "_MatrixEvalQuiesceWatcher: all %d matrix_eval tasks complete;"
+            " starting dependency_graph subprocess",
             len(self._expected),
         )
+        self._import_matrix_eval_archives()
+        try:
+            self._invoke_dependency_graph_worker()
+        except RuntimeError as exc:
+            self._logger.error(
+                "_MatrixEvalQuiesceWatcher: dependency_graph worker"
+                " failed; build phase will not be scheduled: %s", exc,
+            )
+            return
+        descriptors_path = self._out_dir / "_dependency_graph.json"
+        try:
+            payload = json.loads(
+                descriptors_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            self._logger.error(
+                "_MatrixEvalQuiesceWatcher: cannot read %s: %s",
+                descriptors_path, exc,
+            )
+            return
+        descriptors = load_descriptors_from_json(payload)
+        if not descriptors:
+            self._logger.warning(
+                "_MatrixEvalQuiesceWatcher: %s produced 0 descriptors;"
+                " nothing to spawn (matrix may have no buildable variants)",
+                descriptors_path,
+            )
+            return
+        headers = headers_from_descriptors(descriptors)
+        self._spawn_tasks(headers)
+
+    def _import_matrix_eval_archives(self) -> None:
+        """Run ``nix-store --import`` for every ``*.nix-archive`` under
+        :attr:`_out_dir`.
+
+        Per-archive failures are logged but do NOT abort: the
+        dependency_graph subprocess does its own import-or-skip pass
+        per-binary and surfaces irrecoverable misses as a hard failure.
+        """
+        if not self._out_dir.is_dir():
+            self._logger.warning(
+                "_MatrixEvalQuiesceWatcher: out_dir %s is missing; no"
+                " archives to import", self._out_dir,
+            )
+            return
+        archives = sorted(
+            p for p in self._out_dir.iterdir()
+            if p.is_file() and p.suffix == ".nix-archive"
+        )
+        for archive in archives:
+            try:
+                with open(archive, "rb") as fh:
+                    proc = subprocess.run(  # noqa: S603
+                        ["nix-store", "--import"],
+                        stdin=fh,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+            except OSError as exc:
+                self._logger.warning(
+                    "_MatrixEvalQuiesceWatcher: nix-store --import"
+                    " skipped for %s (open/spawn failed: %s)",
+                    archive, exc,
+                )
+                continue
+            if proc.returncode != 0:
+                self._logger.warning(
+                    "_MatrixEvalQuiesceWatcher: nix-store --import"
+                    " failed for %s rc=%d stderr=%r",
+                    archive, proc.returncode,
+                    proc.stderr.decode("utf-8", errors="replace")[:400],
+                )
+
+    def _invoke_dependency_graph_worker(self) -> None:
+        """Run the dependency_graph worker as a subprocess.
+
+        Argv is built from the watcher's state — see
+        :meth:`_build_dependency_graph_argv`. Tests can pre-empt the
+        whole call by passing ``dependency_graph_command_override``
+        at construction (the override is used verbatim).
+
+        Raises :class:`RuntimeError` on a non-zero exit so the caller
+        can log + degrade. The subprocess writes
+        ``_dependency_graph.json`` on success.
+        """
+        argv = (
+            self._dependency_graph_command_override
+            if self._dependency_graph_command_override is not None
+            else self._build_dependency_graph_argv()
+        )
+        if argv is None:
+            raise RuntimeError(
+                "dependency_graph_worker argv could not be assembled"
+                " (likely missing bash store path; check"
+                " `nix eval --raw nixpkgs#bash.outPath`)"
+            )
+        self._logger.info(
+            "_MatrixEvalQuiesceWatcher: invoking dependency_graph"
+            " worker argv=%r", argv,
+        )
+        completed = self._run_subprocess(argv)
+        rc = getattr(completed, "returncode", 1)
+        if rc != 0:
+            stderr_bytes = getattr(completed, "stderr", b"") or b""
+            raise RuntimeError(
+                f"dependency_graph_worker exited rc={rc}: "
+                + stderr_bytes.decode("utf-8", errors="replace").strip()
+            )
+
+    def _build_dependency_graph_argv(self) -> Optional[list[str]]:
+        """Assemble the argv for the dependency_graph_worker subprocess.
+
+        Returns ``None`` when a required input (today: the realised
+        bash store path) is unavailable. The caller treats ``None``
+        as a hard failure.
+        """
+        bash_path = self._bash_path or _resolve_bash_store_path()
+        if not bash_path:
+            return None
+        # Cache the resolved path on the instance so a retry doesn't
+        # re-shell-out (lru_cache scope is process-wide anyway).
+        self._bash_path = bash_path
+        argv: list[str] = [
+            sys.executable, "-m",
+            "compiler_suit_runner.workers.dependency_graph_worker",
+            "--matrix-eval-out-dir", str(self._out_dir),
+            "--bash-path", bash_path,
+            "--sys-name", self._sys_name,
+            "--flake-ref", self._flake_ref,
+        ]
+        if self._manifest_dir is not None:
+            argv += ["--manifest-dir", str(self._manifest_dir)]
+        # Per-toolchain drv paths + their phase-1 task ids (so the
+        # planner can wire build_compilers → build_variant deps). The
+        # subprocess expects ``--toolchain-task-id <ident>=<task_id>``;
+        # ``<ident>`` is the ``<hash>-<name>`` shape derived from the
+        # drv basename.
+        for drv, task_id in sorted(self._toolchain_task_ids.items()):
+            argv += ["--toolchain-drv", drv]
+            ident = self._drv_to_ident(drv)
+            if ident and task_id:
+                argv += ["--toolchain-task-id", f"{ident}={task_id}"]
+        return argv
+
+    @staticmethod
+    def _drv_to_ident(drv_path: str) -> str:
+        """Translate ``/nix/store/<hash>-<name>.drv`` → ``<hash>-<name>``.
+
+        Matches :func:`dependency_graph_planner._ident_to_str`'s
+        canonical shape so the subprocess's parsed mapping keys line
+        up with what the streaming planner emits.
+        """
+        base = pathlib.Path(drv_path).name
+        if base.endswith(".drv"):
+            base = base[:-4]
+        return base
 
     # ── spawn_tasks dispatch ──────────────────────────────────────────
 
-    def _dump_phase1_graph(
+    def _dump_dependency_graph(
         self, headers: list[ManifestHeader],
     ) -> pathlib.Path:
-        """Serialise ``headers`` to ``_phase1_graph.json`` for offline
-        inspection. Returns the path written (or attempted). Best-
-        effort: an OSError is logged + swallowed so the spawn path can
-        still proceed."""
+        """Serialise ``headers`` to ``_dependency_graph.json`` (the
+        descriptors-as-headers companion file) for offline inspection.
+
+        The dependency_graph worker also writes a ``_dependency_graph.json``
+        (descriptor form). The watcher's dump rewrites that file in
+        ManifestHeader-equivalent shape so operators eyeballing the
+        spawn output see the exact JSON the framework will consume.
+
+        Best-effort: an OSError is logged + swallowed so the spawn
+        path can still proceed.
+        """
         self._out_dir.mkdir(parents=True, exist_ok=True)
-        graph_path = self._out_dir / "_phase1_graph.json"
+        graph_path = self._out_dir / "_dependency_graph.json"
         serialised = [
             {
                 "item_class": h.item_class,
@@ -684,14 +977,13 @@ class _Phase0QuiesceWatcher:
             for h in headers
         ]
         try:
-            import json
             graph_path.write_text(
                 json.dumps(serialised, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
         except OSError:
             self._logger.exception(
-                "_Phase0QuiesceWatcher: failed writing %s",
+                "_MatrixEvalQuiesceWatcher: failed writing %s",
                 graph_path,
             )
         return graph_path
@@ -699,16 +991,17 @@ class _Phase0QuiesceWatcher:
     def _spawn_tasks(
         self, headers: list[ManifestHeader]
     ) -> None:
-        """Q5 spawn-dispatch path.
+        """Spawn-dispatch path.
 
-        Always writes ``_phase1_graph.json`` alongside (useful for
-        offline inspection / resume).  When ``self._primary_handle`` is
-        bound:
+        Always overwrites ``_dependency_graph.json`` with the
+        ManifestHeader-shaped view of the descriptor list (useful for
+        offline inspection / resume). When ``self._primary_handle``
+        is bound:
 
         1. Convert each :class:`ManifestHeader` into a framework
            ``TaskInfo`` via :meth:`_header_to_task_info`.
         2. Call ``primary_handle.spawn_tasks(task_infos)``.
-        3. Log spawn count + error count.  Per-error log severity:
+        3. Log spawn count + error count. Per-error log severity:
            - ``duplicate_task_hash`` → WARN (we expect a fresh
              content-hash for every header; a duplicate means we hit
              the framework's idempotent-respawn guard for a hash that
@@ -722,12 +1015,12 @@ class _Phase0QuiesceWatcher:
         framework-pin gap) the JSON dump is the only side effect; an
         INFO log explains the degradation.
         """
-        graph_path = self._dump_phase1_graph(headers)
+        graph_path = self._dump_dependency_graph(headers)
 
         if self._primary_handle is None:
             self._logger.info(
-                "_Phase0QuiesceWatcher: primary_handle unbound; wrote"
-                " %s (Phase 1 dispatch falls back to JSON-only)",
+                "_MatrixEvalQuiesceWatcher: primary_handle unbound;"
+                " wrote %s (build phase falls back to JSON-only)",
                 graph_path,
             )
             return
@@ -738,16 +1031,16 @@ class _Phase0QuiesceWatcher:
                 task_infos.append(self._header_to_task_info(header))
             except Exception:  # noqa: BLE001 — log + skip
                 self._logger.exception(
-                    "_Phase0QuiesceWatcher: header→TaskInfo conversion"
-                    " failed for %s (task_id=%s); skipping",
+                    "_MatrixEvalQuiesceWatcher: header→TaskInfo"
+                    " conversion failed for %s (task_id=%s); skipping",
                     header.name,
                     header.task_id,
                 )
 
         if not task_infos:
             self._logger.warning(
-                "_Phase0QuiesceWatcher: no valid TaskInfo entries to"
-                " spawn (received %d header(s)); wrote %s",
+                "_MatrixEvalQuiesceWatcher: no valid TaskInfo entries"
+                " to spawn (received %d header(s)); wrote %s",
                 len(headers),
                 graph_path,
             )
@@ -757,16 +1050,16 @@ class _Phase0QuiesceWatcher:
             errors = self._primary_handle.spawn_tasks(task_infos)
         except Exception:  # noqa: BLE001 — log + degrade
             self._logger.exception(
-                "_Phase0QuiesceWatcher: primary_handle.spawn_tasks"
-                " raised for %d task(s); Phase 1 may stall",
+                "_MatrixEvalQuiesceWatcher: primary_handle.spawn_tasks"
+                " raised for %d task(s); build phase may stall",
                 len(task_infos),
             )
             return
 
         errors_list = list(errors) if errors is not None else []
         self._logger.info(
-            "_Phase0QuiesceWatcher: spawn_tasks dispatched %d task(s)"
-            " with %d error(s); wrote %s",
+            "_MatrixEvalQuiesceWatcher: spawn_tasks dispatched %d"
+            " task(s) with %d error(s); wrote %s",
             len(task_infos),
             len(errors_list),
             graph_path,
@@ -776,7 +1069,7 @@ class _Phase0QuiesceWatcher:
                 idx, err = idx_err
             except (TypeError, ValueError):
                 self._logger.warning(
-                    "_Phase0QuiesceWatcher: malformed spawn error"
+                    "_MatrixEvalQuiesceWatcher: malformed spawn error"
                     " entry %r; skipping",
                     idx_err,
                 )
@@ -789,13 +1082,13 @@ class _Phase0QuiesceWatcher:
             offending_name = offending.name if offending is not None else "?"
             if kind == "duplicate_task_hash":
                 # Plan builder produced a hash collision with the
-                # ledger.  This is a real signal: the framework does
+                # ledger. This is a real signal: the framework does
                 # NOT silently re-spawn Failed / Unfulfillable entries
                 # on duplicate hash, so a hit here means the planner
                 # re-emitted a hash we'd already submitted (e.g. on a
-                # planner retry).  WARN so operators see it.
+                # planner retry). WARN so operators see it.
                 self._logger.warning(
-                    "_Phase0QuiesceWatcher: spawn_tasks duplicate"
+                    "_MatrixEvalQuiesceWatcher: spawn_tasks duplicate"
                     " task_hash for header %s (idx=%d task_hash=%s)",
                     offending_name, idx, task_hash,
                 )
@@ -806,21 +1099,21 @@ class _Phase0QuiesceWatcher:
                     else ""
                 )
                 self._logger.warning(
-                    "_Phase0QuiesceWatcher: spawn_tasks unknown"
+                    "_MatrixEvalQuiesceWatcher: spawn_tasks unknown"
                     " dependency for header %s (idx=%d"
                     " task_hash=%s dep_task_id=%s)",
                     offending_name, idx, task_hash, dep_task_id,
                 )
             else:
                 self._logger.warning(
-                    "_Phase0QuiesceWatcher: spawn_tasks unrecognised"
+                    "_MatrixEvalQuiesceWatcher: spawn_tasks unrecognised"
                     " error kind for header %s (idx=%d err=%r)",
                     offending_name, idx, err,
                 )
 
     def _header_to_task_info(self, header: ManifestHeader):
         """Convert one :class:`ManifestHeader` directly into a framework
-        ``TaskInfo``.  Mirrors the call shape used by
+        ``TaskInfo``. Mirrors the call shape used by
         :func:`_make_task_info` (the disk-round-trip path used by
         :meth:`SuitTask.discover_items`) so spawn-side and discover-side
         items differ only by source, not by encoding.
@@ -871,8 +1164,6 @@ class SuitTaskConfig:
     sys_name: str
     shared_fs: pathlib.Path
     manifest_dir: pathlib.Path
-    raw_partition_dir: pathlib.Path
-    partition_dir: pathlib.Path
     dataset_dir: pathlib.Path
     peers_dir: pathlib.Path
     run_id: str
@@ -938,15 +1229,12 @@ class SuitTaskConfig:
     # distinct from ``--retry-max-passes`` (the Recoverable-failure
     # retry budget); see ``feedback_state_machine_semantics.md``.
     unfulfillable_reinject_max_per_task: Optional[int] = None
-    input_hash: str = ""
-    toolchain_drvs: frozenset[str] = frozenset()
-    common_threshold: int = 10
-    variants: tuple = ()
-    # Shared bind-mounted path where phase0_eval workers write their
-    # resume markers. Submitter side: <shared_fs>/dataset/_phase0;
-    # secondary container side: /app/out-network/_phase0 (same physical
-    # dir via the framework's --output bind mount).
-    phase0_out_dir: Optional[pathlib.Path] = None
+    # Shared bind-mounted path where matrix_eval workers write their
+    # per-binary ``<binary>.nix-archive`` closures + resume markers.
+    # Submitter side: ``<shared_fs>/dataset/_matrix_eval``; secondary
+    # container side: ``/app/out-network/_matrix_eval`` (same
+    # physical dir via the framework's --output bind mount).
+    matrix_eval_out_dir: Optional[pathlib.Path] = None
 
 
 # ---------------------------------------------------------------------------
@@ -987,20 +1275,18 @@ class SuitTask:
         self._replication_sender: Optional[ReplicationSender] = None
         self._replication_receiver: Optional[ReplicationReceiver] = None
         self._replication_repair: Optional[ReplicationRepairWorker] = None
-        # Phase 0 drv broadcast consumer (mirrors ReplicationReceiver but
-        # for the all-peers flood-fill protocol). Without this the
+        # matrix_eval drv broadcast consumer (mirrors ReplicationReceiver
+        # but for the all-peers flood-fill protocol). Without this the
         # ``/peer/path-broadcast-offer`` endpoint sees deduped offers
         # land on a no-op callback that returns False, so the cluster
         # never actually fetches the broadcast drvs.
         self._broadcast_receiver: Optional[BroadcastReceiver] = None
-        # Phase 0 → Phase 1 quiesce watcher. Populated by on_run_start
-        # only when --distributed-eval is on (i.e. phase0_eval items
-        # are present in the manifest dir). Reference held so the
-        # listener doesn't get GC'd; framework task-completion events
-        # drive its on_task_completed method (best-effort hook
-        # registration; until the framework's task_completed surface
-        # lands the consumer drives it from its own dispatch loop).
-        self._phase0_watcher: Optional[_Phase0QuiesceWatcher] = None
+        # matrix_eval → build quiesce watcher. Populated by
+        # on_run_start when matrix_eval items are present in the
+        # manifest dir. Reference held so the listener doesn't get
+        # GC'd; framework task-completion events drive its
+        # on_task_completed method.
+        self._matrix_eval_watcher: Optional[_MatrixEvalQuiesceWatcher] = None
         # Q4 peer-lifecycle listener (constructed by on_run_start).
         # Held on ``self`` so callers wiring it onto the framework's
         # ``RustPrimaryCoordinator(..., peer_lifecycle_listener=)``
@@ -1060,12 +1346,12 @@ class SuitTask:
 
         The framework invokes the returned callable on every
         ``TaskCompleted`` / ``TaskFailed`` apply with
-        ``(task_id, success, error_kind)``.  We forward the event into
-        ``self._phase0_watcher.on_task_completed`` when the watcher is
-        active AND the task_id is in its expected set; non-matching ids
-        (e.g. toolchain completions) and absent-watcher conditions are
-        NoOps.  The watcher itself is already idempotent on duplicate
-        fires, so the dispatch can be invoked freely.
+        ``(task_id, success, error_kind)``. We forward the event into
+        ``self._matrix_eval_watcher.on_task_completed`` when the
+        watcher is active AND the task_id is in its expected set;
+        non-matching ids (e.g. toolchain completions) and absent-watcher
+        conditions are NoOps. The watcher itself is already idempotent
+        on duplicate fires, so the dispatch can be invoked freely.
 
         Exceptions are swallowed so a buggy consumer-side listener can
         not stall the framework's apply path.
@@ -1077,7 +1363,7 @@ class SuitTask:
         ) -> None:
             del success, error_kind  # not consumed by the watcher today
             try:
-                watcher = self._phase0_watcher
+                watcher = self._matrix_eval_watcher
                 if watcher is None or not task_id:
                     return
                 if task_id not in watcher.expected:
@@ -1231,7 +1517,10 @@ class SuitTask:
             "--manifest-dir",
             str(self.config.manifest_dir),
         ]
-        if type_id in {"eval", "toolchain", "toolchain_validate", "common_dep", "variant"}:
+        if type_id in {
+            "eval", "build_compilers", "toolchain_validate",
+            "common_dep", "variant",
+        }:
             argv = common + [
                 "--flake-ref",
                 self.config.flake_ref,
@@ -1247,7 +1536,7 @@ class SuitTask:
             # available across the framework's fork boundary) and write
             # back its own placement records. The signing public-key
             # authenticates the ``path-have`` push fan-out. For the
-            # ``eval`` type (phase0_eval tasks), ``shared_fs`` is
+            # ``eval`` type (matrix_eval tasks), ``shared_fs`` is
             # additionally required by :func:`build_worker.main`'s
             # BroadcastSender init — the eval worker refuses to run
             # without it and raises NonRecoverableError immediately.
@@ -1259,12 +1548,18 @@ class SuitTask:
                 argv += [
                     "--signing-public-key", self._signing_key.public_key,
                 ]
-            # Phase 0 eval marker dir: bind-mount-visible path so the
-            # primary's _Phase0QuiesceWatcher can read what the worker
-            # wrote. Only meaningful for type_id == "eval"; the other
-            # types ignore it.
-            if type_id == "eval" and self.config.phase0_out_dir is not None:
-                argv += ["--phase0-out-dir", str(self.config.phase0_out_dir)]
+            # matrix_eval marker dir: bind-mount-visible path so the
+            # primary's _MatrixEvalQuiesceWatcher can read what the
+            # worker wrote. Only meaningful for type_id == "eval"; the
+            # other types ignore it.
+            if (
+                type_id == "eval"
+                and self.config.matrix_eval_out_dir is not None
+            ):
+                argv += [
+                    "--matrix-eval-out-dir",
+                    str(self.config.matrix_eval_out_dir),
+                ]
             return argv
         return common
 
@@ -1288,11 +1583,12 @@ class SuitTask:
 
         ``primary_handle`` is the in-flight runtime control surface
         the framework's modern dispatcher (post-``5fa212c``) passes via
-        kwarg.  Captured onto ``self._primary_handle`` so subsequent
-        Phase 0 → Phase 1 dispatch via ``_Phase0QuiesceWatcher`` can
-        drive ``primary_handle.spawn_tasks(...)``.  When the kwarg is
-        absent (legacy callers, single-process tests) the watcher
-        degrades to the JSON-only fallback.
+        kwarg. Captured onto ``self._primary_handle`` so subsequent
+        matrix_eval → build dispatch via
+        ``_MatrixEvalQuiesceWatcher`` can drive
+        ``primary_handle.spawn_tasks(...)``. When the kwarg is absent
+        (legacy callers, single-process tests) the watcher degrades to
+        the JSON-only fallback.
         """
         del source_dir, args  # unused (output_dir consumed below)
         with self._setup_lock:
@@ -1475,7 +1771,7 @@ class SuitTask:
                     )
                     self._peer_lifecycle_listener = None
 
-                # Phase 0 broadcast consumer (path-broadcast-offer).
+                # matrix_eval broadcast consumer (path-broadcast-offer).
                 # Parallel to the K=3 receiver above but for the
                 # all-peers flood-fill protocol: every secondary that
                 # accepts a broadcast both fetches the drv from the
@@ -1531,7 +1827,7 @@ class SuitTask:
                 except Exception:  # noqa: BLE001 — log + continue
                     self._logger.exception(
                         "on_run_start: BroadcastReceiver init failed;"
-                        " phase 0 drv flood-fill consumer disabled"
+                        " matrix_eval drv flood-fill consumer disabled"
                     )
                     self._broadcast_receiver = None
 
@@ -1595,12 +1891,13 @@ class SuitTask:
                     # consumer accepts a ``/peer/path-broadcast-offer``
                     # (the drv has been fetched into our local store),
                     # publish a holder record under
-                    # ``item_class="phase0_eval_drv"`` so the
+                    # ``item_class="matrix_eval_drv"`` so the
                     # placement-map watcher on every other secondary
                     # learns we hold it. Mirrors the K=3 receiver's
                     # post-fetch ``record_self_has`` call but with the
-                    # phase0 item-class so phase0 drv holders are
-                    # distinguishable from toolchain / variant holders.
+                    # matrix_eval item-class so matrix_eval drv holders
+                    # are distinguishable from toolchain / variant
+                    # holders.
                     _record_broadcast_self_has = (
                         self._make_broadcast_record_self_has(
                             peer_watcher, public_key,
@@ -1759,32 +2056,35 @@ class SuitTask:
                         "on_run_start: PeerNixConfWatcher start failed"
                     )
 
-            # 6b. Phase 0 → Phase 1 quiesce watcher.
+            # 6b. matrix_eval → build quiesce watcher.
             #
-            # Scan the manifest dir for phase0_eval items. If any exist,
-            # spin up a _Phase0QuiesceWatcher whose on_task_completed
-            # method is the framework's task-completion hook target. The
-            # watcher fires phase1_planner.plan_phase1 once all phase 0
-            # tasks have completed and dumps the resulting graph to
-            # ``output_dir / "_phase1_graph.json"`` (Q5 stub).
+            # Scan the manifest dir for matrix_eval items. If any
+            # exist, spin up a _MatrixEvalQuiesceWatcher whose
+            # on_task_completed method is the framework's
+            # task-completion hook target. The watcher runs the
+            # dependency_graph subprocess + spawns the resulting build
+            # phase tasks once all matrix_eval tasks have completed
+            # (see _MatrixEvalQuiesceWatcher._fire).
             #
             # We register the watcher best-effort against whatever
             # task-completion surface the framework currently exposes
-            # (none in 2552f7c — the consumer drives it directly until
-            # Q5 lands). The reference is held on ``self`` so it is
+            # — the consumer drives it directly when no hook is
+            # available. The reference is held on ``self`` so it is
             # not garbage-collected mid-run.
             try:
-                self._phase0_watcher = self._build_phase0_watcher(
+                self._matrix_eval_watcher = self._build_matrix_eval_watcher(
                     output_dir=output_dir,
                 )
-                if self._phase0_watcher is not None:
-                    self._register_phase0_watcher(self._phase0_watcher)
+                if self._matrix_eval_watcher is not None:
+                    self._register_matrix_eval_watcher(
+                        self._matrix_eval_watcher,
+                    )
             except Exception:  # noqa: BLE001 — log + continue
                 self._logger.exception(
-                    "on_run_start: _Phase0QuiesceWatcher setup failed;"
-                    " Phase 1 planner will not auto-fire"
+                    "on_run_start: _MatrixEvalQuiesceWatcher setup"
+                    " failed; build phase will not auto-fire"
                 )
-                self._phase0_watcher = None
+                self._matrix_eval_watcher = None
 
             # 7. ssh_debug (opt-in) — spawn sshd as a detached session
             # leader on ``config.ssh_debug_port`` and drop a ready
@@ -1943,11 +2243,11 @@ class SuitTask:
                     "on_run_end: withdraw_self failed"
                 )
 
-            # Drop the phase 0 watcher reference; if it never fired
-            # (e.g. run aborted mid-Phase-0) it just gets GC'd. No
-            # cleanup work — the watcher owns no threads, files, or
-            # sockets of its own.
-            self._phase0_watcher = None
+            # Drop the matrix_eval watcher reference; if it never
+            # fired (e.g. run aborted mid-matrix_eval) it just gets
+            # GC'd. No cleanup work — the watcher owns no threads,
+            # files, or sockets of its own.
+            self._matrix_eval_watcher = None
             self._signing_key = None
             self._setup_done = False
 
@@ -2090,18 +2390,18 @@ class SuitTask:
     def _build_outpath_to_task_hash_lookup(self) -> dict[str, str]:
         """Scan toolchain manifests and build the outpath → task_hash dict.
 
-        For each ``phase2_toolchain`` / ``phase2_toolchain_validate``
-        manifest with both an ``outpath`` payload field and a
-        ``task_id``, compute the task_hash via
-        ``dynamic_runner.compute_task_hash`` (when available) and
-        record the mapping. Without the framework, fall back to the
-        manifest's ``task_id`` so tests still resolve a non-empty
-        identifier (the framework would refuse it as a wrong-shape
-        hash; that's the degraded path the wrappers already log).
+        For each ``build_compilers`` / ``toolchain_validate`` manifest
+        with both an ``outpath`` payload field and a ``task_id``,
+        compute the task_hash via ``dynamic_runner.compute_task_hash``
+        (when available) and record the mapping. Without the framework,
+        fall back to the manifest's ``task_id`` so tests still resolve
+        a non-empty identifier (the framework would refuse it as a
+        wrong-shape hash; that's the degraded path the wrappers
+        already log).
 
         Best-effort: any per-manifest read error logs + skips. Returns
-        an empty dict if no manifests exist (Phase 0 distributed-eval
-        run before toolchains are emitted).
+        an empty dict if no manifests exist (matrix_eval-only run
+        before toolchain manifests are emitted).
         """
         result: dict[str, str] = {}
         try:
@@ -2131,8 +2431,8 @@ class SuitTask:
                 )
                 continue
             if header.item_class not in (
-                "phase2_toolchain",
-                "phase2_toolchain_validate",
+                "build_compilers",
+                "toolchain_validate",
             ):
                 continue
             outpath = header.payload.get("outpath")
@@ -2149,15 +2449,21 @@ class SuitTask:
                 # payload identity; if the API rejects our duck-typed
                 # object we fall through to the task_id fallback.
                 try:
+                    phase_id = (
+                        "build_compilers"
+                        if header.item_class == "build_compilers"
+                        else "build"
+                    )
+                    type_id = (
+                        "build_compilers"
+                        if header.item_class == "build_compilers"
+                        else "toolchain_validate"
+                    )
                     task_info = _make_task_info(
                         path=pathlib.Path(entry.name),
                         size=header.size,
-                        phase_id="phase_build",
-                        type_id=(
-                            "toolchain"
-                            if header.item_class == "phase2_toolchain"
-                            else "toolchain_validate"
-                        ),
+                        phase_id=phase_id,
+                        type_id=type_id,
                         affinity_id=None,
                         payload=dict(header.payload),
                         task_id=task_id,
@@ -2270,7 +2576,7 @@ class SuitTask:
         """Return a callable suitable for ``PeerPushServer.record_broadcast_self_has``.
 
         The returned function calls :func:`peer_paths.record_self_has`
-        with ``item_class=ITEM_CLASS_PHASE0_EVAL_DRV`` and the live
+        with ``item_class=ITEM_CLASS_MATRIX_EVAL_DRV`` and the live
         peer list from *peer_watcher*. Extracted as a method so the
         callable assembly is unit-testable without spinning up the
         full :meth:`on_run_start` lifecycle.
@@ -2291,7 +2597,7 @@ class SuitTask:
                     my_secondary_id=my_sid,
                     outpath=path,
                     drv_path=path,
-                    item_class=peer_paths.ITEM_CLASS_PHASE0_EVAL_DRV,
+                    item_class=peer_paths.ITEM_CLASS_MATRIX_EVAL_DRV,
                     peers=list(peer_watcher_ref.peers),
                     our_pubkey=bound_pubkey,
                 )
@@ -2302,23 +2608,24 @@ class SuitTask:
 
         return _record
 
-    # ── Phase 0 watcher wiring ────────────────────────────────────────
+    # ── matrix_eval watcher wiring ────────────────────────────────────
 
-    def _build_phase0_watcher(
+    def _build_matrix_eval_watcher(
         self,
         *,
         output_dir: Optional[pathlib.Path],
-    ) -> Optional[_Phase0QuiesceWatcher]:
-        """Scan the manifest dir and return a watcher if Phase 0 is active.
+    ) -> Optional[_MatrixEvalQuiesceWatcher]:
+        """Scan the manifest dir and return a watcher if matrix_eval is active.
 
-        Returns ``None`` (no watcher) when no ``phase0_eval`` manifest is
-        present — that's the legacy-eval path (``--distributed-eval``
-        off) and there's nothing to wait for.
+        Returns ``None`` (no watcher) when no ``matrix_eval`` manifest
+        is present — there's nothing to wait for so the build phase
+        can dispatch immediately when the framework gets to it.
 
-        ``config.phase0_out_dir`` (when set) is used as the marker root;
-        it overrides ``output_dir`` and the legacy ``shared_fs/'out'``
-        fallback. ``output_dir`` is the framework-supplied per-run output
-        directory used only when ``phase0_out_dir`` is absent.
+        ``config.matrix_eval_out_dir`` (when set) is used as the
+        archive root; it overrides ``output_dir`` and the legacy
+        ``shared_fs/'out'`` fallback. ``output_dir`` is the
+        framework-supplied per-run output directory used only when
+        ``matrix_eval_out_dir`` is absent.
         """
         manifest_dir = self.config.manifest_dir
         try:
@@ -2340,16 +2647,16 @@ class SuitTask:
                 header = read_manifest(entry)
             except Exception:  # noqa: BLE001 — corrupt manifest
                 continue
-            if header.item_class == "phase0_eval":
+            if header.item_class == "matrix_eval":
                 binary = header.payload.get("binary", "")
                 if isinstance(binary, str) and binary:
                     expected_ids.add(
-                        header.task_id or phase0_eval_task_id(binary)
+                        header.task_id or matrix_eval_task_id(binary)
                     )
                 continue
             if header.item_class in (
-                "phase2_toolchain",
-                "phase2_toolchain_validate",
+                "build_compilers",
+                "toolchain_validate",
             ):
                 if not header.task_id:
                     continue
@@ -2369,8 +2676,8 @@ class SuitTask:
             return None
 
         resolved_out_dir = (
-            self.config.phase0_out_dir
-            if self.config.phase0_out_dir is not None
+            self.config.matrix_eval_out_dir
+            if self.config.matrix_eval_out_dir is not None
             else (
                 pathlib.Path(output_dir)
                 if output_dir is not None
@@ -2378,35 +2685,34 @@ class SuitTask:
             )
         )
 
-        return _Phase0QuiesceWatcher(
+        return _MatrixEvalQuiesceWatcher(
             expected_task_ids=expected_ids,
             out_dir=resolved_out_dir,
             toolchain_task_ids=toolchain_task_ids,
             primary_handle=self._primary_handle,
             logger=self._logger,
             sys_name=self.config.sys_name,
+            manifest_dir=self.config.manifest_dir,
+            flake_ref=self.config.flake_ref,
         )
 
-    def _register_phase0_watcher(
-        self, watcher: _Phase0QuiesceWatcher
+    def _register_matrix_eval_watcher(
+        self, watcher: _MatrixEvalQuiesceWatcher
     ) -> None:
         """Best-effort wire the watcher onto the framework's hook surface.
 
-        The framework's task-completion event seam is still in flight
-        (see Q4 / pending PRs). Try a few duck-typed registration
-        surfaces in priority order; if none exist the watcher remains
-        callable from the consumer's own dispatch loop (legacy single-
-        process CLI drives it directly). Either way we hold the
-        reference on ``self`` so it isn't GC'd.
+        The framework's task-completion event seam is still in flight.
+        Try a few duck-typed registration surfaces in priority order;
+        if none exist the watcher remains callable from the consumer's
+        own dispatch loop (legacy single-process CLI drives it
+        directly). Either way we hold the reference on ``self`` so it
+        isn't GC'd.
         """
-        # Candidate surfaces, in order of preference. Each is a tuple
-        # of (object_attr, method_name, arity-tag) — duck-checked.
-        # ``arity-tag`` documents what we'd pass; not used in code.
         try:
             from dynamic_runner import run as dynrunner_run  # type: ignore[import-not-found]
         except Exception:  # noqa: BLE001 — framework absent
             self._logger.debug(
-                "_register_phase0_watcher: dynamic_runner.run not"
+                "_register_matrix_eval_watcher: dynamic_runner.run not"
                 " importable; watcher attached to SuitTask only"
             )
             return
@@ -2419,19 +2725,19 @@ class SuitTask:
                 try:
                     hook(watcher.on_task_completed)
                     self._logger.info(
-                        "_register_phase0_watcher: wired via"
+                        "_register_matrix_eval_watcher: wired via"
                         " dynamic_runner.run.%s",
                         attr,
                     )
                     return
                 except Exception:  # noqa: BLE001
                     self._logger.exception(
-                        "_register_phase0_watcher: %s raised", attr,
+                        "_register_matrix_eval_watcher: %s raised", attr,
                     )
         self._logger.info(
-            "_register_phase0_watcher: framework task_completed hook"
-            " not found; watcher reachable via"
-            " SuitTask._phase0_watcher.on_task_completed"
+            "_register_matrix_eval_watcher: framework task_completed"
+            " hook not found; watcher reachable via"
+            " SuitTask._matrix_eval_watcher.on_task_completed"
         )
 
     # ==================================================================
@@ -2494,7 +2800,7 @@ class SuitTask:
     ) -> None:
         """Route to the right worker. May raise; caller swallows."""
         del header  # current workers re-read the manifest themselves
-        if item_class in _PHASE2_BUILD_CLASSES or item_class == "phase3_variant":
+        if item_class in _BUILD_DISPATCH_CLASSES:
             env = BuildWorkerEnv(
                 flake_ref=self.config.flake_ref,
                 dataset_output_dir=self.config.dataset_dir,
