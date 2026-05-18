@@ -48,10 +48,10 @@ def _read_single_drv_path(path: Path) -> str:
         if line and not line.startswith("#"):
             return line
     pytest.skip(f"{path.name} contains no drv path")
-    raise AssertionError  # for the type-checker
+    assert False, "unreachable: pytest.skip is NoReturn"
 
 
-def _is_builder_noise(drv_path: str) -> bool:
+def is_builder_noise(drv_path: str) -> bool:
     """Filter out the bash drv our wrappers reference as builder."""
     basename = drv_path.rsplit("/", 1)[-1]
     # Drop the <hash>- prefix so we match the package name.
@@ -59,7 +59,7 @@ def _is_builder_noise(drv_path: str) -> bool:
     return rest.startswith("bash-interactive") or rest.startswith("bash-")
 
 
-def _wrapper_name(drv_path: str) -> str:
+def wrapper_name(drv_path: str) -> str:
     """Return the wrapper's nix `name` field, derived from its basename.
 
     ``/nix/store/HASH-toolchains.drv`` -> ``"toolchains"``.
@@ -96,9 +96,9 @@ def sum_structure(root_drv) -> dict:
     tc_wrapper = None
     matrix_wrappers: dict[str, str] = {}  # binary -> wrapper drv
     for k in root["inputDrvs"]:
-        if _is_builder_noise(k):
+        if is_builder_noise(k):
             continue
-        name = _wrapper_name(k)
+        name = wrapper_name(k)
         if name == "toolchains":
             tc_wrapper = k
         elif name.startswith("matrix-"):
@@ -109,14 +109,14 @@ def sum_structure(root_drv) -> dict:
 
     tc_rec = read_drv_record(tc_wrapper)
     toolchain_drvs: set[str] = {
-        k for k in tc_rec["inputDrvs"] if not _is_builder_noise(k)
+        k for k in tc_rec["inputDrvs"] if not is_builder_noise(k)
     }
 
     matrices: dict[str, dict] = {}
     for binary, mx in matrix_wrappers.items():
         mx_rec = read_drv_record(mx)
         variant_drvs = [
-            k for k in mx_rec["inputDrvs"] if not _is_builder_noise(k)
+            k for k in mx_rec["inputDrvs"] if not is_builder_noise(k)
         ]
 
         # Derive (arch, suffix) labels from drv basenames:

@@ -45,6 +45,9 @@ def test_build_template_from_one_variant(
         name_extractor=hello_name_extractor,
         built_from_label=label,
     )
+    # 20 = floor for a nontrivial hello closure (stdenv + glibc +
+    # gcc-runtime); the real closure is much larger, but this guards
+    # against accidentally walking only the toolchain side.
     assert len(t.nodes) > 20
     assert t.nodes[t.root_id].name == "hello"
     assert any(n.is_toolchain for n in t.nodes)

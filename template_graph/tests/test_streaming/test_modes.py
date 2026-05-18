@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from template_graph.core import TemplateGraphAssertError
 from template_graph.streaming import StreamPlanner
-from template_graph.tests.test_streaming._fixtures import (
+from template_graph.tests.test_streaming.fixtures import (
     Node,
     feed,
     make_hash,
@@ -74,13 +73,16 @@ def test_lax_mode_records_violations_not_raises():
 
 def test_strict_mode_raises_on_calibration_mismatch():
     """The same calibration-shape violation under lax=False raises.
-    The planner currently wraps this with ``TreeWalkError`` at
-    calibration time (see ``_build_template``'s "calibration pair
-    same-name child count mismatch" branch). Other code paths can
-    surface ``TemplateGraphAssertError``; accept either.
+    The planner raises ``TreeWalkError`` at calibration time inside
+    ``_build_template``'s "calibration pair same-name child count
+    mismatch" branch; pin both the class and the message prefix so
+    an unrelated TreeWalkError can't satisfy this assertion.
     """
     planner = StreamPlanner(archs=("x86_64",), lax=False)
-    with pytest.raises((TreeWalkError, TemplateGraphAssertError)):
+    with pytest.raises(
+        TreeWalkError,
+        match=r"calibration pair same-name child count mismatch",
+    ):
         feed(planner, render_tree(_build_calibration_count_mismatch_tree()))
         planner.finalize()
 
