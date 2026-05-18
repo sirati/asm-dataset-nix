@@ -146,3 +146,23 @@ exposure surface.
 planner (`template_graph/streaming.py` + `dependency_graph_planner.py`).
 Once that lands, either reactivate the CLI flag's effect or drop it
 entirely.
+
+---
+
+## Phase D verification carryover — D.6 (slurm-test-env) and D.8 (cross-version)
+
+**Status**: Deferred from the Phase B/C/D taxonomy revamp (see
+`/home/sirati/.claude/plans/lively-beaming-summit.md`).
+
+**D.6 (SLURM T20-T23 in slurm-test-env)**: Operator-only verification.
+Requires `INSTANCE_ID=<tag> SSH_PORT=<port> nix run .#up` in
+`~/devel/python/dynamic_runner/slurm-test-env/` to bring up the local
+podman cluster, then `pytest python/compiler_suit_runner/tests/slurm/
+-k "t20 or t21 or t22 or t23"`. The unit-test sweep is green (691
+pass) and the SLURM tests collect cleanly (206 collected); a real
+dispatch run is the next gating signal.
+
+**D.8 (cross-version fail-loud regression)**: Run a NEW submitter
+against a JSONL aggregate previously written by OLD code; confirm
+the new submitter raises (rather than silently miscounting). Needs
+two deployed versions side-by-side. Defer to operator post-deploy.
