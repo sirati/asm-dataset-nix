@@ -1,10 +1,13 @@
-"""Build worker — phase-2 toolchain, phase-2 common-dep, phase-3 variant.
+"""Build worker — build_common_dep, build_variant, toolchain_validate.
 
-A single worker entry point handles all three nix-build classes; the
-class is encoded in the manifest header's ``item_class``. For phase-3
-variants the worker additionally deref-copies the ELF symlinks from the
-realised nix output's ``elf/`` subdir (mkBinaryFolder layout) into the
-shared dataset directory under ``<pkg>/<variant_dir>/<basename>``.
+A single worker entry point handles the remaining nix-build classes; the
+class is encoded in the manifest header's ``item_class``. For
+``build_variant`` items the worker additionally deref-copies the ELF
+symlinks from the realised nix output's ``elf/`` subdir (mkBinaryFolder
+layout) into the shared dataset directory under
+``<pkg>/<variant_dir>/<basename>``. Toolchain compilation now lives in
+``build_compilers_worker.py``; this module only handles the rare
+``toolchain_validate`` probe (gated by ``--debug-testbuild``).
 
 Subprocess execution and the wall clock are dependency-injected so the
 test suite stays hermetic — no real ``nix build`` invocations and no
@@ -36,10 +39,9 @@ __all__ = [
     "BuildWorkerResult",
     "BuildWorkerEnv",
     "VALID_ITEM_CLASSES",
-    "ITEM_CLASS_PHASE2_TOOLCHAIN",
-    "ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE",
-    "ITEM_CLASS_PHASE2_COMMON_DEP",
-    "ITEM_CLASS_PHASE3_VARIANT",
+    "ITEM_CLASS_TOOLCHAIN_VALIDATE",
+    "ITEM_CLASS_BUILD_COMMON_DEP",
+    "ITEM_CLASS_BUILD_VARIANT",
     "parse_build_manifest",
     "build_attr",
     "copy_elf_folder",
@@ -49,18 +51,17 @@ __all__ = [
 
 # Item-class string tokens (matched against the manifest header). Kept as
 # module-level constants so callers (manifest_gen, suit_task) reference
-# the same string literals.
-ITEM_CLASS_PHASE2_TOOLCHAIN = "phase2_toolchain"
-ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE = "phase2_toolchain_validate"
-ITEM_CLASS_PHASE2_COMMON_DEP = "phase2_common_dep"
-ITEM_CLASS_PHASE3_VARIANT = "phase3_variant"
+# the same string literals. Toolchain *build* is no longer dispatched
+# here — ``build_compilers_worker.py`` owns that path.
+ITEM_CLASS_TOOLCHAIN_VALIDATE = "toolchain_validate"
+ITEM_CLASS_BUILD_COMMON_DEP = "build_common_dep"
+ITEM_CLASS_BUILD_VARIANT = "build_variant"
 
 VALID_ITEM_CLASSES: frozenset[str] = frozenset(
     {
-        ITEM_CLASS_PHASE2_TOOLCHAIN,
-        ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE,
-        ITEM_CLASS_PHASE2_COMMON_DEP,
-        ITEM_CLASS_PHASE3_VARIANT,
+        ITEM_CLASS_TOOLCHAIN_VALIDATE,
+        ITEM_CLASS_BUILD_COMMON_DEP,
+        ITEM_CLASS_BUILD_VARIANT,
     }
 )
 
@@ -176,7 +177,7 @@ def parse_build_manifest(manifest_json_path: pathlib.Path) -> dict:
     .. code-block:: json
 
         {
-          "item_class": "phase2_toolchain" | "phase2_common_dep" | "phase3_variant",
+          "item_class": "build_common_dep" | "build_variant" | "toolchain_validate",
           "name": "<human readable id>",
           "payload": {
             "attr": "<flake attribute path>",
@@ -607,7 +608,7 @@ def _validate_toolchain(
     start: float,
     clock: Callable[[], float],
 ) -> BuildWorkerResult:
-    """Handle a ``phase2_toolchain_validate`` item: fetch instead of build.
+    """Handle a ``toolchain_validate`` item: fetch instead of build.
 
     Cheap path-info probe first; on miss, run a single targeted
     ``nix copy --from http://<peer>:<port>`` against the placement
@@ -629,7 +630,7 @@ def _validate_toolchain(
             success=False,
             duration_seconds=max(0.0, clock() - start),
             error=(
-                "phase2_toolchain_validate manifest missing"
+                "toolchain_validate manifest missing"
                 " 'payload.outpath'; the primary's emit_all_manifests"
                 " should have included it"
             ),
@@ -805,13 +806,12 @@ def build_worker(
 
     1. Parse the manifest. Failure -> failed result with the parse error.
     2. Read ``payload.attr``. Missing -> failed result.
-    3. For ``item_class == phase2_common_dep`` add ``--skip-existing`` so
-       a path that's already in the local store is a no-op (toolchains
-       and variants are best-effort substituted but always allowed to
-       rebuild — common-deps are the only class where partial pre-build
-       progress is expected).
+    3. For ``item_class == build_common_dep`` add ``--skip-existing`` so
+       a path that's already in the local store is a no-op (variants are
+       best-effort substituted but always allowed to rebuild — common-deps
+       are the only class where partial pre-build progress is expected).
     4. ``build_attr`` to actually invoke nix.
-    5. On success for ``item_class == phase3_variant``: locate the
+    5. On success for ``item_class == build_variant``: locate the
        realised output path from the last stdout line and
        :func:`copy_tarball` to ``env.dataset_output_dir``.
     6. Build the result; capture the log excerpt on failure.
@@ -869,7 +869,7 @@ def build_worker(
     # just a path-info probe + targeted ``nix copy`` against the
     # placement map. Branch here so the rest of the dispatch keeps
     # its build-shaped invariants.
-    if item_class == ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE:
+    if item_class == ITEM_CLASS_TOOLCHAIN_VALIDATE:
         return _validate_toolchain(
             payload, env,
             item_class=item_class, name=name,
@@ -893,14 +893,14 @@ def build_worker(
         )
 
     extra_args: list[str] = []
-    if item_class == ITEM_CLASS_PHASE2_COMMON_DEP:
+    if item_class == ITEM_CLASS_BUILD_COMMON_DEP:
         extra_args.append("--skip-existing")
 
     # Variant pre-fetch: pull every input dep the placement map
     # knows about from a single targeted peer (no fanout). Runs
     # before nix build so the deps are already in the local store
     # when nix walks the closure. Best-effort — silent on failure.
-    if item_class == ITEM_CLASS_PHASE3_VARIANT:
+    if item_class == ITEM_CLASS_BUILD_VARIANT:
         _prefetch_variant_inputs(payload, env)
 
     try:
@@ -945,7 +945,7 @@ def build_worker(
         )
 
     output_path: Optional[pathlib.Path] = None
-    if item_class == ITEM_CLASS_PHASE3_VARIANT:
+    if item_class == ITEM_CLASS_BUILD_VARIANT:
         last = _last_nonblank_line(stdout)
         if not last:
             return BuildWorkerResult(
@@ -964,7 +964,7 @@ def build_worker(
                 name=name,
                 success=False,
                 duration_seconds=max(0.0, clock() - start),
-                error="phase3_variant manifest missing 'payload.variant_dir'",
+                error="build_variant manifest missing 'payload.variant_dir'",
             )
         # Group variants by package: ``dataset/<pkg>/<variant_dir>/<elf>``
         # so an operator can ``ls dataset/hello/`` to see every variant
@@ -1035,19 +1035,16 @@ def build_worker(
             drv=drv if isinstance(drv, str) else None,
         )
 
-    # Phase-2 success branch (toolchain build or common_dep). Capture
-    # the realised outpath from nix's stdout for the placement record;
-    # variants already returned above with their own outpath wiring.
+    # Common-dep success branch. Capture the realised outpath from
+    # nix's stdout for the placement record; variants and
+    # toolchain_validate already returned above with their own outpath
+    # wiring. Toolchain *build* placement records are owned by
+    # ``build_compilers_worker.py``.
     success_outpath = _last_nonblank_line(stdout)
     drv_str = drv if isinstance(drv, str) else None
     if success_outpath:
-        placement_class = (
-            "common_dep"
-            if item_class == ITEM_CLASS_PHASE2_COMMON_DEP
-            else "toolchain"
-        )
         _maybe_record_self_has(
-            env, success_outpath, drv_str, placement_class,
+            env, success_outpath, drv_str, "common_dep",
         )
 
     return BuildWorkerResult(
@@ -1139,14 +1136,15 @@ def main() -> int:
     )
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument(
-        "--phase0-out-dir",
+        "--matrix-eval-out-dir",
         type=str,
         default=None,
         help=(
-            "Shared bind-mounted directory for phase0_eval resume"
+            "Shared bind-mounted directory for matrix_eval resume"
             " markers. Marker is written to"
-            " ``<phase0-out-dir>/<binary>/manifest.json``. Required"
-            " for phase0_eval tasks; ignored by build/toolchain types."
+            " ``<matrix-eval-out-dir>/<binary>/manifest.json``. Required"
+            " for matrix_eval tasks; ignored by build_common_dep /"
+            " build_variant / toolchain_validate types."
         ),
     )
     args, _ = parser.parse_known_args()
@@ -1199,13 +1197,13 @@ def main() -> int:
     #
     # The framework picks a single ``worker_module`` per secondary's pool
     # (the first registered one in :func:`_phase_specs` wins), so every
-    # task — phase0_eval, toolchain, toolchain_validate, common_dep, and
-    # variant — funnels through this unified entry point. The handle
-    # closure below sniffs ``task.payload`` to decide which dispatch
-    # path to take:
+    # task — matrix_eval, toolchain_validate, build_common_dep, and
+    # build_variant — funnels through this unified entry point. The
+    # handle closure below sniffs ``task.payload`` to decide which
+    # dispatch path to take:
     #
-    #   * phase0_eval payloads carry a ``binary`` + ``attr`` top-level
-    #     pair (matches ``manifest_gen.make_phase0_eval_header``);
+    #   * matrix_eval payloads carry a ``binary`` + ``attr`` top-level
+    #     pair (matches ``manifest_gen.make_matrix_eval_header``);
     #     dispatched to :func:`eval_worker.run_eval_task`.
     #   * everything else is a build manifest;
     #     dispatched to :func:`build_worker` (this module).
@@ -1246,27 +1244,27 @@ def main() -> int:
 
     _handle_log = logging.getLogger("compiler_suit_runner.build_worker.handle")
 
-    def _extract_phase0_eval_payload(payload: object) -> Optional[dict]:
-        """Return the inner phase0_eval payload dict, or None if the
-        task is not a phase0_eval task.
+    def _extract_matrix_eval_payload(payload: object) -> Optional[dict]:
+        """Return the inner matrix_eval payload dict, or None if the
+        task is not a matrix_eval task.
 
         The framework wraps the ``ManifestHeader`` into
         ``TaskInfo.payload`` so ``task.payload`` is the header_dict
         ``{item_class, name, size, payload: {...}}`` (see
         :meth:`SuitTask._header_to_task_info`). The inner payload is
         what :func:`eval_worker.run_eval_task` consumes; the
-        ``item_class == "phase0_eval"`` marker is the
+        ``item_class == "matrix_eval"`` marker is the
         unambiguous signal that this task targets the eval path.
         """
         if not isinstance(payload, dict):
             return None
-        if payload.get("item_class") != "phase0_eval":
+        if payload.get("item_class") != "matrix_eval":
             return None
         inner = payload.get("payload")
         if not isinstance(inner, dict):
             return None
         # Defensive: the inner payload should carry ``binary`` + ``attr``
-        # + ``sys`` per :func:`manifest_gen.make_phase0_eval_header`.
+        # + ``sys`` per :func:`manifest_gen.make_matrix_eval_header`.
         if "binary" not in inner or "attr" not in inner:
             return None
         return inner
@@ -1274,31 +1272,31 @@ def main() -> int:
     def handle(task: Task) -> Optional[WorkerOutput]:
         payload = task.payload if isinstance(task.payload, dict) else None
         # Phase 0 eval branch — sniff the wrapper header; if its
-        # ``item_class`` matches ``phase0_eval`` the inner payload is
+        # ``item_class`` matches ``matrix_eval`` the inner payload is
         # dispatched to :func:`eval_worker.run_eval_task` instead of
         # the build path.
-        eval_payload = _extract_phase0_eval_payload(payload)
+        eval_payload = _extract_matrix_eval_payload(payload)
         if eval_payload is not None:
             if broadcast_sender is None:
-                # phase0_eval requires shared_fs for the peer-gossip
+                # matrix_eval requires shared_fs for the peer-gossip
                 # directory (BroadcastSender peer URL lookups). Without
                 # it we can't honour the broadcast contract.
                 raise NonRecoverableError(
-                    "phase0_eval requires --shared-fs for peer gossip;"
+                    "matrix_eval requires --shared-fs for peer gossip;"
                     " refusing to proceed without it"
                 )
-            if not args.phase0_out_dir:
-                # phase0_eval marker dir must be passed explicitly —
+            if not args.matrix_eval_out_dir:
+                # matrix_eval marker dir must be passed explicitly —
                 # it's the bind-mounted shared output, distinct from
                 # the per-secondary scratch ``--shared-fs``.
                 raise NonRecoverableError(
-                    "phase0_eval requires --phase0-out-dir (shared"
+                    "matrix_eval requires --matrix-eval-out-dir (shared"
                     " bind-mounted marker dir); refusing to proceed"
                     " without it"
                 )
-            out_dir = pathlib.Path(args.phase0_out_dir)
+            out_dir = pathlib.Path(args.matrix_eval_out_dir)
             _handle_log.info(
-                "handle: dispatching phase0_eval task binary=%r archs=%r",
+                "handle: dispatching matrix_eval task binary=%r archs=%r",
                 eval_payload.get("binary"), eval_payload.get("archs"),
             )
             try:
@@ -1316,14 +1314,14 @@ def main() -> int:
                     " (retry-eligible)"
                 )
                 raise NonRecoverableError(
-                    f"phase0_eval failed: {exc}"
+                    f"matrix_eval failed: {exc}"
                 ) from exc
             except BaseException as exc:  # noqa: BLE001
                 _handle_log.exception(
                     "handle: run_eval_task raised unexpectedly"
                 )
                 raise NonRecoverableError(
-                    f"phase0_eval crashed: {type(exc).__name__}: {exc}"
+                    f"matrix_eval crashed: {type(exc).__name__}: {exc}"
                 ) from exc
             return WorkerOutput()
 

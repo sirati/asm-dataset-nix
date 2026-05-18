@@ -6,7 +6,7 @@ run in milliseconds and never touch the network or the local
 
 Note: ``eval_worker`` is a pure library module. The subprocess
 entry point lives in :func:`workers.build_worker.main`, which
-sniffs ``task.payload`` and dispatches phase0_eval tasks into
+sniffs ``task.payload`` and dispatches matrix_eval tasks into
 :func:`run_eval_task`. The framework-entry tests are in
 ``test_build_worker.py`` accordingly.
 """
@@ -23,7 +23,7 @@ import pytest
 from compiler_suit_runner.peer_replication import BroadcastResult
 from compiler_suit_runner.workers import eval_worker
 from compiler_suit_runner.workers.eval_worker import (
-    PHASE_0_ITEM_CLASS,
+    MATRIX_EVAL_ITEM_CLASS,
     parse_payload,
     run_eval_task,
     sample_suffix_attrs,
@@ -44,7 +44,7 @@ def _make_payload(
     variant_sample: Optional[int] = None,
     variant_seed: Optional[str] = None,
 ) -> dict:
-    """Build a phase0_eval payload matching make_phase0_eval_header."""
+    """Build a matrix_eval payload matching make_matrix_eval_header."""
     archs = archs if archs is not None else ["x86_64"]
     suffixes = suffixes if suffixes is not None else ["O0", "O2"]
     payload: dict[str, Any] = {
@@ -212,7 +212,7 @@ def test_parse_payload_rejects_unsafe_suffix() -> None:
 def test_parse_payload_item_class_constant() -> None:
     # Sanity: the module's exported item-class string matches what
     # manifest_gen uses on the wire.
-    assert PHASE_0_ITEM_CLASS == "phase0_eval"
+    assert MATRIX_EVAL_ITEM_CLASS == "matrix_eval"
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +352,7 @@ def test_run_eval_task_happy_path(tmp_path: pathlib.Path) -> None:
     }
     # item_class kwarg is the broadcast namespace marker.
     for call in sender.enqueue_broadcast.call_args_list:
-        assert call.kwargs["item_class"] == "phase0_eval_drv"
+        assert call.kwargs["item_class"] == "matrix_eval_drv"
 
     # wait_for_completion: one call per broadcast id.
     assert sender.wait_for_completion.call_count == 4
@@ -759,7 +759,7 @@ def test_module_exports_drop_main() -> None:
     assert not hasattr(eval_worker, "main")
     # The library surface stays exported.
     for name in (
-        "PHASE_0_ITEM_CLASS",
+        "MATRIX_EVAL_ITEM_CLASS",
         "RunSubprocess",
         "parse_payload",
         "read_peer_push_urls",

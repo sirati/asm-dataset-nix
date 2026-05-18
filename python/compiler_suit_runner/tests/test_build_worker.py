@@ -14,10 +14,9 @@ import pytest
 
 from compiler_suit_runner.workers import build_worker as bw
 from compiler_suit_runner.workers.build_worker import (
-    ITEM_CLASS_PHASE2_COMMON_DEP,
-    ITEM_CLASS_PHASE2_TOOLCHAIN,
-    ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE,
-    ITEM_CLASS_PHASE3_VARIANT,
+    ITEM_CLASS_BUILD_COMMON_DEP,
+    ITEM_CLASS_BUILD_VARIANT,
+    ITEM_CLASS_TOOLCHAIN_VALIDATE,
     BuildWorkerEnv,
     BuildWorkerResult,
     build_attr,
@@ -91,12 +90,12 @@ def _write_manifest(
 @pytest.mark.parametrize(
     "item_class",
     [
-        ITEM_CLASS_PHASE2_TOOLCHAIN,
-        ITEM_CLASS_PHASE2_COMMON_DEP,
-        ITEM_CLASS_PHASE3_VARIANT,
+        ITEM_CLASS_BUILD_COMMON_DEP,
+        ITEM_CLASS_BUILD_VARIANT,
+        ITEM_CLASS_TOOLCHAIN_VALIDATE,
     ],
 )
-def test_parse_build_manifest_accepts_all_three_classes(tmp_path, item_class):
+def test_parse_build_manifest_accepts_all_known_classes(tmp_path, item_class):
     manifest = _write_manifest(
         tmp_path / "m.json",
         item_class=item_class,
@@ -340,14 +339,14 @@ def test_copy_elf_folder_atomic_replace(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_build_worker_phase2_toolchain_happy(tmp_path):
+def test_build_worker_build_common_dep_passes_skip_existing(tmp_path):
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_TOOLCHAIN,
-        name="gcc15-x86_64-linux-aarch64",
-        payload={"attr": "_crossToolchainMap.x86_64-linux.aarch64.gcc15"},
+        item_class=ITEM_CLASS_BUILD_COMMON_DEP,
+        name="some-common-dep",
+        payload={"attr": "_drvDeps.foo"},
     )
-    runner = RecordingRunner(stdout=b"/nix/store/aaa-toolchain\n")
+    runner = RecordingRunner(stdout=b"/nix/store/bbb\n")
     clock = FakeClock(start=10.0, step=2.5)
     env = BuildWorkerEnv(
         flake_ref=".",
@@ -360,40 +359,20 @@ def test_build_worker_phase2_toolchain_happy(tmp_path):
     assert result.success is True
     assert result.error is None
     assert result.output_path is None
-    assert result.item_class == ITEM_CLASS_PHASE2_TOOLCHAIN
-    assert result.name == "gcc15-x86_64-linux-aarch64"
+    assert result.item_class == ITEM_CLASS_BUILD_COMMON_DEP
+    assert result.name == "some-common-dep"
     assert result.duration_seconds > 0.0
-    # Toolchains do NOT pass --skip-existing.
-    argv = runner.calls[0]
-    assert "--skip-existing" not in argv
-
-
-def test_build_worker_phase2_common_dep_passes_skip_existing(tmp_path):
-    manifest = _write_manifest(
-        tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_COMMON_DEP,
-        name="some-common-dep",
-        payload={"attr": "_drvDeps.foo"},
-    )
-    runner = RecordingRunner(stdout=b"/nix/store/bbb\n")
-    env = BuildWorkerEnv(
-        flake_ref=".",
-        dataset_output_dir=tmp_path / "dataset",
-        run_subprocess=runner,
-    )
-    result = build_worker(manifest, env)
-    assert result.success is True
     argv = runner.calls[0]
     assert "--skip-existing" in argv
 
 
-def test_build_worker_phase3_variant_copies_elf_folder(tmp_path):
+def test_build_worker_build_variant_copies_elf_folder(tmp_path):
     out_dir = tmp_path / "nix-out"
     _make_elf_folder(out_dir, {"hello": b"elf-bytes"})
     variant_dir = "hello__x86_64__gcc15__O2"
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE3_VARIANT,
+        item_class=ITEM_CLASS_BUILD_VARIANT,
         name=variant_dir,
         payload={
             "attr": "dataset.x86_64-linux.hello.x86_64.gcc15.O2",
@@ -417,13 +396,13 @@ def test_build_worker_phase3_variant_copies_elf_folder(tmp_path):
     assert (expected_subdir / "hello").read_bytes() == b"elf-bytes"
 
 
-def test_build_worker_phase3_variant_uses_last_stdout_line(tmp_path):
+def test_build_worker_build_variant_uses_last_stdout_line(tmp_path):
     """If nix prints diagnostics first, the realised path is the LAST line."""
     out_dir = tmp_path / "nix-out"
     _make_elf_folder(out_dir, {"bin": b"v"})
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE3_VARIANT,
+        item_class=ITEM_CLASS_BUILD_VARIANT,
         name="v",
         payload={"attr": "v", "variant_dir": "v", "pkg": "p"},
     )
@@ -456,8 +435,8 @@ def test_build_worker_with_substituters_file_includes_peer_args(tmp_path):
     substituters = _write_substituters_file(tmp_path, peer_args)
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_TOOLCHAIN,
-        name="gcc15",
+        item_class=ITEM_CLASS_BUILD_COMMON_DEP,
+        name="glibc",
         payload={"attr": "x"},
     )
     runner = RecordingRunner()
@@ -481,7 +460,7 @@ def test_build_worker_with_substituters_file_includes_peer_args(tmp_path):
 def test_build_worker_failure_captures_stderr(tmp_path):
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_TOOLCHAIN,
+        item_class=ITEM_CLASS_BUILD_COMMON_DEP,
         name="bad",
         payload={"attr": "broken"},
     )
@@ -509,7 +488,7 @@ def test_build_worker_failure_captures_stderr(tmp_path):
 def test_build_worker_does_not_raise_on_nonzero(tmp_path):
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_TOOLCHAIN,
+        item_class=ITEM_CLASS_BUILD_COMMON_DEP,
         name="bad",
         payload={"attr": "broken"},
     )
@@ -527,7 +506,7 @@ def test_build_worker_does_not_raise_on_nonzero(tmp_path):
 def test_build_worker_does_not_raise_on_subprocess_exception(tmp_path):
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_TOOLCHAIN,
+        item_class=ITEM_CLASS_BUILD_COMMON_DEP,
         name="x",
         payload={"attr": "x"},
     )
@@ -546,13 +525,13 @@ def test_build_worker_does_not_raise_on_subprocess_exception(tmp_path):
     assert "crashed" in result.error
 
 
-def test_build_worker_phase3_missing_elf_folder(tmp_path):
+def test_build_worker_build_variant_missing_elf_folder(tmp_path):
     out_dir = tmp_path / "nix-out"
     out_dir.mkdir()
     # No elf/ subdir placed inside — copy_elf_folder will raise.
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE3_VARIANT,
+        item_class=ITEM_CLASS_BUILD_VARIANT,
         name="nope",
         payload={"attr": "x", "variant_dir": "nope", "pkg": "p"},
     )
@@ -567,12 +546,12 @@ def test_build_worker_phase3_missing_elf_folder(tmp_path):
     assert "elf folder copy failed" in (result.error or "")
 
 
-def test_build_worker_phase3_missing_variant_dir(tmp_path):
+def test_build_worker_build_variant_missing_variant_dir(tmp_path):
     out_dir = tmp_path / "nix-out"
     _make_elf_folder(out_dir, {"x": b"v"})
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE3_VARIANT,
+        item_class=ITEM_CLASS_BUILD_VARIANT,
         name="v",
         payload={"attr": "x"},  # no variant_dir
     )
@@ -602,7 +581,7 @@ def test_build_worker_bad_manifest_returns_failure(tmp_path):
 def test_build_worker_missing_payload_attr(tmp_path):
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_TOOLCHAIN,
+        item_class=ITEM_CLASS_BUILD_COMMON_DEP,
         name="x",
         payload={},  # no attr
     )
@@ -627,14 +606,13 @@ def test_module_exports():
     assert hasattr(bw, "build_attr")
     assert hasattr(bw, "copy_elf_folder")
     assert hasattr(bw, "build_worker")
-    assert ITEM_CLASS_PHASE2_TOOLCHAIN in bw.VALID_ITEM_CLASSES
-    assert ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE in bw.VALID_ITEM_CLASSES
-    assert ITEM_CLASS_PHASE2_COMMON_DEP in bw.VALID_ITEM_CLASSES
-    assert ITEM_CLASS_PHASE3_VARIANT in bw.VALID_ITEM_CLASSES
+    assert ITEM_CLASS_TOOLCHAIN_VALIDATE in bw.VALID_ITEM_CLASSES
+    assert ITEM_CLASS_BUILD_COMMON_DEP in bw.VALID_ITEM_CLASSES
+    assert ITEM_CLASS_BUILD_VARIANT in bw.VALID_ITEM_CLASSES
 
 
 # ---------------------------------------------------------------------------
-# phase2_toolchain_validate dispatch
+# toolchain_validate dispatch
 # ---------------------------------------------------------------------------
 
 
@@ -666,7 +644,7 @@ def test_validate_toolchain_records_placement_when_already_local(tmp_path):
     records the placement and returns success without fetching."""
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE,
+        item_class=ITEM_CLASS_TOOLCHAIN_VALIDATE,
         name="toolchain_validate__aarch64__gcc15",
         payload={
             "drv": "/nix/store/tc.drv",
@@ -704,7 +682,7 @@ def test_validate_toolchain_records_placement_when_already_local(tmp_path):
 def test_validate_toolchain_fetches_from_peer_when_missing(tmp_path):
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE,
+        item_class=ITEM_CLASS_TOOLCHAIN_VALIDATE,
         name="toolchain_validate__aarch64__gcc15",
         payload={
             "drv": "/nix/store/tc.drv",
@@ -765,7 +743,7 @@ def test_validate_toolchain_fails_when_no_peer_has_it(tmp_path):
     surfaces a clear error for the operator."""
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE,
+        item_class=ITEM_CLASS_TOOLCHAIN_VALIDATE,
         name="toolchain_validate__aarch64__gcc15",
         payload={
             "drv": "/nix/store/tc.drv",
@@ -795,7 +773,7 @@ def test_validate_toolchain_missing_outpath_in_payload(tmp_path):
     silently fall through to nix's substituters."""
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_TOOLCHAIN_VALIDATE,
+        item_class=ITEM_CLASS_TOOLCHAIN_VALIDATE,
         name="v",
         payload={"drv": "/nix/store/tc.drv"},  # no outpath
     )
@@ -819,7 +797,7 @@ def test_common_dep_success_records_placement(tmp_path):
     rebuilding."""
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_COMMON_DEP,
+        item_class=ITEM_CLASS_BUILD_COMMON_DEP,
         name="glibc",
         payload={
             "drv": "/nix/store/glibc.drv",
@@ -849,36 +827,6 @@ def test_common_dep_success_records_placement(tmp_path):
     assert placements[0].item_class == "common_dep"
 
 
-def test_toolchain_build_success_records_placement_as_toolchain(tmp_path):
-    """Opt-in toolchain build path also records placement, with the
-    ``toolchain`` item_class so future fetches can prefer toolchain
-    candidates appropriately if we ever want that policy."""
-    manifest = _write_manifest(
-        tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE2_TOOLCHAIN,
-        name="gcc15-aarch64",
-        payload={"attr": "x", "drv": "/nix/store/tc.drv"},
-    )
-    realised = "/nix/store/xyz-toolchain"
-    runner = RecordingRunner(stdout=f"{realised}\n".encode("utf-8"))
-    shared_fs = tmp_path / "shared"
-    shared_fs.mkdir()
-    env = BuildWorkerEnv(
-        flake_ref=".",
-        dataset_output_dir=tmp_path / "dataset",
-        run_subprocess=runner,
-        shared_fs=shared_fs,
-        secondary_id="sec1",
-    )
-    result = build_worker(manifest, env)
-    assert result.success is True
-
-    from compiler_suit_runner.peer_paths import list_self_placements
-    placements = list_self_placements(shared_fs, "sec1")
-    assert len(placements) == 1
-    assert placements[0].item_class == "toolchain"
-
-
 def test_variant_prefetch_issues_targeted_copy_per_known_input(tmp_path):
     """Before invoking ``nix build`` for a variant, the worker
     pre-fetches every input the placement map knows about. Inputs
@@ -887,7 +835,7 @@ def test_variant_prefetch_issues_targeted_copy_per_known_input(tmp_path):
     _make_elf_folder(out_dir, {"hello": b"v"})
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE3_VARIANT,
+        item_class=ITEM_CLASS_BUILD_VARIANT,
         name="hello-x86_64-gcc15-O2",
         payload={
             "attr": "x",
@@ -962,7 +910,7 @@ def test_variant_prefetch_skipped_without_placement_plumbing(tmp_path):
     _make_elf_folder(out_dir, {"hello": b"v"})
     manifest = _write_manifest(
         tmp_path / "m.json",
-        item_class=ITEM_CLASS_PHASE3_VARIANT,
+        item_class=ITEM_CLASS_BUILD_VARIANT,
         name="v",
         payload={
             "attr": "x",
@@ -992,7 +940,7 @@ def test_variant_prefetch_skipped_without_placement_plumbing(tmp_path):
 # Subprocess entry point — main + handle closure (unified dispatch)
 #
 # The framework picks ONE ``worker_module`` per secondary pool, so
-# ``build_worker.main`` must dispatch both phase0_eval payloads
+# ``build_worker.main`` must dispatch both matrix_eval payloads
 # (-> :func:`eval_worker.run_eval_task`) and the original build
 # manifests (-> :func:`build_worker.build_worker`). The handle closure
 # sniffs ``task.payload['item_class']`` to decide which branch fires.
@@ -1019,7 +967,7 @@ def _run_build_worker_main_with_capture(
         def __init__(
             self,
             payload=None,
-            task_id: str = "phase0_eval__hello",
+            task_id: str = "matrix_eval__hello",
             relative_path: str = "",
             resolved_path: str = "",
         ) -> None:
@@ -1072,16 +1020,16 @@ def _run_build_worker_main_with_capture(
     return captured_handle, run_mock, sender_class_mock
 
 
-def _phase0_eval_wrapper_payload(
+def _matrix_eval_wrapper_payload(
     *,
     binary: str = "hello",
     sys_name: str = "x86_64-linux",
 ) -> dict:
     """Return a header_dict wrapper as :class:`SuitTask._header_to_task_info`
-    would emit — ``payload`` field is the inner phase0_eval data."""
+    would emit — ``payload`` field is the inner matrix_eval data."""
     return {
-        "item_class": "phase0_eval",
-        "name": f"phase0_eval__{binary}",
+        "item_class": "matrix_eval",
+        "name": f"matrix_eval__{binary}",
         "size": 1,
         "payload": {
             "binary": binary,
@@ -1093,10 +1041,10 @@ def _phase0_eval_wrapper_payload(
     }
 
 
-def test_main_handle_dispatches_phase0_eval_to_run_eval_task(
+def test_main_handle_dispatches_matrix_eval_to_run_eval_task(
     monkeypatch, tmp_path
 ):
-    """A task whose ``item_class == 'phase0_eval'`` is routed to
+    """A task whose ``item_class == 'matrix_eval'`` is routed to
     :func:`eval_worker.run_eval_task` with the inner payload, the
     shared-fs-derived out_dir, and the constructed BroadcastSender."""
     handle, _, sender_cls = _run_build_worker_main_with_capture(
@@ -1106,7 +1054,7 @@ def test_main_handle_dispatches_phase0_eval_to_run_eval_task(
             "--flake-ref", ".",
             "--dataset-output-dir", str(tmp_path / "dataset"),
             "--shared-fs", str(tmp_path),
-            "--phase0-out-dir", str(tmp_path / "phase0"),
+            "--matrix-eval-out-dir", str(tmp_path / "phase0"),
             "--secondary-id", "sec1",
             "--signing-public-key", "k:abc",
         ],
@@ -1131,7 +1079,7 @@ def test_main_handle_dispatches_phase0_eval_to_run_eval_task(
     fake_task_cls = _sys.modules["dynamic_runner.worker"].Task
     fake_output_cls = _sys.modules["dynamic_runner.worker"].WorkerOutput
 
-    wrapper = _phase0_eval_wrapper_payload(binary="hello")
+    wrapper = _matrix_eval_wrapper_payload(binary="hello")
     task = fake_task_cls(payload=wrapper)
     output = handle(task)
     assert isinstance(output, fake_output_cls)
@@ -1144,7 +1092,7 @@ def test_main_handle_dispatches_phase0_eval_to_run_eval_task(
 def test_main_handle_dispatches_build_manifest_to_build_worker(
     monkeypatch, tmp_path
 ):
-    """A task whose payload is NOT a phase0_eval wrapper (e.g. a
+    """A task whose payload is NOT a matrix_eval wrapper (e.g. a
     toolchain manifest) is routed to the existing build_worker path,
     NOT to run_eval_task."""
     handle, _, _ = _run_build_worker_main_with_capture(
@@ -1173,8 +1121,8 @@ def test_main_handle_dispatches_build_manifest_to_build_worker(
             "manifest_data": manifest_data,
         })
         return bw.BuildWorkerResult(
-            item_class=ITEM_CLASS_PHASE2_TOOLCHAIN,
-            name="tc",
+            item_class=ITEM_CLASS_BUILD_COMMON_DEP,
+            name="cd",
             success=True,
             duration_seconds=0.0,
             outpath="/nix/store/x",
@@ -1186,22 +1134,22 @@ def test_main_handle_dispatches_build_manifest_to_build_worker(
     fake_task_cls = _sys.modules["dynamic_runner.worker"].Task
     fake_output_cls = _sys.modules["dynamic_runner.worker"].WorkerOutput
 
-    # A toolchain manifest wrapper (item_class is one of the build
-    # classes). The handle closure must NOT treat this as phase0_eval.
-    toolchain_payload = {
-        "item_class": ITEM_CLASS_PHASE2_TOOLCHAIN,
-        "name": "tc",
-        "payload": {"attr": "x.tc", "drv": "/nix/store/tc.drv"},
+    # A common-dep manifest wrapper (item_class is one of the build
+    # classes). The handle closure must NOT treat this as matrix_eval.
+    build_payload = {
+        "item_class": ITEM_CLASS_BUILD_COMMON_DEP,
+        "name": "cd",
+        "payload": {"attr": "x.cd", "drv": "/nix/store/cd.drv"},
     }
-    task = fake_task_cls(payload=toolchain_payload, relative_path="m.json")
+    task = fake_task_cls(payload=build_payload, relative_path="m.json")
     output = handle(task)
     assert isinstance(output, fake_output_cls)
     assert not eval_called, "build manifest must NOT reach run_eval_task"
     assert len(build_called) == 1
-    assert build_called[0]["manifest_data"] == toolchain_payload
+    assert build_called[0]["manifest_data"] == build_payload
 
 
-def test_main_handle_phase0_eval_runtime_error_becomes_non_recoverable(
+def test_main_handle_matrix_eval_runtime_error_becomes_non_recoverable(
     monkeypatch, tmp_path
 ):
     """When run_eval_task raises RuntimeError the handle re-raises as
@@ -1214,7 +1162,7 @@ def test_main_handle_phase0_eval_runtime_error_becomes_non_recoverable(
             "--flake-ref", ".",
             "--dataset-output-dir", str(tmp_path / "dataset"),
             "--shared-fs", str(tmp_path),
-            "--phase0-out-dir", str(tmp_path / "phase0"),
+            "--matrix-eval-out-dir", str(tmp_path / "phase0"),
         ],
     )
 
@@ -1230,16 +1178,17 @@ def test_main_handle_phase0_eval_runtime_error_becomes_non_recoverable(
     Task = fake_mod.Task
     NonRecoverable = fake_mod.NonRecoverableError
     with pytest.raises(NonRecoverable) as exc_info:
-        handle(Task(payload=_phase0_eval_wrapper_payload()))
+        handle(Task(payload=_matrix_eval_wrapper_payload()))
     assert "nix-eval-jobs fell over" in str(exc_info.value)
 
 
-def test_main_handle_phase0_eval_without_phase0_out_dir_is_non_recoverable(
+def test_main_handle_matrix_eval_without_matrix_eval_out_dir_is_non_recoverable(
     monkeypatch, tmp_path
 ):
-    """phase0_eval requires --phase0-out-dir (shared bind-mounted marker
-    dir). Receiving the task without that flag — even with --shared-fs
-    — is a structural misconfiguration -> NonRecoverableError."""
+    """matrix_eval requires --matrix-eval-out-dir (shared bind-mounted
+    marker dir). Receiving the task without that flag — even with
+    --shared-fs — is a structural misconfiguration ->
+    NonRecoverableError."""
     handle, _, _ = _run_build_worker_main_with_capture(
         monkeypatch,
         [
@@ -1247,7 +1196,7 @@ def test_main_handle_phase0_eval_without_phase0_out_dir_is_non_recoverable(
             "--flake-ref", ".",
             "--dataset-output-dir", str(tmp_path / "dataset"),
             "--shared-fs", str(tmp_path),
-            # --phase0-out-dir OMITTED
+            # --matrix-eval-out-dir OMITTED
         ],
     )
 
@@ -1256,14 +1205,14 @@ def test_main_handle_phase0_eval_without_phase0_out_dir_is_non_recoverable(
     Task = fake_mod.Task
     NonRecoverable = fake_mod.NonRecoverableError
     with pytest.raises(NonRecoverable) as exc_info:
-        handle(Task(payload=_phase0_eval_wrapper_payload()))
-    assert "phase0-out-dir" in str(exc_info.value)
+        handle(Task(payload=_matrix_eval_wrapper_payload()))
+    assert "matrix-eval-out-dir" in str(exc_info.value)
 
 
-def test_main_handle_phase0_eval_without_shared_fs_is_non_recoverable(
+def test_main_handle_matrix_eval_without_shared_fs_is_non_recoverable(
     monkeypatch, tmp_path
 ):
-    """phase0_eval requires --shared-fs (resume marker + peer gossip
+    """matrix_eval requires --shared-fs (resume marker + peer gossip
     both live under it). Receiving the task without that flag is a
     structural misconfiguration -> NonRecoverableError."""
     handle, _, sender_cls = _run_build_worker_main_with_capture(
@@ -1283,7 +1232,7 @@ def test_main_handle_phase0_eval_without_shared_fs_is_non_recoverable(
     Task = fake_mod.Task
     NonRecoverable = fake_mod.NonRecoverableError
     with pytest.raises(NonRecoverable) as exc_info:
-        handle(Task(payload=_phase0_eval_wrapper_payload()))
+        handle(Task(payload=_matrix_eval_wrapper_payload()))
     assert "shared-fs" in str(exc_info.value)
 
 
@@ -1298,7 +1247,7 @@ def test_main_stops_broadcast_sender_on_exit(monkeypatch, tmp_path):
             "--flake-ref", ".",
             "--dataset-output-dir", str(tmp_path / "dataset"),
             "--shared-fs", str(tmp_path),
-            "--phase0-out-dir", str(tmp_path / "phase0"),
+            "--matrix-eval-out-dir", str(tmp_path / "phase0"),
             "--secondary-id", "sec1",
         ],
     )
