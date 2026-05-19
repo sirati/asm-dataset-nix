@@ -16,6 +16,10 @@ from template_graph.cowalk.build_template import (
     walk_one_sided_subtree,
 )
 from template_graph.cowalk.classify_pair import _classify_pair
+from template_graph.cowalk.cowalk_variant import (
+    CowalkCtx,
+    cowalk_into_arr,
+)
 
 __all__ = [
     "build_template",
@@ -23,4 +27,6 @@ __all__ = [
     "make_template_node",
     "walk_one_sided_subtree",
     "_classify_pair",
+    "CowalkCtx",
+    "cowalk_into_arr",
 ]
