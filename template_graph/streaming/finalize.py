@@ -35,6 +35,9 @@ def finalize(planner: "StreamPlanner") -> dict:
         _finalise_current_variant(planner)
     _close_current_matrix(planner)
     meta_templates_by_binary = _build_meta_templates_post_pass(planner)
+    planner.out.toolchain_node_ids_per_template = (
+        _build_toolchain_node_ids_post_pass(planner)
+    )
     return {
         "templates": planner.out.templates,
         "variant_arrays": planner.out.variant_arrays,
@@ -44,6 +47,29 @@ def finalize(planner: "StreamPlanner") -> dict:
         "arch_indep_deps": planner.out.arch_indep_deps,
         "stdenv_subtrees": planner.out.stdenv_subtrees,
         "meta_templates": meta_templates_by_binary,
+        "toolchain_node_ids_per_template": (
+            planner.out.toolchain_node_ids_per_template
+        ),
+    }
+
+
+def _build_toolchain_node_ids_post_pass(
+    planner: "StreamPlanner",
+) -> dict[int, list[int]]:
+    """For each template, list the node_ids whose ``is_toolchain`` is set.
+
+    ``dependency_graph_planner`` needs this mapping to wire toolchain
+    task ids into per-variant dependency sets: the cowalk short-
+    circuits toolchain subtrees in ``walk_one_sided_subtree`` /
+    ``_walk_pair_node``, so ``arr.hashes`` rows at toolchain node_ids
+    stay empty. Without this map the consumer would have no way to
+    identify which template positions are toolchains.
+    """
+    return {
+        tid: [
+            nid for nid, node in enumerate(t.nodes) if node.is_toolchain
+        ]
+        for tid, t in enumerate(planner.out.templates)
     }
 
 

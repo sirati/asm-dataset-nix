@@ -267,3 +267,66 @@ def test_arch_indep_deps_populated_per_binary():
     assert (goodbye_src.hash, goodbye_src.name) not in indep["hello"]
     # Both binaries appear as keys.
     assert set(indep.keys()) == {"hello", "goodbye"}
+
+
+def test_toolchain_node_ids_per_template_emitted():
+    """A calibration pair whose variants share a toolchain child
+    should mark the corresponding template node ``is_toolchain`` and
+    surface that node_id in
+    ``finalize()['toolchain_node_ids_per_template'][tid]``.
+
+    Setup:
+      * ``toolchains.drv`` at depth 1 with one child ``cc.drv`` that
+        seeds ``out.toolchain_drvs`` at depth 2.
+      * ``matrix-hello`` with two calibrating variants, both
+        referencing ``cc.drv`` (backref on the variant side, since
+        the toolchain section visited it first).
+
+    Expected: the template has a single ``is_toolchain`` node whose
+    name is ``cc.drv``, and the new map points at it.
+    """
+    cc_hash = make_hash(7)
+    toolchain_cc = Node(hash=cc_hash, name="cc.drv")
+    # Both variants reference the same toolchain ident.
+    variant_a = simple_variant(
+        "hello", "x86_64", seed_base=10, comp="gcc15", opt="O0",
+        children=[toolchain_cc],
+    )
+    variant_b = simple_variant(
+        "hello", "x86_64", seed_base=20, comp="gcc15", opt="O1",
+        children=[toolchain_cc],
+    )
+    root = Node(
+        hash=make_hash(0), name="sum-root.drv",
+        children=[
+            Node(hash=make_hash(1), name="toolchains.drv",
+                 children=[toolchain_cc]),
+            Node(
+                hash=make_hash(2), name="matrix-hello.drv",
+                children=[variant_a, variant_b],
+            ),
+        ],
+    )
+    planner = StreamPlanner(archs=("x86_64",))
+    feed(planner, render_tree(root))
+    result = planner.finalize()
+
+    assert "toolchain_node_ids_per_template" in result
+    tc_per_tmpl = result["toolchain_node_ids_per_template"]
+    assert set(tc_per_tmpl.keys()) == {0}
+    template = result["templates"][0]
+    expected = [
+        nid for nid, n in enumerate(template.nodes) if n.is_toolchain
+    ]
+    assert tc_per_tmpl[0] == expected
+    # Sanity: the cc.drv role is in fact marked is_toolchain (the
+    # whole point is that the cowalk short-circuited under it, so
+    # ``arr.hashes`` rows at that nid would be empty).
+    cc_nids = [
+        nid for nid, n in enumerate(template.nodes) if n.name == "cc.drv"
+    ]
+    assert cc_nids and all(
+        template.nodes[nid].is_toolchain for nid in cc_nids
+    )
+    assert set(cc_nids).issubset(set(tc_per_tmpl[0]))
+    assert planner.violations == []
