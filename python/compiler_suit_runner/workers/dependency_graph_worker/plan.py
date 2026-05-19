@@ -194,6 +194,12 @@ def _slice_streaming_result(
         "common_deps_per_arch_template": sliced_classifications,
         "toolchain_drvs": streaming_result.get("toolchain_drvs", set()),
         "arch_indep_deps": streaming_result.get("arch_indep_deps", {}),
+        # Keyed by template_id; pass through unchanged because the
+        # adapter looks up per-cell tmpl_id and templates list is also
+        # un-sliced (cells for non-owned templates are filtered above).
+        "toolchain_node_ids_per_template": streaming_result.get(
+            "toolchain_node_ids_per_template", {}
+        ),
     }
 
 

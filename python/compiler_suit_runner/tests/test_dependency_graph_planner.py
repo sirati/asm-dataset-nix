@@ -306,21 +306,23 @@ class TestMultiVariantCommonDep:
 
 
 class TestToolchainWiring:
-    """A variant whose template has an ``is_toolchain=True`` node with
-    a known ident in the row should get that toolchain's task_id wired
-    into its ``depends_on``.
+    """A template with a toolchain node listed in
+    ``toolchain_node_ids_per_template`` is wired by matching the
+    TemplateNode's role-name to entries in ``toolchain_drvs`` and
+    looking those idents up in ``toolchain_task_ids``.
 
-    Exercises the ``(hash, name)`` → ``"<hash>-<name>"`` translation
-    on the FAST path (not via :func:`convert_toolchain_drvs`)."""
+    The cowalk short-circuits toolchain subtrees so ``arr.hashes`` rows
+    at toolchain node_ids are empty; the role-name → ident join is
+    the canonical wiring path (E6 in the dependency-graph plan)."""
 
     def test_toolchain_task_id_wired_into_variant(self):
         template = _template([
             _node("variant-root", [1]),
-            # Toolchain marker — streaming planner usually skips
-            # storing the ident, but the cowalk can stash it; we
-            # exercise the path where it IS stored so the planner
-            # can resolve it to a task_id.
-            _node("cc-wrapper", [], is_toolchain=True),
+            # Toolchain marker — the cowalk records the node but
+            # short-circuits the subtree, so ``arr.hashes`` carries
+            # no ident at this position. The wiring uses the role
+            # name + ``toolchain_drvs`` instead.
+            _node("gcc-wrapper-15.drv", [], is_toolchain=True),
         ])
         arr = _variant_array(
             template_id=0,
@@ -328,7 +330,10 @@ class TestToolchainWiring:
             variants=["gcc15-O0"],
             hashes=[
                 [("rooth", "hello.drv")],
-                [("ccwh", "gcc-wrapper-15.drv")],
+                # Toolchain row left empty by the cowalk
+                # short-circuit; wiring resolves it via the name
+                # lookup below.
+                [],
             ],
         )
         streaming = {
@@ -338,6 +343,7 @@ class TestToolchainWiring:
                 (0, "x86_64"): {0: "common_dep"},
             },
             "toolchain_drvs": {("ccwh", "gcc-wrapper-15.drv")},
+            "toolchain_node_ids_per_template": {0: [1]},
             "arch_indep_deps": {},
         }
         variant_lookup = {
@@ -356,18 +362,19 @@ class TestToolchainWiring:
 
     def test_unknown_toolchain_ident_is_skipped(self):
         """A toolchain ident that's not in the task-id map is silently
-        omitted from depends_on (the caller's contract is to provide
-        the map for every toolchain it cares about)."""
+        omitted from depends_on. Operator-provided toolchains (which
+        the framework didn't build) legitimately have no task_id —
+        their absence must NOT produce a phantom dep."""
         template = _template([
             _node("root", [1]),
-            _node("cc-wrapper", [], is_toolchain=True),
+            _node("cc-wrapper.drv", [], is_toolchain=True),
         ])
         arr = _variant_array(
             template_id=0, arch="x86_64",
             variants=["gcc15-O0"],
             hashes=[
                 [("rh", "hello.drv")],
-                [("unknownh", "cc-wrapper.drv")],
+                [],
             ],
         )
         streaming = {
@@ -377,6 +384,7 @@ class TestToolchainWiring:
                 (0, "x86_64"): {0: "common_dep"},
             },
             "toolchain_drvs": {("unknownh", "cc-wrapper.drv")},
+            "toolchain_node_ids_per_template": {0: [1]},
             "arch_indep_deps": {},
         }
         variant_lookup = {
@@ -391,6 +399,100 @@ class TestToolchainWiring:
         # No toolchain mapping known → no toolchain dep in variant.
         # Common-dep deps from the root may still be present.
         assert all(not dep.startswith("build_compilers__") for dep in variants[0].depends_on)
+
+    def test_unified_wrapper_role_wires_all_matching_compilers(self):
+        """A toolchain node whose role unifies multiple compiler
+        versions (e.g. ``wrapped-compiler-suit.drv``) must wire ALL
+        matching ``toolchain_drvs`` idents into every variant's
+        ``depends_on``. Per-variant compiler selection is not visible
+        in the role-collapsed template, so over-wiring is the safe
+        choice (the variant waits on extra ``build_compilers__*``
+        tasks that would have been built regardless)."""
+        template = _template([
+            _node("hello-root", [1]),
+            _node(
+                "wrapped-compiler-suit.drv", [], is_toolchain=True,
+            ),
+        ])
+        arr = _variant_array(
+            template_id=0, arch="x86_64",
+            variants=["gcc14-O2", "gcc15-O2"],
+            hashes=[
+                [("rO2g14", "hello-O2.drv"), ("rO2g15", "hello-O2.drv")],
+                [[], []],
+            ],
+        )
+        # ``toolchain_drvs`` carries the post-hash drv name for each
+        # underlying compiler wrapper.
+        streaming = {
+            "templates": [template],
+            "variant_arrays": {(0, "x86_64"): arr},
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "common_dep"},
+            },
+            "toolchain_drvs": {
+                ("g14h", "wrapped-compiler-suit.drv"),
+                ("g15h", "wrapped-compiler-suit.drv"),
+            },
+            "toolchain_node_ids_per_template": {0: [1]},
+            "arch_indep_deps": {},
+        }
+        variant_lookup = {
+            ("x86_64", "gcc14-O2"): _variant_spec("gcc14-O2", "hello", "x86_64"),
+            ("x86_64", "gcc15-O2"): _variant_spec("gcc15-O2", "hello", "x86_64"),
+        }
+        toolchain_task_ids = {
+            "g14h-wrapped-compiler-suit.drv": "build_compilers__x86_64__gcc14",
+            "g15h-wrapped-compiler-suit.drv": "build_compilers__x86_64__gcc15",
+        }
+        descs = plan_phase4_for_binary(
+            "hello", streaming, variant_lookup,
+            toolchain_task_ids=toolchain_task_ids,
+        )
+        variants = [d for d in descs if d.kind == "build_variant"]
+        assert len(variants) == 2
+        for v in variants:
+            assert "build_compilers__x86_64__gcc14" in v.depends_on, v
+            assert "build_compilers__x86_64__gcc15" in v.depends_on, v
+
+    def test_no_toolchain_node_map_no_wiring(self):
+        """Without ``toolchain_node_ids_per_template`` in the streaming
+        snapshot, toolchain wiring is a no-op even if ``is_toolchain``
+        is set on a node — the new wiring path is the SOLE source of
+        truth (legacy ``arr.hashes`` scrape was removed). Existing
+        common-dep wiring must still fire."""
+        template = _template([
+            _node("hello-root", [1]),
+            _node("gcc-wrapper-15.drv", [], is_toolchain=True),
+        ])
+        arr = _variant_array(
+            template_id=0, arch="x86_64",
+            variants=["gcc15-O0"],
+            hashes=[[("rh", "hello.drv")], []],
+        )
+        streaming = {
+            "templates": [template],
+            "variant_arrays": {(0, "x86_64"): arr},
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "common_dep"},
+            },
+            "toolchain_drvs": {("ccwh", "gcc-wrapper-15.drv")},
+            # toolchain_node_ids_per_template intentionally absent.
+            "arch_indep_deps": {},
+        }
+        variant_lookup = {
+            ("x86_64", "gcc15-O0"): _variant_spec("gcc15-O0", "hello", "x86_64"),
+        }
+        toolchain_task_ids = {
+            "ccwh-gcc-wrapper-15.drv": "build_compilers__x86_64__gcc15",
+        }
+        descs = plan_phase4_for_binary(
+            "hello", streaming, variant_lookup,
+            toolchain_task_ids=toolchain_task_ids,
+        )
+        variants = [d for d in descs if d.kind == "build_variant"]
+        assert len(variants) == 1
+        assert "build_compilers__x86_64__gcc15" not in variants[0].depends_on
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +787,42 @@ class TestJsonRoundtrippedInput:
         descs = plan_phase4_for_binary("hello", streaming, variant_lookup)
         assert any(d.kind == "build_common_dep" for d in descs)
         assert any(d.kind == "build_variant" for d in descs)
+
+    def test_toolchain_node_ids_with_string_keys(self):
+        """JSON-roundtripped ``toolchain_node_ids_per_template`` has
+        string outer keys (dict-keys → JSON object keys). The adapter
+        must coerce them to int and still resolve the wiring."""
+        template = _template([
+            _node("root", [1]),
+            _node("gcc-wrapper-15.drv", [], is_toolchain=True),
+        ])
+        arr = _variant_array(
+            0, "x86_64", ["gcc15-O0"],
+            [[["rh", "hello.drv"]], [[]]],
+        )
+        streaming = {
+            "templates": [template],
+            "variant_arrays": {"0|x86_64": arr},
+            "common_deps_per_arch_template": {
+                "0|x86_64": {"0": "common_dep"},
+            },
+            "toolchain_drvs": [["ccwh", "gcc-wrapper-15.drv"]],
+            # Stringified outer key + list node_ids (post-JSON form).
+            "toolchain_node_ids_per_template": {"0": [1]},
+            "arch_indep_deps": {},
+        }
+        variant_lookup = {
+            ("x86_64", "gcc15-O0"): _variant_spec("gcc15-O0", "hello", "x86_64"),
+        }
+        descs = plan_phase4_for_binary(
+            "hello", streaming, variant_lookup,
+            toolchain_task_ids={
+                "ccwh-gcc-wrapper-15.drv": "build_compilers__x86_64__gcc15",
+            },
+        )
+        variants = [d for d in descs if d.kind == "build_variant"]
+        assert len(variants) == 1
+        assert "build_compilers__x86_64__gcc15" in variants[0].depends_on
 
 
 # ---------------------------------------------------------------------------
