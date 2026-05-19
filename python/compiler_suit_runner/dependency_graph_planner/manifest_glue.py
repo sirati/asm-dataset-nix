@@ -19,12 +19,15 @@ from .descriptors import Phase4Descriptor
 
 _LOG = logging.getLogger(__name__)
 
-# TODO: import these from
-# ``compiler_suit_runner.workers.dependency_graph_worker.output`` once
-# sibling task B.1a lands the pickle writer there. The values MUST stay
-# in lockstep with the writer.
-_PHASE4_PICKLE_MAGIC = "csr.dependency_graph.phase4.v1"
-_PHASE4_PICKLE_FORMAT_VERSION = 1
+# Magic + format-version stamped into the ``_dependency_graph.pkl``
+# payload by the writer (see
+# ``compiler_suit_runner.workers.dependency_graph_worker.output``).
+# Defined here -- on the reader side -- because the writer already
+# imports :class:`Phase4Descriptor` from this package, so making the
+# worker the source of truth would form a cycle. The writer imports
+# these names back from this module to keep both sides in lockstep.
+PHASE4_PICKLE_MAGIC = "csr.dependency_graph.phase4.v1"
+PHASE4_PICKLE_FORMAT_VERSION = 1
 
 
 class DependencyGraphPickleError(RuntimeError):
@@ -55,19 +58,27 @@ def load_phase4_descriptors(
             f"{type(payload).__name__}",
         )
     magic = payload.get("format")
-    if magic != _PHASE4_PICKLE_MAGIC:
+    if magic != PHASE4_PICKLE_MAGIC:
         raise DependencyGraphPickleError(
             f"{pkl_path}: unexpected format magic {magic!r}, "
-            f"expected {_PHASE4_PICKLE_MAGIC!r}",
+            f"expected {PHASE4_PICKLE_MAGIC!r}",
         )
     version = payload.get("format_version")
-    if version != _PHASE4_PICKLE_FORMAT_VERSION:
+    if version != PHASE4_PICKLE_FORMAT_VERSION:
         raise DependencyGraphPickleError(
             f"{pkl_path}: unknown format_version {version!r}, "
-            f"expected {_PHASE4_PICKLE_FORMAT_VERSION!r}",
+            f"expected {PHASE4_PICKLE_FORMAT_VERSION!r}",
         )
-    descriptors = payload.get("descriptors", [])
-    summary = payload.get("summary", {})
+    if "descriptors" not in payload:
+        raise DependencyGraphPickleError(
+            f"{pkl_path}: missing required key 'descriptors'",
+        )
+    if "summary" not in payload:
+        raise DependencyGraphPickleError(
+            f"{pkl_path}: missing required key 'summary'",
+        )
+    descriptors = payload["descriptors"]
+    summary = payload["summary"]
     if not isinstance(descriptors, list):
         raise DependencyGraphPickleError(
             f"{pkl_path}: 'descriptors' must be a list, got "

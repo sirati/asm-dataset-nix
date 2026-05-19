@@ -17,6 +17,11 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Union
 
+from compiler_suit_runner.dependency_graph_planner.manifest_glue import (
+    PHASE4_PICKLE_FORMAT_VERSION,
+    PHASE4_PICKLE_MAGIC,
+)
+
 if TYPE_CHECKING:
     from compiler_suit_runner.dependency_graph_planner import Phase4Descriptor
 
@@ -36,11 +41,9 @@ DEPENDENCY_GRAPH_PICKLE = "_dependency_graph.pkl"
 DEPENDENCY_GRAPH_SUMMARY = "_dependency_graph_summary.txt"
 
 
-# Magic + version stamped into the pickle payload so the reader can
-# refuse a file produced by an incompatible writer without unpickling
-# anything more than the top-level dict.
-PHASE4_PICKLE_MAGIC = "csr.dependency_graph.phase4.v1"
-PHASE4_PICKLE_FORMAT_VERSION = 1
+# ``PHASE4_PICKLE_MAGIC`` / ``PHASE4_PICKLE_FORMAT_VERSION`` are sourced
+# from :mod:`compiler_suit_runner.dependency_graph_planner.manifest_glue`
+# so the writer here and the reader there can never drift.
 
 
 # Values stored in the summary dict; we accept ints, floats, and strings
@@ -99,26 +102,32 @@ def write_phase4_summary_text(
     """Atomically write ``_dependency_graph_summary.txt``.
 
     One ``key: value`` line per entry, sorted by key. ``value`` is
-    formatted via ``repr`` for strings (so embedded whitespace is
-    visible) and ``str`` for ints/floats. Atomic write via
-    ``tmp + fsync + os.replace`` mirrors :func:`write_phase4_descriptors`.
+    rendered via plain ``str()`` for every type (ints, floats, and
+    strings alike); strings are emitted verbatim, without ``repr``
+    quoting. Atomic write via ``tmp + fsync + os.replace`` mirrors
+    :func:`write_phase4_descriptors`, including ``.tmp`` cleanup on a
+    crashed write.
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     lines = []
     for key in sorted(summary):
         value = summary[key]
-        if isinstance(value, str):
-            lines.append(f"{key}: {value}")
-        else:
-            lines.append(f"{key}: {value}")
+        lines.append(f"{key}: {value}")
     encoded = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
 
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
-        os.write(fd, encoded)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        try:
+            os.write(fd, encoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
     os.replace(tmp, out_path)
     return out_path
