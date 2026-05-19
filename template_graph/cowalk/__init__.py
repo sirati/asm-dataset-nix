@@ -26,6 +26,7 @@ from template_graph.cowalk.cowalk_variant import (
     CowalkCtx,
     cowalk_into_arr,
 )
+from template_graph.cowalk.cross_arch import build_meta_templates
 
 __all__ = [
     "build_template",
@@ -35,6 +36,7 @@ __all__ = [
     "_classify_pair",
     "CowalkCtx",
     "cowalk_into_arr",
+    "build_meta_templates",
     "_ARCH_TO_TRIPLE",
     "_classify_revisit_diff",
     "_extract_triple",
