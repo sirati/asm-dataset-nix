@@ -607,19 +607,41 @@ def plan_phase4_from_graph(
     binary-name order so the framework's spawn log is stable across
     runs. Cycle detection runs per-binary (the first cycle raises,
     later binaries are not visited).
+
+    Cross-binary ``build_common_dep`` dedup: ``_common_dep_task_id``
+    is keyed only on the shared-dep ident, so two binaries whose
+    templates touch the same sub-drv produce the same task_id. We
+    keep the FIRST descriptor seen for each task_id and drop later
+    duplicates. ``build_variant`` descriptors from later binaries
+    still reference the deduped task_id in their ``depends_on`` —
+    that wiring is automatic since the variant builder reads the
+    task_id off ``_common_dep_task_id`` directly. Stable ordering is
+    enforced by sorting common-deps by ``task_id``.
     """
-    descriptors: list[Phase4Descriptor] = []
+    common_dep_by_task_id: dict[str, Phase4Descriptor] = {}
+    variant_descriptors: list[Phase4Descriptor] = []
+
     for inp in sorted(inputs, key=lambda i: i.binary):
-        descriptors.extend(
-            plan_phase4_for_binary(
-                inp.binary,
-                inp.streaming_result,
-                inp.variant_lookup,
-                sys_name=sys_name,
-                toolchain_task_ids=inp.toolchain_task_ids,
-            )
+        per_binary = plan_phase4_for_binary(
+            inp.binary,
+            inp.streaming_result,
+            inp.variant_lookup,
+            sys_name=sys_name,
+            toolchain_task_ids=inp.toolchain_task_ids,
         )
-    return descriptors
+        for d in per_binary:
+            if d.kind == "build_common_dep":
+                # First binary to emit this task_id wins; subsequent
+                # binaries' duplicates are dropped because the task_id
+                # already encodes the (content-addressed) ident.
+                common_dep_by_task_id.setdefault(d.task_id, d)
+            else:
+                variant_descriptors.append(d)
+
+    common_dep_descriptors = sorted(
+        common_dep_by_task_id.values(), key=lambda d: d.task_id,
+    )
+    return common_dep_descriptors + variant_descriptors
 
 
 # ---------------------------------------------------------------------------
