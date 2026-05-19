@@ -147,6 +147,89 @@ class RawTreeNode:
         return (self.hash, self.name)
 
 
+# ── State groups ─────────────────────────────────────────────────────
+#
+# Phase 3.2 grouping: planner state lives in three typed dataclasses
+# rather than directly on ``StreamPlanner``. ``OutputState`` holds the
+# accumulating outputs (the dict ``finalize()`` returns). ``MatrixState``
+# holds transient state reset on each matrix transition. ``VariantBuilderState``
+# holds transient state for the currently-buffering variant raw tree
+# plus build-context for template construction and cowalk (``_building_*``).
+#
+# Phase 3.3 will move cowalk helpers out of the planner; they will take
+# typed handles to these state groups rather than the planner itself.
+
+
+@dataclass
+class OutputState:
+    """Outputs the planner produces by the end. Same shape as
+    ``plan_phase1_graph``'s return dict (plus ``stdenv_subtrees`` and
+    ``violations``)."""
+    templates: list[Template] = field(default_factory=list)
+    variant_arrays: dict[tuple[int, str], VariantArray] = field(
+        default_factory=dict
+    )
+    placement: dict[str, tuple[int, str, int]] = field(default_factory=dict)
+    classifications: dict[tuple[int, str], dict[int, str]] = field(
+        default_factory=dict
+    )
+    # All identity-bearing collections use ``(hash, name)`` tuples.
+    # The ``/nix/store/`` prefix is implied; never reconstructed.
+    toolchain_drvs: set[tuple[str, str]] = field(default_factory=set)
+    # Per-binary arch-indep deps surfaced at matrix depth 2.
+    arch_indep_deps: dict[str, set[tuple[str, str]]] = field(
+        default_factory=dict
+    )
+    # Stdenv raw subtrees, siphoned during template construction and
+    # cowalk. Keyed by the stdenv root ``(hash, name)`` so a stdenv
+    # referenced from many variants captures once.
+    stdenv_subtrees: dict[tuple[str, str], dict] = field(default_factory=dict)
+    # Lax-mode shape-violation log.
+    violations: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class MatrixState:
+    """Per-matrix transient state. Reset (re-instantiated) when
+    ``_on_depth1`` sees the next matrix wrapper."""
+    matrix_binary: Optional[str] = None
+    pending_raw_trees: dict[str, list[tuple[str, "RawTreeNode"]]] = field(
+        default_factory=dict
+    )
+    arch_template_id: dict[str, int] = field(default_factory=dict)
+    # Drvs encountered (non-backref) in this matrix's variants that
+    # haven't been placed into any bucket. Should drain to empty by
+    # end-of-matrix; non-empty surfaces a missing edge case.
+    unclassified_nodes: set[tuple[str, str]] = field(default_factory=set)
+
+
+@dataclass
+class VariantBuilderState:
+    """Per-variant raw-tree assembly state, plus build-context used
+    while constructing a template or cowalking a variant.
+
+    ``cur_*`` fields hold the raw tree being assembled from incoming
+    feed_line() calls. ``building_arch`` / ``building_label_pair`` are
+    scratch context passed from ``_build_and_drain_arch`` /
+    ``_build_template_singleton`` into the inner ``_alloc`` / ``_visit``
+    closures so stdenv captures know which ``(matrix, arch, label)``
+    triple produced them.
+    """
+    cur_root: Optional["RawTreeNode"] = None
+    cur_arch: Optional[str] = None
+    cur_label: Optional[str] = None
+    cur_drv: Optional[tuple[str, str]] = None
+    cur_stack: list["RawTreeNode"] = field(default_factory=list)
+    # ``(hash, name)`` → RawTreeNode within the variant currently being
+    # built. Collapses re-encountered idents onto the existing node
+    # (DAG via nix's [...] back-refs).
+    cur_path_to_node: dict[tuple[str, str], "RawTreeNode"] = field(
+        default_factory=dict
+    )
+    building_arch: Optional[str] = None
+    building_label_pair: tuple[str, str] = ("", "")
+
+
 # ── Streaming planner ────────────────────────────────────────────────
 
 
@@ -165,60 +248,31 @@ class StreamPlanner:
         # Survey mode: never raise on shape inconsistencies; collect
         # them in ``violations`` and best-effort proceed.
         self.lax = lax
-        self.violations: list[dict] = []
 
-        # ── outputs (same shape as plan_phase1_graph) ──
-        self.templates: list[Template] = []
-        self.variant_arrays: dict[tuple[int, str], VariantArray] = {}
-        self.placement: dict[str, tuple[int, str, int]] = {}
-        self.classifications: dict[tuple[int, str], dict[int, str]] = {}
-        # All identity-bearing collections use ``(hash, name)`` tuples.
-        # The ``/nix/store/`` prefix is implied; never reconstructed.
-        self.toolchain_drvs: set[tuple[str, str]] = set()
-        # Per-binary arch-indep deps surfaced at matrix depth 2.
-        self.arch_indep_deps: dict[str, set[tuple[str, str]]] = {}
-        # Stdenv raw subtrees, siphoned during template construction
-        # and cowalk. Keyed by the stdenv root ``(hash, name)`` so a
-        # stdenv referenced from many variants captures once.
-        self.stdenv_subtrees: dict[tuple[str, str], dict] = {}
-        # Scratch context passed from _build_and_drain_arch / cowalk
-        # callers into the inner _alloc/_visit closures, so stdenv
-        # captures know which (matrix, arch, label) produced them.
-        self._building_arch: Optional[str] = None
-        self._building_label_pair: tuple[str, str] = ("", "")
+        # ── grouped state (see OutputState / MatrixState / VariantBuilderState) ──
+        self.out = OutputState()
+        self.mx = MatrixState()
+        self.vb = VariantBuilderState()
 
-        # ── tree-walk state ──
+        # ── tree-walk section state ──
+        # Plumbing for feed_line() dispatch; not output, not per-matrix
+        # data the cowalk helpers care about.
         self.section: Optional[str] = None
-        self.matrix_binary: Optional[str] = None
         self._saw_toolchain = False
         self._saw_matrix = False
 
-        # ── per-matrix state (reset on matrix transition) ──
-        self.pending_raw_trees: dict[str, list[tuple[str, RawTreeNode]]] = {}
-        self.arch_template_id: dict[str, int] = {}
-        # Drvs encountered (non-backref) in this matrix's variants that
-        # haven't been placed into any bucket. Should drain to empty by
-        # end-of-matrix; non-empty surfaces a missing edge case.
-        self.unclassified_nodes: set[tuple[str, str]] = set()
-
-        # ── currently-buffering variant raw tree (if any) ──
-        self._cur_root: Optional[RawTreeNode] = None
-        self._cur_arch: Optional[str] = None
-        self._cur_label: Optional[str] = None
-        self._cur_drv: Optional[str] = None
-        self._cur_stack: list[RawTreeNode] = []
-        # ``(hash, name)`` → RawTreeNode within the variant currently
-        # being built. Collapses re-encountered idents onto the
-        # existing node (DAG via nix's [...] back-refs).
-        self._cur_path_to_node: dict[tuple[str, str], RawTreeNode] = {}
+    # ── back-compat: external callers read ``planner.violations`` ──
+    @property
+    def violations(self) -> list[dict]:
+        return self.out.violations
 
     # ── lax-mode violation recording ──
 
     def _record(self, kind: str, **details) -> None:
         entry = {"kind": kind, **details}
-        if self.matrix_binary is not None:
-            entry.setdefault("matrix", self.matrix_binary)
-        self.violations.append(entry)
+        if self.mx.matrix_binary is not None:
+            entry.setdefault("matrix", self.mx.matrix_binary)
+        self.out.violations.append(entry)
 
     # ── public API ──
 
@@ -231,7 +285,7 @@ class StreamPlanner:
 
         # If we were inside a variant raw tree and depth drops back to
         # at or below 2 (the matrix-direct-child level), finalise.
-        if self._cur_root is not None and depth <= 2:
+        if self.vb.cur_root is not None and depth <= 2:
             self._finalise_current_variant()
 
         if depth == 1:
@@ -241,7 +295,7 @@ class StreamPlanner:
         # Below depth 1: process per section.
         if self.section == "toolchain":
             if not is_backref:
-                self.toolchain_drvs.add((drv_hash, drv_name))
+                self.out.toolchain_drvs.add((drv_hash, drv_name))
             return
 
         if self.section and self.section.startswith("matrix:"):
@@ -252,17 +306,17 @@ class StreamPlanner:
 
     def finalize(self) -> dict:
         """Drain the last variant and the last matrix's pending buffers."""
-        if self._cur_root is not None:
+        if self.vb.cur_root is not None:
             self._finalise_current_variant()
         self._close_current_matrix()
         return {
-            "templates": self.templates,
-            "variant_arrays": self.variant_arrays,
-            "placement": self.placement,
-            "common_deps_per_arch_template": self.classifications,
-            "toolchain_drvs": self.toolchain_drvs,
-            "arch_indep_deps": self.arch_indep_deps,
-            "stdenv_subtrees": self.stdenv_subtrees,
+            "templates": self.out.templates,
+            "variant_arrays": self.out.variant_arrays,
+            "placement": self.out.placement,
+            "common_deps_per_arch_template": self.out.classifications,
+            "toolchain_drvs": self.out.toolchain_drvs,
+            "arch_indep_deps": self.out.arch_indep_deps,
+            "stdenv_subtrees": self.out.stdenv_subtrees,
         }
 
     # ── depth-1 section transitions ──
@@ -282,7 +336,7 @@ class StreamPlanner:
             self.section = "toolchain"
             self._saw_toolchain = True
             if not is_backref:
-                self.toolchain_drvs.add((drv_hash, drv_name))
+                self.out.toolchain_drvs.add((drv_hash, drv_name))
             return
         m = _MATRIX_RE.match(drv_name)
         if m is not None:
@@ -294,13 +348,10 @@ class StreamPlanner:
                     f"toolchains ref that drives the refcount sort."
                 )
             self._close_current_matrix()
-            self.matrix_binary = m.group("binary")
-            self.section = f"matrix:{self.matrix_binary}"
+            self.mx = MatrixState(matrix_binary=m.group("binary"))
+            self.section = f"matrix:{self.mx.matrix_binary}"
             self._saw_matrix = True
-            self.pending_raw_trees = {}
-            self.arch_template_id = {}
-            self.unclassified_nodes = set()
-            self.arch_indep_deps.setdefault(self.matrix_binary, set())
+            self.out.arch_indep_deps.setdefault(self.mx.matrix_binary, set())
             return
         # Some other depth-1 (bash builder reference, etc.).
         self.section = "other"
@@ -326,40 +377,40 @@ class StreamPlanner:
                 binary, arch, comp, opt = parse_variant_path(
                     drv_name, archs=self.archs
                 )
-                if binary != self.matrix_binary:
+                if binary != self.mx.matrix_binary:
                     raise TreeWalkError(
                         f"variant {drv_name!r} parses as binary={binary!r} "
-                        f"but tree-walked under matrix-{self.matrix_binary!r}"
+                        f"but tree-walked under matrix-{self.mx.matrix_binary!r}"
                     )
                 root = RawTreeNode(
                     hash=drv_hash, name=drv_name,
                     is_backref=False, depth=2,
                 )
-                self._cur_root = root
-                self._cur_arch = arch
-                self._cur_label = f"{comp}-{opt}"
-                self._cur_drv = ident
-                self._cur_stack = [root]
-                self._cur_path_to_node = {ident: root}
+                self.vb.cur_root = root
+                self.vb.cur_arch = arch
+                self.vb.cur_label = f"{comp}-{opt}"
+                self.vb.cur_drv = ident
+                self.vb.cur_stack = [root]
+                self.vb.cur_path_to_node = {ident: root}
             else:
                 if not is_backref:
-                    self.arch_indep_deps[self.matrix_binary].add(ident)
+                    self.out.arch_indep_deps[self.mx.matrix_binary].add(ident)
             return
 
         # depth > 2: inside the current variant's subtree
-        if self._cur_root is None:
+        if self.vb.cur_root is None:
             raise TreeWalkError(
-                f"depth-{depth} line under matrix-{self.matrix_binary} "
+                f"depth-{depth} line under matrix-{self.mx.matrix_binary} "
                 f"with no active variant subtree (ident={ident!r})"
             )
-        while self._cur_stack and self._cur_stack[-1].depth >= depth:
-            self._cur_stack.pop()
-        if not self._cur_stack:
+        while self.vb.cur_stack and self.vb.cur_stack[-1].depth >= depth:
+            self.vb.cur_stack.pop()
+        if not self.vb.cur_stack:
             raise TreeWalkError(
                 f"raw-tree splice failed at depth {depth} for ident={ident!r}"
             )
-        parent = self._cur_stack[-1]
-        existing = self._cur_path_to_node.get(ident)
+        parent = self.vb.cur_stack[-1]
+        existing = self.vb.cur_path_to_node.get(ident)
         if existing is not None:
             parent.children.append(existing)
             return
@@ -368,69 +419,69 @@ class StreamPlanner:
             is_backref=is_backref, depth=depth,
         )
         parent.children.append(node)
-        self._cur_path_to_node[ident] = node
+        self.vb.cur_path_to_node[ident] = node
         if not is_backref:
-            self._cur_stack.append(node)
-            if ident not in self.toolchain_drvs:
-                self.unclassified_nodes.add(ident)
+            self.vb.cur_stack.append(node)
+            if ident not in self.out.toolchain_drvs:
+                self.mx.unclassified_nodes.add(ident)
 
     # ── variant raw-tree completion ──
 
     def _finalise_current_variant(self) -> None:
-        root = self._cur_root
-        arch = self._cur_arch
-        label = self._cur_label
+        root = self.vb.cur_root
+        arch = self.vb.cur_arch
+        label = self.vb.cur_label
         assert root is not None and arch is not None
         # Reset buffer pointers BEFORE doing the heavy work so that
         # any recursive calls (shouldn't happen, but defence) don't
         # confuse state.
-        self._cur_root = None
-        self._cur_arch = None
-        self._cur_label = None
-        self._cur_drv = None
-        self._cur_stack = []
-        self._cur_path_to_node = {}
-        if arch in self.arch_template_id:
+        self.vb.cur_root = None
+        self.vb.cur_arch = None
+        self.vb.cur_label = None
+        self.vb.cur_drv = None
+        self.vb.cur_stack = []
+        self.vb.cur_path_to_node = {}
+        if arch in self.mx.arch_template_id:
             # Template exists — stream-cowalk this variant immediately.
-            tmpl_id = self.arch_template_id[arch]
+            tmpl_id = self.mx.arch_template_id[arch]
             self._cowalk_into_arr(tmpl_id, arch, label, root)
         else:
-            self.pending_raw_trees.setdefault(arch, []).append((label, root))
-            if len(self.pending_raw_trees[arch]) == 2:
+            self.mx.pending_raw_trees.setdefault(arch, []).append((label, root))
+            if len(self.mx.pending_raw_trees[arch]) == 2:
                 self._build_and_drain_arch(arch)
 
     # ── template construction from calibration pair ──
 
     def _build_and_drain_arch(self, arch: str) -> None:
-        pair = self.pending_raw_trees[arch]
+        pair = self.mx.pending_raw_trees[arch]
         assert len(pair) == 2, (
             f"calibration pair must have exactly 2 raw trees for {arch}; "
             f"got {len(pair)}"
         )
         (label0, tree0), (label1, tree1) = pair
-        self._building_arch = arch
-        self._building_label_pair = (label0, label1)
+        self.vb.building_arch = arch
+        self.vb.building_label_pair = (label0, label1)
         candidate = self._build_template(tree0, tree1, label0, label1)
         tmpl_id, _was_new = find_or_register_template(
-            self.templates, candidate
+            self.out.templates, candidate
         )
-        self.arch_template_id[arch] = tmpl_id
-        template = self.templates[tmpl_id]
+        self.mx.arch_template_id[arch] = tmpl_id
+        template = self.out.templates[tmpl_id]
         arr = VariantArray(
             template_id=tmpl_id,
             arch=arch,
             variants=[],
             hashes=[[] for _ in template.nodes],
         )
-        self.variant_arrays[(tmpl_id, arch)] = arr
+        self.out.variant_arrays[(tmpl_id, arch)] = arr
         # Drain the calibration pair into the new VariantArray (these
         # are the only entries for THIS arch; other archs keep their
         # singletons buffered).
         self._cowalk_into_arr(tmpl_id, arch, label0, tree0, _arr=arr)
         self._cowalk_into_arr(tmpl_id, arch, label1, tree1, _arr=arr)
-        self.pending_raw_trees[arch] = []
+        self.mx.pending_raw_trees[arch] = []
         # Classify on the calibration pair (variants 0 and 1).
-        self.classifications[(tmpl_id, arch)] = self._classify_pair(
+        self.out.classifications[(tmpl_id, arch)] = self._classify_pair(
             arr, template
         )
 
@@ -466,7 +517,7 @@ class StreamPlanner:
             tnode = self._make_template_node(
                 [t0, t1],
                 optional=False,
-                label_slots=list(self._building_label_pair),
+                label_slots=list(self.vb.building_label_pair),
             )
             nid = len(template.nodes)
             template.nodes.append(tnode)
@@ -478,7 +529,7 @@ class StreamPlanner:
             Every template node it allocates is optional. Identity is
             keyed ``(ident, None)`` or ``(None, ident)`` so it never
             collides with pair-walked nodes."""
-            slot = self._building_label_pair[0 if is_t0_side else 1]
+            slot = self.vb.building_label_pair[0 if is_t0_side else 1]
 
             def _alloc(r: RawTreeNode) -> tuple[int, bool]:
                 key = (r.ident, None) if is_t0_side else (None, r.ident)
@@ -497,9 +548,9 @@ class StreamPlanner:
         def _walk(t0: RawTreeNode, t1: RawTreeNode) -> int:
             nid, fresh = _alloc(t0, t1)
             if not t0.is_backref:
-                self.unclassified_nodes.discard(t0.ident)
+                self.mx.unclassified_nodes.discard(t0.ident)
             if not t1.is_backref:
-                self.unclassified_nodes.discard(t1.ident)
+                self.mx.unclassified_nodes.discard(t1.ident)
             if not fresh:
                 return nid
             node = template.nodes[nid]
@@ -572,15 +623,18 @@ class StreamPlanner:
         *,
         _arr: Optional[VariantArray] = None,
     ) -> None:
-        template = self.templates[tmpl_id]
-        arr = _arr if _arr is not None else self.variant_arrays[(tmpl_id, arch)]
+        template = self.out.templates[tmpl_id]
+        arr = (
+            _arr if _arr is not None
+            else self.out.variant_arrays[(tmpl_id, arch)]
+        )
         v_pos = len(arr.variants)
         arr.variants.append(label)
         for row in arr.hashes:
             row.append(None)
         for n in template.nodes:
             n.visit_flag = False
-        self.placement[tree.ident] = (tmpl_id, arch, v_pos)
+        self.out.placement[tree.ident] = (tmpl_id, arch, v_pos)
 
         def _resolve_enforce(
             enf: tuple[str, Optional[str]],
@@ -615,7 +669,7 @@ class StreamPlanner:
             # original's row so previously-cowalked variants (which
             # agreed on both DAG paths) keep their value for the new
             # node too — only divergent variants will overwrite later.
-            for (tid_x, _ax), other_arr in self.variant_arrays.items():
+            for (tid_x, _ax), other_arr in self.out.variant_arrays.items():
                 if tid_x == tmpl_id:
                     other_arr.hashes.append(list(other_arr.hashes[cid]))
             arr.hashes[new_nid][v_pos] = observed_ident
@@ -704,7 +758,7 @@ class StreamPlanner:
         ) -> None:
             node = template.nodes[nid]
             if not t_node.is_backref:
-                self.unclassified_nodes.discard(t_node.ident)
+                self.mx.unclassified_nodes.discard(t_node.ident)
             if node.visit_flag:
                 if not node.is_toolchain:
                     stored = arr.hashes[nid][v_pos]
@@ -751,9 +805,9 @@ class StreamPlanner:
             node.visit_flag = True
             if node.is_toolchain:
                 if _is_stdenv_role(node.name):
-                    self.stdenv_subtrees.setdefault(t_node.ident, {
+                    self.out.stdenv_subtrees.setdefault(t_node.ident, {
                         "first_seen_in": {
-                            "matrix": self.matrix_binary,
+                            "matrix": self.mx.matrix_binary,
                             "arch": arch,
                             "label": label,
                         },
@@ -789,16 +843,16 @@ class StreamPlanner:
         """
         name = self.name_extractor(raw_nodes[0].name)
         is_stdenv = _is_stdenv_role(name)
-        eff_arch = arch if arch is not None else self._building_arch
+        eff_arch = arch if arch is not None else self.vb.building_arch
         if is_stdenv:
             seen: set[tuple[str, str]] = set()
             for rn, slot in zip(raw_nodes, label_slots):
                 if rn.ident in seen:
                     continue
                 seen.add(rn.ident)
-                self.stdenv_subtrees.setdefault(rn.ident, {
+                self.out.stdenv_subtrees.setdefault(rn.ident, {
                     "first_seen_in": {
-                        "matrix": self.matrix_binary,
+                        "matrix": self.mx.matrix_binary,
                         "arch": eff_arch,
                         "label": slot,
                     },
@@ -807,7 +861,7 @@ class StreamPlanner:
         is_toolchain = (
             is_stdenv
             or _is_compiler_wrapper_role(name)
-            or any(rn.ident in self.toolchain_drvs for rn in raw_nodes)
+            or any(rn.ident in self.out.toolchain_drvs for rn in raw_nodes)
         )
         return TemplateNode(
             name=name,
@@ -831,7 +885,7 @@ class StreamPlanner:
         """
         nid, fresh = alloc_fn(rn)
         if not rn.is_backref:
-            self.unclassified_nodes.discard(rn.ident)
+            self.mx.unclassified_nodes.discard(rn.ident)
         if not fresh:
             return nid
         node = template.nodes[nid]
@@ -864,8 +918,8 @@ class StreamPlanner:
         template, records the variant's hashes, then attaches the new
         subtree's root to ``parent_nid``'s ``child_ids``.
         """
-        template = self.templates[tmpl_id]
-        arr = self.variant_arrays[(tmpl_id, arch)]
+        template = self.out.templates[tmpl_id]
+        arr = self.out.variant_arrays[(tmpl_id, arch)]
         label = arr.variants[v_pos]
         local_path_to_nid: dict[tuple[str, str], int] = {}
 
@@ -879,7 +933,7 @@ class StreamPlanner:
             template.nodes.append(tnode)
             local_path_to_nid[rn.ident] = nid
             # Every variant_array for this template gets a None row.
-            for (tid_x, _ax), other_arr in self.variant_arrays.items():
+            for (tid_x, _ax), other_arr in self.out.variant_arrays.items():
                 if tid_x == tmpl_id:
                     other_arr.hashes.append(
                         [None] * len(other_arr.variants)
@@ -906,7 +960,7 @@ class StreamPlanner:
         return (
             _is_stdenv_role(name)
             or _is_compiler_wrapper_role(name)
-            or raw_node.ident in self.toolchain_drvs
+            or raw_node.ident in self.out.toolchain_drvs
         )
 
     # ── discard a raw subtree from unclassified ──
@@ -920,7 +974,7 @@ class StreamPlanner:
         while stack:
             n = stack.pop()
             if not n.is_backref:
-                self.unclassified_nodes.discard(n.ident)
+                self.mx.unclassified_nodes.discard(n.ident)
             stack.extend(n.children)
 
     # ── classification on calibration pair ──
@@ -963,11 +1017,11 @@ class StreamPlanner:
     # ── end-of-matrix cleanup ──
 
     def _close_current_matrix(self) -> None:
-        if self.matrix_binary is None:
+        if self.mx.matrix_binary is None:
             return
         # Singletons: archs that only saw one variant. Build a
         # single-variant template from each.
-        for arch, pending in list(self.pending_raw_trees.items()):
+        for arch, pending in list(self.mx.pending_raw_trees.items()):
             if not pending:
                 continue
             if len(pending) >= 2:
@@ -976,39 +1030,39 @@ class StreamPlanner:
                 self._build_and_drain_arch(arch)
             else:
                 label, tree = pending[0]
-                self._building_arch = arch
+                self.vb.building_arch = arch
                 template = self._build_template_singleton(tree, label)
                 tmpl_id, _ = find_or_register_template(
-                    self.templates, template
+                    self.out.templates, template
                 )
-                self.arch_template_id[arch] = tmpl_id
+                self.mx.arch_template_id[arch] = tmpl_id
                 arr = VariantArray(
                     template_id=tmpl_id,
                     arch=arch,
                     variants=[],
-                    hashes=[[] for _ in self.templates[tmpl_id].nodes],
+                    hashes=[[] for _ in self.out.templates[tmpl_id].nodes],
                 )
-                self.variant_arrays[(tmpl_id, arch)] = arr
+                self.out.variant_arrays[(tmpl_id, arch)] = arr
                 self._cowalk_into_arr(tmpl_id, arch, label, tree)
-                self.classifications[(tmpl_id, arch)] = self._classify_pair(
-                    arr, self.templates[tmpl_id]
+                self.out.classifications[(tmpl_id, arch)] = self._classify_pair(
+                    arr, self.out.templates[tmpl_id]
                 )
-                self.pending_raw_trees[arch] = []
-        if self.unclassified_nodes:
-            sample = sorted(self.unclassified_nodes)[:5]
+                self.mx.pending_raw_trees[arch] = []
+        if self.mx.unclassified_nodes:
+            sample = sorted(self.mx.unclassified_nodes)[:5]
             if not self.lax:
                 raise TreeWalkError(
-                    f"matrix-{self.matrix_binary} ended with "
-                    f"{len(self.unclassified_nodes)} drvs still in "
+                    f"matrix-{self.mx.matrix_binary} ended with "
+                    f"{len(self.mx.unclassified_nodes)} drvs still in "
                     f"unclassified_nodes — algorithm gap. "
                     f"First 5: {sample}"
                 )
             self._record(
                 "unclassified-at-matrix-end",
-                count=len(self.unclassified_nodes),
+                count=len(self.mx.unclassified_nodes),
                 sample=sample,
             )
-            self.unclassified_nodes = set()
+            self.mx.unclassified_nodes = set()
 
     def _build_template_singleton(
         self, tree: RawTreeNode, label: str
@@ -1024,10 +1078,10 @@ class StreamPlanner:
             name = self.name_extractor(tn.name)
             is_stdenv = _is_stdenv_role(name)
             if is_stdenv:
-                self.stdenv_subtrees.setdefault(tn.ident, {
+                self.out.stdenv_subtrees.setdefault(tn.ident, {
                     "first_seen_in": {
-                        "matrix": self.matrix_binary,
-                        "arch": self._building_arch,
+                        "matrix": self.mx.matrix_binary,
+                        "arch": self.vb.building_arch,
                         "label": label,
                     },
                     "root": tn,
@@ -1035,7 +1089,7 @@ class StreamPlanner:
             is_toolchain = (
                 is_stdenv
                 or _is_compiler_wrapper_role(name)
-                or tn.ident in self.toolchain_drvs
+                or tn.ident in self.out.toolchain_drvs
             )
             if name in template.name_to_id:
                 return template.name_to_id[name]
@@ -1055,7 +1109,7 @@ class StreamPlanner:
         def _walk(tn: RawTreeNode) -> int:
             nid = _alloc(tn)
             if not tn.is_backref:
-                self.unclassified_nodes.discard(tn.ident)
+                self.mx.unclassified_nodes.discard(tn.ident)
             if nid in visited:
                 return nid
             visited.add(nid)
