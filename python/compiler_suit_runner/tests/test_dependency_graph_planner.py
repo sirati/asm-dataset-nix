@@ -643,6 +643,59 @@ class TestToolchainWiring:
         assert g15_id in by_label["gcc15-O2"].depends_on
         assert g14_id not in by_label["gcc15-O2"].depends_on
 
+    def test_two_compilers_one_cell_wire_independently(self):
+        """Sharp regression for the original cell-level conflation
+        bug: two DISTINCT wrappers (gcc14 + clang20, cross-family,
+        distinct hashes) in the same cell must each wire ONLY to
+        their own ``build_compilers__*`` task. Pre-fix, both wrappers
+        got unioned into every variant; the negative assertions
+        below are what that bug violated."""
+        g14_hash = "0000000000000000000000000000gcc14"  # 32-char-style
+        cl20_hash = "00000000000000000000000000clang20"
+        template = _template([
+            _node("hello-root", [1, 2]),
+            _node("gcc-wrapper-14.3.0.drv", [], is_toolchain=True),
+            _node("clang-wrapper-20.1.8.drv", [], is_toolchain=True),
+        ])
+        arr = _variant_array(
+            template_id=0, arch="x86_64",
+            variants=["gcc14-O2", "clang20-O2"],
+            hashes=[[("rg", "hello.drv"), ("rc", "hello.drv")], [], []],
+        )
+        g14_id = "build_compilers__x86_64-linux__x86_64__gcc14"
+        cl20_id = "build_compilers__x86_64-linux__x86_64__clang20"
+        streaming = {
+            "templates": [template],
+            "variant_arrays": {(0, "x86_64"): arr},
+            "common_deps_per_arch_template": {(0, "x86_64"): {0: "common_dep"}},
+            "toolchain_drvs": {
+                (g14_hash, "gcc-wrapper-14.3.0.drv"),
+                (cl20_hash, "clang-wrapper-20.1.8.drv"),
+            },
+            "toolchain_node_ids_per_template": {0: [1, 2]},
+            "arch_indep_deps": {},
+        }
+        variant_lookup = {
+            ("x86_64", "gcc14-O2"): _variant_spec("gcc14-O2", "hello", "x86_64"),
+            ("x86_64", "clang20-O2"): _variant_spec("clang20-O2", "hello", "x86_64"),
+        }
+        descs = plan_phase4_for_binary(
+            "hello", streaming, variant_lookup,
+            toolchain_task_ids={
+                f"{g14_hash}-gcc-wrapper-14.3.0.drv": g14_id,
+                f"{cl20_hash}-clang-wrapper-20.1.8.drv": cl20_id,
+            },
+        )
+        by_label = {
+            v.payload["label"]: v
+            for v in descs if v.kind == "build_variant"
+        }
+        assert len(by_label) == 2
+        assert g14_id in by_label["gcc14-O2"].depends_on
+        assert cl20_id not in by_label["gcc14-O2"].depends_on
+        assert cl20_id in by_label["clang20-O2"].depends_on
+        assert g14_id not in by_label["clang20-O2"].depends_on
+
     def test_unknown_toolchain_task_id_skipped(self):
         """Per-variant wiring composes ``build_compilers__<sys>__<arch>__<comp>``
         from the variant drv and looks it up in ``toolchain_task_ids``'s
