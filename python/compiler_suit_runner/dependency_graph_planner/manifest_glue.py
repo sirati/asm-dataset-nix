@@ -8,11 +8,15 @@ before calling ``primary_handle.spawn_tasks``.
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 import pathlib
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 from .descriptors import Phase4Descriptor
+
+_LOG = logging.getLogger(__name__)
 
 
 def load_descriptors_from_json(payload: Any) -> list[Phase4Descriptor]:
@@ -53,12 +57,20 @@ def load_descriptors_from_json(payload: Any) -> list[Phase4Descriptor]:
             deps_tuple = tuple(d for d in raw_deps if isinstance(d, str))
         else:
             deps_tuple = ()
+        raw_priority = entry.get("priority_hint", 0)
+        priority = (
+            raw_priority
+            if isinstance(raw_priority, int)
+            and not isinstance(raw_priority, bool)
+            else 0
+        )
         out.append(Phase4Descriptor(
             kind=kind,
             task_id=task_id,
             name=name,
             payload=dict(payload_dict),
             depends_on=deps_tuple,
+            priority_hint=priority,
         ))
     return out
 
@@ -89,6 +101,17 @@ def headers_from_descriptors(descriptors: Iterable[Phase4Descriptor]) -> list:
     """
     from compiler_suit_runner.manifest_gen import ManifestHeader  # noqa: PLC0415
 
+    # ``priority_hint`` was added on the framework side at the same
+    # time as the planner-side field (plan §E7). Detect support via
+    # dataclass-field introspection so an older ``ManifestHeader``
+    # checked out alongside a newer planner degrades gracefully: the
+    # hint is dropped and the descriptor's payload still carries the
+    # information for downstream observers. The probe is cheap (one
+    # ``dataclasses.fields`` call per ``headers_from_descriptors``
+    # invocation, not per descriptor).
+    header_field_names = {f.name for f in dataclasses.fields(ManifestHeader)}
+    supports_priority = "priority_hint" in header_field_names
+
     headers: list = []
     for d in descriptors:
         if d.kind == "build_common_dep":
@@ -96,13 +119,12 @@ def headers_from_descriptors(descriptors: Iterable[Phase4Descriptor]) -> list:
             payload.setdefault(
                 "attr", payload.get("drv") or payload.get("ident", ""),
             )
-            headers.append(ManifestHeader(
+            headers.append(_build_header(
+                ManifestHeader,
                 item_class="build_common_dep",
-                name=d.name,
-                size=0,
+                descriptor=d,
                 payload=payload,
-                task_id=d.task_id,
-                task_depends_on=tuple(d.depends_on),
+                supports_priority=supports_priority,
             ))
             continue
         if d.kind == "build_variant":
@@ -113,17 +135,53 @@ def headers_from_descriptors(descriptors: Iterable[Phase4Descriptor]) -> list:
             label = payload.get("label", "")
             if "attr" not in payload and sys_name and pkg and arch and label:
                 payload["attr"] = f"dataset.{sys_name}.{pkg}.{arch}.{label}"
-            headers.append(ManifestHeader(
+            headers.append(_build_header(
+                ManifestHeader,
                 item_class="build_variant",
-                name=d.name,
-                size=0,
+                descriptor=d,
                 payload=payload,
-                task_id=d.task_id,
-                task_depends_on=tuple(d.depends_on),
+                supports_priority=supports_priority,
             ))
             continue
         # Unknown kind -- skip silently; caller logs the gap.
     return headers
+
+
+def _build_header(
+    header_cls,
+    *,
+    item_class: str,
+    descriptor: Phase4Descriptor,
+    payload: dict,
+    supports_priority: bool,
+):
+    """Mint a ManifestHeader; thread ``priority_hint`` when supported.
+
+    Falls back to omitting the kwarg (and emitting a one-shot debug
+    log line per process) when an older ``ManifestHeader`` predates
+    plan §E7. The descriptor's hint is still observable via
+    ``Phase4Descriptor.priority_hint`` for callers that bypass the
+    framework wrapper.
+    """
+    kwargs = {
+        "item_class": item_class,
+        "name": descriptor.name,
+        "size": 0,
+        "payload": payload,
+        "task_id": descriptor.task_id,
+        "task_depends_on": tuple(descriptor.depends_on),
+    }
+    if descriptor.priority_hint:
+        if supports_priority:
+            kwargs["priority_hint"] = descriptor.priority_hint
+        elif not getattr(_build_header, "_warned", False):
+            _LOG.debug(
+                "ManifestHeader has no 'priority_hint' field; dropping "
+                "hint=%d for task %r (will not warn again this run)",
+                descriptor.priority_hint, descriptor.task_id,
+            )
+            _build_header._warned = True  # type: ignore[attr-defined]
+    return header_cls(**kwargs)
 
 
 def variant_label_key(drv_path_or_name: str) -> str:

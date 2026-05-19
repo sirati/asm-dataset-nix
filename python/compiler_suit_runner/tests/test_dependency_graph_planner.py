@@ -1467,3 +1467,258 @@ class TestMetaTemplateNoOpCases:
             and d.task_id == "build_common_dep__shareh-shared-lib.drv"
         ]
         assert len(per_cell) == 1
+
+
+# ---------------------------------------------------------------------------
+# priority_hint on meta-level common_dep descriptors (Phase 6.2 / plan §E7)
+# ---------------------------------------------------------------------------
+
+
+class TestPriorityHintOnMetaDescriptors:
+    """Cross-arch and per-family meta ``build_common_dep`` descriptors
+    carry a positive ``priority_hint`` so the framework's scheduler
+    picks them up before per-arch variants. Every other Phase 4 task
+    (per-cell common_dep, arch_indep, build_variant) stays at the
+    neutral default of ``0`` — the field is opt-in, never imposed on
+    tasks that don't need a scheduling nudge."""
+
+    def _two_arch_streaming(self, libfoo_ident: tuple[str, str]):
+        tmpl_x = _template([
+            _node("hello-x86_64-root", [1]),
+            _node("libfoo.drv", []),
+        ])
+        tmpl_a = _template([
+            _node("hello-aarch64-root", [1]),
+            _node("libfoo.drv", []),
+        ])
+        arr_x = _variant_array(
+            template_id=0, arch="x86_64",
+            variants=["gcc15-O2"],
+            hashes=[
+                [("rxh", "hello-x86_64.drv")],
+                [libfoo_ident],
+            ],
+        )
+        arr_a = _variant_array(
+            template_id=1, arch="aarch64",
+            variants=["gcc15-O2"],
+            hashes=[
+                [("rah", "hello-aarch64.drv")],
+                [libfoo_ident],
+            ],
+        )
+        meta = _meta_template(
+            template_id_per_arch={"x86_64": 0, "aarch64": 1},
+            role_at_node=["hello-elf-folder.drv", "libfoo.drv"],
+            cross_arch_classification=[
+                "variant_specific", "cross_arch_common_dep",
+            ],
+            drv_per_node=[None, libfoo_ident],
+        )
+        streaming = {
+            "templates": [tmpl_x, tmpl_a],
+            "variant_arrays": {
+                (0, "x86_64"): arr_x,
+                (1, "aarch64"): arr_a,
+            },
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "variant_specific", 1: "common_dep"},
+                (1, "aarch64"): {0: "variant_specific", 1: "common_dep"},
+            },
+            "toolchain_drvs": set(),
+            "arch_indep_deps": {},
+            "meta_templates": {"hello": [meta]},
+        }
+        lookup = {
+            ("x86_64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "x86_64",
+            ),
+            ("aarch64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "aarch64",
+            ),
+        }
+        return streaming, lookup
+
+    def test_cross_arch_descriptor_has_positive_hint(self):
+        streaming, lookup = self._two_arch_streaming(("shareh", "libfoo.drv"))
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        cross = next(
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.task_id.startswith("build_common_dep__cross_arch__")
+        )
+        assert cross.priority_hint > 0, cross.priority_hint
+
+    def test_variant_descriptors_keep_default_zero_hint(self):
+        streaming, lookup = self._two_arch_streaming(("shareh", "libfoo.drv"))
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        variants = [d for d in descs if d.kind == "build_variant"]
+        assert variants, "two-arch fixture must emit variants"
+        for v in variants:
+            assert v.priority_hint == 0, (v.task_id, v.priority_hint)
+
+    def test_uni_arch_per_cell_common_dep_has_zero_hint(self):
+        """A single-arch shared dep (no meta-level emission) goes out
+        with the default-0 hint so the field doesn't accidentally bias
+        every common_dep — only the cross-arch / family ones do."""
+        template = _template([
+            _node("root", [1]),
+            _node("shared-lib.drv", []),
+        ])
+        arr = _variant_array(
+            0, "x86_64", ["gcc15-O2"],
+            [
+                [("rh", "hello.drv")],
+                [("shareh", "shared-lib.drv")],
+            ],
+        )
+        streaming = {
+            "templates": [template],
+            "variant_arrays": {(0, "x86_64"): arr},
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "variant_specific", 1: "common_dep"},
+            },
+        }
+        lookup = {
+            ("x86_64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "x86_64",
+            ),
+        }
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        per_cell = next(
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.task_id == "build_common_dep__shareh-shared-lib.drv"
+        )
+        assert per_cell.priority_hint == 0
+
+    def test_family_descriptors_have_positive_hint(self):
+        """Family-level meta common_dep descriptors are equally shared
+        within their family and get the same scheduling nudge."""
+        x86_ident = ("xh", "libfam.drv")
+        arm_ident = ("ah", "libfam.drv")
+        tmpl_x = _template([
+            _node("hello-x86_64-root", [1]),
+            _node("libfam.drv", []),
+        ])
+        tmpl_a = _template([
+            _node("hello-aarch64-root", [1]),
+            _node("libfam.drv", []),
+        ])
+        arr_x = _variant_array(
+            template_id=0, arch="x86_64",
+            variants=["gcc15-O2"],
+            hashes=[
+                [("rxh", "hello-x86_64.drv")],
+                [x86_ident],
+            ],
+        )
+        arr_a = _variant_array(
+            template_id=1, arch="aarch64",
+            variants=["gcc15-O2"],
+            hashes=[
+                [("rah", "hello-aarch64.drv")],
+                [arm_ident],
+            ],
+        )
+        meta = _meta_template(
+            template_id_per_arch={"x86_64": 0, "aarch64": 1},
+            role_at_node=["hello-elf-folder.drv", "libfam.drv"],
+            cross_arch_classification=[
+                "variant_specific", "family_common_dep",
+            ],
+            drv_per_node=[None, {"x86": x86_ident, "arm": arm_ident}],
+        )
+        streaming = {
+            "templates": [tmpl_x, tmpl_a],
+            "variant_arrays": {
+                (0, "x86_64"): arr_x,
+                (1, "aarch64"): arr_a,
+            },
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "variant_specific", 1: "common_dep"},
+                (1, "aarch64"): {0: "variant_specific", 1: "common_dep"},
+            },
+            "toolchain_drvs": set(),
+            "arch_indep_deps": {},
+            "meta_templates": {"hello": [meta]},
+        }
+        lookup = {
+            ("x86_64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "x86_64",
+            ),
+            ("aarch64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "aarch64",
+            ),
+        }
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        family = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.task_id.startswith("build_common_dep__family__")
+        ]
+        assert family, [d.task_id for d in descs]
+        for d in family:
+            assert d.priority_hint > 0, (d.task_id, d.priority_hint)
+
+    def test_default_priority_hint_is_zero_on_phase4descriptor(self):
+        """Direct constructor check: omitting the field defaults to
+        ``0``, so callers (and round-tripped legacy JSON) that don't
+        know about the new field stay neutral."""
+        d = Phase4Descriptor(
+            kind="build_common_dep",
+            task_id="x",
+            name="x",
+            payload={},
+        )
+        assert d.priority_hint == 0
+
+    def test_manifest_header_threads_priority_hint(self):
+        """``headers_from_descriptors`` passes ``priority_hint`` through
+        to the framework's :class:`ManifestHeader` (Phase 6.2 wiring)."""
+        from compiler_suit_runner.dependency_graph_planner import (
+            headers_from_descriptors,
+        )
+
+        d_hi = Phase4Descriptor(
+            kind="build_common_dep",
+            task_id="build_common_dep__cross_arch__h-libfoo.drv",
+            name="build_common_dep__hello__cross_arch__libfoo.drv",
+            payload={"sys": "x86_64-linux", "arch": "cross_arch"},
+            priority_hint=10,
+        )
+        d_lo = Phase4Descriptor(
+            kind="build_common_dep",
+            task_id="build_common_dep__h-libfoo.drv",
+            name="build_common_dep__hello__x86_64__libfoo.drv",
+            payload={"sys": "x86_64-linux", "arch": "x86_64"},
+        )
+        headers = headers_from_descriptors([d_hi, d_lo])
+        assert len(headers) == 2
+        # Map by task_id so the assertions don't depend on iteration
+        # order if a future change re-sorts ``headers_from_descriptors``.
+        by_id = {h.task_id: h for h in headers}
+        assert by_id[d_hi.task_id].priority_hint == 10
+        assert by_id[d_lo.task_id].priority_hint == 0
+
+    def test_priority_hint_roundtrips_via_json(self):
+        """:func:`load_descriptors_from_json` recovers ``priority_hint``
+        from the dataclass-asdict on-disk shape so the watcher reads
+        back what the dependency-graph worker wrote."""
+        import dataclasses
+
+        from compiler_suit_runner.dependency_graph_planner import (
+            load_descriptors_from_json,
+        )
+
+        original = Phase4Descriptor(
+            kind="build_common_dep",
+            task_id="build_common_dep__cross_arch__h-libfoo.drv",
+            name="build_common_dep__hello__cross_arch__libfoo.drv",
+            payload={"sys": "x86_64-linux", "arch": "cross_arch"},
+            priority_hint=10,
+        )
+        wire = {"phase4_descriptors": [dataclasses.asdict(original)]}
+        recovered = load_descriptors_from_json(wire)
+        assert len(recovered) == 1
+        assert recovered[0].priority_hint == 10

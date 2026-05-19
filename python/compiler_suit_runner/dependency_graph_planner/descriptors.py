@@ -45,6 +45,19 @@ class Phase4Descriptor:
     constructor names. ``payload`` carries the worker-visible
     arguments; ``depends_on`` is the tuple of task_ids whose completion
     gates this task.
+
+    ``priority_hint`` is a non-negative scheduling-priority bias passed
+    through to the framework: ``0`` is the neutral default (the value
+    every per-cell common_dep and per-variant task carries), and higher
+    values request earlier dispatch. The dependency-graph planner sets
+    a positive hint on cross-arch / per-family meta common_dep
+    descriptors (see :mod:`.plan_meta`) so the most-shared artefacts —
+    every variant of every covered arch transitively wants them — run
+    ahead of per-arch variant builds. The integration layer
+    (:func:`headers_from_descriptors`) threads it onto
+    :class:`manifest_gen.ManifestHeader`; manifests without explicit
+    hints keep the framework's default ordering (FIFO / phase-order)
+    intact.
     """
 
     kind: str
@@ -52,6 +65,7 @@ class Phase4Descriptor:
     name: str
     payload: dict
     depends_on: tuple[str, ...] = ()
+    priority_hint: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
