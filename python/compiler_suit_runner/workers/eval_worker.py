@@ -21,21 +21,20 @@ worker:
    ``nix-store --query --requisites`` + ``nix-store --export`` so the
    primary's ``_MatrixEvalQuiesceWatcher`` + ``dependency_graph_worker``
    can re-import the full drv graph into the primary's local store
-   without re-evaluating the flake. Writes a sidecar JSON
-   ``<binary>.nix-archive.json`` carrying ``{variant_drvs, binary,
-   variants, broadcasts, produced_at, sys}`` so the
-   ``dependency_graph_worker`` discovers the ROOT (kept) drvs vs the
-   transitive closure without parsing the archive itself.
+   without re-evaluating the flake. The
+   ``dependency_graph_worker`` discovers the ROOT (kept) drvs by
+   parsing the variant path of each imported .drv directly
+   (``parse_variant_path``) — no JSON sidecar is emitted.
 
 Resume marker
 -------------
 
-The archive + sidecar pair IS the resume marker. A short-circuit
-fires when both files exist and the archive is non-empty: re-execution
-returns the sidecar contents and skips eval + broadcast + export. The
-legacy ``<out_dir>/<binary>/manifest.json`` JSON marker is no longer
-emitted — the hard-cutover post-A3 design uses archive presence as the
-single source of truth.
+The archive itself IS the resume marker. A short-circuit fires when
+the archive exists and is non-empty: re-execution skips eval +
+broadcast + export. The legacy ``<out_dir>/<binary>/manifest.json``
+marker and the post-A3 ``<binary>.nix-archive.json`` sidecar are no
+longer emitted — the hard-cutover design uses archive presence as
+the single source of truth.
 
 Error-type contract (framework integration)
 -------------------------------------------
@@ -380,7 +379,7 @@ def _drv_size(drv_path: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Archive + sidecar (resume marker for post-A3 hard-cutover format)
+# Archive (resume marker for post-A3 hard-cutover format)
 # ---------------------------------------------------------------------------
 
 
@@ -392,45 +391,6 @@ def _archive_path(out_dir: pathlib.Path, binary: str) -> pathlib.Path:
     each binary's kept-variant closure lands at ``<out_dir>/<binary>.nix-archive``.
     """
     return out_dir / f"{binary}.nix-archive"
-
-
-def _sidecar_path(archive: pathlib.Path) -> pathlib.Path:
-    """Sidecar JSON path for a ``<binary>.nix-archive`` archive."""
-    return archive.with_suffix(archive.suffix + ".json")
-
-
-def _read_sidecar(sidecar: pathlib.Path) -> Optional[dict]:
-    """Return the parsed sidecar dict, or ``None`` if absent / unreadable.
-
-    A corrupt sidecar is treated as absent: corruption is visible
-    from outside the runner (file on disk) and forcing a re-eval is
-    cheaper than blocking forever on a half-written file. The
-    function's contract is "best effort".
-    """
-    if not sidecar.exists():
-        return None
-    try:
-        with open(sidecar, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    return data
-
-
-def _write_sidecar(sidecar: pathlib.Path, payload: dict) -> None:
-    """Atomically write the sidecar JSON.
-
-    Uses tmp-then-rename within the same directory so a crash
-    mid-write never leaves a half-parsed sidecar on disk.
-    """
-    sidecar.parent.mkdir(parents=True, exist_ok=True)
-    tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2, sort_keys=True)
-        fh.write("\n")
-    os.replace(tmp, sidecar)
 
 
 def _export_kept_closure(
@@ -574,9 +534,12 @@ def run_eval_task(
     """Matrix-eval per-binary eval dispatch entry point.
 
     See the module docstring for the protocol. The function returns
-    the sidecar dict (also persisted to
-    ``out_dir/<binary>.nix-archive.json``) on success. The archive
-    itself lives at ``out_dir/<binary>.nix-archive``.
+    an in-process summary dict (binary/sys/variant_drvs/variants/
+    broadcasts/produced_at) for caller introspection; the only on-disk
+    artefact is the binary archive at ``out_dir/<binary>.nix-archive``.
+    The dependency_graph_worker derives variant lookup from the
+    imported .drv paths via ``parse_variant_path`` — no JSON sidecar
+    is written.
 
     Failure modes raise :class:`RuntimeError` — the framework worker
     harness then surfaces ``ErrorType::Errored`` to the primary,
@@ -594,8 +557,7 @@ def run_eval_task(
     out_dir :
         Matrix-eval-specific output directory (the bind-mounted shared
         path). The archive is written to
-        ``out_dir / <binary>.nix-archive`` and the sidecar to
-        ``out_dir / <binary>.nix-archive.json``.
+        ``out_dir / <binary>.nix-archive``.
     broadcast_sender :
         :class:`peer_replication.BroadcastSender` instance owned by
         the worker process — lifecycle management (start/stop) is
@@ -629,18 +591,27 @@ def run_eval_task(
     variant_seed = parsed["variant_seed"]
 
     archive = _archive_path(out_dir, binary)
-    sidecar = _sidecar_path(archive)
 
-    # Step 0: resume short-circuit. If both the archive (non-empty) and
-    # the sidecar are present we trust that some prior run of this task
-    # (perhaps on a different secondary that previously held it) already
-    # broadcast every drv to the cluster AND exported the kept-variant
-    # closure. The primary's _MatrixEvalQuiesceWatcher uses archive
-    # presence as the matrix_eval-quiesce signal, so the contract is
-    # "archive present == matrix_eval done".
-    existing = _read_sidecar(sidecar)
-    if existing is not None and archive.exists() and archive.stat().st_size > 0:
-        return existing
+    # Step 0: resume short-circuit. If the archive exists and is
+    # non-empty we trust that some prior run of this task (perhaps on
+    # a different secondary that previously held it) already broadcast
+    # every drv to the cluster AND exported the kept-variant closure.
+    # The primary's _MatrixEvalQuiesceWatcher uses archive presence as
+    # the matrix_eval-quiesce signal, so the contract is "archive
+    # present == matrix_eval done". The consumer
+    # (dependency_graph_worker) derives variant lookup from the
+    # imported .drv paths directly, so re-running this worker would
+    # only duplicate work.
+    if archive.exists() and archive.stat().st_size > 0:
+        return {
+            "binary": binary,
+            "sys": sys_name,
+            "produced_at": float(clock()),
+            "variant_drvs": [],
+            "variants": [],
+            "broadcasts": [],
+            "resumed": True,
+        }
 
     # Step 1: enumerate drvs per arch. Each arch is one
     # ``nix-eval-jobs`` invocation. If sampling is in play we first
@@ -725,13 +696,14 @@ def run_eval_task(
     kept_drvs: list[str] = sorted({v["drv"] for v in variants})
     _export_kept_closure(archive, kept_drvs, run_subprocess=runner)
 
-    # Step 5: persist the sidecar JSON. The dependency_graph worker
-    # discovers the ROOT (kept) drvs via ``variant_drvs`` here; the
+    # Step 5: return an in-process summary for caller introspection.
+    # No sidecar JSON is written — the archive itself is the resume
+    # marker, and the dependency_graph worker derives variant lookup
+    # from the imported .drv paths via ``parse_variant_path``. The
     # primary's _MatrixEvalQuiesceWatcher uses archive-presence as the
-    # matrix_eval-quiesce gate. variants + broadcasts are kept for
-    # operator-visible diagnostics + variant_lookup population in the
-    # downstream planner.
-    sidecar_data: dict = {
+    # matrix_eval-quiesce gate. variants + broadcasts are kept in the
+    # return value for operator-visible diagnostics.
+    return {
         "binary": binary,
         "sys": sys_name,
         "produced_at": float(clock()),
@@ -739,8 +711,6 @@ def run_eval_task(
         "variants": variants,
         "broadcasts": broadcast_results,
     }
-    _write_sidecar(sidecar, sidecar_data)
-    return sidecar_data
 
 
 __all__ = [
