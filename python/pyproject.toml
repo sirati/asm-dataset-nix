@@ -64,11 +64,13 @@ testpaths = [
     "compiler_suit_runner/tests",
     "ssh_debug_runner/tests",
 ]
-# ``-m 'not slurm_live'`` excludes the live-cluster end-to-end tests
-# from a default ``pytest`` invocation: they require the local
-# slurm-test-env to be up and take minutes per case. Run them
-# explicitly with ``pytest -m slurm_live`` or by file path.
-addopts = "-q --tb=short -m 'not slurm_live'"
+# ``-m 'not slurm_live and not nix'`` excludes the live-cluster
+# end-to-end tests (slurm_live) and the live-nix matrix smoke test
+# (nix) from a default ``pytest`` invocation: both require external
+# infrastructure (the slurm-test-env / a working ``nix-instantiate``
+# against this repo's flake) and take minutes per case. Run them
+# explicitly with ``pytest -m slurm_live`` or ``pytest -m nix``.
+addopts = "-q --tb=short -m 'not slurm_live and not nix'"
 filterwarnings = [
     # tarfile.extractall(filter=...) was added in 3.12; older test
     # fixtures call it without the kwarg and trigger a DeprecationWarning
@@ -78,4 +80,5 @@ filterwarnings = [
 ]
 markers = [
     "slurm_live: end-to-end tests that drive the live slurm-test-env (off by default; run via -m slurm_live or by file path)",
+    "nix: tests requiring a real nix-instantiate against this repo's flake (off by default; run via -m nix)",
 ]
