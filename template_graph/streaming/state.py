@@ -202,10 +202,9 @@ class StreamPlanner:
         """Cowalk one variant raw tree into this template's variant
         array. Thin shim — implementation lives in
         ``template_graph.cowalk.cowalk_variant.cowalk_into_arr``."""
-        # Local import: cowalk module pulls a few symbols from this
-        # module via local imports (``_ARCH_TO_TRIPLE``,
-        # ``_classify_revisit_diff``) so import at top level would
-        # introduce a cycle.
+        # Local import: top-level would re-introduce the streaming ->
+        # cowalk -> streaming import chain (state.py is imported by
+        # cowalk via TYPE_CHECKING).
         from template_graph.cowalk import cowalk_into_arr
         cowalk_into_arr(
             self, tmpl_id, arch, label, tree, arr=_arr,

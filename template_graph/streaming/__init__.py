@@ -22,9 +22,12 @@ This subpackage replaces the legacy single-file ``streaming.py``:
     finalize.py  — finalize + _build_and_drain_arch +
                    _close_current_matrix.
     entry.py     — plan_from_tree_streaming convenience entry.
-    _helpers.py  — drv_name_full, _ARCH_TO_TRIPLE, _extract_triple /
-                   _extract_version, _classify_revisit_diff,
-                   _classify_cross_arch_sharing.
+    _helpers.py  — drv_name_full, _classify_cross_arch_sharing,
+                   _ARCH_FAMILIES. (``_ARCH_TO_TRIPLE`` /
+                   ``_extract_triple`` / ``_extract_version`` /
+                   ``_classify_revisit_diff`` moved to
+                   ``template_graph.cowalk._helpers``; re-exported
+                   here for back-compat.)
 
 Public surface (re-exported here for back-compat):
     StreamPlanner — instantiate, feed lines via .feed_line(), call .finalize().
@@ -40,12 +43,17 @@ from __future__ import annotations
 # Free helpers used by both this package and external callers.
 from template_graph.streaming._helpers import (
     _ARCH_FAMILIES,
-    _ARCH_TO_TRIPLE,
     _classify_cross_arch_sharing,
+    drv_name_full,
+)
+# Back-compat: the four symbols below moved to
+# ``template_graph.cowalk._helpers``; re-export so existing
+# ``from template_graph.streaming import _ARCH_TO_TRIPLE`` works.
+from template_graph.cowalk._helpers import (  # noqa: F401
+    _ARCH_TO_TRIPLE,
     _classify_revisit_diff,
     _extract_triple,
     _extract_version,
-    drv_name_full,
 )
 
 # State dataclasses + StreamPlanner.

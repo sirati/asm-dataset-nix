@@ -9,6 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+from template_graph.cowalk._helpers import (
+    _ARCH_TO_TRIPLE,
+    _classify_revisit_diff,
+)
 from template_graph.graph import (
     Template,
     TemplateGraphAssertError,
@@ -40,8 +44,7 @@ def _resolve_enforce(
     ctx: CowalkCtx, enf: tuple[str, Optional[str]],
 ) -> tuple[str, Optional[str]]:
     """Collapse a triple-enforce into 'this-target' when it equals the
-    current arch's triple. Local import avoids a streaming cycle."""
-    from template_graph.streaming import _ARCH_TO_TRIPLE
+    current arch's triple."""
     if enf[0] == "triple":
         target = _ARCH_TO_TRIPLE.get(ctx.arch)
         if enf[1] is not None and enf[1] == target:
@@ -201,7 +204,6 @@ def _handle_revisit(
 ) -> None:
     """Revisit: stored match → noop; clean triple/version delta with
     a parent → DAG-split + recurse; else raise (strict) or record."""
-    from template_graph.streaming import _classify_revisit_diff
     stored = ctx.arr.hashes[nid][ctx.v_pos]
     if stored is None or stored == t_node.ident:
         return
