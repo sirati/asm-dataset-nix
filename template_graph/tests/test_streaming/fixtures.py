@@ -54,12 +54,27 @@ class Node:
     children: list["Node"] = field(default_factory=list)
 
 
-_VARIANT_SUFFIX_TAIL = "-baseline-default-san-off-march-default-elf-folder.drv"
+_VARIANT_BASELINE_INNER = "baseline-default-san-off-march-default"
+_VARIANT_SUFFIX_TAIL = f"-{_VARIANT_BASELINE_INNER}-elf-folder.drv"
 
 
-def variant_name(binary: str, arch: str, comp: str = "gcc15", opt: str = "O0") -> str:
+def variant_label(
+    binary: str, arch: str, comp: str = "gcc15", opt: str = "O0",
+    *, inner: str = _VARIANT_BASELINE_INNER,
+) -> str:
+    """Sidecar-form variant label produced by the streaming planner
+    (``<binary>__<arch>__<comp>-<opt>-<flag>-<hardening>-san-<san>-march-<march>``).
+    Pass ``inner`` to override the default baseline suffix axes.
+    """
+    return f"{binary}__{arch}__{comp}-{opt}-{inner}"
+
+
+def variant_name(
+    binary: str, arch: str, comp: str = "gcc15", opt: str = "O0",
+    *, inner: str = _VARIANT_BASELINE_INNER,
+) -> str:
     """Produce a drv name that parse_variant_path accepts."""
-    return f"{binary}-{arch}-{comp}-{opt}{_VARIANT_SUFFIX_TAIL}"
+    return f"{binary}-{arch}-{comp}-{opt}-{inner}-elf-folder.drv"
 
 
 def render_tree(root: Node) -> str:
@@ -113,6 +128,7 @@ def simple_variant(
     seed_base: int,
     comp: str = "gcc15",
     opt: str = "O0",
+    inner: str = _VARIANT_BASELINE_INNER,
     children: Optional[list[Node]] = None,
 ) -> Node:
     """Build a variant-root Node with the canonical entry-point name.
@@ -120,6 +136,6 @@ def simple_variant(
     """
     return Node(
         hash=make_hash(seed_base),
-        name=variant_name(binary, arch, comp=comp, opt=opt),
+        name=variant_name(binary, arch, comp=comp, opt=opt, inner=inner),
         children=list(children or []),
     )
