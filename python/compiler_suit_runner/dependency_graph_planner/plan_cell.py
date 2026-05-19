@@ -7,6 +7,7 @@ this module just owns the building blocks each cell traversal calls.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
@@ -24,6 +25,60 @@ from .shapes import (
     _template_nodes,
     _variant_array_fields,
 )
+
+# Match ``/nix/store/<hash>-`` so the remaining basename can be fed
+# into ``parse_variant_path``. The hash segment is alphanumeric only,
+# so a non-greedy match up to the first ``-`` works for real nix paths
+# (32-char base32 hash) and shorter test fixtures alike.
+_STORE_HASH_PREFIX_RE = re.compile(r"^/nix/store/[^-]+-")
+
+
+def _variant_toolchain_task_id(
+    sys_name: str,
+    arch: str,
+    comp: str,
+    known_task_ids: frozenset[str],
+) -> Optional[str]:
+    """Compose the canonical ``build_compilers__*`` task_id for one
+    variant's ``(arch, comp)`` and return it iff phase-1 emitted it.
+    Mirrors :func:`manifest_gen.build_compilers_task_id`. ``None``
+    skips wiring for operator-provided toolchains (no task to depend
+    on).
+    """
+    task_id = f"build_compilers__{sys_name}__{arch}__{comp}"
+    return task_id if task_id in known_task_ids else None
+
+
+def _variant_toolchain_dep(
+    spec: Mapping[str, Any],
+    sys_name: str,
+    known_task_ids: frozenset[str],
+) -> Optional[str]:
+    """Per-variant toolchain dep: parse the variant drv path's
+    ``(arch, comp)`` and compose its phase-1 task_id. Returns ``None``
+    when the drv shape is unrecognised or the composed id isn't in
+    ``known_task_ids`` -- best-effort enrichment, not a hard failure.
+    """
+    from template_graph.tree_walker import (  # noqa: PLC0415
+        DEFAULT_ARCHS,
+        TreeWalkError,
+        parse_variant_path,
+    )
+    drv_path = spec.get("drv", "")
+    if not isinstance(drv_path, str) or not drv_path:
+        return None
+    basename = _STORE_HASH_PREFIX_RE.sub("", drv_path)
+    if basename == drv_path:
+        return None  # no store prefix matched
+    try:
+        _binary, arch_v, comp, _opt = parse_variant_path(
+            basename, archs=DEFAULT_ARCHS,
+        )
+    except TreeWalkError:
+        return None
+    return _variant_toolchain_task_id(
+        sys_name, arch_v, comp, known_task_ids,
+    )
 
 
 def _load_source_terminal_predicate():
@@ -82,36 +137,6 @@ def _resolve_arch_indep_descriptors(
         descriptors.append(descriptor)
         task_ids.append(descriptor.task_id)
     return descriptors, task_ids
-
-
-def _resolve_toolchain_task_ids(
-    *,
-    tmpl_id: int,
-    nodes: Sequence[Any],
-    toolchain_node_ids: Mapping[int, Sequence[int]],
-    toolchain_idents_by_name: Mapping[str, Sequence[tuple[str, str]]],
-    toolchain_task_ids: Mapping[str, str],
-) -> set[str]:
-    """Resolve the set of toolchain task_ids that every variant in this
-    cell should depend on.
-
-    Every variant in a ``(tmpl_id, arch)`` cell gets the same set of
-    toolchain deps -- we can't distinguish per-variant compilers
-    within a role-collapsed template node, so wire every ident matching
-    the role (see :func:`shapes._toolchain_idents_by_name`).
-    """
-    out: set[str] = set()
-    for tc_node_id in toolchain_node_ids.get(tmpl_id, []):
-        if tc_node_id < 0 or tc_node_id >= len(nodes):
-            continue
-        node_name = str(_node_field(
-            nodes[tc_node_id], "name", f"node_{tc_node_id}",
-        ))
-        for ident in toolchain_idents_by_name.get(node_name, ()):
-            task_id = toolchain_task_ids.get(_ident_to_str(ident))
-            if task_id:
-                out.add(task_id)
-    return out
 
 
 def _mint_common_dep_descriptors(
@@ -213,6 +238,11 @@ def _plan_cell(
     _tid, _arch, variants, hashes = _variant_array_fields(arr)
     classes = classification_map.get((tmpl_id, arch), {})
 
+    # Snapshot the set of phase-1 ``build_compilers__*`` task_ids once
+    # so per-variant wiring can compose-then-check without rebuilding
+    # the lookup for every variant in this cell.
+    known_task_ids: frozenset[str] = frozenset(toolchain_task_ids.values())
+
     # Seed each variant's dep set with every arch-indep task we minted
     # for this binary. Arch-indep tasks gate every variant of every
     # arch -- they materialise the per-binary fetched source / patch
@@ -220,19 +250,6 @@ def _plan_cell(
     per_variant_dep_ids: list[set[str]] = [
         set(arch_indep_dep_task_ids) for _ in variants
     ]
-
-    # Resolve toolchain task_ids for this template once: every
-    # variant in this cell gets the same set of toolchain deps.
-    toolchain_task_id_set = _resolve_toolchain_task_ids(
-        tmpl_id=tmpl_id,
-        nodes=nodes,
-        toolchain_node_ids=toolchain_node_ids,
-        toolchain_idents_by_name=toolchain_idents_by_name,
-        toolchain_task_ids=toolchain_task_ids,
-    )
-    if toolchain_task_id_set:
-        for deps in per_variant_dep_ids:
-            deps.update(toolchain_task_id_set)
 
     tc_node_id_set = set(toolchain_node_ids.get(tmpl_id, []))
     common_dep_descriptors = _mint_common_dep_descriptors(
@@ -259,6 +276,12 @@ def _plan_cell(
         if spec is None:
             continue
         deps = per_variant_dep_ids[variant_idx]
+        # Per-variant toolchain wiring: the role-collapsed template
+        # node can't distinguish per-variant compilers, but the
+        # variant drv basename can -- read ``(arch, comp)`` off it.
+        tc_task_id = _variant_toolchain_dep(spec, sys_name, known_task_ids)
+        if tc_task_id is not None:
+            deps = deps | {tc_task_id}
         if meta_extra_variant_deps:
             deps = deps | meta_extra_variant_deps.get((arch, label), set())
         if meta_toolchain_extras:
