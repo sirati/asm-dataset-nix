@@ -83,37 +83,44 @@ def import_archive(
     caller can include it in a per-binary error message.
 
     Streams the file into stdin to avoid loading multi-GiB archives
-    into Python memory. The injected runner branch (unit tests) is for
-    small payloads only.
+    into Python memory. ``run_subprocess`` is honoured only for the
+    argv-sniffing test stub (when it is callable AND advertises the
+    ``_stdin_aware`` attribute set to True); otherwise the production
+    ``subprocess.run`` with explicit stdin is always used, even when
+    callers thread a runner through for other helpers (e.g. the
+    ``is_path_locally_present`` probe). Previously this branched on
+    ``run_subprocess is None`` alone and a production caller passing a
+    real subprocess wrapper would take the argv-stub path, handing
+    nix-store a literal ``<<N bytes>>`` positional that triggers
+    ``error: no arguments expected``.
     """
     if not archive.is_file():
         return False, f"archive not found: {archive}".encode("utf-8")
 
-    if run_subprocess is None:
+    if run_subprocess is not None and getattr(
+        run_subprocess, "_stdin_aware", False,
+    ):
         try:
-            with open(archive, "rb") as fh:
-                proc = subprocess.run(  # noqa: S603
-                    ["nix-store", "--import"],
-                    stdin=fh,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                )
-            return proc.returncode == 0, proc.stderr or b""
+            contents = archive.read_bytes()
         except OSError as exc:
             return False, str(exc).encode("utf-8")
+        _stdout, stderr, rc = run_subprocess([
+            "nix-store", "--import", f"<<{len(contents)}bytes>>",
+        ])
+        return rc == 0, stderr
 
     try:
-        contents = archive.read_bytes()
+        with open(archive, "rb") as fh:
+            proc = subprocess.run(  # noqa: S603
+                ["nix-store", "--import"],
+                stdin=fh,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        return proc.returncode == 0, proc.stderr or b""
     except OSError as exc:
         return False, str(exc).encode("utf-8")
-    # The injected runner doesn't carry stdin natively; tests stub the
-    # whole import call by argv-sniffing so we just hand them the
-    # cmdline and they decide. Production never hits this branch.
-    _stdout, stderr, rc = run_subprocess([
-        "nix-store", "--import", f"<<{len(contents)}bytes>>",
-    ])
-    return rc == 0, stderr
 
 
 # ---------------------------------------------------------------------------

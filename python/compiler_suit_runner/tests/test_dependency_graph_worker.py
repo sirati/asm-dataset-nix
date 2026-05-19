@@ -43,7 +43,14 @@ class _SubprocessStub:
     Each invocation records the argv; the stub returns
     ``(stdout, stderr, rc)`` according to the first matching response
     registered for the argv prefix.
+
+    ``_stdin_aware = True`` signals to ``import_archive`` that this
+    stub wants the synthetic ``<<N bytes>>`` argv form instead of a
+    real stdin file descriptor; production wrappers omit the attribute
+    so they take the real ``subprocess.run`` with stdin streaming.
     """
+
+    _stdin_aware = True
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []

@@ -92,8 +92,25 @@ DEFAULT_ARCHS = (
 )
 
 _VARIANT_RE = re.compile(
-    r"^(?P<rest>.+?)"
-    r"-baseline-default-san-off-march-default-elf-folder\.drv$"
+    # ``<rest>-<flag_set>-<hardening...>-san-<sanitizer>-march-<march>-elf-folder.drv``
+    #
+    # ``rest`` is anchored to end on the opt-level token
+    # (``-O0``…``-Ofast``, ``-Odefault``, ``-Os``, ``-Og``, ``-Oz``)
+    # so the variable-width hardening field on the right doesn't slurp
+    # the opt into it. The original pattern required the baseline
+    # quadruple (``baseline-default-san-off-march-default``) verbatim,
+    # which tripped TreeWalkError on every non-baseline sampled
+    # variant. ``parse_variant_path`` only returns
+    # ``(binary, arch, comp, opt)`` — flag_set / hardening / sanitizer
+    # / march never reach the caller — so the inner axes use ``.*?``
+    # between ``-<flag_set>-`` and ``-san-`` to absorb the (possibly
+    # multi-token) hardening value.
+    r"^(?P<rest>.+?-(?:O[0-9]|Os|Og|Oz|Ofast|Odefault))"
+    r"-(?P<flag_set>[A-Za-z0-9]+)"
+    r"-(?P<hardening>.*?)"
+    r"-san-(?P<sanitizer>[A-Za-z0-9_+]+)"
+    r"-march-(?P<march>[A-Za-z0-9_+]+)"
+    r"-elf-folder\.drv$"
 )
 _OPT_RE = re.compile(r"-(O[0-9]|Os|Og|Oz|Ofast|Odefault)$")
 _COMP_RE = re.compile(r"-((?:gcc|clang)[0-9]+(?:_[0-9]+)?)$")
