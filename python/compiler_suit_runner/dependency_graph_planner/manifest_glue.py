@@ -1,7 +1,7 @@
-"""Descriptor -> ManifestHeader glue and JSON roundtrip helpers.
+"""Descriptor -> ManifestHeader glue and pickle reader.
 
 These live on the primary-side spawn path: the watcher reads
-``_dependency_graph.json`` off disk via :func:`load_descriptors_from_json`
+``_dependency_graph.pkl`` off disk via :func:`load_phase4_descriptors`
 and hands the typed descriptors to :func:`headers_from_descriptors`
 before calling ``primary_handle.spawn_tasks``.
 """
@@ -11,68 +11,74 @@ from __future__ import annotations
 import dataclasses
 import logging
 import pathlib
-from collections.abc import Iterable, Mapping
-from typing import Any
+import pickle
+from collections.abc import Iterable
+from typing import Union
 
 from .descriptors import Phase4Descriptor
 
 _LOG = logging.getLogger(__name__)
 
+# TODO: import these from
+# ``compiler_suit_runner.workers.dependency_graph_worker.output`` once
+# sibling task B.1a lands the pickle writer there. The values MUST stay
+# in lockstep with the writer.
+_PHASE4_PICKLE_MAGIC = "csr.dependency_graph.phase4.v1"
+_PHASE4_PICKLE_FORMAT_VERSION = 1
 
-def load_descriptors_from_json(payload: Any) -> list[Phase4Descriptor]:
-    """Re-tuple JSON-roundtripped Phase 4 descriptors.
 
-    ``dependency_graph_worker.write_dependency_graph_json`` writes a
-    dict ``{"phase4_descriptors": [<asdict-form>, ...]}``; this helper
-    is the inverse for callers that read the file off disk and want a
-    typed descriptor list back. Accepts either the wrapping dict or a
-    bare descriptor list so test fixtures can pass either shape.
+class DependencyGraphPickleError(RuntimeError):
+    """Raised when the dependency_graph pickle is malformed,
+    has a wrong magic, or carries an unknown format_version."""
 
-    Malformed entries (non-dict, missing ``kind`` / ``task_id``) are
-    skipped with no error -- callers are expected to validate against
-    ``primary_handle.spawn_tasks`` results, which surface the
-    semantic-level issues (duplicate hashes, unknown deps).
+
+def load_phase4_descriptors(
+    pkl_path: pathlib.Path,
+) -> tuple[list[Phase4Descriptor], dict[str, Union[int, float]]]:
+    """Load and validate ``_dependency_graph.pkl``.
+
+    Returns a ``(descriptors, summary)`` pair. Hard-fails with
+    :class:`DependencyGraphPickleError` on any shape mismatch (bad
+    magic, unknown format_version, non-dict payload, non-list
+    descriptors). No JSON fallback.
     """
-    if isinstance(payload, Mapping):
-        raw_list = payload.get("phase4_descriptors", [])
-    else:
-        raw_list = payload
-    if not isinstance(raw_list, (list, tuple)):
-        return []
-    out: list[Phase4Descriptor] = []
-    for entry in raw_list:
-        if not isinstance(entry, Mapping):
-            continue
-        kind = entry.get("kind")
-        task_id = entry.get("task_id")
-        name = entry.get("name")
-        payload_dict = entry.get("payload")
-        if not (
-            isinstance(kind, str) and isinstance(task_id, str)
-            and isinstance(name, str) and isinstance(payload_dict, Mapping)
-        ):
-            continue
-        raw_deps = entry.get("depends_on") or ()
-        if isinstance(raw_deps, (list, tuple)):
-            deps_tuple = tuple(d for d in raw_deps if isinstance(d, str))
-        else:
-            deps_tuple = ()
-        raw_priority = entry.get("priority_hint", 0)
-        priority = (
-            raw_priority
-            if isinstance(raw_priority, int)
-            and not isinstance(raw_priority, bool)
-            else 0
+    try:
+        with open(pkl_path, "rb") as fh:
+            payload = pickle.load(fh)
+    except (OSError, pickle.UnpicklingError) as exc:
+        raise DependencyGraphPickleError(
+            f"failed to read {pkl_path}: {exc}",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise DependencyGraphPickleError(
+            f"{pkl_path}: expected dict payload, got "
+            f"{type(payload).__name__}",
         )
-        out.append(Phase4Descriptor(
-            kind=kind,
-            task_id=task_id,
-            name=name,
-            payload=dict(payload_dict),
-            depends_on=deps_tuple,
-            priority_hint=priority,
-        ))
-    return out
+    magic = payload.get("format")
+    if magic != _PHASE4_PICKLE_MAGIC:
+        raise DependencyGraphPickleError(
+            f"{pkl_path}: unexpected format magic {magic!r}, "
+            f"expected {_PHASE4_PICKLE_MAGIC!r}",
+        )
+    version = payload.get("format_version")
+    if version != _PHASE4_PICKLE_FORMAT_VERSION:
+        raise DependencyGraphPickleError(
+            f"{pkl_path}: unknown format_version {version!r}, "
+            f"expected {_PHASE4_PICKLE_FORMAT_VERSION!r}",
+        )
+    descriptors = payload.get("descriptors", [])
+    summary = payload.get("summary", {})
+    if not isinstance(descriptors, list):
+        raise DependencyGraphPickleError(
+            f"{pkl_path}: 'descriptors' must be a list, got "
+            f"{type(descriptors).__name__}",
+        )
+    if not isinstance(summary, dict):
+        raise DependencyGraphPickleError(
+            f"{pkl_path}: 'summary' must be a dict, got "
+            f"{type(summary).__name__}",
+        )
+    return list(descriptors), dict(summary)
 
 
 def headers_from_descriptors(descriptors: Iterable[Phase4Descriptor]) -> list:
