@@ -127,6 +127,14 @@ class ManifestHeader:
     before this task is dispatchable. Empty means no deps (e.g.
     toolchains). Variants reference their toolchain's task_id so the
     scheduler can hold them until the toolchain build finishes.
+
+    ``priority_hint`` is a non-negative scheduling-priority bias (0 is
+    the default neutral value; higher = earlier). The dependency_graph
+    planner uses it to tag cross-arch / per-family meta
+    ``build_common_dep`` tasks — the most-shared artefacts — so they
+    surface ahead of per-arch variant builds. The field is emitted on
+    disk only when non-zero so legacy manifests round-trip unchanged
+    and the framework's wire-format remains free to ignore the hint.
     """
 
     item_class: ItemClass
@@ -135,6 +143,7 @@ class ManifestHeader:
     payload: dict
     task_id: str = ""
     task_depends_on: tuple[str, ...] = ()
+    priority_hint: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -448,13 +457,16 @@ def _header_to_jsonable(header: ManifestHeader) -> dict:
         "size": header.size,
         "payload": header.payload,
     }
-    # task_id / task_depends_on are emitted only when populated so
-    # legacy manifests round-trip unchanged (older preflight outputs
-    # without these fields parse cleanly via the read-side defaults).
+    # task_id / task_depends_on / priority_hint are emitted only when
+    # populated so legacy manifests round-trip unchanged (older
+    # preflight outputs without these fields parse cleanly via the
+    # read-side defaults).
     if header.task_id:
         out["task_id"] = header.task_id
     if header.task_depends_on:
         out["task_depends_on"] = list(header.task_depends_on)
+    if header.priority_hint:
+        out["priority_hint"] = header.priority_hint
     return out
 
 
@@ -527,6 +539,11 @@ def read_manifest(path: pathlib.Path) -> ManifestHeader:
         raise ValueError(
             f"{path}: 'task_depends_on' must be a list of strings"
         )
+    raw_priority = parsed.get("priority_hint", 0)
+    # ``bool`` is a subclass of ``int``; reject explicitly so a JSON
+    # ``true`` doesn't sneak in as 1.
+    if not isinstance(raw_priority, int) or isinstance(raw_priority, bool):
+        raise ValueError(f"{path}: 'priority_hint' must be an int")
 
     return ManifestHeader(
         item_class=parsed["item_class"],  # type: ignore[arg-type]
@@ -535,6 +552,7 @@ def read_manifest(path: pathlib.Path) -> ManifestHeader:
         payload=parsed["payload"],
         task_id=raw_task_id,
         task_depends_on=tuple(raw_deps),
+        priority_hint=raw_priority,
     )
 
 

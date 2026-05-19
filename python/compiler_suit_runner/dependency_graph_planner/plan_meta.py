@@ -14,19 +14,13 @@ cross-arch skeleton. Each position carries one of four classifications:
     emission already handles this; meta pass is a no-op.
   * ``"variant_specific"`` — folded into the variant build; no task.
 
-Wiring contract (returned tuple from :func:`_plan_meta_for_binary`):
-
-``meta_descriptors``      new ``build_common_dep`` descriptors with
-                          task_ids ``build_common_dep__cross_arch__<ident>``
-                          or ``build_common_dep__family__<family>__<ident>``.
-``extra_variant_deps``    ``dict[(arch, label), set[task_id]]`` —
-                          extras for the variant ``depends_on`` sets.
-``meta_skip_idents``      ident strings whose per-cell common_dep
-                          emission should be SKIPPED (avoids duplicate
-                          dispatch when a meta-level task subsumes it).
-``toolchain_meta_extras`` ``dict[(arch, label), set[task_id]]`` extra
-                          toolchain task_ids for meta-classed toolchain
-                          positions.
+:func:`_plan_meta_for_binary` returns ``(meta_descriptors,
+extra_variant_deps, meta_skip_idents, toolchain_meta_extras)``:
+new descriptors with task_ids
+``build_common_dep__cross_arch__<ident>`` /
+``build_common_dep__family__<family>__<ident>``; per-(arch,label)
+extra deps + toolchain-extra dicts; idents whose per-cell common_dep
+emission must be skipped to avoid duplicate dispatch.
 """
 
 from __future__ import annotations
@@ -41,6 +35,12 @@ from .shapes import (
     _iter_variant_arrays,
     _variant_array_fields,
 )
+
+
+_META_COMMON_DEP_PRIORITY_HINT = 10
+"""Priority bias for cross-arch / per-family meta ``build_common_dep``
+descriptors (plan §E7). Small positive: outranks the default-0
+per-cell / per-variant tasks, leaves room above for future tiers."""
 
 
 def _load_arch_families() -> dict[str, str]:
@@ -84,6 +84,7 @@ def _meta_descriptor(
             "attr": ident_str,
         },
         depends_on=(),
+        priority_hint=_META_COMMON_DEP_PRIORITY_HINT,
     )
 
 
