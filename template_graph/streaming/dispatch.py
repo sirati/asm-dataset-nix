@@ -138,7 +138,7 @@ def _on_matrix_depth2(
                 f"is a backref; each variant should occur exactly "
                 f"once in the tree"
             )
-        binary, arch, comp, opt = parse_variant_path(
+        binary, arch, _comp, _opt = parse_variant_path(
             drv_name, archs=planner.archs
         )
         if binary != planner.mx.matrix_binary:
@@ -146,13 +146,24 @@ def _on_matrix_depth2(
                 f"variant {drv_name!r} parses as binary={binary!r} "
                 f"but tree-walked under matrix-{planner.mx.matrix_binary!r}"
             )
+        # Full-suffix label matching the matrix_eval sidecar
+        # (``<binary>__<arch>__<comp>-<opt>-<flag>-<hardening>-san-<san>-march-<march>``).
+        # Strips ``<binary>-<arch>-`` prefix and ``-elf-folder.drv``
+        # suffix from drv_name, then composes with ``__`` separators
+        # the way ``mkVariant`` does. Required so per-cell variants
+        # with the same (comp, opt) but different inner-axes (when
+        # ``matrix_eval`` samples > 1 per cell) are individually
+        # identifiable in ``variant_lookup`` for descriptor emission.
+        suffix = drv_name[
+            len(binary) + 1 + len(arch) + 1 : -len(VARIANT_SUFFIX)
+        ]
         root = RawTreeNode(
             hash=drv_hash, name=drv_name,
             is_backref=False, depth=2,
         )
         planner.vb.cur_root = root
         planner.vb.cur_arch = arch
-        planner.vb.cur_label = f"{comp}-{opt}"
+        planner.vb.cur_label = f"{binary}__{arch}__{suffix}"
         planner.vb.cur_drv = ident
         planner.vb.cur_stack = [root]
         planner.vb.cur_path_to_node = {ident: root}

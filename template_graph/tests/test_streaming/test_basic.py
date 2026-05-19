@@ -23,6 +23,7 @@ from template_graph.tests.test_streaming.fixtures import (
     make_hash,
     render_tree,
     simple_variant,
+    variant_label,
 )
 
 
@@ -64,7 +65,7 @@ def test_single_binary_single_variant_smoke():
 
     assert list(result["variant_arrays"].keys()) == [(0, "x86_64")]
     arr = result["variant_arrays"][(0, "x86_64")]
-    assert arr.variants == ["gcc15-O0"]
+    assert arr.variants == [variant_label("hello", "x86_64")]
     # Singleton-arch classification marks all non-toolchain nodes
     # as common_dep.
     classes = result["common_deps_per_arch_template"][(0, "x86_64")]
@@ -211,7 +212,10 @@ def test_calibration_cowalk_then_third_variant_assertion():
     result = planner.finalize()
 
     arr = result["variant_arrays"][(0, "x86_64")]
-    assert arr.variants == ["gcc15-O0", "gcc15-O1", "gcc15-O2"]
+    assert arr.variants == [
+        variant_label("hello", "x86_64", opt=o)
+        for o in ("O0", "O1", "O2")
+    ]
     classes = result["common_deps_per_arch_template"][(0, "x86_64")]
     # Find the zlib node and confirm it's classified as common_dep
     # (all three variants share the same hash).
@@ -330,3 +334,48 @@ def test_toolchain_node_ids_per_template_emitted():
     )
     assert set(cc_nids).issubset(set(tc_per_tmpl[0]))
     assert planner.violations == []
+
+
+def test_variant_label_matches_sidecar_full_suffix_form():
+    """Regression: ``cur_label`` must be the full sidecar form
+    ``<binary>__<arch>__<comp>-<opt>-<flag>-<hardening>-san-<san>-march-<march>``,
+    not the short ``<comp>-<opt>`` form. Without this, the variant
+    lookup populated from the matrix_eval sidecar (keyed by full
+    suffix) never matches the planner's per-variant rows and
+    ``plan_phase4_for_binary`` skips every variant.
+
+    Also covers ``--variant-sample > 1``: two variants share
+    ``(comp, opt)`` but differ in inner axes; the planner must
+    record them as distinct labels (not duplicated short labels).
+    """
+    # Two variants in the same (gcc15, O0) cell with DIFFERENT inner
+    # axes — matches the matrix_eval sampler shape.
+    v1 = simple_variant(
+        "hello", "x86_64", seed_base=10,
+        comp="gcc15", opt="O0",
+        inner="baseline-default-san-off-march-default",
+    )
+    v2 = simple_variant(
+        "hello", "x86_64", seed_base=20,
+        comp="gcc15", opt="O0",
+        inner="unroll-fortify-san-off-march-default",
+    )
+    root = Node(
+        hash=make_hash(0), name="sum-root.drv",
+        children=[
+            Node(hash=make_hash(1), name="toolchains.drv"),
+            Node(
+                hash=make_hash(2), name="matrix-hello.drv",
+                children=[v1, v2],
+            ),
+        ],
+    )
+    planner = StreamPlanner(archs=("x86_64",))
+    feed(planner, render_tree(root))
+    result = planner.finalize()
+
+    arr = result["variant_arrays"][(0, "x86_64")]
+    assert arr.variants == [
+        "hello__x86_64__gcc15-O0-baseline-default-san-off-march-default",
+        "hello__x86_64__gcc15-O0-unroll-fortify-san-off-march-default",
+    ]
