@@ -3,24 +3,22 @@ emission.
 
 The streaming planner's finalize pass adds ``meta_templates``: per
 binary, a list of :class:`template_graph.graph.MetaTemplate` objects
-that project the per-arch templates' role-merged keymap into a single
+projecting the per-arch templates' role-merged keymap into a single
 cross-arch skeleton. Each position carries one of four classifications:
 
   * ``"cross_arch_common_dep"`` — same ident across every covered arch
     (class D). ONE meta-level task collapses the per-arch realisations.
-  * ``"family_common_dep"`` — same ident within an arch family, differs
-    across families (class B). ONE meta-level task per family.
-  * ``"uni_arch_common_dep"`` — per-arch (class A or C). Per-cell
-    emission already handles this; meta pass is a no-op.
+  * ``"family_common_dep"`` — same ident within an arch family,
+    differs across families (class B). ONE meta-level task per family.
+  * ``"uni_arch_common_dep"`` — per-arch (A/C); per-cell handles it.
   * ``"variant_specific"`` — folded into the variant build; no task.
 
 :func:`_plan_meta_for_binary` returns ``(meta_descriptors,
-extra_variant_deps, meta_skip_idents, toolchain_meta_extras)``:
-new descriptors with task_ids
-``build_common_dep__cross_arch__<ident>`` /
+extra_variant_deps, meta_skip_idents, toolchain_meta_extras)`` --
+descriptors with task_ids ``build_common_dep__cross_arch__<ident>`` /
 ``build_common_dep__family__<family>__<ident>``; per-(arch,label)
-extra deps + toolchain-extra dicts; idents whose per-cell common_dep
-emission must be skipped to avoid duplicate dispatch.
+extra deps + toolchain-extra dicts; idents whose per-cell emission
+must be skipped to avoid duplicate dispatch.
 """
 
 from __future__ import annotations
@@ -29,6 +27,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
 from .descriptors import Phase4Descriptor
+from .plan_cell import _variant_toolchain_dep
 from .shapes import (
     _coerce_ident,
     _ident_to_str,
@@ -38,9 +37,8 @@ from .shapes import (
 
 
 _META_COMMON_DEP_PRIORITY_HINT = 10
-"""Priority bias for cross-arch / per-family meta ``build_common_dep``
-descriptors (plan §E7). Small positive: outranks the default-0
-per-cell / per-variant tasks, leaves room above for future tiers."""
+"""Plan §E7 priority bias: outranks default-0 per-cell / per-variant
+tasks, leaves room above for future tiers."""
 
 
 def _load_arch_families() -> dict[str, str]:
@@ -66,10 +64,10 @@ def _meta_descriptor(
     role: str,
     scope: str,
 ) -> Phase4Descriptor:
-    """Mint a meta-level ``build_common_dep`` descriptor. ``scope`` is
-    ``"cross_arch"`` or ``"family__<family>"`` and lands in
-    ``payload["arch"]`` so downstream tooling distinguishes meta entries
-    from per-cell ones (which carry a concrete arch).
+    """Mint a meta-level ``build_common_dep`` descriptor. ``scope``
+    (``"cross_arch"`` / ``"family__<family>"``) lands in
+    ``payload["arch"]`` so downstream tooling distinguishes meta
+    entries from per-cell ones (which carry a concrete arch).
     """
     return Phase4Descriptor(
         kind="build_common_dep",
@@ -101,16 +99,29 @@ def _arch_to_labels_from_variant_arrays(
     return out
 
 
-def _resolve_toolchain_for_role(
-    role: str,
-    toolchain_idents_by_name: Mapping[str, Sequence[tuple[str, str]]],
-    toolchain_task_ids: Mapping[str, str],
+def _resolve_toolchain_for_archs(
+    target_archs: Sequence[str],
+    arch_to_labels: Mapping[str, Sequence[str]],
+    variant_lookup: Mapping[tuple[str, str], Mapping[str, Any]],
+    sys_name: str,
+    known_task_ids: frozenset[str],
 ) -> set[str]:
-    """Toolchain task_ids matching ``role`` (post-hash drv name)."""
+    """Toolchain task_ids for one representative variant per arch.
+    Role-collapsed meta positions can't distinguish per-variant
+    compilers; per-arch we pick one variant, parse its drv path back
+    to ``(arch, comp)`` via :func:`plan_cell._variant_toolchain_dep`,
+    compose the canonical ``build_compilers__*`` task_id. Per-cell
+    already wires each variant's own toolchain dep; meta-level extras
+    are additive so per-arch broadcast is harmless over-wiring.
+    """
     out: set[str] = set()
-    for ident in toolchain_idents_by_name.get(role, ()):
-        task_id = toolchain_task_ids.get(_ident_to_str(ident))
-        if task_id:
+    for arch in target_archs:
+        labels = arch_to_labels.get(arch, ())
+        spec = variant_lookup.get((arch, labels[0])) if labels else None
+        if spec is None:
+            continue
+        task_id = _variant_toolchain_dep(spec, sys_name, known_task_ids)
+        if task_id is not None:
             out.add(task_id)
     return out
 
@@ -149,40 +160,31 @@ def _process_position(
     target_archs: Sequence[str],
 ) -> None:
     """Route one position through the three plan §E2 sub-categories
-    (toolchain / source_terminal / plain) and update ``state`` in place.
-
-    ``state`` carries the shared per-binary accumulators and resolver
-    callables; aggregating in one dict keeps the function signature
-    short across both call sites (cross_arch and family).
+    (toolchain / source_terminal / plain) and update ``state`` in
+    place. ``state`` carries the shared per-binary accumulators +
+    resolver callables (one dict keeps both call sites short).
     """
-    role_resolved = role
-    if role_resolved in state["toolchain_idents_by_name"]:
-        resolved = _resolve_toolchain_for_role(
-            role_resolved,
-            state["toolchain_idents_by_name"],
-            state["toolchain_task_ids"],
+    state["meta_skip_idents"].add(ident_str)
+    if ident_str in state["toolchain_drv_idents"]:
+        resolved = _resolve_toolchain_for_archs(
+            target_archs, state["arch_to_labels"],
+            state["variant_lookup"], state["sys_name"],
+            state["known_task_ids"],
         )
         _add_to_extras(
             state["toolchain_meta_extras"], target_archs,
             state["arch_to_labels"], resolved,
         )
-        state["meta_skip_idents"].add(ident_str)
         return
-    if state["is_source_terminal"](state["drv_role"](role_resolved)):
-        state["meta_skip_idents"].add(ident_str)
+    if state["is_source_terminal"](state["drv_role"](role)):
         return
     meta_descriptors: list[Phase4Descriptor] = state["meta_descriptors"]
     if not any(d.task_id == task_id for d in meta_descriptors):
         meta_descriptors.append(_meta_descriptor(
-            binary=state["binary"],
-            sys_name=state["sys_name"],
-            task_id=task_id,
-            name_suffix=name_suffix,
-            ident_str=ident_str,
-            role=role,
-            scope=scope,
+            binary=state["binary"], sys_name=state["sys_name"],
+            task_id=task_id, name_suffix=name_suffix,
+            ident_str=ident_str, role=role, scope=scope,
         ))
-    state["meta_skip_idents"].add(ident_str)
     _add_to_extras(
         state["extra_variant_deps"], target_archs,
         state["arch_to_labels"], {task_id},
@@ -197,22 +199,16 @@ def _process_cross_arch(
         return
     ident_str = _ident_to_str(ident)
     _process_position(
-        state=state,
-        role=role,
-        ident_str=ident_str,
+        state=state, role=role, ident_str=ident_str,
         task_id=_cross_arch_task_id(ident_str),
         name_suffix=f"cross_arch__{role}",
-        scope="cross_arch",
-        target_archs=covered_archs,
+        scope="cross_arch", target_archs=covered_archs,
     )
 
 
 def _process_family(
-    state: dict,
-    role: str,
-    drv_map: Mapping,
-    covered_archs: Sequence[str],
-    arch_families: Mapping[str, str],
+    state: dict, role: str, drv_map: Mapping,
+    covered_archs: Sequence[str], arch_families: Mapping[str, str],
 ) -> None:
     archs_by_family: dict[str, list[str]] = {}
     for arch in covered_archs:
@@ -228,13 +224,10 @@ def _process_family(
         if not fam_archs:
             continue
         _process_position(
-            state=state,
-            role=role,
-            ident_str=ident_str,
+            state=state, role=role, ident_str=ident_str,
             task_id=_family_task_id(str(family), ident_str),
             name_suffix=f"family__{family}__{role}",
-            scope=f"family__{family}",
-            target_archs=fam_archs,
+            scope=f"family__{family}", target_archs=fam_archs,
         )
 
 
@@ -244,7 +237,8 @@ def _plan_meta_for_binary(
     sys_name: str,
     meta_templates: Sequence[Any],
     arch_to_labels: Mapping[str, Sequence[str]],
-    toolchain_idents_by_name: Mapping[str, Sequence[tuple[str, str]]],
+    variant_lookup: Mapping[tuple[str, str], Mapping[str, Any]],
+    toolchain_drv_idents: frozenset[str],
     toolchain_task_ids: Mapping[str, str],
     is_source_terminal,
     drv_role,
@@ -254,23 +248,24 @@ def _plan_meta_for_binary(
     set[str],
     dict[tuple[str, str], set[str]],
 ]:
-    """MetaTemplate post-pass for one binary.
-
-    Returns ``(meta_descriptors, extra_variant_deps, meta_skip_idents,
-    toolchain_meta_extras)``. See module docstring for shapes.
+    """MetaTemplate post-pass for one binary. ``toolchain_drv_idents``
+    (precomputed by :func:`shapes._toolchain_ident_strs`) flags meta
+    positions as toolchain by direct ident match -- replaces the old
+    role-name lookup which conflated compilers folding onto
+    ``wrapped-compiler-suit.drv``. ``variant_lookup`` feeds the
+    per-arch toolchain resolution; ``toolchain_task_ids`` is used only
+    to derive ``known_task_ids``. Returns ``(meta_descriptors,
+    extra_variant_deps, meta_skip_idents, toolchain_meta_extras)``.
     """
     state: dict = {
-        "binary": binary,
-        "sys_name": sys_name,
+        "binary": binary, "sys_name": sys_name,
         "arch_to_labels": arch_to_labels,
-        "toolchain_idents_by_name": toolchain_idents_by_name,
-        "toolchain_task_ids": toolchain_task_ids,
-        "is_source_terminal": is_source_terminal,
-        "drv_role": drv_role,
-        "meta_descriptors": [],
-        "extra_variant_deps": {},
-        "meta_skip_idents": set(),
-        "toolchain_meta_extras": {},
+        "variant_lookup": variant_lookup,
+        "toolchain_drv_idents": toolchain_drv_idents,
+        "known_task_ids": frozenset(toolchain_task_ids.values()),
+        "is_source_terminal": is_source_terminal, "drv_role": drv_role,
+        "meta_descriptors": [], "extra_variant_deps": {},
+        "meta_skip_idents": set(), "toolchain_meta_extras": {},
     }
     arch_families: Optional[dict[str, str]] = None
     for meta in meta_templates:
