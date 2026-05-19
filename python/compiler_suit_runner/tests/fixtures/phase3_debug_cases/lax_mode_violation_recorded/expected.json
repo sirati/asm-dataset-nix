@@ -1,0 +1,7 @@
+{
+  "build_variant_count": 2,
+  "violations_min": 1,
+  "violations_at_least_kinds": [
+    "calibration-same-name-count-mismatch"
+  ]
+}
