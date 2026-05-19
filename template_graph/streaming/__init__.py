@@ -16,7 +16,7 @@ This subpackage replaces the legacy single-file ``streaming.py``:
                    VariantBuilderState, RawTreeNode) + the
                    ``StreamPlanner`` class (constructor, ``_record``,
                    ``_cowalk_into_arr``, ``_extend_template_with_subtree``,
-                   ``_is_toolchain_child``, ``_discard_subtree``).
+                   ``_discard_subtree``).
     dispatch.py  — per-line walk (feed_line, _on_depth1,
                    _on_matrix_inner, _finalise_current_variant).
     finalize.py  — finalize + _build_and_drain_arch +

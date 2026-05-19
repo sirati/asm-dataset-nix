@@ -6,10 +6,9 @@ is the in-memory per-variant raw-tree node.
 
 ``StreamPlanner`` owns these state objects plus a few small helper
 methods (``_record``, ``_cowalk_into_arr``, ``_extend_template_with_subtree``,
-``_is_toolchain_child``, ``_discard_subtree``) that the cowalk module
-imports back from this module via ``planner.<method>(...)``. The bulk
-parser-dispatch and finalization logic lives in
-``template_graph.streaming.dispatch`` and
+``_discard_subtree``) that the cowalk module imports back from this
+module via ``planner.<method>(...)``. The bulk parser-dispatch and
+finalization logic lives in ``template_graph.streaming.dispatch`` and
 ``template_graph.streaming.finalize`` as free functions; the methods
 here delegate into those.
 """
@@ -21,11 +20,7 @@ from typing import Optional
 
 from template_graph.cowalk import make_template_node, walk_one_sided_subtree
 from template_graph.graph import Template, VariantArray
-from template_graph.parser.role import (
-    _is_compiler_wrapper_role,
-    _is_stdenv_role,
-    drv_role,
-)
+from template_graph.parser.role import drv_role
 from template_graph.tree_walker import DEFAULT_ARCHS
 
 
@@ -258,18 +253,6 @@ class StreamPlanner:
         if new_nid not in template.nodes[parent_nid].child_ids:
             template.nodes[parent_nid].child_ids.append(new_nid)
         return new_nid
-
-    # ── toolchain-child detection (for parent-level filtering) ──
-
-    def _is_toolchain_child(self, raw_node: RawTreeNode) -> bool:
-        """Classify a raw-tree child as toolchain *without* allocating a
-        template node. Mirrors the is_toolchain logic at _alloc time."""
-        name = self.name_extractor(raw_node.name)
-        return (
-            _is_stdenv_role(name)
-            or _is_compiler_wrapper_role(name)
-            or raw_node.ident in self.out.toolchain_drvs
-        )
 
     # ── discard a raw subtree from unclassified ──
 
