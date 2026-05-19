@@ -44,7 +44,7 @@ def discover_archives(matrix_eval_out_dir: pathlib.Path) -> list[pathlib.Path]:
     """Return every ``<binary>.nix-archive`` under ``matrix_eval_out_dir``.
 
     Sorted by binary name (== file stem) for deterministic processing
-    order so the resulting ``_dependency_graph.json`` and any operator
+    order so the resulting ``_dependency_graph.pkl`` and any operator
     log line is stable across runs.
     """
     if not matrix_eval_out_dir.is_dir():
