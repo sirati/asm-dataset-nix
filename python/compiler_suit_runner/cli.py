@@ -381,6 +381,18 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--slurm-setup-deadline-secs",
+        type=int,
+        default=None,
+        help=(
+            "Per-secondary setup deadline (seconds). Pass-through to the "
+            "framework; defaults to the framework's auto-scaled value "
+            "max(60, num_secondaries * 15). Override only on clusters "
+            "slower than LMU (e.g. slurm-test-env requires 600 to absorb "
+            "the rootless-podman image load latency on shared /home)."
+        ),
+    )
+    parser.add_argument(
         "--ssh-identity-file",
         default=None,
         help=(
