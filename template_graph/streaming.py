@@ -63,6 +63,12 @@ from template_graph.dot import (
     merge_binary_to_dot,  # noqa: F401  back-compat re-export
     save_binary_merged_dot,  # noqa: F401  back-compat re-export
 )
+# Cowalk helpers were lifted into ``template_graph.cowalk``; re-export
+# ``_classify_pair`` here so external callers that import it from this
+# module keep working.
+from template_graph.cowalk.classify_pair import (
+    _classify_pair,  # noqa: F401  back-compat re-export
+)
 
 
 def drv_name_full(name: str) -> str:
@@ -481,7 +487,7 @@ class StreamPlanner:
         self._cowalk_into_arr(tmpl_id, arch, label1, tree1, _arr=arr)
         self.mx.pending_raw_trees[arch] = []
         # Classify on the calibration pair (variants 0 and 1).
-        self.out.classifications[(tmpl_id, arch)] = self._classify_pair(
+        self.out.classifications[(tmpl_id, arch)] = _classify_pair(
             arr, template
         )
 
@@ -977,43 +983,6 @@ class StreamPlanner:
                 self.mx.unclassified_nodes.discard(n.ident)
             stack.extend(n.children)
 
-    # ── classification on calibration pair ──
-
-    def _classify_pair(
-        self, arr: VariantArray, template: Template
-    ) -> dict[int, str]:
-        """At this point arr.hashes has exactly two columns (variants
-        0 and 1). For each non-toolchain node: equal → common_dep,
-        differing → variant_specific.
-
-        Subsequent variants of this arch will be checked incrementally
-        by ``_cowalk_into_arr`` via ``assert_classification_after_cowalk``.
-        """
-        out: dict[int, str] = {}
-        for nid, node in enumerate(template.nodes):
-            if node.is_toolchain:
-                continue
-            h0 = arr.hashes[nid][0]
-            h1 = arr.hashes[nid][1] if len(arr.hashes[nid]) > 1 else None
-            if h0 is None:
-                # Variant 0 didn't reach this node during cowalk. If
-                # not already optional, promote it now — same handling
-                # the cowalk-time path uses for "required but absent
-                # in some variant". Downstream merged render uses
-                # whichever non-None hash exists.
-                if not node.optional:
-                    node.optional = True
-                out[nid] = "common_dep"
-                continue
-            if h1 is None:
-                # Single-variant calibration (rare; happens via
-                # _close_current_matrix when an arch had only one
-                # variant). Mark as common_dep.
-                out[nid] = "common_dep"
-                continue
-            out[nid] = "common_dep" if h0 == h1 else "variant_specific"
-        return out
-
     # ── end-of-matrix cleanup ──
 
     def _close_current_matrix(self) -> None:
@@ -1044,7 +1013,7 @@ class StreamPlanner:
                 )
                 self.out.variant_arrays[(tmpl_id, arch)] = arr
                 self._cowalk_into_arr(tmpl_id, arch, label, tree)
-                self.out.classifications[(tmpl_id, arch)] = self._classify_pair(
+                self.out.classifications[(tmpl_id, arch)] = _classify_pair(
                     arr, self.out.templates[tmpl_id]
                 )
                 self.mx.pending_raw_trees[arch] = []
