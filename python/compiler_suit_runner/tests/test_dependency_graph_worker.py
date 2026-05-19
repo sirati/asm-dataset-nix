@@ -7,10 +7,10 @@ template_graph eval, no /nix/store).
 Coverage:
 
   * archive discovery (sorted, file-only, suffix filter);
-  * sidecar JSON reader (present / missing / malformed);
-  * matrix_eval header reader (defensive secondary discovery);
-  * kept-drv discovery precedence (sidecar > header > empty + warn);
-  * import_archive happy + missing-file + subprocess-failure paths;
+  * kept-drv derivation from ``nix-store --import`` stdout
+    (filter, dedup, label compose);
+  * import_archive happy + missing-file + subprocess-failure paths,
+    including stdout-path capture;
   * write_phase4_descriptors roundtrip (descriptor + summary), including
     the ``_dependency_graph_summary.txt`` companion file shape;
   * --toolchain-task-id parser;
@@ -22,7 +22,6 @@ Coverage:
 
 from __future__ import annotations
 
-import json
 import pathlib
 from typing import Any, Optional
 
@@ -58,6 +57,11 @@ class _SubprocessStub:
         self.path_info_rc: Optional[int] = None
         self.import_rc = 0
         self.import_stderr = b""
+        # Default stdout returned for every ``nix-store --import``
+        # call. Override with ``import_stdout_queue`` to feed
+        # per-archive responses in invocation order.
+        self.import_stdout = b""
+        self.import_stdout_queue: list[bytes] = []
         self.tree_stdout = b""
         self.tree_rc = 0
 
@@ -70,7 +74,11 @@ class _SubprocessStub:
             present = store_path in self.path_info_present
             return b"", b"", 0 if present else 1
         if argv[:2] == ["nix-store", "--import"]:
-            return b"", self.import_stderr, self.import_rc
+            if self.import_stdout_queue:
+                stdout = self.import_stdout_queue.pop(0)
+            else:
+                stdout = self.import_stdout
+            return stdout, self.import_stderr, self.import_rc
         if argv[:3] == ["nix-store", "--query", "--tree"]:
             return self.tree_stdout, b"", self.tree_rc
         raise AssertionError(f"unexpected argv to stub: {argv!r}")
@@ -106,150 +114,147 @@ class TestDiscoverArchives:
 
 
 # ---------------------------------------------------------------------------
-# Kept-drv discovery (sidecar + header)
+# Kept-drv derivation from ``nix-store --import`` stdout
 # ---------------------------------------------------------------------------
 
 
-class TestKeptDrvDiscovery:
+def _variant_drv(
+    binary: str, arch: str, opt: str = "O0", comp: str = "gcc15",
+    *, hash_prefix: str,
+    inner: str = "baseline-default-san-off-march-default",
+) -> str:
+    """Build a synthetic ``/nix/store/<hash>-<...>-elf-folder.drv`` path.
 
-    def test_sidecar_variant_drvs(self, tmp_path: pathlib.Path):
-        archive = tmp_path / "hello.nix-archive"
-        archive.write_bytes(b"")
-        sidecar = archive.with_suffix(".nix-archive.json")
-        sidecar.write_text(
-            json.dumps({"variant_drvs": [
-                "/nix/store/aaa-hello-O0.drv",
-                "/nix/store/bbb-hello-O2.drv",
-            ]}),
-            encoding="utf-8",
-        )
-        drvs, lookup = dgw.discover_kept_drvs(archive, None)
-        assert drvs == [
-            "/nix/store/aaa-hello-O0.drv",
-            "/nix/store/bbb-hello-O2.drv",
+    Mirrors :func:`template_graph.tests.test_streaming.fixtures.variant_name`
+    so the produced post-hash basename is accepted by
+    :func:`parse_variant_path`. ``hash_prefix`` is short-form (any
+    length) and is right-padded with ``a`` to the 32-char base32 hash
+    width expected by ``_post_hash_basename``.
+    """
+    h = (hash_prefix + "a" * 32)[:32]
+    name = f"{binary}-{arch}-{comp}-{opt}-{inner}-elf-folder.drv"
+    return f"/nix/store/{h}-{name}"
+
+
+class TestDiscoverKeptDrvsFromImportedStore:
+
+    def test_filters_to_elf_folder_drvs(self):
+        v_hello = _variant_drv("hello", "x86_64", "O0", hash_prefix="hh1")
+        v_world = _variant_drv("world", "aarch64", "O2", hash_prefix="ww1")
+        imported = [
+            v_hello,
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.39.drv",
+            v_world,
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-source.tar",
         ]
-        assert lookup == {}
-
-    def test_sidecar_with_variant_lookup(self, tmp_path: pathlib.Path):
-        """Sidecar with full ``variants`` list populates variant_lookup."""
-        archive = tmp_path / "hello.nix-archive"
-        archive.write_bytes(b"")
-        sidecar = archive.with_suffix(".nix-archive.json")
-        sidecar.write_text(
-            json.dumps({"variants": [
-                {"label": "gcc15-O0", "arch": "x86_64",
-                 "drv": "/nix/store/aaa-hello-O0.drv",
-                 "compiler_id": "gcc15", "optimization": "O0"},
-                {"label": "gcc15-O2", "arch": "x86_64",
-                 "drv": "/nix/store/bbb-hello-O2.drv"},
-            ]}),
-            encoding="utf-8",
+        drvs, lookup = dgw.discover_kept_drvs_from_imported_store(imported)
+        assert drvs == [v_hello, v_world]
+        assert ("x86_64", lookup[("x86_64", lookup_key_for(v_hello))]["arch"]) == (
+            "x86_64", "x86_64"
         )
-        drvs, lookup = dgw.discover_kept_drvs(archive, None)
-        assert set(drvs) == {
-            "/nix/store/aaa-hello-O0.drv",
-            "/nix/store/bbb-hello-O2.drv",
-        }
-        assert lookup[("x86_64", "gcc15-O0")]["compiler_id"] == "gcc15"
-        assert lookup[("x86_64", "gcc15-O2")]["drv"].endswith("O2.drv")
-
-    def test_matrix_eval_header_post_b1a(self, tmp_path: pathlib.Path):
-        archive = tmp_path / "hello.nix-archive"
-        archive.write_bytes(b"")
-        manifest_dir = tmp_path / "manifests"
-        manifest_dir.mkdir()
-        header = {
-            "item_class": "matrix_eval",
-            "name": "matrix_eval__hello",
-            "size": 0,
-            "payload": {
-                "binary": "hello",
-                "variant_drvs": [
-                    "/nix/store/aaa-hello-O0.drv",
-                ],
-            },
-        }
-        (manifest_dir / "matrix_eval__hello.json").write_text(
-            json.dumps(header), encoding="utf-8",
+        # Direct sanity: the lookup is keyed by (arch, label) and the
+        # label is the streaming planner's ``cur_label`` (binary__arch__suffix).
+        h_label = (
+            "hello__x86_64__gcc15-O0-baseline-default-san-off-march-default"
         )
-        drvs, _lookup = dgw.discover_kept_drvs(archive, manifest_dir)
-        assert drvs == ["/nix/store/aaa-hello-O0.drv"]
-
-    def test_legacy_phase0_eval_header_ignored(
-        self, tmp_path: pathlib.Path,
-    ):
-        """Per A6's hard cutover, a leftover legacy
-        ``phase0_eval__<binary>.json`` is NOT consulted — only the new
-        ``matrix_eval__<binary>.json`` name is recognised. Operators
-        with pre-rename run state on disk must re-issue under the new
-        run_id namespace."""
-        archive = tmp_path / "hello.nix-archive"
-        archive.write_bytes(b"")
-        manifest_dir = tmp_path / "manifests"
-        manifest_dir.mkdir()
-        header = {
-            "item_class": "phase0_eval",
-            "name": "phase0_eval__hello",
-            "size": 0,
-            "payload": {
-                "variant_drvs": ["/nix/store/legacy-hello.drv"],
-            },
-        }
-        (manifest_dir / "phase0_eval__hello.json").write_text(
-            json.dumps(header), encoding="utf-8",
+        w_label = (
+            "world__aarch64__gcc15-O2-baseline-default-san-off-march-default"
         )
-        drvs, _lookup = dgw.discover_kept_drvs(archive, manifest_dir)
-        assert drvs == []
+        assert ("x86_64", h_label) in lookup
+        assert ("aarch64", w_label) in lookup
+        assert lookup[("x86_64", h_label)]["drv"] == v_hello
+        assert lookup[("aarch64", w_label)]["drv"] == v_world
 
-    def test_no_source_returns_empty(
-        self, tmp_path: pathlib.Path, caplog,
-    ):
-        archive = tmp_path / "hello.nix-archive"
-        archive.write_bytes(b"")
-        drvs, lookup = dgw.discover_kept_drvs(archive, None)
+    def test_dedupes_preserving_order(self):
+        v = _variant_drv("hello", "x86_64", "O0", hash_prefix="dup")
+        v2 = _variant_drv("hello", "x86_64", "O2", hash_prefix="d22")
+        # Repeats removed; insertion order preserved.
+        drvs, _ = dgw.discover_kept_drvs_from_imported_store([
+            v, v2, v,
+        ])
+        assert drvs == [v, v2]
+
+    def test_empty_when_no_variant_drvs_in_stream(self):
+        drvs, lookup = dgw.discover_kept_drvs_from_imported_store([
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.39.drv",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-source.tar",
+        ])
         assert drvs == []
         assert lookup == {}
 
-    def test_sidecar_preferred_over_header(
-        self, tmp_path: pathlib.Path,
+    def test_unparseable_variant_drv_skipped_with_warning(
+        self, caplog,
     ):
-        """Sidecar wins when both are present."""
-        archive = tmp_path / "hello.nix-archive"
-        archive.write_bytes(b"")
-        sidecar = archive.with_suffix(".nix-archive.json")
-        sidecar.write_text(
-            json.dumps({"variant_drvs": ["/nix/store/aaa-sidecar.drv"]}),
-            encoding="utf-8",
+        """A path that ends in ``-elf-folder.drv`` but doesn't parse
+        as a variant (no arch / no compiler suffix) is dropped from
+        the lookup with a WARN log line. The drv still lands in the
+        ``variant_drvs`` list — the streaming planner is the
+        authoritative shape arbiter and will raise its own
+        TreeWalkError on the same tree."""
+        import logging  # noqa: PLC0415
+        bad = (
+            "/nix/store/cccccccccccccccccccccccccccccccc-"
+            "not-a-variant-elf-folder.drv"
         )
-        manifest_dir = tmp_path / "manifests"
-        manifest_dir.mkdir()
-        (manifest_dir / "matrix_eval__hello.json").write_text(
-            json.dumps({
-                "payload": {
-                    "variant_drvs": ["/nix/store/bbb-header.drv"],
-                },
-            }),
-            encoding="utf-8",
+        good = _variant_drv("hello", "x86_64", "O0", hash_prefix="hh1")
+        with caplog.at_level(
+            logging.WARNING,
+            logger="compiler_suit_runner.dependency_graph_worker",
+        ):
+            drvs, lookup = dgw.discover_kept_drvs_from_imported_store([
+                bad, good,
+            ])
+        # Both drvs are kept (filter is suffix-only).
+        assert drvs == [bad, good]
+        # Only the parseable variant lands in the lookup.
+        assert len(lookup) == 1
+        assert any(
+            "unparseable variant drv" in r.message
+            for r in caplog.records
         )
-        drvs, _ = dgw.discover_kept_drvs(archive, manifest_dir)
-        assert drvs == ["/nix/store/aaa-sidecar.drv"]
 
-    def test_invalid_drv_entries_dropped(self, tmp_path: pathlib.Path):
-        """Non-string / non-.drv entries are filtered."""
-        archive = tmp_path / "hello.nix-archive"
-        archive.write_bytes(b"")
-        sidecar = archive.with_suffix(".nix-archive.json")
-        sidecar.write_text(
-            json.dumps({"variant_drvs": [
-                "/nix/store/aaa-hello.drv",
-                "/nix/store/bbb-no-suffix",  # dropped
-                123,                          # dropped
-                None,                         # dropped
-            ]}),
-            encoding="utf-8",
+
+class TestDeriveVariantLookupFromDrvs:
+
+    def test_label_matches_streaming_planner_cur_label(self):
+        """``derive_variant_lookup_from_drvs`` composes the label the
+        same way ``StreamPlanner._on_matrix_depth2`` does:
+        ``f"{binary}__{arch}__{suffix}"`` where ``suffix`` is the
+        substring between ``<binary>-<arch>-`` and ``-elf-folder.drv``.
+        """
+        v = _variant_drv(
+            "busybox", "aarch64", "O2", comp="clang19",
+            hash_prefix="bbx",
+            inner="size-pie-on-san-off-march-armv8",
         )
-        drvs, _ = dgw.discover_kept_drvs(archive, None)
-        assert drvs == ["/nix/store/aaa-hello.drv"]
+        lookup = dgw.derive_variant_lookup_from_drvs([v])
+        label = "busybox__aarch64__clang19-O2-size-pie-on-san-off-march-armv8"
+        assert lookup[("aarch64", label)] == {
+            "drv": v, "arch": "aarch64", "label": label,
+            "suffix": "clang19-O2-size-pie-on-san-off-march-armv8",
+        }
+
+    def test_non_elf_folder_inputs_ignored(self):
+        lookup = dgw.derive_variant_lookup_from_drvs([
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.39.drv",
+        ])
+        assert lookup == {}
+
+
+def lookup_key_for(drv_path: str) -> str:
+    """Reconstruct the planner-form label for a synthetic variant drv.
+
+    Test helper: parses the post-hash basename and re-derives the
+    ``"<binary>__<arch>__<suffix>"`` label so assertions can be
+    written without hard-coding the inner-axis tokens.
+    """
+    from template_graph.tree_walker import VARIANT_SUFFIX, parse_variant_path
+
+    # _post_hash_basename mirror: strip "/nix/store/<32 chars>-".
+    body = drv_path[len("/nix/store/") + 32 + 1:]
+    binary, arch, _comp, _opt = parse_variant_path(body)
+    suffix = body[len(binary) + 1 + len(arch) + 1 : -len(VARIANT_SUFFIX)]
+    return f"{binary}__{arch}__{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -284,9 +289,12 @@ class TestImportArchive:
     def test_missing_archive(self, tmp_path: pathlib.Path):
         archive = tmp_path / "missing.nix-archive"
         stub = _SubprocessStub()
-        ok, err = dgw.import_archive(archive, run_subprocess=stub)
+        ok, err, imported = dgw.import_archive(
+            archive, run_subprocess=stub,
+        )
         assert ok is False
         assert b"archive not found" in err
+        assert imported == []
         # No subprocess invocation — short-circuit on missing file.
         assert stub.calls == []
 
@@ -295,11 +303,22 @@ class TestImportArchive:
         archive.write_bytes(b"fake-archive-bytes")
         stub = _SubprocessStub()
         stub.import_rc = 0
-        ok, err = dgw.import_archive(archive, run_subprocess=stub)
+        stub.import_stdout = (
+            b"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello.drv\n"
+            b"/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc.drv\n"
+        )
+        ok, err, imported = dgw.import_archive(
+            archive, run_subprocess=stub,
+        )
         assert ok is True
         assert err == b""
         # Subprocess was invoked with --import.
         assert any(c[:2] == ["nix-store", "--import"] for c in stub.calls)
+        # Stdout is parsed line-by-line into the imported_paths return.
+        assert imported == [
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello.drv",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc.drv",
+        ]
 
     def test_subprocess_failure(self, tmp_path: pathlib.Path):
         archive = tmp_path / "x.nix-archive"
@@ -307,9 +326,44 @@ class TestImportArchive:
         stub = _SubprocessStub()
         stub.import_rc = 1
         stub.import_stderr = b"corrupt archive"
-        ok, err = dgw.import_archive(archive, run_subprocess=stub)
+        stub.import_stdout = b"/nix/store/partial.drv\n"
+        ok, err, imported = dgw.import_archive(
+            archive, run_subprocess=stub,
+        )
         assert ok is False
         assert b"corrupt" in err
+        # Failure path: imported_paths is empty regardless of partial
+        # stdout from the failed subprocess.
+        assert imported == []
+
+    def test_empty_stdout_yields_empty_paths(
+        self, tmp_path: pathlib.Path,
+    ):
+        archive = tmp_path / "x.nix-archive"
+        archive.write_bytes(b"x")
+        stub = _SubprocessStub()
+        stub.import_stdout = b""
+        ok, _err, imported = dgw.import_archive(
+            archive, run_subprocess=stub,
+        )
+        assert ok is True
+        assert imported == []
+
+    def test_blank_lines_in_stdout_skipped(
+        self, tmp_path: pathlib.Path,
+    ):
+        archive = tmp_path / "x.nix-archive"
+        archive.write_bytes(b"x")
+        stub = _SubprocessStub()
+        stub.import_stdout = (
+            b"\n/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv\n\n"
+        )
+        _ok, _err, imported = dgw.import_archive(
+            archive, run_subprocess=stub,
+        )
+        assert imported == [
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -441,16 +495,31 @@ class TestRunDependencyGraphTask:
         self,
         matrix_dir: pathlib.Path,
         binary: str,
-        kept_drvs: list[str],
+        _kept_drvs: list[str],
     ) -> pathlib.Path:
+        """Drop a placeholder ``<binary>.nix-archive`` in ``matrix_dir``.
+
+        The kept-drv list is no longer read from a sidecar JSON; the
+        ``import_stdout`` field on :class:`_SubprocessStub` drives
+        the post-import kept-drv derivation instead. ``_kept_drvs`` is
+        kept on the signature so tests stay legible at the call site.
+        """
         archive = matrix_dir / f"{binary}.nix-archive"
         archive.write_bytes(b"fake")
-        sidecar = archive.with_suffix(".nix-archive.json")
-        sidecar.write_text(
-            json.dumps({"variant_drvs": kept_drvs}),
-            encoding="utf-8",
-        )
         return archive
+
+    def _stub_import_stdout(
+        self, *binaries_with_drvs: tuple[str, list[str]],
+    ) -> bytes:
+        """Render the synthetic ``nix-store --import`` stdout for a
+        set of per-binary kept drv lists. Empty input → empty stdout.
+        """
+        lines: list[str] = []
+        for _binary, drvs in binaries_with_drvs:
+            lines.extend(drvs)
+        if not lines:
+            return b""
+        return ("\n".join(lines) + "\n").encode("utf-8")
 
     def test_empty_matrix_dir_writes_empty_graph(
         self, tmp_path: pathlib.Path,
@@ -480,13 +549,13 @@ class TestRunDependencyGraphTask:
     ):
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        self._seed_archive(
-            matrix_dir, "hello",
-            ["/nix/store/aaa-hello-O0.drv", "/nix/store/bbb-hello-O2.drv"],
-        )
+        v_o0 = _variant_drv("hello", "x86_64", "O0", hash_prefix="hh1")
+        v_o2 = _variant_drv("hello", "x86_64", "O2", hash_prefix="hh2")
+        self._seed_archive(matrix_dir, "hello", [v_o0, v_o2])
 
         stub = _SubprocessStub()
-        # No paths present locally → import must run.
+        # ``nix-store --import`` stdout carries the kept-drv list now.
+        stub.import_stdout = self._stub_import_stdout(("hello", [v_o0, v_o2]))
         stub.tree_stdout = b"/nix/store/sum-drv.drv\n"
 
         # Monkey-patch the multi-binary sum-drv builder + planner to
@@ -544,10 +613,7 @@ class TestRunDependencyGraphTask:
         # sum_drv builder saw the kept drvs in matrix-hello.
         assert len(sum_drv_calls) == 1
         assert sum_drv_calls[0]["matrix_drvs"] == {
-            "matrix-hello": [
-                "/nix/store/aaa-hello-O0.drv",
-                "/nix/store/bbb-hello-O2.drv",
-            ],
+            "matrix-hello": [v_o0, v_o2],
         }
         # Planner saw the toolchain task ids and the binary list.
         assert plan_calls[0]["toolchain_task_ids"] == {
@@ -564,17 +630,26 @@ class TestRunDependencyGraphTask:
         assert len(descriptors) == 1
         assert descriptors[0].task_id == "bv_hello"
 
-    def test_skip_import_when_all_locally_present(
+    def test_import_runs_unconditionally(
         self, tmp_path: pathlib.Path, monkeypatch,
     ):
+        """Post-cutover, the worker always imports the archive — the
+        ``nix-store --import`` stdout IS the kept-drv source, so the
+        old "skip if all drvs locally present" probe-then-skip
+        optimisation cannot fire. ``skip_import_when_present`` is
+        retained on the API surface but is inert.
+        """
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        self._seed_archive(
-            matrix_dir, "hello", ["/nix/store/aaa-hello.drv"],
-        )
+        v = _variant_drv("hello", "x86_64", "O0", hash_prefix="sk1")
+        self._seed_archive(matrix_dir, "hello", [v])
 
         stub = _SubprocessStub()
-        stub.path_info_present.add("/nix/store/aaa-hello.drv")
+        # Even with the kept drv "locally present", the worker must
+        # call --import because it learns the kept-drv list FROM the
+        # import output.
+        stub.path_info_present.add(v)
+        stub.import_stdout = self._stub_import_stdout(("hello", [v]))
         stub.tree_stdout = b"/nix/store/sum.drv\n"
 
         monkeypatch.setattr(
@@ -592,11 +667,13 @@ class TestRunDependencyGraphTask:
             bash_path="/nix/store/bash",
             toolchain_drvs=["/nix/store/tc.drv"],
             run_subprocess=stub,
+            skip_import_when_present=True,  # inert now
         )
-        # No --import call because all drvs were already present.
-        assert not any(
-            c[:2] == ["nix-store", "--import"] for c in stub.calls
-        )
+        # --import runs once even though the kept drv is "present".
+        import_calls = [
+            c for c in stub.calls if c[:2] == ["nix-store", "--import"]
+        ]
+        assert len(import_calls) == 1
 
     def test_import_failure_raises(
         self, tmp_path: pathlib.Path, monkeypatch,
@@ -633,11 +710,10 @@ class TestRunDependencyGraphTask:
     ):
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        self._seed_archive(
-            matrix_dir, "hello", ["/nix/store/aaa-hello.drv"],
-        )
+        v = _variant_drv("hello", "x86_64", "O0", hash_prefix="qt1")
+        self._seed_archive(matrix_dir, "hello", [v])
         stub = _SubprocessStub()
-        stub.path_info_present.add("/nix/store/aaa-hello.drv")
+        stub.import_stdout = self._stub_import_stdout(("hello", [v]))
         stub.tree_rc = 1
 
         monkeypatch.setattr(
@@ -666,13 +742,20 @@ class TestRunDependencyGraphTask:
         """
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        self._seed_archive(matrix_dir, "hello", ["/nix/store/h-hello.drv"])
-        self._seed_archive(matrix_dir, "world", ["/nix/store/w-world.drv"])
+        v_hello = _variant_drv("hello", "x86_64", "O0", hash_prefix="tb1")
+        v_world = _variant_drv("world", "aarch64", "O0", hash_prefix="tb2")
+        self._seed_archive(matrix_dir, "hello", [v_hello])
+        self._seed_archive(matrix_dir, "world", [v_world])
 
+        # Per-archive --import stdout via the queue: the worker walks
+        # archives in sorted order (hello, world), so the first --import
+        # call returns hello's kept drv list and the second returns
+        # world's.
         stub = _SubprocessStub()
-        stub.path_info_present.update(
-            ["/nix/store/h-hello.drv", "/nix/store/w-world.drv"]
-        )
+        stub.import_stdout_queue = [
+            self._stub_import_stdout(("hello", [v_hello])),
+            self._stub_import_stdout(("world", [v_world])),
+        ]
         stub.tree_stdout = b"/nix/store/sum-drv.drv\n"
 
         sum_drv_calls: list[dict] = []
@@ -725,18 +808,26 @@ class TestRunDependencyGraphTask:
     def test_binary_with_no_kept_drvs_is_skipped(
         self, tmp_path: pathlib.Path, monkeypatch,
     ):
-        """An archive with neither sidecar nor header → skip the binary
-        and proceed with the rest."""
+        """An archive whose ``nix-store --import`` stdout carries no
+        ``*-elf-folder.drv`` entries → no kept variant drvs → skip
+        that binary and proceed with the rest."""
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        # ``hello`` has no sidecar / header → skipped.
+        # ``hello``'s archive yields a non-variant payload only.
         (matrix_dir / "hello.nix-archive").write_bytes(b"x")
-        # ``world`` has a sidecar.
-        self._seed_archive(
-            matrix_dir, "world", ["/nix/store/world.drv"],
-        )
+        # ``world``'s archive yields a real variant drv.
+        v_world = _variant_drv("world", "x86_64", "O0", hash_prefix="ww1")
+        self._seed_archive(matrix_dir, "world", [v_world])
 
         stub = _SubprocessStub()
+        stub.import_stdout_queue = [
+            # hello: no variant drvs in stdout → kept_drvs is empty,
+            # binary is skipped.
+            (
+                b"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc.drv\n"
+            ),
+            self._stub_import_stdout(("world", [v_world])),
+        ]
         stub.tree_stdout = b"/nix/store/sum.drv\n"
 
         monkeypatch.setattr(
@@ -1112,26 +1203,16 @@ class TestDependencyGraphCounters:
         planner output, and the summary log line fires."""
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        archive = matrix_dir / "hello.nix-archive"
-        archive.write_bytes(b"x")
-        sidecar = archive.with_suffix(".nix-archive.json")
-        sidecar.write_text(
-            json.dumps({"variant_drvs": ["/nix/store/aaa-hello.drv"]}),
-            encoding="utf-8",
-        )
-        archive2 = matrix_dir / "world.nix-archive"
-        archive2.write_bytes(b"x")
-        sidecar2 = archive2.with_suffix(".nix-archive.json")
-        sidecar2.write_text(
-            json.dumps({"variant_drvs": ["/nix/store/bbb-world.drv"]}),
-            encoding="utf-8",
-        )
+        v_hello = _variant_drv("hello", "x86_64", "O0", hash_prefix="rh1")
+        v_world = _variant_drv("world", "aarch64", "O0", hash_prefix="rw1")
+        (matrix_dir / "hello.nix-archive").write_bytes(b"x")
+        (matrix_dir / "world.nix-archive").write_bytes(b"x")
 
         stub = _SubprocessStub()
-        stub.path_info_present.update([
-            "/nix/store/aaa-hello.drv",
-            "/nix/store/bbb-world.drv",
-        ])
+        stub.import_stdout_queue = [
+            (v_hello + "\n").encode("utf-8"),
+            (v_world + "\n").encode("utf-8"),
+        ]
         stub.tree_stdout = b"/nix/store/sum.drv\n"
 
         descriptors = self._two_binary_descriptors()

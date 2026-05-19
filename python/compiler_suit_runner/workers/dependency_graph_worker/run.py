@@ -90,10 +90,16 @@ def run_dependency_graph_task(
     runner = run_subprocess or default_run_subprocess
     tc_ids: dict[str, str] = dict(toolchain_task_ids or {})
 
+    # ``manifest_dir`` is accepted for backward-compatibility with the
+    # outer scheduler (it threads the manifests dir through every
+    # worker uniformly) but is no longer consumed for kept-drv
+    # discovery — the post-import store-path stdout from
+    # :func:`archive.import_archive` IS the kept-drv source.
+    _ = manifest_dir
+
     matrix_drvs, variant_lookups, plannable_binaries = (
         _collect_and_import_archives(
             archives=archives,
-            manifest_dir=manifest_dir,
             runner=runner,
             skip_import_when_present=skip_import_when_present,
         )
@@ -159,7 +165,6 @@ def run_dependency_graph_task(
 def _collect_and_import_archives(
     *,
     archives: list[pathlib.Path],
-    manifest_dir: Optional[pathlib.Path],
     runner: RunSubprocess,
     skip_import_when_present: bool,
 ) -> tuple[
@@ -167,9 +172,8 @@ def _collect_and_import_archives(
     dict[str, dict[tuple[str, str], dict]],
     list[str],
 ]:
-    """Walk every archive, surfacing kept drvs + the variant lookup
-    per binary, and import any archive whose kept drvs are not all
-    locally present.
+    """Import every archive and derive the kept-drv + variant_lookup
+    per binary from the import-stdout paths.
 
     Returns ``(matrix_drvs, variant_lookups, plannable_binaries)``:
 
@@ -183,27 +187,36 @@ def _collect_and_import_archives(
         an empty matrix doesn't poison the multi-binary sum-drv (the
         ``make_sum_drv_from_paths`` contract forbids zero-variant
         matrices).
+
+    ``skip_import_when_present`` is retained on the public API for
+    backward-compatibility but is now inert. The previous "probe the
+    sidecar's kept drvs and skip import iff all present" path was
+    coupled to the JSON sidecar that the matrix_eval worker no longer
+    writes; with the hard cutover we need ``nix-store --import``'s
+    stdout to learn the kept-drv list, so the optimisation cannot
+    fire ahead of the import. Re-importing a fully-resident archive
+    is cheap inside nix-store (no duplicate inserts) — the cost is
+    one archive read per quiesce, not one full store materialisation.
     """
+    _ = skip_import_when_present
+
     matrix_drvs: dict[str, list[str]] = {}
     variant_lookups: dict[str, dict[tuple[str, str], dict]] = {}
     plannable_binaries: list[str] = []
 
     for archive in archives:
         binary = archive.stem
-        kept_drvs, variant_lookup = _archive.discover_kept_drvs(
-            archive, manifest_dir,
+        imported_paths = _import_archive_or_raise(
+            archive=archive, runner=runner, binary=binary,
+        )
+        kept_drvs, variant_lookup = (
+            _archive.discover_kept_drvs_from_imported_store(imported_paths)
         )
         if not kept_drvs:
-            # Logged inside discover_kept_drvs; treat as skip.
+            # No ``*-elf-folder.drv`` in the import stream — the
+            # archive carried no plannable variants. Mirrors the old
+            # "no kept-drv source" skip path.
             continue
-
-        _maybe_import_archive(
-            archive=archive,
-            kept_drvs=kept_drvs,
-            runner=runner,
-            skip_import_when_present=skip_import_when_present,
-            binary=binary,
-        )
 
         matrix_drvs[f"matrix-{binary}"] = kept_drvs
         variant_lookups[binary] = variant_lookup
@@ -212,24 +225,22 @@ def _collect_and_import_archives(
     return matrix_drvs, variant_lookups, plannable_binaries
 
 
-def _maybe_import_archive(
+def _import_archive_or_raise(
     *,
     archive: pathlib.Path,
-    kept_drvs: list[str],
     runner: RunSubprocess,
-    skip_import_when_present: bool,
     binary: str,
-) -> None:
-    """Import the archive unless every kept drv is already locally present."""
-    need_import = True
-    if skip_import_when_present:
-        need_import = not all(
-            _archive.is_path_locally_present(p, run_subprocess=runner)
-            for p in kept_drvs
-        )
-    if not need_import:
-        return
-    ok, err = _archive.import_archive(archive, run_subprocess=runner)
+) -> list[str]:
+    """``nix-store --import`` the archive, surfacing the stdout paths.
+
+    Raises :class:`DependencyGraphWorkerError` (stage ``"import"``)
+    on failure so the worker driver can convert that to a non-zero
+    exit. On success returns the parsed list of imported store
+    paths.
+    """
+    ok, err, imported_paths = _archive.import_archive(
+        archive, run_subprocess=runner,
+    )
     if not ok:
         raise DependencyGraphWorkerError(
             binary=binary, stage="import",
@@ -238,6 +249,7 @@ def _maybe_import_archive(
                 + err.decode("utf-8", errors="replace").strip()
             ),
         )
+    return imported_paths
 
 
 def _plan_all_binaries(
