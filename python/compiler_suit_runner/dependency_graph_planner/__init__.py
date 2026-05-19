@@ -111,6 +111,7 @@ from .shapes import (
     _iter_variant_arrays,
     _node_field,
     _template_nodes,
+    _toolchain_ident_strs,
     _toolchain_idents_by_name,
     _variant_array_fields,
     convert_toolchain_drvs,

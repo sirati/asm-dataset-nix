@@ -246,3 +246,25 @@ def _toolchain_idents_by_name(raw: Any) -> dict[str, list[tuple[str, str]]]:
             continue
         out.setdefault(ident[1], []).append(ident)
     return out
+
+
+def _toolchain_ident_strs(raw: Any) -> frozenset[str]:
+    """Project ``out.toolchain_drvs`` to a ``frozenset`` of
+    ``"<hash>-<name>"`` strings.
+
+    Replaces the role-name keyed :func:`_toolchain_idents_by_name`
+    lookup for the meta-pass toolchain-position check: a MetaTemplate
+    position is a toolchain position iff its ident string appears in
+    this set. Direct ident match avoids the role-collapse conflation
+    that bit the old keyed-by-name path (multiple compilers folding
+    onto ``wrapped-compiler-suit.drv``).
+    """
+    out: set[str] = set()
+    if not raw:
+        return frozenset()
+    for entry in raw:
+        ident = _coerce_ident(entry)
+        if ident is None:
+            continue
+        out.add(_ident_to_str(ident))
+    return frozenset(out)

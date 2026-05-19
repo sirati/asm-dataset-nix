@@ -27,6 +27,7 @@ from .shapes import (
     _coerce_toolchain_node_ids,
     _iter_classifications,
     _iter_variant_arrays,
+    _toolchain_ident_strs,
     _toolchain_idents_by_name,
 )
 
@@ -74,9 +75,9 @@ def plan_phase4_for_binary(
     toolchain_node_ids = _coerce_toolchain_node_ids(
         streaming_result.get("toolchain_node_ids_per_template", {})
     )
-    toolchain_idents_by_name = _toolchain_idents_by_name(
-        streaming_result.get("toolchain_drvs", set())
-    )
+    toolchain_drvs_raw = streaming_result.get("toolchain_drvs", set())
+    toolchain_idents_by_name = _toolchain_idents_by_name(toolchain_drvs_raw)
+    toolchain_drv_idents = _toolchain_ident_strs(toolchain_drvs_raw)
     arch_indep_deps_raw = streaming_result.get("arch_indep_deps", {}) or {}
 
     _check_no_cycles(templates)
@@ -124,7 +125,8 @@ def plan_phase4_for_binary(
             sys_name=sys_name,
             meta_templates=meta_templates,
             arch_to_labels=arch_to_labels,
-            toolchain_idents_by_name=toolchain_idents_by_name,
+            variant_lookup=variant_lookup,
+            toolchain_drv_idents=toolchain_drv_idents,
             toolchain_task_ids=toolchain_task_ids,
             is_source_terminal=is_source_terminal,
             drv_role=drv_role,
