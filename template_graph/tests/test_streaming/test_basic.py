@@ -11,7 +11,7 @@ constructed via ``_fixtures.py``; no nix subprocess or real
 
 from __future__ import annotations
 
-from template_graph.core import (
+from template_graph.graph import (
     Template,
     TemplateNode,
     find_or_register_template,
