@@ -1,0 +1,10 @@
+/nix/store/000000000puvclarohmn4d2jg9efs5qb-sum-root.drv
+├───/nix/store/00000001167kti30puvclarohmn4d2jg-toolchains.drv
+└───/nix/store/000000022jg9efs5qb8167kti30puvcl-matrix-hello.drv
+    ├───/nix/store/00000010arohmn4d2jg9efs5qb8167kt-hello-x86_64-gcc15-O0-baseline-default-san-off-march-default-elf-folder.drv
+    │   ├───/nix/store/00000110efs5qb8167kti30puvclaroh-lib-thing-1.0.drv
+    │   └───/nix/store/00000111fs5qb8167kti30puvclarohm-lib-thing-2.0.drv
+    └───/nix/store/00000020kti30puvclarohmn4d2jg9ef-hello-x86_64-gcc15-O1-baseline-default-san-off-march-default-elf-folder.drv
+        ├───/nix/store/00000120ohmn4d2jg9efs5qb8167kti3-lib-thing-1.0.drv
+        ├───/nix/store/00000121puvclarohmn4d2jg9efs5qb8-lib-thing-2.0.drv
+        └───/nix/store/00000122qb8167kti30puvclarohmn4d-lib-thing-3.0.drv
