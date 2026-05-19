@@ -9,10 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-from template_graph.cowalk._helpers import (
-    _ARCH_TO_TRIPLE,
-    _classify_revisit_diff,
-)
+from template_graph.cowalk._helpers import _ARCH_TO_TRIPLE, _classify_revisit_diff
 from template_graph.graph import (
     Template,
     TemplateGraphAssertError,
