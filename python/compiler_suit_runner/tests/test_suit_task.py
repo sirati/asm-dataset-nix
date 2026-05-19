@@ -308,9 +308,11 @@ def test_import_matrix_eval_archives_walks_both_dirs(
     bc_archive_clang.write_bytes(b"NIX_EXPORT:clang19-closure")
 
     # Mix in non-archive files in both dirs — they MUST be ignored.
-    (matrix_eval_dir / "hello.nix-archive.json").write_text(
-        json.dumps({"variant_drvs": []}), encoding="utf-8",
-    )
+    # Use generic non-archive filenames; the post-cutover archive
+    # path no longer has a JSON sidecar (kept-drvs come from
+    # ``nix-store --import`` stdout), so the noise file here just
+    # needs to be SOMETHING the dir walk should ignore.
+    (matrix_eval_dir / "noise.txt").write_text("noise", encoding="utf-8")
     (build_compilers_dir / "README.md").write_text("noise", encoding="utf-8")
 
     imported: list[pathlib.Path] = []

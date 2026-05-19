@@ -1,39 +1,41 @@
-"""Archive discovery, kept-drv discovery, presence probe + import.
+"""Archive discovery, kept-drv derivation, presence probe + import.
 
 Per-binary kept-drv discovery
 -----------------------------
 
 The phase-2 ``matrix_eval`` worker writes a self-contained
-``<binary>.nix-archive`` PLUS a sidecar JSON
-``<binary>.nix-archive.json`` that lists the ROOT (kept) drvs via
-``variant_drvs``. The closure walk via
-``nix-store --query --requisites`` would conflate roots with
-transitive dependencies, so the sidecar is the canonical source.
+``<binary>.nix-archive``. The kept (root) variant drvs are NOT
+discoverable by closure walk (``nix-store --query --requisites``
+would conflate roots with transitive dependencies), so we instead
+derive them from the store paths that ``nix-store --import`` prints
+to stdout — every archive entry shows up on stdout exactly once,
+including the variant ``*-elf-folder.drv`` roots that the matrix_eval
+keep-policy preserved.
 
-Two discovery modes, tried in order (first hit wins):
-
-  * **Sidecar JSON** at ``<binary>.nix-archive.json`` — primary,
-    written by the matrix_eval worker alongside the archive.
-  * **Per-binary matrix_eval header** at
-    ``<manifest_dir>/matrix_eval__<binary>.json`` — DEFENSIVE.
+The earlier ``<binary>.nix-archive.json`` sidecar (and the
+``matrix_eval__<binary>.json`` defensive secondary discovery) have
+been retired: hard cutover, no fallback.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import pathlib
 import subprocess
+from collections.abc import Sequence
 from typing import Optional
+
+from template_graph.tree_walker import VARIANT_SUFFIX, parse_variant_path
 
 from .subproc import RunSubprocess, default_run_subprocess
 
 
 __all__ = [
+    "derive_variant_lookup_from_drvs",
     "discover_archives",
-    "is_path_locally_present",
+    "discover_kept_drvs_from_imported_store",
     "import_archive",
-    "discover_kept_drvs",
+    "is_path_locally_present",
 ]
 
 
@@ -76,26 +78,33 @@ def import_archive(
     archive: pathlib.Path,
     *,
     run_subprocess: Optional[RunSubprocess] = None,
-) -> tuple[bool, bytes]:
+) -> tuple[bool, bytes, list[str]]:
     """``nix-store --import < <archive>`` into the local store.
 
-    Returns ``(success, stderr_bytes)``. Failure surfaces stderr so the
-    caller can include it in a per-binary error message.
+    Returns ``(success, stderr_bytes, imported_paths)``.
 
-    Streams the file into stdin to avoid loading multi-GiB archives
-    into Python memory. ``run_subprocess`` is honoured only for the
-    argv-sniffing test stub (when it is callable AND advertises the
-    ``_stdin_aware`` attribute set to True); otherwise the production
+    ``nix-store --import`` prints one freshly-imported store path per
+    line on stdout. We capture those and surface them as
+    ``imported_paths`` so the caller can derive the kept-drv list
+    (variant ``*-elf-folder.drv`` roots) without a sidecar JSON.
+
+    On any failure path (missing archive, OSError, non-zero rc), the
+    ``imported_paths`` list is empty. Streams the file into stdin to
+    avoid loading multi-GiB archives into Python memory.
+
+    ``run_subprocess`` is honoured only for the argv-sniffing test
+    stub (when it is callable AND advertises the ``_stdin_aware``
+    attribute set to True); otherwise the production
     ``subprocess.run`` with explicit stdin is always used, even when
     callers thread a runner through for other helpers (e.g. the
     ``is_path_locally_present`` probe). Previously this branched on
-    ``run_subprocess is None`` alone and a production caller passing a
-    real subprocess wrapper would take the argv-stub path, handing
+    ``run_subprocess is None`` alone and a production caller passing
+    a real subprocess wrapper would take the argv-stub path, handing
     nix-store a literal ``<<N bytes>>`` positional that triggers
     ``error: no arguments expected``.
     """
     if not archive.is_file():
-        return False, f"archive not found: {archive}".encode("utf-8")
+        return False, f"archive not found: {archive}".encode("utf-8"), []
 
     if run_subprocess is not None and getattr(
         run_subprocess, "_stdin_aware", False,
@@ -103,11 +112,13 @@ def import_archive(
         try:
             contents = archive.read_bytes()
         except OSError as exc:
-            return False, str(exc).encode("utf-8")
-        _stdout, stderr, rc = run_subprocess([
+            return False, str(exc).encode("utf-8"), []
+        stdout, stderr, rc = run_subprocess([
             "nix-store", "--import", f"<<{len(contents)}bytes>>",
         ])
-        return rc == 0, stderr
+        if rc != 0:
+            return False, stderr, []
+        return True, stderr, _split_import_stdout(stdout)
 
     try:
         with open(archive, "rb") as fh:
@@ -118,125 +129,118 @@ def import_archive(
                 stderr=subprocess.PIPE,
                 check=False,
             )
-        return proc.returncode == 0, proc.stderr or b""
+        if proc.returncode != 0:
+            return False, proc.stderr or b"", []
+        return True, proc.stderr or b"", _split_import_stdout(proc.stdout or b"")
     except OSError as exc:
-        return False, str(exc).encode("utf-8")
+        return False, str(exc).encode("utf-8"), []
+
+
+def _split_import_stdout(stdout: bytes) -> list[str]:
+    """Parse ``nix-store --import`` stdout into a list of store paths.
+
+    Empty lines are skipped; non-empty lines are returned in the
+    order ``nix-store`` emitted them. ``nix-store --import`` prints
+    one absolute store path per line, e.g.
+    ``/nix/store/<hash>-<drv_basename>``.
+    """
+    text = stdout.decode("utf-8", errors="replace") if stdout else ""
+    return [line for line in (raw.strip() for raw in text.splitlines()) if line]
 
 
 # ---------------------------------------------------------------------------
-# Kept-drv discovery
+# Kept-drv derivation from imported store paths
 # ---------------------------------------------------------------------------
 
 
-def _load_sidecar(archive: pathlib.Path) -> Optional[dict]:
-    """Read ``<archive>.json`` if it exists, else None."""
-    sidecar = archive.with_suffix(archive.suffix + ".json")
-    if not sidecar.exists():
-        return None
-    try:
-        with open(sidecar, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
+def derive_variant_lookup_from_drvs(
+    imported_drvs: Sequence[str],
+) -> dict[tuple[str, str], dict[str, str]]:
+    """Build the ``(arch, label) -> {drv, arch, label, suffix}`` mapping.
 
+    Filters ``imported_drvs`` to ``*-elf-folder.drv`` paths, runs
+    :func:`template_graph.tree_walker.parse_variant_path` on the
+    post-hash drv basename, then composes the label exactly the way
+    the streaming planner's ``cur_label`` does:
+    ``f"{binary}__{arch}__{suffix}"`` where ``suffix`` is the
+    substring between ``<binary>-<arch>-`` and ``-elf-folder.drv``.
 
-def _load_matrix_eval_header(
-    manifest_dir: pathlib.Path, binary: str,
-) -> Optional[dict]:
-    """Read ``<manifest_dir>/matrix_eval__<binary>.json`` if present.
-
-    Defensive secondary discovery — the sidecar is the primary source
-    (see :func:`discover_kept_drvs`). Today's
-    :func:`manifest_gen.make_matrix_eval_header` doesn't include
-    ``variant_drvs`` (the header is built at submit-time, before drvs
-    are realised) so this path returns ``None`` in production unless a
-    future header iteration adds the field.
+    Drv names that ``parse_variant_path`` rejects (shape mismatch)
+    are skipped with a warning — they are not legitimate variant
+    roots, so they cannot land in the lookup.
     """
-    path = manifest_dir / f"matrix_eval__{binary}.json"
-    if not path.is_file():
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _extract_drvs_from_payload(payload: object) -> tuple[list[str], dict]:
-    """Pull a kept-drv list + a variant-lookup dict out of a payload.
-
-    Accepts:
-
-      * ``payload["variant_drvs"]`` — flat list of store paths (post-B.1a
-        canonical shape).
-      * ``payload["variants"]`` — list of ``{label, drv, ...}`` dicts
-        (legacy phase0_eval marker shape).
-
-    Returns ``(variant_drvs, variant_lookup_by_arch_label)``. The
-    lookup is keyed by ``(arch, label)`` matching
-    ``BinaryPlanInput.variant_lookup``. When ``variants`` is absent the
-    lookup is empty.
-    """
-    if not isinstance(payload, dict):
-        return [], {}
-    variant_lookup: dict[tuple[str, str], dict] = {}
-    drvs: list[str] = []
-    raw_drvs = payload.get("variant_drvs")
-    if isinstance(raw_drvs, list):
-        drvs = [d for d in raw_drvs if isinstance(d, str) and d.endswith(".drv")]
-    raw_variants = payload.get("variants")
-    if isinstance(raw_variants, list):
-        for entry in raw_variants:
-            if not isinstance(entry, dict):
-                continue
-            drv = entry.get("drv")
-            arch = entry.get("arch")
-            label = entry.get("label") or entry.get("suffix")
-            if isinstance(drv, str) and drv.endswith(".drv"):
-                drvs.append(drv)
-            if isinstance(arch, str) and isinstance(label, str):
-                variant_lookup[(arch, str(label))] = dict(entry)
-    # Deduplicate while preserving deterministic order.
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for d in drvs:
-        if d in seen:
+    lookup: dict[tuple[str, str], dict[str, str]] = {}
+    for path in imported_drvs:
+        if not path.endswith(VARIANT_SUFFIX):
             continue
-        seen.add(d)
-        deduped.append(d)
-    return deduped, variant_lookup
+        drv_basename = _post_hash_basename(path)
+        if drv_basename is None:
+            continue
+        try:
+            binary, arch, _comp, _opt = parse_variant_path(drv_basename)
+        except Exception as exc:  # noqa: BLE001 - TreeWalkError + future kinds
+            logger.warning(
+                "skipping unparseable variant drv %r: %s", path, exc,
+            )
+            continue
+        # Mirror StreamPlanner._on_matrix_depth2 (template_graph
+        # streaming/dispatch.py): label = "<binary>__<arch>__<suffix>"
+        # where <suffix> is drv_basename[len(binary)+1+len(arch)+1 :
+        # -len(VARIANT_SUFFIX)].
+        suffix = drv_basename[
+            len(binary) + 1 + len(arch) + 1 : -len(VARIANT_SUFFIX)
+        ]
+        label = f"{binary}__{arch}__{suffix}"
+        lookup[(arch, label)] = {
+            "drv": path,
+            "arch": arch,
+            "label": label,
+            "suffix": suffix,
+        }
+    return lookup
 
 
-def discover_kept_drvs(
-    archive: pathlib.Path,
-    manifest_dir: Optional[pathlib.Path],
-) -> tuple[list[str], dict[tuple[str, str], dict]]:
-    """Locate the per-binary kept-drv list + variant lookup.
+def discover_kept_drvs_from_imported_store(
+    import_paths: Sequence[str],
+) -> tuple[list[str], dict[tuple[str, str], dict[str, str]]]:
+    """Pick the kept variant drvs out of ``nix-store --import`` stdout.
 
-    Tries the sidecar JSON first, then the matrix_eval header. Returns
-    ``([], {})`` when neither source surfaces a drv list — the caller
-    treats that as "binary has no plannable variants" and skips it.
+    Filters ``import_paths`` to ``*-elf-folder.drv`` (the variant
+    root drvs preserved by matrix_eval's keep-policy), deduplicates
+    while preserving order, and derives the per-binary
+    ``variant_lookup`` mapping via
+    :func:`derive_variant_lookup_from_drvs`.
+
+    Returns ``(variant_drvs, variant_lookup)``. The caller treats an
+    empty ``variant_drvs`` list as "binary has no plannable variants"
+    and skips it in the multi-binary sum-drv.
     """
-    binary = archive.stem  # ``<binary>.nix-archive`` → ``<binary>``
+    seen: set[str] = set()
+    drvs: list[str] = []
+    for path in import_paths:
+        if not path.endswith(VARIANT_SUFFIX):
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        drvs.append(path)
+    lookup = derive_variant_lookup_from_drvs(drvs)
+    return drvs, lookup
 
-    sidecar = _load_sidecar(archive)
-    if sidecar is not None:
-        drvs, lookup = _extract_drvs_from_payload(sidecar)
-        if drvs:
-            return drvs, lookup
 
-    if manifest_dir is not None:
-        header = _load_matrix_eval_header(manifest_dir, binary)
-        if header is not None:
-            inner = header.get("payload") if isinstance(header, dict) else None
-            drvs, lookup = _extract_drvs_from_payload(inner)
-            if drvs:
-                return drvs, lookup
+def _post_hash_basename(store_path: str) -> Optional[str]:
+    """Return the post-hash basename of a ``/nix/store/<hash>-<name>`` path.
 
-    logger.warning(
-        "no kept-drv source found for binary %r at %r; skipping",
-        binary, str(archive),
-    )
-    return [], {}
+    Drops the ``/nix/store/`` prefix and the ``<hash>-`` prefix
+    (32-char base32 hash + dash). Returns ``None`` on shape
+    mismatch — production callers either skip such entries or log
+    them upstream.
+    """
+    prefix = "/nix/store/"
+    if not store_path.startswith(prefix):
+        return None
+    rest = store_path[len(prefix):]
+    # nix base32 hash is 32 chars followed by a dash.
+    if len(rest) < 33 or rest[32] != "-":
+        return None
+    return rest[33:]

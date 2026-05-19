@@ -8,9 +8,11 @@ Worker flow:
 
   1. ``nix-store --import < <matrix_eval_out_dir>/<binary>.nix-archive``
      loads the kept variant drvs + their transitive input closure into
-     the primary's local store. Skipped per-binary when every kept-drv
-     in the archive's sidecar is already present locally.
-  2. Discover the kept variant-drv list (sidecar first, header second).
+     the primary's local store. The store paths printed on stdout by
+     ``nix-store --import`` ARE the kept-drv source — no sidecar JSON,
+     no header lookup.
+  2. Filter that stdout to ``*-elf-folder.drv`` to recover the kept
+     variant-drv list + per-binary ``variant_lookup``.
   3. ``template_graph.make_sum_drv.make_sum_drv_from_paths`` glues
      toolchains + per-binary kept-drvs into a single sum-root drv;
      ``nix-store --query --tree`` walks that into the line-by-line
@@ -52,8 +54,9 @@ from __future__ import annotations
 import sys
 
 from .archive import (
+    derive_variant_lookup_from_drvs,
     discover_archives,
-    discover_kept_drvs,
+    discover_kept_drvs_from_imported_store,
     import_archive,
     is_path_locally_present,
 )
@@ -89,8 +92,9 @@ __all__ = [
     "build_sum_drv",
     "build_sum_drv_multi",
     "compute_dependency_graph_counters",
+    "derive_variant_lookup_from_drvs",
     "discover_archives",
-    "discover_kept_drvs",
+    "discover_kept_drvs_from_imported_store",
     "import_archive",
     "is_path_locally_present",
     "main",
