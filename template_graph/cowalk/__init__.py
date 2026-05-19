@@ -9,6 +9,12 @@ can be read, tested, and extended in isolation.
 
 from __future__ import annotations
 
+from template_graph.cowalk._helpers import (
+    _ARCH_TO_TRIPLE,
+    _classify_revisit_diff,
+    _extract_triple,
+    _extract_version,
+)
 from template_graph.cowalk.build_template import (
     build_template,
     build_template_singleton,
@@ -29,4 +35,8 @@ __all__ = [
     "_classify_pair",
     "CowalkCtx",
     "cowalk_into_arr",
+    "_ARCH_TO_TRIPLE",
+    "_classify_revisit_diff",
+    "_extract_triple",
+    "_extract_version",
 ]

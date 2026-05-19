@@ -113,39 +113,65 @@ def _on_matrix_inner(
     drv_name: str,
     is_backref: bool,
 ) -> None:
+    """Thin dispatcher: depth-2 is variant entry / arch-indep dep,
+    depth>2 is raw-tree splice into the current variant builder."""
     ident = (drv_hash, drv_name)
     if depth == 2:
-        if drv_name.endswith(VARIANT_SUFFIX):
-            if is_backref:
-                raise TreeWalkError(
-                    f"variant entry-point {drv_name} at matrix depth 2 "
-                    f"is a backref; each variant should occur exactly "
-                    f"once in the tree"
-                )
-            binary, arch, comp, opt = parse_variant_path(
-                drv_name, archs=planner.archs
-            )
-            if binary != planner.mx.matrix_binary:
-                raise TreeWalkError(
-                    f"variant {drv_name!r} parses as binary={binary!r} "
-                    f"but tree-walked under matrix-{planner.mx.matrix_binary!r}"
-                )
-            root = RawTreeNode(
-                hash=drv_hash, name=drv_name,
-                is_backref=False, depth=2,
-            )
-            planner.vb.cur_root = root
-            planner.vb.cur_arch = arch
-            planner.vb.cur_label = f"{comp}-{opt}"
-            planner.vb.cur_drv = ident
-            planner.vb.cur_stack = [root]
-            planner.vb.cur_path_to_node = {ident: root}
-        else:
-            if not is_backref:
-                planner.out.arch_indep_deps[planner.mx.matrix_binary].add(ident)
+        _on_matrix_depth2(planner, ident, drv_hash, drv_name, is_backref)
         return
+    _on_matrix_depth_inner(planner, depth, ident, drv_hash, drv_name, is_backref)
 
-    # depth > 2: inside the current variant's subtree
+
+def _on_matrix_depth2(
+    planner: "StreamPlanner",
+    ident: tuple[str, str],
+    drv_hash: str,
+    drv_name: str,
+    is_backref: bool,
+) -> None:
+    """Matrix depth-2 line: either a variant entry-point (opens a new
+    raw-tree buffer) or an arch-indep dep (added to per-binary set)."""
+    if drv_name.endswith(VARIANT_SUFFIX):
+        if is_backref:
+            raise TreeWalkError(
+                f"variant entry-point {drv_name} at matrix depth 2 "
+                f"is a backref; each variant should occur exactly "
+                f"once in the tree"
+            )
+        binary, arch, comp, opt = parse_variant_path(
+            drv_name, archs=planner.archs
+        )
+        if binary != planner.mx.matrix_binary:
+            raise TreeWalkError(
+                f"variant {drv_name!r} parses as binary={binary!r} "
+                f"but tree-walked under matrix-{planner.mx.matrix_binary!r}"
+            )
+        root = RawTreeNode(
+            hash=drv_hash, name=drv_name,
+            is_backref=False, depth=2,
+        )
+        planner.vb.cur_root = root
+        planner.vb.cur_arch = arch
+        planner.vb.cur_label = f"{comp}-{opt}"
+        planner.vb.cur_drv = ident
+        planner.vb.cur_stack = [root]
+        planner.vb.cur_path_to_node = {ident: root}
+        return
+    if not is_backref:
+        planner.out.arch_indep_deps[planner.mx.matrix_binary].add(ident)
+
+
+def _on_matrix_depth_inner(
+    planner: "StreamPlanner",
+    depth: int,
+    ident: tuple[str, str],
+    drv_hash: str,
+    drv_name: str,
+    is_backref: bool,
+) -> None:
+    """Matrix depth>2 line: splice into the active variant's raw subtree.
+    Pops the stack to the parent of this depth, then attaches the
+    existing DAG node (backref-collapse) or allocates a new RawTreeNode."""
     if planner.vb.cur_root is None:
         raise TreeWalkError(
             f"depth-{depth} line under matrix-{planner.mx.matrix_binary} "
