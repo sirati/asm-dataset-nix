@@ -27,6 +27,11 @@ from template_graph.cowalk.cowalk_variant import (
     cowalk_into_arr,
 )
 from template_graph.cowalk.cross_arch import build_meta_templates
+from template_graph.cowalk.template_histogram import (
+    TemplateShapeHistogram,
+    format_histogram,
+    template_shape_histogram,
+)
 
 __all__ = [
     "build_template",
@@ -37,6 +42,9 @@ __all__ = [
     "CowalkCtx",
     "cowalk_into_arr",
     "build_meta_templates",
+    "TemplateShapeHistogram",
+    "template_shape_histogram",
+    "format_histogram",
     "_ARCH_TO_TRIPLE",
     "_classify_revisit_diff",
     "_extract_triple",

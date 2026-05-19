@@ -54,6 +54,7 @@ from .cli_io import (
 )
 from .cli_sumdrv import _build_sum_drv, _query_drv_tree
 from .core import TemplateGraphAssertError
+from .cowalk import format_histogram, template_shape_histogram
 from .streaming import plan_from_tree_streaming
 
 
@@ -103,6 +104,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         return 1
     _print_run_summary(result)
+    if args.histogram:
+        print()
+        print("=== template shape histogram ===")
+        print(format_histogram(template_shape_histogram(result)))
     return 0
 
 
@@ -211,6 +216,14 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument(
         "--bash-path", required=True,
         help="realised bash store path (e.g. /nix/store/...-bash-5.2)",
+    )
+    run.add_argument(
+        "--histogram", action="store_true",
+        help=(
+            "print a cross-binary template shape histogram after the "
+            "run summary (Phase 4 diagnostic; counts shapes by arch + "
+            "binary)."
+        ),
     )
     run.set_defaults(func=cmd_run)
 
