@@ -19,8 +19,8 @@ def _classify_pair(
     0 and 1). For each non-toolchain node: equal → common_dep,
     differing → variant_specific.
 
-    Subsequent variants of this arch will be checked incrementally
-    by ``_cowalk_into_arr`` via ``assert_classification_after_cowalk``.
+    Subsequent variants of this arch are checked incrementally
+    by ``_cowalk_into_arr`` (see ``_classify_revisit_diff``).
     """
     out: dict[int, str] = {}
     for nid, node in enumerate(template.nodes):
