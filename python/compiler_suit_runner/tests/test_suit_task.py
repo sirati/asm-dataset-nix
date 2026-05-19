@@ -491,7 +491,6 @@ def test_fire_invokes_dependency_graph_subprocess_and_spawns(
         toolchain_task_ids={},
         primary_handle=handle,
         sys_name=_SYS,
-        manifest_dir=tmp_path / "manifests",
         run_subprocess=fake_run,
         dependency_graph_command_override=["true"],
         bash_path="/nix/store/fake-bash",
@@ -607,7 +606,6 @@ def test_fire_argv_includes_toolchain_drv_and_task_id_mappings(
             ),
         },
         sys_name=_SYS,
-        manifest_dir=tmp_path / "manifests",
         bash_path="/nix/store/fake-bash",
         run_subprocess=fake_run,
         # Do NOT pass dependency_graph_command_override — exercise the
@@ -882,8 +880,6 @@ def test_build_matrix_eval_watcher_collects_expected_and_toolchains(
     }
     # out_dir falls through directly from the caller.
     assert w._out_dir == tmp_path / "out"
-    # manifest_dir was wired through.
-    assert w._manifest_dir == config.manifest_dir
 
 
 def test_build_matrix_eval_watcher_falls_back_to_shared_fs(

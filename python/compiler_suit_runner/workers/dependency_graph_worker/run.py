@@ -33,14 +33,12 @@ __all__ = [
 def run_dependency_graph_task(
     *,
     matrix_eval_out_dir: pathlib.Path,
-    manifest_dir: Optional[pathlib.Path],
     bash_path: str,
     toolchain_drvs: list[str],
     toolchain_task_ids: Optional[dict[str, str]] = None,
     sys_name: str = "x86_64-linux",
     run_subprocess: Optional[RunSubprocess] = None,
     clock: Optional[Callable[[], float]] = None,
-    skip_import_when_present: bool = True,
 ) -> DependencyGraphResult:
     """Walk every ``<binary>.nix-archive`` under ``matrix_eval_out_dir``
     and produce ``_dependency_graph.pkl`` (plus the
@@ -90,18 +88,10 @@ def run_dependency_graph_task(
     runner = run_subprocess or default_run_subprocess
     tc_ids: dict[str, str] = dict(toolchain_task_ids or {})
 
-    # ``manifest_dir`` is accepted for backward-compatibility with the
-    # outer scheduler (it threads the manifests dir through every
-    # worker uniformly) but is no longer consumed for kept-drv
-    # discovery — the post-import store-path stdout from
-    # :func:`archive.import_archive` IS the kept-drv source.
-    _ = manifest_dir
-
     matrix_drvs, variant_lookups, plannable_binaries = (
         _collect_and_import_archives(
             archives=archives,
             runner=runner,
-            skip_import_when_present=skip_import_when_present,
         )
     )
 
@@ -166,7 +156,6 @@ def _collect_and_import_archives(
     *,
     archives: list[pathlib.Path],
     runner: RunSubprocess,
-    skip_import_when_present: bool,
 ) -> tuple[
     dict[str, list[str]],
     dict[str, dict[tuple[str, str], dict]],
@@ -188,18 +177,13 @@ def _collect_and_import_archives(
         ``make_sum_drv_from_paths`` contract forbids zero-variant
         matrices).
 
-    ``skip_import_when_present`` is retained on the public API for
-    backward-compatibility but is now inert. The previous "probe the
-    sidecar's kept drvs and skip import iff all present" path was
-    coupled to the JSON sidecar that the matrix_eval worker no longer
-    writes; with the hard cutover we need ``nix-store --import``'s
-    stdout to learn the kept-drv list, so the optimisation cannot
-    fire ahead of the import. Re-importing a fully-resident archive
-    is cheap inside nix-store (no duplicate inserts) — the cost is
-    one archive read per quiesce, not one full store materialisation.
+    Every archive is imported unconditionally: ``nix-store --import``'s
+    stdout IS the kept-drv source post-cutover, so no probe-then-skip
+    optimisation can fire ahead of the import. Re-importing a
+    fully-resident archive is cheap inside nix-store (no duplicate
+    inserts) — the cost is one archive read per quiesce, not one full
+    store materialisation.
     """
-    _ = skip_import_when_present
-
     matrix_drvs: dict[str, list[str]] = {}
     variant_lookups: dict[str, dict[tuple[str, str], dict]] = {}
     plannable_binaries: list[str] = []

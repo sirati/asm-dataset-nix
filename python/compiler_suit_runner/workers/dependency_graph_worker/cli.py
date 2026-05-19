@@ -44,16 +44,6 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--manifest-dir",
-        type=str,
-        default=None,
-        help=(
-            "Framework manifests directory; consulted for"
-            " matrix_eval__<binary>.json headers when no sidecar JSON"
-            " accompanies the archive."
-        ),
-    )
-    parser.add_argument(
         "--flake-ref",
         type=str,
         default=".",
@@ -93,14 +83,6 @@ def build_cli_parser() -> argparse.ArgumentParser:
         type=str,
         default="x86_64-linux",
         help="Target system attr (default x86_64-linux).",
-    )
-    parser.add_argument(
-        "--no-skip-import-when-present",
-        action="store_true",
-        help=(
-            "Always run nix-store --import even when all kept drvs are"
-            " already locally present (default: skip)."
-        ),
     )
     return parser
 
@@ -142,20 +124,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     from .run import run_dependency_graph_task  # noqa: PLC0415
 
     matrix_eval_out_dir = pathlib.Path(args.matrix_eval_out_dir)
-    manifest_dir = (
-        pathlib.Path(args.manifest_dir) if args.manifest_dir else None
-    )
     toolchain_task_ids = parse_task_id_mappings(args.toolchain_task_id)
 
     try:
         result = run_dependency_graph_task(
             matrix_eval_out_dir=matrix_eval_out_dir,
-            manifest_dir=manifest_dir,
             bash_path=args.bash_path,
             toolchain_drvs=list(args.toolchain_drv),
             toolchain_task_ids=toolchain_task_ids,
             sys_name=args.sys_name,
-            skip_import_when_present=not args.no_skip_import_when_present,
         )
     except DependencyGraphWorkerError as exc:
         logger.error("dependency_graph_worker failed: %s", exc)

@@ -624,9 +624,9 @@ class _MatrixEvalQuiesceWatcher:
        primary's local store).
     2. Invokes ``workers.dependency_graph_worker`` as a subprocess
        (``python -m compiler_suit_runner.workers.dependency_graph_worker``)
-       with ``--matrix-eval-out-dir`` + ``--manifest-dir`` +
-       ``--bash-path`` + per-toolchain ``--toolchain-drv`` /
-       ``--toolchain-task-id`` flags. The subprocess writes
+       with ``--matrix-eval-out-dir`` + ``--bash-path`` +
+       per-toolchain ``--toolchain-drv`` / ``--toolchain-task-id``
+       flags. The subprocess writes
        ``<matrix_eval_out_dir>/_dependency_graph.pkl``.
     3. Reads that pickle via
        :func:`dependency_graph_planner.load_phase4_descriptors`,
@@ -665,7 +665,6 @@ class _MatrixEvalQuiesceWatcher:
         primary_handle: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
         sys_name: str = "x86_64-linux",
-        manifest_dir: Optional[pathlib.Path] = None,
         flake_ref: str = ".",
         run_subprocess: Optional[_SubprocessRunner] = None,
         dependency_graph_command_override: Optional[list[str]] = None,
@@ -677,9 +676,6 @@ class _MatrixEvalQuiesceWatcher:
         self._toolchain_task_ids: dict[str, str] = dict(toolchain_task_ids)
         self._primary_handle = primary_handle
         self._sys_name = sys_name
-        self._manifest_dir = (
-            pathlib.Path(manifest_dir) if manifest_dir is not None else None
-        )
         self._flake_ref = flake_ref
         self._run_subprocess: _SubprocessRunner = (
             run_subprocess or _default_subprocess_runner
@@ -957,8 +953,6 @@ class _MatrixEvalQuiesceWatcher:
             "--sys-name", self._sys_name,
             "--flake-ref", self._flake_ref,
         ]
-        if self._manifest_dir is not None:
-            argv += ["--manifest-dir", str(self._manifest_dir)]
         # Per-toolchain drv paths + their phase-1 task ids (so the
         # planner can wire build_compilers → build_variant deps). The
         # subprocess expects ``--toolchain-task-id <ident>=<task_id>``;
@@ -2732,7 +2726,6 @@ class SuitTask:
             primary_handle=self._primary_handle,
             logger=self._logger,
             sys_name=self.config.sys_name,
-            manifest_dir=self.config.manifest_dir,
             flake_ref=self.config.flake_ref,
         )
 

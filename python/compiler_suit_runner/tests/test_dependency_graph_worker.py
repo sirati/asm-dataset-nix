@@ -531,7 +531,6 @@ class TestRunDependencyGraphTask:
         matrix_dir.mkdir()
         result = dgw.run_dependency_graph_task(
             matrix_eval_out_dir=matrix_dir,
-            manifest_dir=None,
             bash_path="/nix/store/aaaa-bash",
             toolchain_drvs=["/nix/store/zzzz-gcc15.drv"],
         )
@@ -599,7 +598,6 @@ class TestRunDependencyGraphTask:
 
         result = dgw.run_dependency_graph_task(
             matrix_eval_out_dir=matrix_dir,
-            manifest_dir=None,
             bash_path="/nix/store/aaaa-bash",
             toolchain_drvs=["/nix/store/zzzz-gcc15.drv"],
             toolchain_task_ids={
@@ -636,8 +634,7 @@ class TestRunDependencyGraphTask:
         """Post-cutover, the worker always imports the archive — the
         ``nix-store --import`` stdout IS the kept-drv source, so the
         old "skip if all drvs locally present" probe-then-skip
-        optimisation cannot fire. ``skip_import_when_present`` is
-        retained on the API surface but is inert.
+        optimisation cannot fire.
         """
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
@@ -663,11 +660,9 @@ class TestRunDependencyGraphTask:
 
         dgw.run_dependency_graph_task(
             matrix_eval_out_dir=matrix_dir,
-            manifest_dir=None,
             bash_path="/nix/store/bash",
             toolchain_drvs=["/nix/store/tc.drv"],
             run_subprocess=stub,
-            skip_import_when_present=True,  # inert now
         )
         # --import runs once even though the kept drv is "present".
         import_calls = [
@@ -697,7 +692,6 @@ class TestRunDependencyGraphTask:
         with pytest.raises(dgw.DependencyGraphWorkerError) as excinfo:
             dgw.run_dependency_graph_task(
                 matrix_eval_out_dir=matrix_dir,
-                manifest_dir=None,
                 bash_path="/nix/store/bash",
                 toolchain_drvs=["/nix/store/tc.drv"],
                 run_subprocess=stub,
@@ -723,7 +717,6 @@ class TestRunDependencyGraphTask:
         with pytest.raises(dgw.DependencyGraphWorkerError) as excinfo:
             dgw.run_dependency_graph_task(
                 matrix_eval_out_dir=matrix_dir,
-                manifest_dir=None,
                 bash_path="/nix/store/bash",
                 toolchain_drvs=["/nix/store/tc.drv"],
                 run_subprocess=stub,
@@ -782,7 +775,6 @@ class TestRunDependencyGraphTask:
 
         result = dgw.run_dependency_graph_task(
             matrix_eval_out_dir=matrix_dir,
-            manifest_dir=None,
             bash_path="/nix/store/bash",
             toolchain_drvs=["/nix/store/tc.drv"],
             run_subprocess=stub,
@@ -847,7 +839,6 @@ class TestRunDependencyGraphTask:
 
         result = dgw.run_dependency_graph_task(
             matrix_eval_out_dir=matrix_dir,
-            manifest_dir=None,
             bash_path="/nix/store/bash",
             toolchain_drvs=["/nix/store/tc.drv"],
             run_subprocess=stub,
@@ -881,7 +872,6 @@ class TestCliParser:
             "--toolchain-drv", "/nix/store/tc1.drv",
             "--toolchain-drv", "/nix/store/tc2.drv",
             "--toolchain-task-id", "tc1.drv=task1",
-            "--manifest-dir", "/tmp/manifests",
             "--sys-name", "aarch64-linux",
         ])
         assert args.matrix_eval_out_dir == "/tmp/me"
@@ -1232,7 +1222,6 @@ class TestDependencyGraphCounters:
         ):
             result = dgw.run_dependency_graph_task(
                 matrix_eval_out_dir=matrix_dir,
-                manifest_dir=None,
                 bash_path="/nix/store/bash",
                 toolchain_drvs=["/nix/store/tc.drv"],
                 run_subprocess=stub,
