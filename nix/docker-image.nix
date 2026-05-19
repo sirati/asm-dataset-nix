@@ -395,6 +395,14 @@ pkgs.dockerTools.buildLayeredImage {
       "LANG=C.UTF-8"
       "PYTHONPATH=/app/python"
       "PATH=/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin"
+      # Direct store-path pointer to the baked flake source. Layered
+      # images sometimes present /app/flake as a symlink-into-store
+      # tree; nix-eval-jobs then re-copies it into its own sandbox
+      # with the host-side prefix preserved (yielding a doubly-nested
+      # /nix/store/<sandbox>/nix/store/<flake>/app/flake/ that fails
+      # to resolve). The worker reads this env var to pass the store
+      # path directly to nix-eval-jobs.
+      "CSR_FLAKE_DIR=${flakeFiles}/app/flake"
       # Force every ``nix`` client to talk to nix-daemon over the unix
       # socket instead of opening /nix/var/nix/db/db.sqlite directly.
       # Even in multi-user mode, ``nix`` running as root with the

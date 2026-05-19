@@ -534,24 +534,30 @@ def _export_kept_closure(
 
 
 _CONTAINER_FLAKE_ROOT = "/app/flake"
+_CONTAINER_FLAKE_ENV = "CSR_FLAKE_DIR"
 
 
 def _resolve_flake_ref(flake_ref: str) -> str:
     """When the worker runs inside the dynamic_runner secondary container
     the CWD is ``/app`` and there is no flake.nix there. The image
     bakes the flake source at ``/app/flake`` (see
-    ``nix/docker-image.nix``'s ``flakeFiles`` stage), but
-    ``/app/flake`` in a layered image is a symlink into ``/nix/store``;
-    nix-eval-jobs would otherwise treat the symlinked path as a fresh
-    flake source and copy-into-sandbox via the *target's* nested path,
-    yielding ``/nix/store/<copy>/nix/store/<flake>/app/flake/flake.nix``
-    which fails to resolve. Returning ``realpath`` (the underlying
-    store path) sidesteps the copy + nested-resolve entirely.
-    Non-default flake_ref values are honoured verbatim.
+    ``nix/docker-image.nix``'s ``flakeFiles`` stage) and exposes the
+    underlying store path via the ``CSR_FLAKE_DIR`` env var. Prefer
+    the env-var value so nix-eval-jobs sees the store path directly
+    and skips its copy-into-sandbox step (which would otherwise nest
+    the path under another ``/nix/store/...`` layer and 404 on
+    ``flake.nix``). Fall back to ``/app/flake`` if the env var is
+    missing (legacy images / unrelated container runtimes); honour
+    non-default flake_ref values verbatim.
     """
-    if flake_ref == "." and os.path.isdir(_CONTAINER_FLAKE_ROOT) and \
+    if flake_ref != ".":
+        return flake_ref
+    env_path = os.environ.get(_CONTAINER_FLAKE_ENV)
+    if env_path and os.path.isfile(os.path.join(env_path, "flake.nix")):
+        return env_path
+    if os.path.isdir(_CONTAINER_FLAKE_ROOT) and \
             os.path.isfile(os.path.join(_CONTAINER_FLAKE_ROOT, "flake.nix")):
-        return os.path.realpath(_CONTAINER_FLAKE_ROOT)
+        return _CONTAINER_FLAKE_ROOT
     return flake_ref
 
 
