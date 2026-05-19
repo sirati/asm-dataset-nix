@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from template_graph.graph.template import (
     Template,
+    TemplateAlignment,
     TemplateGraphAssertError,
     TemplateNode,
     _shape_equal,
@@ -22,6 +23,7 @@ from template_graph.graph.variant_array import VariantArray
 
 __all__ = [
     "Template",
+    "TemplateAlignment",
     "TemplateNode",
     "VariantArray",
     "TemplateGraphAssertError",
