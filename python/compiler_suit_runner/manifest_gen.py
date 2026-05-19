@@ -544,6 +544,15 @@ def read_manifest(path: pathlib.Path) -> ManifestHeader:
     # ``true`` doesn't sneak in as 1.
     if not isinstance(raw_priority, int) or isinstance(raw_priority, bool):
         raise ValueError(f"{path}: 'priority_hint' must be an int")
+    # ``ManifestHeader`` documents priority_hint as non-negative
+    # (higher = earlier scheduling bias); reject negatives here so
+    # malformed sidecars surface at load time rather than silently
+    # de-prioritising tasks downstream.
+    if raw_priority < 0:
+        raise ValueError(
+            f"{path}: 'priority_hint' must be non-negative, "
+            f"got {raw_priority}"
+        )
 
     return ManifestHeader(
         item_class=parsed["item_class"],  # type: ignore[arg-type]
