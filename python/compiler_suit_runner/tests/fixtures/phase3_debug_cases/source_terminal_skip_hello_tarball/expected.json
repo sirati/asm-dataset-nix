@@ -1,0 +1,8 @@
+{
+  "build_variant_count": 2,
+  "no_common_dep_for_terminals": [
+    "hello-2.12.tar.gz.drv",
+    "gettext-runtime-0.21.1.tar.gz.drv"
+  ],
+  "source_terminal_skipped_min": 2
+}

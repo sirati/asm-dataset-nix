@@ -1,0 +1,9 @@
+/nix/store/000000000puvclarohmn4d2jg9efs5qb-sum-root.drv
+├───/nix/store/00000001167kti30puvclarohmn4d2jg-toolchains.drv
+│   ├───/nix/store/000001004d2jg9efs5qb8167kti30puv-wrapped-compiler-suit.drv
+│   └───/nix/store/000001015qb8167kti30puvclarohmn4-wrapped-compiler-suit.drv
+└───/nix/store/000000022jg9efs5qb8167kti30puvcl-matrix-hello.drv
+    ├───/nix/store/00000014efs5qb8167kti30puvclaroh-hello-x86_64-gcc14-O2-baseline-default-san-off-march-default-elf-folder.drv
+    │   └───/nix/store/000001004d2jg9efs5qb8167kti30puv-wrapped-compiler-suit.drv [...]
+    └───/nix/store/00000020kti30puvclarohmn4d2jg9ef-hello-x86_64-clang20-O2-baseline-default-san-off-march-default-elf-folder.drv
+        └───/nix/store/000001015qb8167kti30puvclarohmn4-wrapped-compiler-suit.drv [...]
