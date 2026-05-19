@@ -126,7 +126,14 @@ class BinaryPlanInput:
     (``"<hash>-<name>"`` — the format returned by
     :func:`convert_toolchain_drvs`) to its phase-1 ``build_compilers``
     task_id. Variants whose template touches that toolchain get the
-    id wired into their ``depends_on``. Empty mapping is fine
+    id wired into their ``depends_on``. The streaming planner's
+    ``toolchain_node_ids_per_template`` map identifies which template
+    nodes are toolchains (the cowalk short-circuits their subtrees so
+    ``arr.hashes`` rows stay empty); we resolve those node_ids to
+    idents by matching the TemplateNode's role-name against
+    ``out.toolchain_drvs`` entries. Idents not present in
+    ``toolchain_task_ids`` (operator-provided toolchains with no
+    framework task) are silently omitted. Empty mapping is fine
     (variants then have only common-dep deps).
     """
 
@@ -288,6 +295,60 @@ def _iter_classifications(
                 except (TypeError, ValueError):
                     continue
         yield (tid, arch), normalised
+
+
+def _coerce_toolchain_node_ids(raw: Any) -> dict[int, list[int]]:
+    """Normalise ``toolchain_node_ids_per_template`` to ``{int: [int, ...]}``.
+
+    The streaming planner emits this as ``dict[int, list[int]]``; a
+    JSON roundtrip turns the outer keys into strings. We accept either
+    shape and silently drop entries that won't coerce so a malformed
+    snapshot never crashes the plan.
+    """
+    if not isinstance(raw, Mapping):
+        return {}
+    out: dict[int, list[int]] = {}
+    for key, inner in raw.items():
+        try:
+            tid = int(key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(inner, (list, tuple)):
+            continue
+        node_ids: list[int] = []
+        for nid in inner:
+            try:
+                node_ids.append(int(nid))
+            except (TypeError, ValueError):
+                continue
+        out[tid] = node_ids
+    return out
+
+
+def _toolchain_idents_by_name(raw: Any) -> dict[str, list[tuple[str, str]]]:
+    """Index ``out.toolchain_drvs`` by drv ``name`` for fast role-lookup.
+
+    The cowalk short-circuits toolchain subtrees so ``arr.hashes`` rows
+    at toolchain node_ids are empty (E6). Instead, we resolve each
+    toolchain TemplateNode's role to one or more ``(hash, name)`` idents
+    by matching on the post-hash drv name carried in
+    ``out.toolchain_drvs``. Multiple compiler versions can share a
+    unified wrapper role (``wrapped-compiler-suit.drv``) so the map
+    value is a LIST: every matching ident's task_id gets wired into
+    each variant's ``depends_on``. Over-wiring is harmless (the
+    variant waits on extra ``build_compilers__*`` tasks that would
+    have been built anyway); under-wiring would break the build by
+    starting a variant before its compiler is ready.
+    """
+    out: dict[str, list[tuple[str, str]]] = {}
+    if not raw:
+        return out
+    for entry in raw:
+        ident = _coerce_ident(entry)
+        if ident is None:
+            continue
+        out.setdefault(ident[1], []).append(ident)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +546,12 @@ def plan_phase4_for_binary(
     templates = list(streaming_result.get("templates", []) or [])
     variant_arrays = streaming_result.get("variant_arrays", {}) or {}
     classifications = streaming_result.get("common_deps_per_arch_template", {})
+    toolchain_node_ids = _coerce_toolchain_node_ids(
+        streaming_result.get("toolchain_node_ids_per_template", {})
+    )
+    toolchain_idents_by_name = _toolchain_idents_by_name(
+        streaming_result.get("toolchain_drvs", set())
+    )
 
     _check_no_cycles(templates)
 
@@ -499,7 +566,11 @@ def plan_phase4_for_binary(
     # for nodes classified as common_dep, then mint a variant
     # descriptor per label. depends_on for a variant accumulates the
     # ids of every common-dep cell that fires in this template +
-    # every toolchain whose ident appears in the cell's hashes.
+    # every toolchain task_id resolved from
+    # ``toolchain_node_ids_per_template`` (the cowalk short-circuits
+    # toolchain subtrees so ``arr.hashes`` rows are empty for them;
+    # we map node_id → role-name → ``toolchain_drvs`` idents →
+    # caller-supplied ``toolchain_task_ids``).
     for (tmpl_id, arch), arr in _iter_variant_arrays(variant_arrays):
         if tmpl_id < 0 or tmpl_id >= len(templates):
             continue
@@ -510,24 +581,34 @@ def plan_phase4_for_binary(
 
         per_variant_dep_ids: list[set[str]] = [set() for _ in variants]
 
+        # Resolve toolchain task_ids for this template once: every
+        # variant in this cell gets the same set of toolchain deps
+        # (we can't distinguish per-variant compilers within a
+        # role-collapsed template node, so wire every ident matching
+        # the role — see :func:`_toolchain_idents_by_name`).
+        toolchain_task_id_set: set[str] = set()
+        for tc_node_id in toolchain_node_ids.get(tmpl_id, []):
+            if tc_node_id < 0 or tc_node_id >= len(nodes):
+                continue
+            node_name = str(_node_field(
+                nodes[tc_node_id], "name", f"node_{tc_node_id}",
+            ))
+            for ident in toolchain_idents_by_name.get(node_name, ()):
+                task_id = toolchain_task_ids.get(_ident_to_str(ident))
+                if task_id:
+                    toolchain_task_id_set.add(task_id)
+        if toolchain_task_id_set:
+            for deps in per_variant_dep_ids:
+                deps.update(toolchain_task_id_set)
+
+        tc_node_id_set = set(toolchain_node_ids.get(tmpl_id, []))
         for node_id, node in enumerate(nodes):
-            is_toolchain = bool(_node_field(node, "is_toolchain", False))
+            if node_id in tc_node_id_set:
+                # Toolchain node — wired via toolchain_node_ids above;
+                # skip the common-dep / hashes path entirely.
+                continue
             cls = classes.get(node_id)
             row = hashes[node_id] if node_id < len(hashes) else []
-            if is_toolchain:
-                # Toolchains are wired in by the caller via
-                # toolchain_task_ids. Their idents appear in the row
-                # only if the streaming planner happened to record
-                # them; the cowalk usually short-circuits and leaves
-                # the row empty for is_toolchain nodes. Probe both.
-                for variant_idx, cell in enumerate(row):
-                    ident = _coerce_ident(cell)
-                    if ident is None:
-                        continue
-                    task_id = toolchain_task_ids.get(_ident_to_str(ident))
-                    if task_id:
-                        per_variant_dep_ids[variant_idx].add(task_id)
-                continue
             if cls != "common_dep":
                 # variant_specific (or unclassified) nodes are
                 # subsumed into their variant's own build — no
