@@ -193,6 +193,28 @@
             pkgs = runnerPkgs;
             lib = runnerPkgs.lib;
             runnerSrc = ./python;
+            # The matrix_eval worker calls `nix-eval-jobs --flake
+            # /app/flake#dataset.<sys>.<binary>.<arch>` inside the
+            # secondary container; bake the flake source in so the
+            # call doesn't need a host-side bind-mount. Filter to
+            # what the flake itself needs (flake.nix, flake.lock,
+            # lib/, nix/, python/) — drop dataset/, .claude/, .git/,
+            # docs/, slurm.md, .docker-layer-cache.json, and other
+            # paths the worker never reads.
+            flakeSrc = runnerPkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter = path: type:
+                let base = baseNameOf path; in
+                !(base == ".git"
+                  || base == ".claude"
+                  || base == ".docker-layer-cache.json"
+                  || base == "dataset"
+                  || base == "docs"
+                  || base == "result"
+                  || base == "__pycache__"
+                  || runnerPkgs.lib.hasPrefix ".direnv" base
+                  || runnerPkgs.lib.hasSuffix ".pyc" base);
+            };
             harmonia = runnerPkgs.harmonia or null;
             # Bake the same dev-debug pubkey we use for the
             # ssh-debug task so `--enable-ssh-debug` on the runner

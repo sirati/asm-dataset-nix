@@ -533,19 +533,20 @@ def _export_kept_closure(
 # ---------------------------------------------------------------------------
 
 
-_CONTAINER_FLAKE_MOUNT = "/app/src-network"
+_CONTAINER_FLAKE_ROOT = "/app/flake"
 
 
 def _resolve_flake_ref(flake_ref: str) -> str:
     """When the worker runs inside the dynamic_runner secondary container
-    the CWD is ``/app`` (no flake.nix). The framework bind-mounts the
-    flake source at ``/app/src-network`` (Bug-F convention). A submitter-
-    side ``flake_ref="."`` therefore needs translating to the container
-    mount path; a non-default value is honoured verbatim.
+    the CWD is ``/app`` and there is no flake.nix there. The image
+    bakes the flake source at ``/app/flake`` (see
+    ``nix/docker-image.nix``'s ``flakeFiles`` stage). Translate a
+    submitter-side ``flake_ref="."`` to the in-container path; honour
+    non-default values verbatim.
     """
-    if flake_ref == "." and os.path.isdir(_CONTAINER_FLAKE_MOUNT) and \
-            os.path.isfile(os.path.join(_CONTAINER_FLAKE_MOUNT, "flake.nix")):
-        return _CONTAINER_FLAKE_MOUNT
+    if flake_ref == "." and os.path.isdir(_CONTAINER_FLAKE_ROOT) and \
+            os.path.isfile(os.path.join(_CONTAINER_FLAKE_ROOT, "flake.nix")):
+        return _CONTAINER_FLAKE_ROOT
     return flake_ref
 
 

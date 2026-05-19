@@ -31,6 +31,13 @@
   name ? "asm-dataset-nix-runner",
   tag ? "latest",
   runnerSrc,
+  # Source of the flake (flake.nix, flake.lock, lib/, nix/) staged at
+  # /app/flake inside the image so the matrix_eval worker can call
+  # ``nix-eval-jobs --flake /app/flake#dataset.<sys>.<binary>.<arch>``
+  # without the framework needing to bind-mount the host's repo dir.
+  # Default is null → matrix_eval will fail because no flake is
+  # reachable; callers (see flake.nix) should pass the repo root.
+  flakeSrc ? null,
   contents ? [ ],
   pythonPackages ? (_: [ ]),
   harmonia ? pkgs.harmonia or null,
@@ -70,6 +77,28 @@ let
     cp -r ${runnerSrc}/compiler_suit_runner/. $out/app/python/compiler_suit_runner/
     chmod -R +w $out/app
   '';
+
+  # Flake source materialised under /app/flake so the matrix_eval
+  # worker can evaluate ``dataset.<sys>.<binary>.<arch>`` without
+  # depending on a host-side bind-mount. The submitter's --flake
+  # argv is translated to /app/flake at worker spawn time
+  # (see workers/eval_worker._resolve_flake_ref).
+  #
+  # When flakeSrc is null we still emit an empty stage so the layered
+  # image build doesn't choke on a missing input; matrix_eval will
+  # then fail loudly in the container with "flake.nix not found" —
+  # the explicit failure mode is preferable to a silent skip.
+  flakeFiles =
+    if flakeSrc == null then
+      pkgs.runCommand "asm-dataset-nix-flake-empty" { } ''
+        mkdir -p $out/app/flake
+      ''
+    else
+      pkgs.runCommand "asm-dataset-nix-flake-source" { } ''
+        mkdir -p $out/app/flake
+        cp -r ${flakeSrc}/. $out/app/flake/
+        chmod -R +w $out/app/flake
+      '';
 
   # Optional cachix uploader. Wrapped in `or null` so a stripped
   # nixpkgs (or `--option allowed-substituters` pinning) still
@@ -272,6 +301,7 @@ let
     ++ [
       pythonEnv
       projectFiles
+      flakeFiles
       nssFiles
       nixConfDir
       hostKeys
@@ -331,6 +361,11 @@ let
       {
         name = "project-code";
         roots = [ projectFiles ];
+        isolate = true;
+      }
+      {
+        name = "flake-source";
+        roots = [ flakeFiles ];
         isolate = true;
       }
       {
