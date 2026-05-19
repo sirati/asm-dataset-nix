@@ -60,6 +60,7 @@ import json
 import logging
 import os
 import pathlib
+import pickle
 import subprocess
 import sys
 import threading
@@ -82,8 +83,9 @@ from compiler_suit_runner.manifest_gen import (
     read_manifest,
 )
 from compiler_suit_runner.dependency_graph_planner import (
+    DependencyGraphPickleError,
     headers_from_descriptors,
-    load_descriptors_from_json,
+    load_phase4_descriptors,
 )
 from compiler_suit_runner.peer_cache import (
     SUBSTITUTERS_FILENAME,
@@ -626,9 +628,9 @@ class _MatrixEvalQuiesceWatcher:
        with ``--matrix-eval-out-dir`` + ``--manifest-dir`` +
        ``--bash-path`` + per-toolchain ``--toolchain-drv`` /
        ``--toolchain-task-id`` flags. The subprocess writes
-       ``<matrix_eval_out_dir>/_dependency_graph.json``.
-    3. Reads that JSON via
-       :func:`dependency_graph_planner.load_descriptors_from_json`,
+       ``<matrix_eval_out_dir>/_dependency_graph.pkl``.
+    3. Reads that pickle via
+       :func:`dependency_graph_planner.load_phase4_descriptors`,
        translates the :class:`Phase4Descriptor` list into
        :class:`ManifestHeader` instances via
        :func:`headers_from_descriptors`, and feeds the result to
@@ -644,8 +646,10 @@ class _MatrixEvalQuiesceWatcher:
     ``dependency_graph_command_override`` (constructor kwarg used by
     unit tests). When ``primary_handle`` is None (single-process
     tests, framework-pin gap) ``_spawn_tasks`` degrades to writing
-    the dump-equivalent JSON (``_dependency_graph.json`` from the
-    worker — already on disk) and logging an INFO line.
+    the dump-equivalent JSON
+    (``_dependency_graph_headers.json``, alongside the worker's
+    ``_dependency_graph.pkl`` already on disk) and logging an INFO
+    line.
 
     The watcher is NOT a framework task — it runs entirely in-process
     on whichever thread the framework's task-completion notification is
@@ -773,10 +777,11 @@ class _MatrixEvalQuiesceWatcher:
            continue; the subprocess will retry the import itself if a
            kept-drv is still missing.
         2. ``workers.dependency_graph_worker`` invocation. The
-           subprocess writes ``_dependency_graph.json`` (a list of
-           :class:`Phase4Descriptor` records) into :attr:`_out_dir`.
-           Exit-nonzero raises; without the planner output we cannot
-           spawn the build phase.
+           subprocess writes ``_dependency_graph.pkl`` (a pickled
+           dict with a list of :class:`Phase4Descriptor` records and
+           a summary) into :attr:`_out_dir`. Exit-nonzero raises;
+           without the planner output we cannot spawn the build
+           phase.
         3. :func:`headers_from_descriptors` translation + ``_spawn_tasks``
            hand-off into ``primary_handle.spawn_tasks``.
 
@@ -798,18 +803,15 @@ class _MatrixEvalQuiesceWatcher:
                 " failed; build phase will not be scheduled: %s", exc,
             )
             return
-        descriptors_path = self._out_dir / "_dependency_graph.json"
+        descriptors_path = self._out_dir / "_dependency_graph.pkl"
         try:
-            payload = json.loads(
-                descriptors_path.read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError) as exc:
+            descriptors, _summary = load_phase4_descriptors(descriptors_path)
+        except (OSError, pickle.UnpicklingError, DependencyGraphPickleError) as exc:
             self._logger.error(
                 "_MatrixEvalQuiesceWatcher: cannot read %s: %s",
                 descriptors_path, exc,
             )
             return
-        descriptors = load_descriptors_from_json(payload)
         if not descriptors:
             self._logger.warning(
                 "_MatrixEvalQuiesceWatcher: %s produced 0 descriptors;"
@@ -909,7 +911,7 @@ class _MatrixEvalQuiesceWatcher:
 
         Raises :class:`RuntimeError` on a non-zero exit so the caller
         can log + degrade. The subprocess writes
-        ``_dependency_graph.json`` on success.
+        ``_dependency_graph.pkl`` on success.
         """
         argv = (
             self._dependency_graph_command_override
@@ -988,19 +990,22 @@ class _MatrixEvalQuiesceWatcher:
     def _dump_dependency_graph(
         self, headers: list[ManifestHeader],
     ) -> pathlib.Path:
-        """Serialise ``headers`` to ``_dependency_graph.json`` (the
-        descriptors-as-headers companion file) for offline inspection.
+        """Serialise ``headers`` to ``_dependency_graph_headers.json``
+        (the descriptors-as-headers companion file) for offline
+        inspection.
 
-        The dependency_graph worker also writes a ``_dependency_graph.json``
-        (descriptor form). The watcher's dump rewrites that file in
-        ManifestHeader-equivalent shape so operators eyeballing the
-        spawn output see the exact JSON the framework will consume.
+        The dependency_graph worker writes the authoritative descriptor
+        payload to ``_dependency_graph.pkl`` (pickle, hard cutover).
+        This helper emits a parallel ManifestHeader-equivalent JSON
+        view under a distinct name so operators eyeballing the spawn
+        output see what the framework will consume, without colliding
+        with the pickle path.
 
         Best-effort: an OSError is logged + swallowed so the spawn
         path can still proceed.
         """
         self._out_dir.mkdir(parents=True, exist_ok=True)
-        graph_path = self._out_dir / "_dependency_graph.json"
+        graph_path = self._out_dir / "_dependency_graph_headers.json"
         serialised = [
             {
                 "item_class": h.item_class,
@@ -1029,7 +1034,7 @@ class _MatrixEvalQuiesceWatcher:
     ) -> None:
         """Spawn-dispatch path.
 
-        Always overwrites ``_dependency_graph.json`` with the
+        Always overwrites ``_dependency_graph_headers.json`` with the
         ManifestHeader-shaped view of the descriptor list (useful for
         offline inspection / resume). When ``self._primary_handle``
         is bound:
