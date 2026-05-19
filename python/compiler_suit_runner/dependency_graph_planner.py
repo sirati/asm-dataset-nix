@@ -267,6 +267,35 @@ def _iter_variant_arrays(
                 yield (0, str(key)), arr
 
 
+def _arch_indep_idents_for_binary(
+    arch_indep_deps_raw: Any,
+    binary: str,
+) -> list[tuple[str, str]]:
+    """Extract this binary's arch-indep idents from the streaming
+    result's ``arch_indep_deps`` field.
+
+    Streaming-native form is ``dict[str, set[(hash, name)]]``. After a
+    JSON roundtrip both the outer set→list and inner tuple→list
+    coercions apply, so we accept either shape and emit a typed
+    ``list[(hash, name)]``. Entries that fail to coerce are dropped —
+    same best-effort policy as :func:`convert_toolchain_drvs`.
+    """
+    if not isinstance(arch_indep_deps_raw, Mapping):
+        return []
+    bucket = arch_indep_deps_raw.get(binary)
+    if bucket is None:
+        return []
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in bucket:
+        ident = _coerce_ident(entry)
+        if ident is None or ident in seen:
+            continue
+        seen.add(ident)
+        out.append(ident)
+    return out
+
+
 def _iter_classifications(
     raw: Any,
 ) -> Iterable[tuple[tuple[int, str], dict[int, str]]]:
@@ -439,8 +468,37 @@ def _common_dep_task_id(ident_str: str) -> str:
     return f"build_common_dep__{ident_str}"
 
 
+def _arch_indep_task_id(binary: str, ident_str: str) -> str:
+    """Per-binary task id for an ``arch_indep_deps`` ident.
+
+    Arch-indep deps live one-level under the matrix wrapper and are
+    shared by every variant of a binary (across opt-levels) but differ
+    across binaries — so the task_id retains a ``binary`` prefix. The
+    arch axis is intentionally elided (the dep is arch-independent by
+    construction).
+    """
+    return f"build_common_dep__arch_indep__{binary}__{ident_str}"
+
+
 def _variant_task_id(binary: str, sys_name: str, label: str) -> str:
     return f"build_variant__{sys_name}__{binary}__{label}"
+
+
+def _load_source_terminal_predicate():
+    """Lazy-load ``template_graph.parser.role._is_source_terminal_role``.
+
+    Returns ``(predicate, role_extractor)`` callables. template_graph is
+    the source of truth for arch-indep terminal patterns; this lazy
+    import keeps adapter-only callers light. The import is required —
+    if template_graph is unreachable the planner cannot correctly
+    classify arch-indep deps, so we let ImportError propagate rather
+    than silently emit tasks for every source tarball.
+    """
+    from template_graph.parser.role import (  # noqa: PLC0415
+        _is_source_terminal_role,
+        drv_role,
+    )
+    return _is_source_terminal_role, drv_role
 
 
 def _common_dep_descriptor(
@@ -471,6 +529,40 @@ def _common_dep_descriptor(
             # prefix). Keeping the bare ident is forward-compatible
             # with both classic ``nix build <drv>`` and the
             # archive-import path used after matrix_eval.
+            "attr": ident_str,
+        },
+        depends_on=(),
+    )
+
+
+def _arch_indep_descriptor(
+    *,
+    binary: str,
+    sys_name: str,
+    ident_str: str,
+    node_name: str,
+) -> Phase4Descriptor:
+    """Build a ``build_common_dep`` descriptor for one arch-indep dep.
+
+    Arch-indep deps come from ``OutputState.arch_indep_deps`` (depth-2
+    matrix children that aren't variant entry-points). They are
+    shared across every variant of THIS binary regardless of arch /
+    compiler / opt-level. The descriptor's ``arch`` payload field is
+    fixed to ``"arch_indep"`` so the worker can branch its build
+    invocation; the task_id encodes the same axis for spawn-log
+    grepping.
+    """
+    task_id = _arch_indep_task_id(binary, ident_str)
+    return Phase4Descriptor(
+        kind="build_common_dep",
+        task_id=task_id,
+        name=f"build_common_dep__arch_indep__{binary}__{node_name}",
+        payload={
+            "sys": sys_name,
+            "binary": binary,
+            "arch": "arch_indep",
+            "node_name": node_name,
+            "ident": ident_str,
             "attr": ident_str,
         },
         depends_on=(),
@@ -564,6 +656,7 @@ def plan_phase4_for_binary(
     toolchain_idents_by_name = _toolchain_idents_by_name(
         streaming_result.get("toolchain_drvs", set())
     )
+    arch_indep_deps_raw = streaming_result.get("arch_indep_deps", {}) or {}
 
     _check_no_cycles(templates)
 
@@ -573,6 +666,36 @@ def plan_phase4_for_binary(
 
     common_dep_descriptors: list[Phase4Descriptor] = []
     variant_descriptors: list[Phase4Descriptor] = []
+
+    # ── Arch-indep deps: emit one build_common_dep per non-source-terminal
+    # ident under THIS binary's bucket. Source-terminal idents (source
+    # tarballs, fetchurl, builder scripts, patches, setup-hooks) are
+    # arch-independent by role and resolve via the nix substituter at
+    # build time — no task needed, the build worker fetches on demand.
+    # Every variant of this binary depends on every arch-indep task_id
+    # we emit (the dep gates the variant's own build worker so the
+    # arch-indep artefact is materialised before any variant builds).
+    arch_indep_descriptors: list[Phase4Descriptor] = []
+    arch_indep_dep_task_ids: list[str] = []
+    binary_indep_idents = _arch_indep_idents_for_binary(
+        arch_indep_deps_raw, binary,
+    )
+    if binary_indep_idents:
+        is_source_terminal, role_of = _load_source_terminal_predicate()
+        for ident in sorted(binary_indep_idents):
+            ident_str = _ident_to_str(ident)
+            node_name = ident[1]
+            if is_source_terminal(role_of(node_name)):
+                # Cache substitutes; no task minted.
+                continue
+            descriptor = _arch_indep_descriptor(
+                binary=binary,
+                sys_name=sys_name,
+                ident_str=ident_str,
+                node_name=node_name,
+            )
+            arch_indep_descriptors.append(descriptor)
+            arch_indep_dep_task_ids.append(descriptor.task_id)
 
     # Visit each (template_id, arch) cell, mint common-dep descriptors
     # for nodes classified as common_dep, then mint a variant
@@ -591,7 +714,13 @@ def plan_phase4_for_binary(
         _tid, _arch, variants, hashes = _variant_array_fields(arr)
         classes = classification_map.get((tmpl_id, arch), {})
 
-        per_variant_dep_ids: list[set[str]] = [set() for _ in variants]
+        # Seed each variant's dep set with every arch-indep task we
+        # minted for this binary. Arch-indep tasks gate every variant
+        # of every arch — they materialise the per-binary fetched
+        # source / patch artefacts the variant builds consume.
+        per_variant_dep_ids: list[set[str]] = [
+            set(arch_indep_dep_task_ids) for _ in variants
+        ]
 
         # Resolve toolchain task_ids for this template once: every
         # variant in this cell gets the same set of toolchain deps
@@ -671,8 +800,12 @@ def plan_phase4_for_binary(
             variant_descriptors.append(descriptor)
 
     common_dep_descriptors.sort(key=lambda d: (d.payload["arch"], d.payload["node_name"], d.payload["ident"]))
+    arch_indep_descriptors.sort(key=lambda d: (d.payload["node_name"], d.payload["ident"]))
     variant_descriptors.sort(key=lambda d: (d.payload["arch"], d.payload["label"]))
-    return common_dep_descriptors + variant_descriptors
+    # Order: arch-indep deps first (they gate every variant), then per-
+    # cell common_deps (which mostly gate intra-arch siblings), then
+    # variants. Mirrors the spawn-order the framework prefers.
+    return arch_indep_descriptors + common_dep_descriptors + variant_descriptors
 
 
 def plan_phase4_from_graph(

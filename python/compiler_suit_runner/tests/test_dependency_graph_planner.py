@@ -301,6 +301,142 @@ class TestMultiVariantCommonDep:
 
 
 # ---------------------------------------------------------------------------
+# Arch-indep dep emission (per-binary build_common_dep__arch_indep tasks)
+# ---------------------------------------------------------------------------
+
+
+class TestArchIndepDepEmission:
+    """``arch_indep_deps[binary]`` contains depth-2 matrix children that
+    aren't variant entry-points: source tarballs, fetched archives,
+    patches, setup-hook scripts, and the occasional non-toolchain
+    arch-indep helper drv. The planner emits one
+    ``build_common_dep__arch_indep__<binary>__<ident>`` task per
+    NON-source-terminal ident; source-terminal idents (recognised by
+    ``_is_source_terminal_role``) get NO task — nix's substituter
+    materialises them at build time."""
+
+    def _build_streaming(
+        self,
+        binary: str,
+        indep_idents: list[tuple[str, str]],
+    ) -> tuple[dict, dict[tuple[str, str], dict]]:
+        template = _template([
+            _node(f"{binary}-root", []),
+        ])
+        arr = _variant_array(
+            template_id=0,
+            arch="x86_64",
+            variants=["gcc15-O2"],
+            hashes=[[(f"rh-{binary}", f"{binary}.drv")]],
+        )
+        streaming = {
+            "templates": [template],
+            "variant_arrays": {(0, "x86_64"): arr},
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "variant_specific"},
+            },
+            "toolchain_drvs": set(),
+            "arch_indep_deps": {binary: set(indep_idents)},
+        }
+        variant_lookup = {
+            ("x86_64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", binary, "x86_64",
+            ),
+        }
+        return streaming, variant_lookup
+
+    def test_source_terminal_idents_skipped(self):
+        """A hello-fixture style mix: a ``-source.drv`` and a
+        ``.tar.gz.drv`` are both source-terminal-roled and must NOT
+        emit tasks; a plain ``<binary>-helper.drv`` is a regular
+        arch-indep dep and must emit one
+        ``build_common_dep__arch_indep__hello__<ident>`` task."""
+        indep = [
+            ("srch", "hello-2.12-source.drv"),
+            ("tarh", "hello-2.12.tar.gz.drv"),
+            ("helph", "hello-helper.drv"),
+        ]
+        streaming, lookup = self._build_streaming("hello", indep)
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        arch_indep = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.payload.get("arch") == "arch_indep"
+        ]
+        # Only the non-source-terminal ident becomes a task.
+        assert len(arch_indep) == 1, [d.task_id for d in arch_indep]
+        helper = arch_indep[0]
+        assert helper.task_id == (
+            "build_common_dep__arch_indep__hello__helph-hello-helper.drv"
+        )
+        assert helper.payload["binary"] == "hello"
+        assert helper.payload["arch"] == "arch_indep"
+        assert helper.payload["ident"] == "helph-hello-helper.drv"
+
+    def test_emitted_task_wired_into_every_variant(self):
+        """Every variant of every arch for this binary lists the
+        emitted ``build_common_dep__arch_indep`` task in its
+        ``depends_on``."""
+        indep = [("helph", "hello-helper.drv")]
+        streaming, lookup = self._build_streaming("hello", indep)
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        arch_indep = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.payload.get("arch") == "arch_indep"
+        ]
+        assert len(arch_indep) == 1
+        ai_id = arch_indep[0].task_id
+        variants = [d for d in descs if d.kind == "build_variant"]
+        assert variants, "expected at least one variant descriptor"
+        for v in variants:
+            assert ai_id in v.depends_on, (v.task_id, v.depends_on)
+
+    def test_all_source_terminal_emits_nothing(self):
+        """When every arch-indep ident is source-terminal-roled, no
+        task is emitted and variant ``depends_on`` carries no
+        arch-indep task ids."""
+        indep = [
+            ("srch", "hello-2.12-source.drv"),
+            ("patch", "hello-fix.patch"),
+            ("hook", "hello-setup-hook.sh"),
+        ]
+        streaming, lookup = self._build_streaming("hello", indep)
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        arch_indep = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.payload.get("arch") == "arch_indep"
+        ]
+        assert arch_indep == []
+        variants = [d for d in descs if d.kind == "build_variant"]
+        for v in variants:
+            assert not any(
+                dep.startswith("build_common_dep__arch_indep__")
+                for dep in v.depends_on
+            ), v
+
+    def test_idents_for_other_binary_ignored(self):
+        """Arch-indep deps stay scoped to the binary they live under."""
+        streaming, lookup = self._build_streaming(
+            "hello", [("helph", "hello-helper.drv")],
+        )
+        # Inject a non-hello bucket; it must NOT bleed into the hello
+        # plan.
+        streaming["arch_indep_deps"]["busybox"] = {
+            ("xh", "busybox-helper.drv"),
+        }
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        arch_indep = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.payload.get("arch") == "arch_indep"
+        ]
+        idents = {d.payload["ident"] for d in arch_indep}
+        assert idents == {"helph-hello-helper.drv"}, idents
+
+
+# ---------------------------------------------------------------------------
 # Toolchain ident wiring (set[(hash, name)] → variant depends_on)
 # ---------------------------------------------------------------------------
 
