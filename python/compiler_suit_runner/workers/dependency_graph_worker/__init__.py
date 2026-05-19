@@ -60,7 +60,12 @@ from .cli import main
 from .cli import parse_task_id_mappings as _parse_task_id_mappings
 from .errors import DependencyGraphResult, DependencyGraphWorkerError
 from .output import DEPENDENCY_GRAPH_JSON, write_dependency_graph_json
-from .plan import plan_binary, plan_total
+from .plan import (
+    compute_dependency_graph_counters,
+    plan_binary,
+    plan_total,
+    plan_total_with_counters,
+)
 from .run import run_dependency_graph_task
 from .sum_drv import build_sum_drv, build_sum_drv_multi, query_drv_tree
 
@@ -71,6 +76,7 @@ __all__ = [
     "DEPENDENCY_GRAPH_JSON",
     "build_sum_drv",
     "build_sum_drv_multi",
+    "compute_dependency_graph_counters",
     "discover_archives",
     "discover_kept_drvs",
     "import_archive",
@@ -78,6 +84,7 @@ __all__ = [
     "main",
     "plan_binary",
     "plan_total",
+    "plan_total_with_counters",
     "query_drv_tree",
     "run_dependency_graph_task",
     "write_dependency_graph_json",

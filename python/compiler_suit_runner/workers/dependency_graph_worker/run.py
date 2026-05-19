@@ -18,6 +18,7 @@ from typing import Any, Optional
 from . import archive as _archive
 from . import output as _output
 from . import sum_drv as _sum_drv
+from . import summary as _summary
 from .errors import DependencyGraphResult, DependencyGraphWorkerError
 from .subproc import RunSubprocess, default_run_subprocess
 
@@ -98,7 +99,7 @@ def run_dependency_graph_task(
             duration_seconds=max(0.0, clock_fn() - start),
         )
 
-    descriptors = _plan_all_binaries(
+    descriptors, counters, violation_entries = _plan_all_binaries(
         bash_path=bash_path,
         toolchain_drvs=toolchain_drvs,
         matrix_drvs=matrix_drvs,
@@ -109,6 +110,13 @@ def run_dependency_graph_task(
         runner=runner,
     )
 
+    _summary.emit_summary_log(
+        binaries=plannable_binaries,
+        counters=counters,
+    )
+    if counters.get("violations", 0) > 0:
+        _summary.emit_violations_log(violation_entries)
+
     out_path = _output.write_dependency_graph_json(
         matrix_eval_out_dir / _output.DEPENDENCY_GRAPH_JSON, descriptors
     )
@@ -117,6 +125,17 @@ def run_dependency_graph_task(
         binary_count=len(plannable_binaries),
         descriptor_count=len(descriptors),
         duration_seconds=max(0.0, clock_fn() - start),
+        templates=counters.get("templates", 0),
+        meta_templates=counters.get("meta_templates", 0),
+        variants=counters.get("variants", 0),
+        common_deps_cross_arch=counters.get("common_deps_cross_arch", 0),
+        common_deps_family=counters.get("common_deps_family", 0),
+        common_deps_uni_arch=counters.get("common_deps_uni_arch", 0),
+        common_deps_arch_indep=counters.get("common_deps_arch_indep", 0),
+        source_terminal_skipped=counters.get("source_terminal_skipped", 0),
+        toolchain_wired=counters.get("toolchain_wired", 0),
+        stdenv_subtrees=counters.get("stdenv_subtrees", 0),
+        violations=counters.get("violations", 0),
     )
 
 
@@ -214,20 +233,16 @@ def _plan_all_binaries(
     variant_lookups: dict[str, dict[tuple[str, str], dict]],
     tc_ids: dict[str, str],
     runner: RunSubprocess,
-) -> list[Any]:
-    """Build the multi-binary sum-drv, query its tree, and produce ONE
-    descriptor list spanning every plannable binary.
+) -> tuple[list[Any], dict[str, int], list[dict]]:
+    """Build the multi-binary sum-drv, query its tree, and produce
+    ``(descriptors, counters, violation_entries)`` spanning every
+    plannable binary.
 
     Stages are surfaced via :class:`DependencyGraphWorkerError` tagged
-    with ``binary="<all>"`` for the sum-drv / tree-query / plan steps
-    that are no longer per-binary; per-binary failures inside the
-    planner are surfaced by re-raising the underlying exception with
-    the binary name.
-
-    The ``build_sum_drv_multi`` and ``plan_total`` callables are
-    resolved via the package's top-level namespace at call time so
-    test ``monkeypatch.setattr(<pkg>, "build_sum_drv_multi", ...)``
-    is honoured.
+    with ``binary="<all>"`` for the sum-drv / tree-query / plan steps.
+    ``build_sum_drv_multi`` and ``plan_total`` are resolved through
+    the package namespace so test monkeypatches are honoured; see
+    :func:`summary.invoke_planner` for the planner-call shim.
     """
     import importlib  # noqa: PLC0415
     _pkg = importlib.import_module(__package__)
@@ -255,11 +270,12 @@ def _plan_all_binaries(
         ) from exc
 
     try:
-        return _pkg.plan_total(
+        return _summary.invoke_planner(
+            pkg=_pkg,
             tree_text=tree_text,
             binaries=binaries,
             variant_lookups=variant_lookups,
-            toolchain_task_ids=tc_ids,
+            tc_ids=tc_ids,
             sys_name=sys_name,
         )
     except Exception as exc:  # noqa: BLE001

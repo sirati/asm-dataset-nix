@@ -50,6 +50,10 @@ def finalize(planner: "StreamPlanner") -> dict:
         "toolchain_node_ids_per_template": (
             planner.out.toolchain_node_ids_per_template
         ),
+        # Diagnostic counter surfaced for the dependency_graph_worker
+        # summary log (Phase 6.1b); fresh allocations skipped because
+        # the role is an arch-indep source terminal (cache substitutes).
+        "source_terminal_skipped": planner.out.source_terminal_skipped,
     }
 
 
