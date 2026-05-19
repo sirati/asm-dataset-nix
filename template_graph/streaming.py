@@ -66,7 +66,11 @@ from template_graph.dot import (
 # Cowalk helpers were lifted into ``template_graph.cowalk``; re-export
 # ``_classify_pair`` here so external callers that import it from this
 # module keep working.
-from template_graph.cowalk.classify_pair import (
+from template_graph.cowalk import (
+    build_template,
+    build_template_singleton,
+    make_template_node,
+    walk_one_sided_subtree,
     _classify_pair,  # noqa: F401  back-compat re-export
 )
 
@@ -467,7 +471,7 @@ class StreamPlanner:
         (label0, tree0), (label1, tree1) = pair
         self.vb.building_arch = arch
         self.vb.building_label_pair = (label0, label1)
-        candidate = self._build_template(tree0, tree1, label0, label1)
+        candidate = build_template(self, tree0, tree1, label0, label1)
         tmpl_id, _was_new = find_or_register_template(
             self.out.templates, candidate
         )
@@ -490,133 +494,6 @@ class StreamPlanner:
         self.out.classifications[(tmpl_id, arch)] = _classify_pair(
             arr, template
         )
-
-    def _build_template(
-        self,
-        tree0: RawTreeNode,
-        tree1: RawTreeNode,
-        label0: str,
-        label1: str,
-    ) -> Template:
-        """Parallel-walk two raw trees. Identity during construction is
-        the pair ``(t0.drv_path, t1.drv_path)``: re-encountering the
-        same pair (DAG join in both raw trees at once) links back to
-        the existing template node. Distinct hash-paths — even with
-        identical post-hash names — get distinct template nodes.
-        """
-        template = Template(
-            nodes=[],
-            name_to_id={},
-            root_id=0,
-            template_built_from=[label0, label1],
-        )
-        # pair_to_id key shapes:
-        #  - pair walk:       ((h0, n0), (h1, n1))
-        #  - one-sided t0:    ((h, n), None)
-        #  - one-sided t1:    (None, (h, n))
-        pair_to_id: dict = {}
-
-        def _alloc(t0: RawTreeNode, t1: RawTreeNode) -> tuple[int, bool]:
-            key = (t0.ident, t1.ident)
-            if key in pair_to_id:
-                return pair_to_id[key], False
-            tnode = self._make_template_node(
-                [t0, t1],
-                optional=False,
-                label_slots=list(self.vb.building_label_pair),
-            )
-            nid = len(template.nodes)
-            template.nodes.append(tnode)
-            pair_to_id[key] = nid
-            return nid, True
-
-        def _walk_single(rn: RawTreeNode, is_t0_side: bool) -> int:
-            """Walk a raw subtree present on only one calibration side.
-            Every template node it allocates is optional. Identity is
-            keyed ``(ident, None)`` or ``(None, ident)`` so it never
-            collides with pair-walked nodes."""
-            slot = self.vb.building_label_pair[0 if is_t0_side else 1]
-
-            def _alloc(r: RawTreeNode) -> tuple[int, bool]:
-                key = (r.ident, None) if is_t0_side else (None, r.ident)
-                if key in pair_to_id:
-                    return pair_to_id[key], False
-                tnode = self._make_template_node(
-                    [r], optional=True, label_slots=[slot],
-                )
-                nid_ = len(template.nodes)
-                template.nodes.append(tnode)
-                pair_to_id[key] = nid_
-                return nid_, True
-
-            return self._walk_one_sided_subtree(rn, template, _alloc)
-
-        def _walk(t0: RawTreeNode, t1: RawTreeNode) -> int:
-            nid, fresh = _alloc(t0, t1)
-            if not t0.is_backref:
-                self.mx.unclassified_nodes.discard(t0.ident)
-            if not t1.is_backref:
-                self.mx.unclassified_nodes.discard(t1.ident)
-            if not fresh:
-                return nid
-            node = template.nodes[nid]
-            if node.is_toolchain:
-                self._discard_subtree(t0)
-                self._discard_subtree(t1)
-                return nid
-            if t0.ident == t1.ident:
-                ref = t0 if t0.children else t1
-                for c in ref.children:
-                    node.child_ids.append(_walk(c, c))
-                return nid
-            t0_by_name: dict[str, list[RawTreeNode]] = {}
-            for c in t0.children:
-                t0_by_name.setdefault(
-                    self.name_extractor(c.name), []
-                ).append(c)
-            t1_by_name: dict[str, list[RawTreeNode]] = {}
-            for c in t1.children:
-                t1_by_name.setdefault(
-                    self.name_extractor(c.name), []
-                ).append(c)
-            common = set(t0_by_name) & set(t1_by_name)
-            only_t0 = set(t0_by_name) - common
-            only_t1 = set(t1_by_name) - common
-            # One-sided children become optional subtrees attached to
-            # the parent. They cease to be a "violation" — they are an
-            # *expected* phenomenon (stdenv splices setup-hooks based
-            # on compiler choice, etc.).
-            for name in sorted(only_t0):
-                for c0 in t0_by_name[name]:
-                    node.child_ids.append(_walk_single(c0, is_t0_side=True))
-            for name in sorted(only_t1):
-                for c1 in t1_by_name[name]:
-                    node.child_ids.append(_walk_single(c1, is_t0_side=False))
-            for name in sorted(common):
-                t0_lst = sorted(t0_by_name[name], key=lambda r: r.ident)
-                t1_lst = sorted(t1_by_name[name], key=lambda r: r.ident)
-                if len(t0_lst) != len(t1_lst):
-                    if not self.lax:
-                        raise TreeWalkError(
-                            f"calibration pair same-name child count "
-                            f"mismatch at node {node.name!r}, name "
-                            f"{name!r}: t0={len(t0_lst)} vs t1={len(t1_lst)}"
-                        )
-                    self._record(
-                        "calibration-same-name-count-mismatch",
-                        node_role=node.name,
-                        child_name=name,
-                        t0_count=len(t0_lst),
-                        t1_count=len(t1_lst),
-                        labels=list(template.template_built_from),
-                    )
-                n = min(len(t0_lst), len(t1_lst))
-                for c0, c1 in zip(t0_lst[:n], t1_lst[:n]):
-                    node.child_ids.append(_walk(c0, c1))
-            return nid
-
-        _walk(tree0, tree1)
-        return template
 
     # ── cowalk one raw tree into a VariantArray ──
 
@@ -832,82 +709,6 @@ class StreamPlanner:
         # variants of the same (binary, arch).
         _visit(template.root_id, tree, parent_nid=None)
 
-    # ── shared template-node construction ──
-
-    def _make_template_node(
-        self,
-        raw_nodes: list[RawTreeNode],
-        *,
-        optional: bool,
-        label_slots: list[str],
-        arch: Optional[str] = None,
-    ) -> TemplateNode:
-        """Build a TemplateNode from one or two raw nodes. Handles
-        stdenv capture (siphoning the subtree into ``stdenv_subtrees``)
-        and toolchain classification (stdenv role, compiler-wrapper
-        role, or drv-path membership in ``toolchain_drvs``).
-        """
-        name = self.name_extractor(raw_nodes[0].name)
-        is_stdenv = _is_stdenv_role(name)
-        eff_arch = arch if arch is not None else self.vb.building_arch
-        if is_stdenv:
-            seen: set[tuple[str, str]] = set()
-            for rn, slot in zip(raw_nodes, label_slots):
-                if rn.ident in seen:
-                    continue
-                seen.add(rn.ident)
-                self.out.stdenv_subtrees.setdefault(rn.ident, {
-                    "first_seen_in": {
-                        "matrix": self.mx.matrix_binary,
-                        "arch": eff_arch,
-                        "label": slot,
-                    },
-                    "root": rn,
-                })
-        is_toolchain = (
-            is_stdenv
-            or _is_compiler_wrapper_role(name)
-            or any(rn.ident in self.out.toolchain_drvs for rn in raw_nodes)
-        )
-        return TemplateNode(
-            name=name,
-            child_ids=[],
-            is_toolchain=is_toolchain,
-            visit_flag=False,
-            optional=optional,
-        )
-
-    def _walk_one_sided_subtree(
-        self,
-        rn: RawTreeNode,
-        template: Template,
-        alloc_fn,  # (RawTreeNode) -> (nid, fresh)
-        post_fresh=None,  # optional (nid, rn) -> None for hash-record etc
-    ) -> int:
-        """Walk a raw subtree from a single calibration side / variant,
-        recursing through children. ``alloc_fn`` returns ``(nid,
-        fresh)`` and is responsible for any dedup. ``post_fresh`` runs
-        after fresh allocation for callers that need to record hashes.
-        """
-        nid, fresh = alloc_fn(rn)
-        if not rn.is_backref:
-            self.mx.unclassified_nodes.discard(rn.ident)
-        if not fresh:
-            return nid
-        node = template.nodes[nid]
-        if post_fresh is not None:
-            post_fresh(nid, rn)
-        if node.is_toolchain:
-            self._discard_subtree(rn)
-            return nid
-        for c in rn.children:
-            cid = self._walk_one_sided_subtree(
-                c, template, alloc_fn, post_fresh
-            )
-            if cid not in node.child_ids:
-                node.child_ids.append(cid)
-        return nid
-
     # ── template extension during cowalk ──
 
     def _extend_template_with_subtree(
@@ -932,8 +733,8 @@ class StreamPlanner:
         def _alloc(rn: RawTreeNode) -> tuple[int, bool]:
             if rn.ident in local_path_to_nid:
                 return local_path_to_nid[rn.ident], False
-            tnode = self._make_template_node(
-                [rn], optional=True, label_slots=[label], arch=arch,
+            tnode = make_template_node(
+                self, [rn], optional=True, label_slots=[label], arch=arch,
             )
             nid = len(template.nodes)
             template.nodes.append(tnode)
@@ -950,8 +751,8 @@ class StreamPlanner:
             if not template.nodes[nid].is_toolchain:
                 arr.hashes[nid][v_pos] = rn.ident
 
-        new_nid = self._walk_one_sided_subtree(
-            raw_root, template, _alloc, post_fresh=_record
+        new_nid = walk_one_sided_subtree(
+            self, raw_root, template, _alloc, post_fresh=_record
         )
         if new_nid not in template.nodes[parent_nid].child_ids:
             template.nodes[parent_nid].child_ids.append(new_nid)
@@ -1000,7 +801,7 @@ class StreamPlanner:
             else:
                 label, tree = pending[0]
                 self.vb.building_arch = arch
-                template = self._build_template_singleton(tree, label)
+                template = build_template_singleton(self, tree, label)
                 tmpl_id, _ = find_or_register_template(
                     self.out.templates, template
                 )
@@ -1032,68 +833,6 @@ class StreamPlanner:
                 sample=sample,
             )
             self.mx.unclassified_nodes = set()
-
-    def _build_template_singleton(
-        self, tree: RawTreeNode, label: str
-    ) -> Template:
-        """Single-variant arch → mirror its structure, all nodes
-        become common_dep candidates (no calibration possible)."""
-        template = Template(
-            nodes=[], name_to_id={}, root_id=0,
-            template_built_from=[label],
-        )
-
-        def _alloc(tn: RawTreeNode) -> int:
-            name = self.name_extractor(tn.name)
-            is_stdenv = _is_stdenv_role(name)
-            if is_stdenv:
-                self.out.stdenv_subtrees.setdefault(tn.ident, {
-                    "first_seen_in": {
-                        "matrix": self.mx.matrix_binary,
-                        "arch": self.vb.building_arch,
-                        "label": label,
-                    },
-                    "root": tn,
-                })
-            is_toolchain = (
-                is_stdenv
-                or _is_compiler_wrapper_role(name)
-                or tn.ident in self.out.toolchain_drvs
-            )
-            if name in template.name_to_id:
-                return template.name_to_id[name]
-            node = TemplateNode(
-                name=name,
-                child_ids=[],
-                is_toolchain=is_toolchain,
-                visit_flag=False,
-            )
-            nid = len(template.nodes)
-            template.nodes.append(node)
-            template.name_to_id[name] = nid
-            return nid
-
-        visited: set[int] = set()
-
-        def _walk(tn: RawTreeNode) -> int:
-            nid = _alloc(tn)
-            if not tn.is_backref:
-                self.mx.unclassified_nodes.discard(tn.ident)
-            if nid in visited:
-                return nid
-            visited.add(nid)
-            if template.nodes[nid].is_toolchain:
-                self._discard_subtree(tn)
-                return nid
-            for c in tn.children:
-                cid = _walk(c)
-                if cid not in template.nodes[nid].child_ids:
-                    template.nodes[nid].child_ids.append(cid)
-            return nid
-
-        _walk(tree)
-        return template
-
 
 # ── convenience entry point ──
 
