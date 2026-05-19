@@ -43,7 +43,8 @@ def run_dependency_graph_task(
     skip_import_when_present: bool = True,
 ) -> DependencyGraphResult:
     """Walk every ``<binary>.nix-archive`` under ``matrix_eval_out_dir``
-    and produce ``_dependency_graph.json``.
+    and produce ``_dependency_graph.pkl`` (plus the
+    ``_dependency_graph_summary.txt`` companion).
 
     Plan §5.2 unifies the previous per-binary loop into:
 

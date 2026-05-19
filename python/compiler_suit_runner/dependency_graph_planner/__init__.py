@@ -73,10 +73,11 @@ This module emits **descriptors**, not pre-built
 The package does NOT import ``template_graph`` at module load: the
 caller passes the streaming result as a plain dict (the same shape
 ``plan_from_tree_streaming`` returns, but also tolerant of a
-JSON-roundtripped form produced by ``dependency_graph_worker``'s
-``_dependency_graph.json``). This keeps unit tests dependency-free
-and lets the worker either pickle dataclasses or serialise to JSON
-without dragging the adapter into either choice.
+list-coerced form -- e.g. tuples-as-lists, stringified integer keys --
+so callers that route the streaming result through a serialisation
+layer keep working). This keeps unit tests dependency-free and lets
+the worker pickle dataclasses to ``_dependency_graph.pkl`` without
+dragging the adapter into the choice of on-disk format.
 """
 
 from __future__ import annotations
