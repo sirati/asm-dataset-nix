@@ -114,6 +114,44 @@ def _is_compiler_wrapper_role(role: str) -> bool:
     )
 
 
+# Source-terminal roles: arch-independent build inputs (source tarballs,
+# fetched archives, builder scripts, patches, setup-hook shell snippets)
+# that always resolve via cache rather than per-variant compilation.
+# Recognising them by role-pattern lets the streaming planner skip
+# entering them as template nodes (no per-variant cell tracking) and
+# emit no ``build_common_dep`` task downstream (cache substitutes them).
+#
+# All checks are pure string-pattern on the role name as produced by
+# ``drv_role``. NO nix call.
+_SOURCE_TERMINAL_RES: tuple[re.Pattern[str], ...] = (
+    # ``*-source`` (post-drv-suffix) — git/fetchgit checkouts, etc.
+    re.compile(r"-source(?:\.drv)?$"),
+    # Archive tarballs of the common compressions. ``drv_role`` retains
+    # extensions up to 2 levels so the role ends with ``.tar.<ext>(.drv)``.
+    re.compile(
+        r"\.tar\.(?:gz|xz|bz2|bz|zst|lz|lzma|Z|7z|lz4)(?:\.drv)?$"
+    ),
+    # ``fetchurl-…`` (and the ``builtins.fetchurl`` family) drv names.
+    re.compile(r"(?:^|-)fetchurl(?:-|\.drv$|$)"),
+    # Builder scripts inlined as separate drvs (uncommon but real).
+    re.compile(r"-builder\.(?:sh|pl)(?:\.drv)?$"),
+    # Patch files referenced as drv inputs.
+    re.compile(r"\.patch(?:\.drv)?$"),
+    # Setup-hook shell snippets.
+    re.compile(r"-setup-hook(?:\.sh)?(?:\.drv)?$"),
+)
+
+
+def _is_source_terminal_role(role: str) -> bool:
+    """Whether ``role`` denotes an arch-independent source-terminal:
+    source tarball, fetched archive, builder script, patch, or
+    setup-hook. These don't need per-variant template tracking and
+    don't get ``build_common_dep`` tasks emitted (cache substitutes
+    them); they're still recorded in per-binary ``arch_indep_deps``
+    for diagnostic counting."""
+    return any(rx.search(role) is not None for rx in _SOURCE_TERMINAL_RES)
+
+
 _TRIPLE_RE = re.compile(
     rf"(?:^|-)(?:{_TRIPLE_ARCH})-(?:{_TRIPLE_VENDOR})"
     rf"-(?:{_TRIPLE_OS})-(?:{_TRIPLE_ABI})"

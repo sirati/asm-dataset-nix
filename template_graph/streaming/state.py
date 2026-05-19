@@ -93,6 +93,12 @@ class OutputState:
     )
     # Lax-mode shape-violation log.
     violations: list[dict] = field(default_factory=list)
+    # Count of fresh allocations short-circuited by
+    # ``_is_source_terminal_role`` (arch-indep terminal: source tarball,
+    # builder script, patch, setup-hook, fetchurl). Diagnostic-only;
+    # the idents themselves are still recorded in ``arch_indep_deps``
+    # for the per-binary skipped-counter surfaced in Phase 6.
+    source_terminal_skipped: int = 0
 
 
 @dataclass
