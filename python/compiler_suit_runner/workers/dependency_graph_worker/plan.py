@@ -8,6 +8,13 @@ Two entry points:
     after the per-binary loop collapse. Runs the streaming planner ONCE
     on a multi-binary sum-drv tree and partitions the result per binary
     before feeding :func:`plan_phase4_from_graph`.
+  * :func:`plan_total_with_counters` — same as :func:`plan_total` but
+    also returns the per-category integer counters used in the worker's
+    post-planning summary log (Phase 6.1b).
+  * :func:`compute_dependency_graph_counters` — pure-function counter
+    aggregation over a streaming result + descriptor list; exported so
+    the worker (and tests) can derive counters without re-running the
+    planner.
 """
 
 from __future__ import annotations
@@ -15,9 +22,14 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 
+from .counters import compute_dependency_graph_counters
+
+
 __all__ = [
     "plan_binary",
     "plan_total",
+    "plan_total_with_counters",
+    "compute_dependency_graph_counters",
 ]
 
 
@@ -96,6 +108,69 @@ def plan_total(
 
     Raises :class:`DependencyGraphCycleError` on cycle detection.
     """
+    descriptors, _streaming = _plan_total_impl(
+        tree_text=tree_text,
+        binaries=binaries,
+        variant_lookups=variant_lookups,
+        toolchain_task_ids=toolchain_task_ids,
+        sys_name=sys_name,
+        lax=lax,
+    )
+    return descriptors
+
+
+def plan_total_with_counters(
+    *,
+    tree_text: str,
+    binaries: list[str],
+    variant_lookups: dict[str, dict[tuple[str, str], dict]],
+    toolchain_task_ids: dict[str, str],
+    sys_name: str,
+    lax: bool = True,
+) -> tuple[list[Any], dict[str, int], list[dict]]:
+    """Variant of :func:`plan_total` that also returns the per-category
+    integer counters used in the worker's post-planning summary log
+    and the survey-mode violation entries the streaming planner recorded.
+
+    Returns ``(descriptors, counters, violation_entries)``. ``counters``
+    keys match the integer fields on :class:`DependencyGraphResult`
+    (Phase 6.1b); ``violation_entries`` is the planner's
+    ``streaming_result["violations"]`` list, ready for the worker's
+    WARN-level dump when non-empty.
+    """
+    descriptors, streaming_result = _plan_total_impl(
+        tree_text=tree_text,
+        binaries=binaries,
+        variant_lookups=variant_lookups,
+        toolchain_task_ids=toolchain_task_ids,
+        sys_name=sys_name,
+        lax=lax,
+    )
+    counters = compute_dependency_graph_counters(
+        streaming_result=streaming_result,
+        descriptors=descriptors,
+        binaries=binaries,
+    )
+    violation_entries = list(streaming_result.get("violations", []) or [])
+    return descriptors, counters, violation_entries
+
+
+def _plan_total_impl(
+    *,
+    tree_text: str,
+    binaries: list[str],
+    variant_lookups: dict[str, dict[tuple[str, str], dict]],
+    toolchain_task_ids: dict[str, str],
+    sys_name: str,
+    lax: bool = True,
+) -> tuple[list[Any], Mapping[str, Any]]:
+    """Shared body of :func:`plan_total` and :func:`plan_total_with_counters`.
+
+    Runs ONE streaming pass and returns both the emitted phase-4
+    descriptors and the raw streaming-planner result dict (the latter
+    is consumed by :func:`compute_dependency_graph_counters` and is not
+    part of the public worker contract).
+    """
     from template_graph.streaming import plan_from_tree_streaming  # noqa: PLC0415
     from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
         BinaryPlanInput,
@@ -124,7 +199,8 @@ def plan_total(
             toolchain_task_ids=toolchain_task_ids,
         ))
 
-    return plan_phase4_from_graph(inputs, sys_name=sys_name)
+    descriptors = plan_phase4_from_graph(inputs, sys_name=sys_name)
+    return descriptors, streaming_result
 
 
 def _binary_of_template(template: Any) -> str:

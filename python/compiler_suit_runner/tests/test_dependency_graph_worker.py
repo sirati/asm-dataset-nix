@@ -911,3 +911,238 @@ class TestPlanTotalLaxDefault:
                 sys_name="x86_64-linux",
                 lax=False,
             )
+# Phase 6.1b: per-category counters + summary log
+# ---------------------------------------------------------------------------
+
+
+class TestDependencyGraphCounters:
+    """Smoke tests for the counter aggregation + summary log surface.
+
+    Counters are derived from the streaming-planner result dict +
+    descriptor list; the helper :func:`compute_dependency_graph_counters`
+    is exported so the worker (and tests) can call it without re-running
+    the planner. The fixture below fabricates a 2-binary streaming
+    result + descriptor list that exercises every counter field.
+    """
+
+    def _two_binary_streaming_result(self) -> dict:
+        """Streaming-result-shaped dict with non-zero counter inputs
+        for every category the summary log surfaces.
+        """
+        # Two templates (one per binary) so ``templates=2``.
+        return {
+            "templates": ["t0", "t1"],
+            "variant_arrays": {},
+            "common_deps_per_arch_template": {},
+            "toolchain_drvs": set(),
+            "arch_indep_deps": {"hello": set(), "world": set()},
+            "stdenv_subtrees": {("h0", "stdenv-1.drv"): {}},
+            # Two meta-templates for ``hello``, one for ``world``;
+            # summing across binaries should give 3.
+            "meta_templates": {
+                "hello": ["mt0", "mt1"], "world": ["mt2"],
+            },
+            "source_terminal_skipped": 5,
+            "violations": [
+                {"kind": "test", "matrix": "hello"},
+                {"kind": "test", "matrix": "world"},
+            ],
+        }
+
+    def _two_binary_descriptors(self) -> list[Phase4Descriptor]:
+        """Descriptor list covering each common-dep category + a few
+        ``build_variant`` records (one wired to a toolchain task)."""
+        return [
+            Phase4Descriptor(
+                kind="build_common_dep",
+                task_id="build_common_dep__cross_arch__hh-shared.drv",
+                name="build_common_dep__hello__cross_arch__shared.drv",
+                payload={"binary": "hello", "arch": "cross_arch"},
+                depends_on=(),
+            ),
+            Phase4Descriptor(
+                kind="build_common_dep",
+                task_id="build_common_dep__family__x86__zz-lib.drv",
+                name="build_common_dep__hello__family__x86__lib.drv",
+                payload={"binary": "hello", "arch": "family__x86"},
+                depends_on=(),
+            ),
+            Phase4Descriptor(
+                kind="build_common_dep",
+                task_id="build_common_dep__arch_indep__world__aa-src.tar",
+                name="build_common_dep__arch_indep__world__src.tar",
+                payload={"binary": "world", "arch": "arch_indep"},
+                depends_on=(),
+            ),
+            Phase4Descriptor(
+                kind="build_common_dep",
+                task_id="build_common_dep__bb-glibc.drv",
+                name="build_common_dep__hello__x86_64__glibc.drv",
+                payload={"binary": "hello", "arch": "x86_64"},
+                depends_on=(),
+            ),
+            Phase4Descriptor(
+                kind="build_variant",
+                task_id="build_variant__x86_64-linux__hello__gcc15-O2",
+                name="build_variant__hello__gcc15-O2",
+                payload={"binary": "hello"},
+                depends_on=("build_compilers__x86_64__gcc15",),
+            ),
+            Phase4Descriptor(
+                kind="build_variant",
+                task_id="build_variant__x86_64-linux__world__gcc15-O0",
+                name="build_variant__world__gcc15-O0",
+                payload={"binary": "world"},
+                depends_on=(),
+            ),
+        ]
+
+    def test_compute_counters_populated_for_two_binaries(self):
+        from compiler_suit_runner.workers.dependency_graph_worker import (
+            compute_dependency_graph_counters,
+        )
+        counters = compute_dependency_graph_counters(
+            streaming_result=self._two_binary_streaming_result(),
+            descriptors=self._two_binary_descriptors(),
+            binaries=["hello", "world"],
+        )
+        assert counters["templates"] == 2
+        assert counters["meta_templates"] == 3
+        assert counters["variants"] == 2
+        assert counters["common_deps_cross_arch"] == 1
+        assert counters["common_deps_family"] == 1
+        assert counters["common_deps_uni_arch"] == 1
+        assert counters["common_deps_arch_indep"] == 1
+        assert counters["source_terminal_skipped"] == 5
+        # Only one of the two build_variant descriptors has a
+        # ``build_compilers__`` task in its depends_on.
+        assert counters["toolchain_wired"] == 1
+        assert counters["stdenv_subtrees"] == 1
+        assert counters["violations"] == 2
+
+    def test_compute_counters_empty_inputs(self):
+        from compiler_suit_runner.workers.dependency_graph_worker import (
+            compute_dependency_graph_counters,
+        )
+        counters = compute_dependency_graph_counters(
+            streaming_result={},
+            descriptors=[],
+            binaries=[],
+        )
+        # Every field defaults to 0 so callers that hand it a stub
+        # streaming dict (e.g. monkeypatched plan_total paths) still
+        # get a stable shape.
+        assert counters == {
+            "templates": 0,
+            "meta_templates": 0,
+            "variants": 0,
+            "common_deps_cross_arch": 0,
+            "common_deps_family": 0,
+            "common_deps_uni_arch": 0,
+            "common_deps_arch_indep": 0,
+            "source_terminal_skipped": 0,
+            "toolchain_wired": 0,
+            "stdenv_subtrees": 0,
+            "violations": 0,
+        }
+
+    def test_result_carries_counter_fields(
+        self, tmp_path: pathlib.Path, monkeypatch, caplog,
+    ):
+        """End-to-end smoke: the worker's ``DependencyGraphResult``
+        carries the counter fields populated from the monkeypatched
+        planner output, and the summary log line fires."""
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        archive = matrix_dir / "hello.nix-archive"
+        archive.write_bytes(b"x")
+        sidecar = archive.with_suffix(".nix-archive.json")
+        sidecar.write_text(
+            json.dumps({"variant_drvs": ["/nix/store/aaa-hello.drv"]}),
+            encoding="utf-8",
+        )
+        archive2 = matrix_dir / "world.nix-archive"
+        archive2.write_bytes(b"x")
+        sidecar2 = archive2.with_suffix(".nix-archive.json")
+        sidecar2.write_text(
+            json.dumps({"variant_drvs": ["/nix/store/bbb-world.drv"]}),
+            encoding="utf-8",
+        )
+
+        stub = _SubprocessStub()
+        stub.path_info_present.update([
+            "/nix/store/aaa-hello.drv",
+            "/nix/store/bbb-world.drv",
+        ])
+        stub.tree_stdout = b"/nix/store/sum.drv\n"
+
+        descriptors = self._two_binary_descriptors()
+
+        monkeypatch.setattr(
+            dgw, "build_sum_drv_multi", lambda **kw: "/nix/store/sum.drv",
+        )
+        monkeypatch.setattr(
+            dgw, "plan_total",
+            lambda **kw: descriptors,
+        )
+
+        import logging  # noqa: PLC0415
+        with caplog.at_level(
+            logging.INFO,
+            logger="compiler_suit_runner.dependency_graph_worker",
+        ):
+            result = dgw.run_dependency_graph_task(
+                matrix_eval_out_dir=matrix_dir,
+                manifest_dir=None,
+                bash_path="/nix/store/bash",
+                toolchain_drvs=["/nix/store/tc.drv"],
+                run_subprocess=stub,
+            )
+
+        # Counter fields exist + default to descriptor-derived values
+        # for the monkeypatched plan_total path (streaming-result-only
+        # counters degrade to 0 because the patch hid the planner).
+        assert result.binary_count == 2
+        assert result.descriptor_count == len(descriptors)
+        assert result.variants == 2
+        assert result.toolchain_wired == 1
+        assert result.common_deps_cross_arch == 1
+        assert result.common_deps_family == 1
+        assert result.common_deps_uni_arch == 1
+        assert result.common_deps_arch_indep == 1
+        # Streaming-result-derived counters are 0 on the monkeypatched
+        # plan_total path -- the patch shadows the planner so the
+        # worker can only count descriptor categories.
+        assert result.templates == 0
+        assert result.meta_templates == 0
+        assert result.stdenv_subtrees == 0
+        assert result.source_terminal_skipped == 0
+        assert result.violations == 0
+        # Summary log line fired at INFO level.
+        summary_records = [
+            r for r in caplog.records
+            if r.message.startswith("dependency_graph: binaries=")
+        ]
+        assert len(summary_records) == 1
+        assert summary_records[0].levelno == logging.INFO
+
+    def test_violations_dump_fires_at_warn(self, caplog):
+        """The WARN-level violation dump fires on non-empty entries."""
+        import logging  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (
+            summary as _summary_mod,
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger="compiler_suit_runner.dependency_graph_worker",
+        ):
+            _summary_mod.emit_violations_log([
+                {"kind": "shape", "matrix": "hello", "node": "x"},
+                {"kind": "shape", "matrix": "world", "node": "y"},
+            ])
+        warn_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "violation" in r.message
+        ]
+        assert len(warn_records) == 1, [r.message for r in caplog.records]
