@@ -82,6 +82,15 @@ class OutputState:
     # cowalk. Keyed by the stdenv root ``(hash, name)`` so a stdenv
     # referenced from many variants captures once.
     stdenv_subtrees: dict[tuple[str, str], dict] = field(default_factory=dict)
+    # Per-template list of node_ids whose ``TemplateNode.is_toolchain``
+    # flag is set. Computed post-pass in ``finalize()`` (the cowalk
+    # short-circuits toolchain subtrees, so ``arr.hashes`` rows at
+    # those node_ids stay empty — consumers that need to wire toolchain
+    # idents back to nodes use this map instead of scraping hashes).
+    # Keys are positional ``template_id`` indices into ``templates``.
+    toolchain_node_ids_per_template: dict[int, list[int]] = field(
+        default_factory=dict
+    )
     # Lax-mode shape-violation log.
     violations: list[dict] = field(default_factory=list)
 
