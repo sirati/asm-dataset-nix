@@ -252,10 +252,11 @@ def _eval_jobs_for_arch(
     arch: str,
     suffixes: list[str],
     *,
+    flake_ref: str,
     run_subprocess: RunSubprocess,
 ) -> dict[str, str]:
-    """Run ``nix-eval-jobs`` for ``<attr>.<arch>`` filtered by
-    ``suffixes`` and return ``{suffix: drvPath}``.
+    """Run ``nix-eval-jobs`` for ``<flake_ref>#<attr>.<arch>`` filtered
+    by ``suffixes`` and return ``{suffix: drvPath}``.
 
     Mirrors the ``--select intersectAttrs`` pattern from
     ``preflight._eval_drv_paths_for_suffixes`` so the wire form
@@ -284,7 +285,7 @@ def _eval_jobs_for_arch(
     argv: list[str] = [
         "nix-eval-jobs",
         "--flake",
-        f"{attr}.{arch}",
+        f"{flake_ref}#{attr}.{arch}",
         "--select",
         select_expr,
         "--max-jobs",
@@ -650,6 +651,7 @@ def run_eval_task(
             attr,
             arch,
             sampled_suffixes,
+            flake_ref=flake_ref,
             run_subprocess=runner,
         )
 

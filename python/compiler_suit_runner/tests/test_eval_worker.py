@@ -364,8 +364,8 @@ def test_run_eval_task_happy_path(tmp_path: pathlib.Path) -> None:
     assert len(eval_calls) == 2
     flake_args = sorted(c[2] for c in eval_calls)
     assert flake_args == [
-        "dataset.x86_64-linux.hello.aarch64",
-        "dataset.x86_64-linux.hello.x86_64",
+        ".#dataset.x86_64-linux.hello.aarch64",
+        ".#dataset.x86_64-linux.hello.x86_64",
     ]
     # The --select expression must use intersectAttrs with both suffixes.
     for c in eval_calls:
