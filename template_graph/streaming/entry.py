@@ -2,7 +2,7 @@
 
 ``plan_from_tree_streaming(tree_text, *, archs=...)`` constructs a
 ``StreamPlanner``, feeds it line-by-line, finalizes, and returns the
-result dict (same shape as ``core.plan_phase1_graph``).
+planner output dict (see ``template_graph.streaming`` for the shape).
 """
 
 from __future__ import annotations

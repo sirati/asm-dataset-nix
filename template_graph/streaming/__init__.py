@@ -1,8 +1,8 @@
 """Single-pass streaming planner over `nix-store --query --tree` output.
 
-Replaces the two-phase (walk → plan_phase1_graph) approach: we never
-call ``nix derivation show`` because every drv's immediate inputs are
-already present in the tree (as direct children at depth+1). The
+We never call ``nix derivation show`` because every drv's immediate
+inputs are already present in the tree (as direct children at
+depth+1). The
 algorithm walks the output line-by-line, opens a per-variant RawTree
 buffer when it enters a matrix variant subtree, and as soon as ANY
 arch accumulates two raw trees we build the template from that
@@ -33,7 +33,7 @@ This subpackage replaces the legacy single-file ``streaming.py``:
 Public surface (re-exported here for back-compat):
     StreamPlanner — instantiate, feed lines via .feed_line(), call .finalize().
     plan_from_tree_streaming(tree_text, *, archs=...) -> dict
-        Same return shape as ``core.plan_phase1_graph``:
+        Returns the planner output dict:
             { templates, variant_arrays, placement,
               common_deps_per_arch_template,
               toolchain_drvs, arch_indep_deps }

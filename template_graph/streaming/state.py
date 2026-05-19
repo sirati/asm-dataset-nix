@@ -60,9 +60,8 @@ class RawTreeNode:
 
 @dataclass
 class OutputState:
-    """Outputs the planner produces by the end. Same shape as
-    ``plan_phase1_graph``'s return dict (plus ``stdenv_subtrees`` and
-    ``violations``)."""
+    """Outputs the planner produces by the end. The planner return
+    dict, plus ``stdenv_subtrees`` and ``violations``."""
     templates: list[Template] = field(default_factory=list)
     variant_arrays: dict[tuple[int, str], VariantArray] = field(
         default_factory=dict
