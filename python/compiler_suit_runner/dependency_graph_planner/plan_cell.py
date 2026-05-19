@@ -208,7 +208,6 @@ def _plan_cell(
     templates: Sequence[Any],
     classification_map: Mapping[tuple[int, str], Mapping[int, str]],
     toolchain_node_ids: Mapping[int, Sequence[int]],
-    toolchain_idents_by_name: Mapping[str, Sequence[tuple[str, str]]],
     toolchain_task_ids: Mapping[str, str],
     variant_lookup: Mapping[tuple[str, str], Mapping[str, Any]],
     arch_indep_dep_task_ids: Sequence[str],

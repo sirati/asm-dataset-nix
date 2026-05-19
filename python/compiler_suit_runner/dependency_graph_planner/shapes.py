@@ -222,42 +222,15 @@ def _coerce_toolchain_node_ids(raw: Any) -> dict[int, list[int]]:
     return out
 
 
-def _toolchain_idents_by_name(raw: Any) -> dict[str, list[tuple[str, str]]]:
-    """Index ``out.toolchain_drvs`` by drv ``name`` for fast role-lookup.
-
-    The cowalk short-circuits toolchain subtrees so ``arr.hashes`` rows
-    at toolchain node_ids are empty (E6). Instead, we resolve each
-    toolchain TemplateNode's role to one or more ``(hash, name)`` idents
-    by matching on the post-hash drv name carried in
-    ``out.toolchain_drvs``. Multiple compiler versions can share a
-    unified wrapper role (``wrapped-compiler-suit.drv``) so the map
-    value is a LIST: every matching ident's task_id gets wired into
-    each variant's ``depends_on``. Over-wiring is harmless (the
-    variant waits on extra ``build_compilers__*`` tasks that would
-    have been built anyway); under-wiring would break the build by
-    starting a variant before its compiler is ready.
-    """
-    out: dict[str, list[tuple[str, str]]] = {}
-    if not raw:
-        return out
-    for entry in raw:
-        ident = _coerce_ident(entry)
-        if ident is None:
-            continue
-        out.setdefault(ident[1], []).append(ident)
-    return out
-
-
 def _toolchain_ident_strs(raw: Any) -> frozenset[str]:
     """Project ``out.toolchain_drvs`` to a ``frozenset`` of
     ``"<hash>-<name>"`` strings.
 
-    Replaces the role-name keyed :func:`_toolchain_idents_by_name`
-    lookup for the meta-pass toolchain-position check: a MetaTemplate
-    position is a toolchain position iff its ident string appears in
-    this set. Direct ident match avoids the role-collapse conflation
-    that bit the old keyed-by-name path (multiple compilers folding
-    onto ``wrapped-compiler-suit.drv``).
+    The meta-pass tests for toolchain positions by direct ident-string
+    match; per-variant resolution in ``plan_cell`` and ``plan_meta``
+    composes the canonical ``build_compilers__<sys>__<arch>__<comp>``
+    task_id from the variant's parsed drv name, so no role-name index
+    is needed.
     """
     out: set[str] = set()
     if not raw:

@@ -28,7 +28,6 @@ from .shapes import (
     _iter_classifications,
     _iter_variant_arrays,
     _toolchain_ident_strs,
-    _toolchain_idents_by_name,
 )
 
 
@@ -76,7 +75,6 @@ def plan_phase4_for_binary(
         streaming_result.get("toolchain_node_ids_per_template", {})
     )
     toolchain_drvs_raw = streaming_result.get("toolchain_drvs", set())
-    toolchain_idents_by_name = _toolchain_idents_by_name(toolchain_drvs_raw)
     toolchain_drv_idents = _toolchain_ident_strs(toolchain_drvs_raw)
     arch_indep_deps_raw = streaming_result.get("arch_indep_deps", {}) or {}
 
@@ -145,7 +143,6 @@ def plan_phase4_for_binary(
             templates=templates,
             classification_map=classification_map,
             toolchain_node_ids=toolchain_node_ids,
-            toolchain_idents_by_name=toolchain_idents_by_name,
             toolchain_task_ids=toolchain_task_ids,
             variant_lookup=variant_lookup,
             arch_indep_dep_task_ids=arch_indep_dep_task_ids,
