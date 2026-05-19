@@ -519,7 +519,7 @@ class TestEmptyInput:
 
 class TestPlanFromGraphMultiBinary:
 
-    def test_two_binaries_concatenated_in_name_order(self):
+    def test_two_binaries_variants_in_name_order(self):
         def _make(binary: str):
             template = _template([_node(f"{binary}-root", [])])
             arr = _variant_array(
@@ -545,13 +545,113 @@ class TestPlanFromGraphMultiBinary:
             BinaryPlanInput("hello", hb, hlookup),
             BinaryPlanInput("busybox", sb, slookup),
         ])
-        binaries_seen = [d.payload.get("binary") or d.payload.get("pkg") for d in descs]
-        # busybox descriptors come first.
-        busybox_indices = [i for i, b in enumerate(binaries_seen) if b == "busybox"]
-        hello_indices = [i for i, b in enumerate(binaries_seen) if b == "hello"]
-        assert busybox_indices, descs
-        assert hello_indices, descs
-        assert max(busybox_indices) < min(hello_indices)
+        # Common-deps come first, deduped across binaries and sorted by
+        # task_id; variants come after, in binary-name order.
+        variants = [d for d in descs if d.kind == "build_variant"]
+        variant_binaries = [v.payload.get("pkg") for v in variants]
+        busybox_idx = [i for i, b in enumerate(variant_binaries) if b == "busybox"]
+        hello_idx = [i for i, b in enumerate(variant_binaries) if b == "hello"]
+        assert busybox_idx, descs
+        assert hello_idx, descs
+        assert max(busybox_idx) < min(hello_idx)
+
+    def test_shared_common_dep_collapses_across_binaries(self):
+        """Two binaries whose templates both touch the SAME shared
+        sub-drv (same ident) must produce ONE build_common_dep
+        descriptor, and BOTH binaries' variants must depend on its
+        task_id.
+        """
+        # Both binaries' templates have a node 1 classified as
+        # common_dep with ident ``shareh-libshared.drv`` — that single
+        # ident is the dedup pivot.
+        def _make(binary: str):
+            template = _template([
+                _node(f"{binary}-root", [1]),
+                _node("libshared", []),
+            ])
+            arr = _variant_array(
+                template_id=0, arch="x86_64",
+                variants=[f"gcc15-{binary}"],
+                hashes=[
+                    [(f"rooth-{binary}", f"{binary}.drv")],
+                    [("shareh", "libshared.drv")],
+                ],
+            )
+            return {
+                "templates": [template],
+                "variant_arrays": {(0, "x86_64"): arr},
+                "common_deps_per_arch_template": {
+                    (0, "x86_64"): {
+                        0: "variant_specific",
+                        1: "common_dep",
+                    },
+                },
+            }, {
+                ("x86_64", f"gcc15-{binary}"): _variant_spec(
+                    f"gcc15-{binary}", binary, "x86_64",
+                ),
+            }
+
+        hb, hlookup = _make("hello")
+        sb, slookup = _make("busybox")
+        descs = plan_phase4_from_graph([
+            BinaryPlanInput("hello", hb, hlookup),
+            BinaryPlanInput("busybox", sb, slookup),
+        ])
+        common = [d for d in descs if d.kind == "build_common_dep"]
+        variants = [d for d in descs if d.kind == "build_variant"]
+        # ONE descriptor for the shared sub-drv even though both
+        # binaries' templates carry the same node.
+        assert len(common) == 1, [d.task_id for d in common]
+        cd_id = common[0].task_id
+        assert cd_id == "build_common_dep__shareh-libshared.drv"
+        # Both variants point at the dedup'd task_id.
+        assert len(variants) == 2
+        for v in variants:
+            assert cd_id in v.depends_on, v
+
+    def test_dedup_is_stable_across_runs(self):
+        """Two consecutive plan calls with the same inputs (passed in
+        differing order) produce the same descriptor list — common-deps
+        sorted deterministically by task_id, variants in binary-name
+        order.
+        """
+        def _make(binary: str):
+            template = _template([
+                _node(f"{binary}-root", [1]),
+                _node("libshared", []),
+            ])
+            arr = _variant_array(
+                template_id=0, arch="x86_64",
+                variants=[f"gcc15-{binary}"],
+                hashes=[
+                    [(f"rooth-{binary}", f"{binary}.drv")],
+                    [("shareh", "libshared.drv")],
+                ],
+            )
+            return {
+                "templates": [template],
+                "variant_arrays": {(0, "x86_64"): arr},
+                "common_deps_per_arch_template": {
+                    (0, "x86_64"): {0: "variant_specific", 1: "common_dep"},
+                },
+            }, {
+                ("x86_64", f"gcc15-{binary}"): _variant_spec(
+                    f"gcc15-{binary}", binary, "x86_64",
+                ),
+            }
+
+        hb, hlookup = _make("hello")
+        sb, slookup = _make("busybox")
+        a = plan_phase4_from_graph([
+            BinaryPlanInput("hello", hb, hlookup),
+            BinaryPlanInput("busybox", sb, slookup),
+        ])
+        b = plan_phase4_from_graph([
+            BinaryPlanInput("busybox", sb, slookup),
+            BinaryPlanInput("hello", hb, hlookup),
+        ])
+        assert a == b
 
 
 # ---------------------------------------------------------------------------
