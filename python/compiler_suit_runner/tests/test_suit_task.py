@@ -8,6 +8,12 @@ The watcher's ``_fire`` runs the dependency_graph_worker as a
 subprocess and feeds its output into ``primary_handle.spawn_tasks``;
 the tests below substitute the subprocess + (optionally) the spawn
 handle so the bookkeeping side is testable hermetically.
+
+Post-pickle-migration the worker writes ``_dependency_graph.pkl``
+(typed dataclass list) and the watcher's operator-debug helper writes
+``_dependency_graph_headers.json`` (ManifestHeader view). The two
+files have disjoint names so tests can seed the read-path without
+clashing with assertions on the write-path.
 """
 
 from __future__ import annotations
@@ -35,6 +41,23 @@ from compiler_suit_runner.suit_task import (
     SuitTaskConfig,
     _MatrixEvalQuiesceWatcher,
 )
+from compiler_suit_runner.workers.dependency_graph_worker.output import (
+    DEPENDENCY_GRAPH_PICKLE,
+    write_phase4_descriptors,
+)
+
+
+def _seed_empty_dependency_graph_pickle(out_dir: pathlib.Path) -> None:
+    """Seed an empty ``_dependency_graph.pkl`` under ``out_dir``.
+
+    Mirrors what the worker subprocess would have produced on a no-op
+    matrix; the watcher's read step finds the file and proceeds with
+    an empty descriptor list.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_phase4_descriptors(
+        descriptors=[], summary={}, out_path=out_dir / DEPENDENCY_GRAPH_PICKLE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -209,11 +232,8 @@ def test_watcher_fires_when_complete(
     toolchain_drv = "/nix/store/c-gcc15.drv"
     toolchain_id = build_compilers_task_id(_SYS, "x86_64", "gcc15")
 
-    # Pre-seed an empty dependency_graph.json so the read step is a no-op.
-    (out_dir / "_dependency_graph.json").write_text(
-        json.dumps({"phase4_descriptors": []}),
-        encoding="utf-8",
-    )
+    # Pre-seed an empty _dependency_graph.pkl so the read step is a no-op.
+    _seed_empty_dependency_graph_pickle(out_dir)
 
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={hello},
@@ -237,9 +257,7 @@ def test_watcher_is_idempotent_on_duplicate_completion(
     busybox = matrix_eval_task_id("busybox")
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    (out_dir / "_dependency_graph.json").write_text(
-        json.dumps({"phase4_descriptors": []}), encoding="utf-8",
-    )
+    _seed_empty_dependency_graph_pickle(out_dir)
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={hello, busybox},
         out_dir=out_dir,
@@ -316,9 +334,7 @@ def test_import_matrix_eval_archives_walks_both_dirs(
     )
 
     hello = matrix_eval_task_id("hello")
-    (matrix_eval_dir / "_dependency_graph.json").write_text(
-        json.dumps({"phase4_descriptors": []}), encoding="utf-8",
-    )
+    _seed_empty_dependency_graph_pickle(matrix_eval_dir)
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={hello},
         out_dir=matrix_eval_dir,
@@ -410,50 +426,51 @@ def test_fire_invokes_dependency_graph_subprocess_and_spawns(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Happy path: _fire runs the subprocess override, reads the
-    descriptor list from _dependency_graph.json, and feeds the
+    descriptor list from _dependency_graph.pkl, and feeds the
     translated headers to primary_handle.spawn_tasks."""
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     # Seed a non-empty descriptor list on disk; the subprocess is a
-    # no-op so we control the input directly.
-    descriptors_payload = {
-        "phase4_descriptors": [
-            {
-                "kind": "build_common_dep",
-                "task_id": "build_common_dep__hello__x86_64__abc-glibc",
-                "name": "build_common_dep__hello__x86_64__glibc",
-                "payload": {
-                    "sys": _SYS,
-                    "binary": "hello",
-                    "arch": "x86_64",
-                    "ident": "abc-glibc",
-                    "node_name": "glibc",
-                    "node_id": 0,
-                    "attr": "abc-glibc",
-                },
-                "depends_on": [],
+    # no-op so we control the input directly. Typed dataclasses survive
+    # the pickle roundtrip so the watcher's loader returns them as-is.
+    descriptors = [
+        Phase4Descriptor(
+            kind="build_common_dep",
+            task_id="build_common_dep__hello__x86_64__abc-glibc",
+            name="build_common_dep__hello__x86_64__glibc",
+            payload={
+                "sys": _SYS,
+                "binary": "hello",
+                "arch": "x86_64",
+                "ident": "abc-glibc",
+                "node_name": "glibc",
+                "node_id": 0,
+                "attr": "abc-glibc",
             },
-            {
-                "kind": "build_variant",
-                "task_id": "build_variant__x86_64-linux__hello__hello-x86_64-gcc15-O2",
-                "name": "build_variant__hello__hello-x86_64-gcc15-O2",
-                "payload": {
-                    "sys": _SYS,
-                    "pkg": "hello",
-                    "arch": "x86_64",
-                    "label": "hello-x86_64-gcc15-O2",
-                    "compiler_id": "gcc15",
-                    "drv": "/nix/store/v.drv",
-                    "tier": 1,
-                },
-                "depends_on": [
-                    "build_common_dep__hello__x86_64__abc-glibc",
-                ],
+            depends_on=(),
+        ),
+        Phase4Descriptor(
+            kind="build_variant",
+            task_id="build_variant__x86_64-linux__hello__hello-x86_64-gcc15-O2",
+            name="build_variant__hello__hello-x86_64-gcc15-O2",
+            payload={
+                "sys": _SYS,
+                "pkg": "hello",
+                "arch": "x86_64",
+                "label": "hello-x86_64-gcc15-O2",
+                "compiler_id": "gcc15",
+                "drv": "/nix/store/v.drv",
+                "tier": 1,
             },
-        ]
-    }
-    (out_dir / "_dependency_graph.json").write_text(
-        json.dumps(descriptors_payload), encoding="utf-8",
+            depends_on=(
+                "build_common_dep__hello__x86_64__abc-glibc",
+            ),
+        ),
+    ]
+    write_phase4_descriptors(
+        descriptors=descriptors,
+        summary={"descriptor_count": 2},
+        out_path=out_dir / DEPENDENCY_GRAPH_PICKLE,
     )
 
     runs: list[list[str]] = []
@@ -539,7 +556,7 @@ def test_fire_logs_and_degrades_when_descriptors_missing(
     subprocess run, we log + skip spawn."""
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    # No _dependency_graph.json file.
+    # No _dependency_graph.pkl file.
     handle = mock.MagicMock()
     logger = logging.getLogger("test_fire_no_descriptors")
     hello = matrix_eval_task_id("hello")
@@ -557,7 +574,7 @@ def test_fire_logs_and_degrades_when_descriptors_missing(
         w.on_task_completed(hello)
     handle.spawn_tasks.assert_not_called()
     assert any(
-        "cannot read" in rec.message and "_dependency_graph.json" in rec.message
+        "cannot read" in rec.message and "_dependency_graph.pkl" in rec.message
         for rec in caplog.records
     )
 
@@ -570,9 +587,7 @@ def test_fire_argv_includes_toolchain_drv_and_task_id_mappings(
     sorted-drv order for determinism."""
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    (out_dir / "_dependency_graph.json").write_text(
-        json.dumps({"phase4_descriptors": []}), encoding="utf-8",
-    )
+    _seed_empty_dependency_graph_pickle(out_dir)
     runs: list[list[str]] = []
 
     def fake_run(argv: list[str]) -> subprocess.CompletedProcess:
@@ -621,8 +636,8 @@ def test_spawn_tasks_no_handle_writes_dependency_graph_and_logs_count(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
     """With ``primary_handle=None`` the spawn path falls back to
-    writing ``_dependency_graph.json`` (the headers view) and emits
-    an INFO log explaining the degradation."""
+    writing ``_dependency_graph_headers.json`` (the operator-debug
+    headers view) and emits an INFO log explaining the degradation."""
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     logger = logging.getLogger("test_spawn_no_handle")
@@ -639,7 +654,7 @@ def test_spawn_tasks_no_handle_writes_dependency_graph_and_logs_count(
     ]
     with caplog.at_level(logging.INFO, logger="test_spawn_no_handle"):
         w._spawn_tasks(headers)
-    graph_path = out_dir / "_dependency_graph.json"
+    graph_path = out_dir / "_dependency_graph_headers.json"
     assert graph_path.is_file()
     parsed = json.loads(graph_path.read_text(encoding="utf-8"))
     assert isinstance(parsed, list)
@@ -668,7 +683,7 @@ def test_spawn_tasks_no_handle_creates_missing_out_dir(
         primary_handle=None,
     )
     w._spawn_tasks([])
-    assert (out_dir / "_dependency_graph.json").is_file()
+    assert (out_dir / "_dependency_graph_headers.json").is_file()
 
 
 def test_spawn_tasks_with_handle_calls_primary_handle(
@@ -701,7 +716,7 @@ def test_spawn_tasks_with_handle_calls_primary_handle(
     assert ti0.payload["item_class"] == "build_common_dep"
     ti1 = task_infos[1]
     assert ti1.payload["item_class"] == "build_variant"
-    assert (out_dir / "_dependency_graph.json").is_file()
+    assert (out_dir / "_dependency_graph_headers.json").is_file()
     assert any(
         "spawn_tasks dispatched 2 task(s) with 0 error(s)" in rec.message
         for rec in caplog.records
@@ -1520,9 +1535,7 @@ def test_task_completed_listener_forwards_to_watcher(
     hello = matrix_eval_task_id("hello")
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    (out_dir / "_dependency_graph.json").write_text(
-        json.dumps({"phase4_descriptors": []}), encoding="utf-8",
-    )
+    _seed_empty_dependency_graph_pickle(out_dir)
     watcher = _MatrixEvalQuiesceWatcher(
         expected_task_ids={hello},
         out_dir=out_dir,

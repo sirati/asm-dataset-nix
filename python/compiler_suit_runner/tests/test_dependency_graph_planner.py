@@ -1008,16 +1008,20 @@ class TestPlanFromGraphMultiBinary:
 
 
 # ---------------------------------------------------------------------------
-# JSON-roundtripped streaming result (worker writes _dependency_graph.json,
-# adapter reads it back).
+# List-coerced streaming result (legacy JSON-roundtripped shape). The
+# planner stays tolerant of this form so callers that route the
+# streaming result through any list-coercing serialisation layer keep
+# working; the production worker now pickles dataclasses directly, but
+# the shape-tolerance has independent value.
 # ---------------------------------------------------------------------------
 
 
 class TestJsonRoundtrippedInput:
-    """The plan calls for ``dependency_graph_worker`` to write a JSON
-    snapshot; the planner consumes the same shape after a round-trip.
-    Tuples become lists, dict keys become strings ("3|x86_64"), node
-    ids become string keys in the classification dict."""
+    """The planner consumes both the native streaming result and a
+    list-coerced form (tuples become lists, dict keys become strings
+    ("3|x86_64"), node ids become string keys in the classification
+    dict). This used to be the on-disk worker shape; today it's a
+    backwards-compat guarantee for the planner adapter."""
 
     def test_string_keys_and_list_idents(self):
         template = _template([_node("root", [])])
@@ -1802,14 +1806,16 @@ class TestPriorityHintOnMetaDescriptors:
         assert by_id[d_hi.task_id].priority_hint == 10
         assert by_id[d_lo.task_id].priority_hint == 0
 
-    def test_priority_hint_roundtrips_via_json(self):
-        """:func:`load_descriptors_from_json` recovers ``priority_hint``
-        from the dataclass-asdict on-disk shape so the watcher reads
-        back what the dependency-graph worker wrote."""
-        import dataclasses
-
+    def test_priority_hint_roundtrips_via_pickle(self, tmp_path):
+        """:func:`load_phase4_descriptors` recovers ``priority_hint``
+        from the on-disk pickle so the watcher reads back what the
+        dependency-graph worker wrote."""
         from compiler_suit_runner.dependency_graph_planner import (
-            load_descriptors_from_json,
+            load_phase4_descriptors,
+        )
+        from compiler_suit_runner.workers.dependency_graph_worker.output import (
+            DEPENDENCY_GRAPH_PICKLE,
+            write_phase4_descriptors,
         )
 
         original = Phase4Descriptor(
@@ -1819,7 +1825,10 @@ class TestPriorityHintOnMetaDescriptors:
             payload={"sys": "x86_64-linux", "arch": "cross_arch"},
             priority_hint=10,
         )
-        wire = {"phase4_descriptors": [dataclasses.asdict(original)]}
-        recovered = load_descriptors_from_json(wire)
+        out_path = tmp_path / DEPENDENCY_GRAPH_PICKLE
+        write_phase4_descriptors(
+            descriptors=[original], summary={}, out_path=out_path,
+        )
+        recovered, _summary = load_phase4_descriptors(out_path)
         assert len(recovered) == 1
         assert recovered[0].priority_hint == 10

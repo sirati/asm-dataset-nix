@@ -12,7 +12,7 @@ The signal we assert against is the watcher's on-disk dump: at
 matrix_eval quiesce, ``_MatrixEvalQuiesceWatcher._dump_dependency_graph``
 (see ``suit_task.py``) serialises the synthesised
 :class:`ManifestHeader` list to
-``<matrix_eval_out_dir>/_dependency_graph.json``. Reading that file
+``<matrix_eval_out_dir>/_dependency_graph_headers.json``. Reading that file
 post-run gives the test full visibility into the synthesised DAG
 independent of whether ``primary_handle.spawn_tasks`` actually fired
 (the dump is unconditional; the spawn is gated on a bound
@@ -22,7 +22,7 @@ What this test asserts:
 
 * Run completes cleanly (standard 7-invariant audit;
   ``expected_failure_count=0``).
-* ``_dependency_graph.json`` exists under
+* ``_dependency_graph_headers.json`` exists under
   ``<matrix_eval_out_dir>`` (defaults to
   ``<shared_fs>/dataset/_matrix_eval``).
 * The JSON is a list of header dicts; at least one entry has
@@ -133,7 +133,7 @@ def _candidate_graph_paths(
     shared_fs: pathlib.Path,
     log_dir: Optional[pathlib.Path],
 ) -> list[pathlib.Path]:
-    """Return every plausible location for ``_dependency_graph.json``.
+    """Return every plausible location for ``_dependency_graph_headers.json``.
 
     The watcher writes to the configured ``matrix_eval_out_dir`` —
     which defaults to ``<shared_fs>/dataset/_matrix_eval`` per
@@ -143,13 +143,13 @@ def _candidate_graph_paths(
     to a recursive scan so the test stays robust to wiring changes.
     """
     candidates: list[pathlib.Path] = [
-        shared_fs / "dataset" / "_matrix_eval" / "_dependency_graph.json",
-        shared_fs / "dataset" / "_dependency_graph.json",
-        shared_fs / "out" / "_dependency_graph.json",
-        shared_fs / "_dependency_graph.json",
+        shared_fs / "dataset" / "_matrix_eval" / "_dependency_graph_headers.json",
+        shared_fs / "dataset" / "_dependency_graph_headers.json",
+        shared_fs / "out" / "_dependency_graph_headers.json",
+        shared_fs / "_dependency_graph_headers.json",
     ]
     if log_dir is not None:
-        candidates.append(log_dir / "_dependency_graph.json")
+        candidates.append(log_dir / "_dependency_graph_headers.json")
     return candidates
 
 
@@ -166,13 +166,13 @@ def _find_graph_file(
     # candidate list and the framework's actual output_dir shows up
     # here rather than as an opaque AssertionError.
     if shared_fs.is_dir():
-        for hit in shared_fs.rglob("_dependency_graph.json"):
+        for hit in shared_fs.rglob("_dependency_graph_headers.json"):
             return hit
     return None
 
 
 def _parse_graph(path: pathlib.Path) -> list[dict[str, Any]]:
-    """Decode ``_dependency_graph.json`` into the header-dict list.
+    """Decode ``_dependency_graph_headers.json`` into the header-dict list.
 
     :meth:`_MatrixEvalQuiesceWatcher._dump_dependency_graph`
     serialises each :class:`ManifestHeader` as a JSON object with
@@ -224,7 +224,7 @@ def test_t23_dependency_graph_common_dep_dedup(
     extra CLI flag is required to engage it.
 
     Post-flight: standard 7-invariant audit, then locate the
-    watcher's ``_dependency_graph.json`` under the shared FS, parse
+    watcher's ``_dependency_graph_headers.json`` under the shared FS, parse
     it, and assert:
 
     * ≥ 1 ``build_common_dep`` task was emitted.
@@ -346,7 +346,7 @@ def test_t23_dependency_graph_common_dep_dedup(
     # ------------------------------------------------------------------
     graph_path = _find_graph_file(invocation.shared_fs, result.log_dir)
     assert graph_path is not None, (
-        f"_dependency_graph.json not found under "
+        f"_dependency_graph_headers.json not found under "
         f"{invocation.shared_fs!s}; checked candidates: "
         + ", ".join(
             str(c) for c in _candidate_graph_paths(

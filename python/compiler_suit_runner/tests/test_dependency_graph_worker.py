@@ -11,7 +11,8 @@ Coverage:
   * matrix_eval header reader (defensive secondary discovery);
   * kept-drv discovery precedence (sidecar > header > empty + warn);
   * import_archive happy + missing-file + subprocess-failure paths;
-  * write_dependency_graph_json roundtrip (dataclass + dict descriptors);
+  * write_phase4_descriptors roundtrip (descriptor + summary), including
+    the ``_dependency_graph_summary.txt`` companion file shape;
   * --toolchain-task-id parser;
   * end-to-end run_dependency_graph_task with stubbed planner +
     sum-drv builder + subprocess;
@@ -21,7 +22,6 @@ Coverage:
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import pathlib
 from typing import Any, Optional
@@ -313,15 +313,25 @@ class TestImportArchive:
 
 
 # ---------------------------------------------------------------------------
-# write_dependency_graph_json
+# write_phase4_descriptors / write_phase4_summary_text
 # ---------------------------------------------------------------------------
 
 
-class TestWriteDependencyGraphJson:
+class TestWritePhase4Descriptors:
+    """Phase 6 pickle migration: the worker writes typed
+    :class:`Phase4Descriptor` instances to ``_dependency_graph.pkl`` so
+    the watcher (via ``load_phase4_descriptors``) gets them back with
+    zero re-tupling. A human-readable
+    ``_dependency_graph_summary.txt`` companion is written alongside.
+    """
 
     def test_dataclass_descriptors_roundtrip(
         self, tmp_path: pathlib.Path,
     ):
+        from compiler_suit_runner.dependency_graph_planner import (
+            load_phase4_descriptors,
+        )
+
         descriptors = [
             Phase4Descriptor(
                 kind="build_common_dep",
@@ -338,30 +348,60 @@ class TestWriteDependencyGraphJson:
                 depends_on=("cd_1",),
             ),
         ]
-        out = dgw.write_dependency_graph_json(
-            tmp_path / "_dependency_graph.json", descriptors,
+        out_path = tmp_path / dgw.DEPENDENCY_GRAPH_PICKLE
+        out = dgw.write_phase4_descriptors(
+            descriptors=descriptors,
+            summary={"binary_count": 1, "descriptor_count": 2},
+            out_path=out_path,
         )
-        loaded = json.loads(out.read_text(encoding="utf-8"))
-        assert "phase4_descriptors" in loaded
-        descs = loaded["phase4_descriptors"]
-        assert len(descs) == 2
-        assert descs[0]["kind"] == "build_common_dep"
-        assert descs[1]["depends_on"] == ["cd_1"]  # tuple → list in JSON
-
-    def test_dict_descriptors_roundtrip(self, tmp_path: pathlib.Path):
-        out = dgw.write_dependency_graph_json(
-            tmp_path / "out.json",
-            [{"kind": "x", "task_id": "y", "depends_on": ()}],
-        )
-        loaded = json.loads(out.read_text(encoding="utf-8"))
-        assert loaded["phase4_descriptors"][0]["kind"] == "x"
+        assert out == out_path
+        recovered, summary = load_phase4_descriptors(out_path)
+        assert len(recovered) == 2
+        # Typed dataclasses survive the pickle roundtrip — no list
+        # coercion, no string-keyed dicts.
+        assert recovered[0].kind == "build_common_dep"
+        assert recovered[0].task_id == "cd_1"
+        assert recovered[1].depends_on == ("cd_1",)
+        assert summary == {"binary_count": 1, "descriptor_count": 2}
 
     def test_empty_list_writes_valid_file(self, tmp_path: pathlib.Path):
-        out = dgw.write_dependency_graph_json(
-            tmp_path / "out.json", [],
+        from compiler_suit_runner.dependency_graph_planner import (
+            load_phase4_descriptors,
         )
-        loaded = json.loads(out.read_text(encoding="utf-8"))
-        assert loaded == {"phase4_descriptors": []}
+
+        out_path = tmp_path / dgw.DEPENDENCY_GRAPH_PICKLE
+        dgw.write_phase4_descriptors(
+            descriptors=[],
+            summary={},
+            out_path=out_path,
+        )
+        recovered, summary = load_phase4_descriptors(out_path)
+        assert recovered == []
+        assert summary == {}
+
+    def test_summary_text_companion(self, tmp_path: pathlib.Path):
+        """The summary-text writer emits a ``key: value`` per line
+        sorted by key for diff-friendly operator inspection."""
+        out_path = tmp_path / dgw.DEPENDENCY_GRAPH_SUMMARY
+        dgw.write_phase4_summary_text(
+            summary={"templates": 2, "binaries": "a/b", "violations": 0},
+            out_path=out_path,
+        )
+        text = out_path.read_text(encoding="utf-8")
+        # Sorted-by-key emission keeps diff-noise low.
+        assert text == "binaries: a/b\ntemplates: 2\nviolations: 0\n"
+
+    def test_atomic_write_no_tmp_left_behind(
+        self, tmp_path: pathlib.Path,
+    ):
+        """The writer routes through ``<path>.tmp`` + ``os.replace``;
+        a successful write leaves no stray ``.tmp`` file."""
+        out_path = tmp_path / dgw.DEPENDENCY_GRAPH_PICKLE
+        dgw.write_phase4_descriptors(
+            descriptors=[], summary={}, out_path=out_path,
+        )
+        tmp_files = list(tmp_path.glob("*.tmp"))
+        assert tmp_files == []
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +455,9 @@ class TestRunDependencyGraphTask:
     def test_empty_matrix_dir_writes_empty_graph(
         self, tmp_path: pathlib.Path,
     ):
+        from compiler_suit_runner.dependency_graph_planner import (
+            load_phase4_descriptors,
+        )
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
         result = dgw.run_dependency_graph_task(
@@ -425,8 +468,12 @@ class TestRunDependencyGraphTask:
         )
         assert result.binary_count == 0
         assert result.descriptor_count == 0
-        loaded = json.loads(result.output_path.read_text(encoding="utf-8"))
-        assert loaded == {"phase4_descriptors": []}
+        # ``output_path`` is the pickle; the loader recovers the empty
+        # descriptor list and the descriptor-derived summary fields.
+        descriptors, summary = load_phase4_descriptors(result.output_path)
+        assert descriptors == []
+        assert summary["binary_count"] == 0
+        assert summary["descriptor_count"] == 0
 
     def test_end_to_end_single_binary(
         self, tmp_path: pathlib.Path, monkeypatch,
@@ -509,10 +556,13 @@ class TestRunDependencyGraphTask:
         assert plan_calls[0]["binaries"] == ["hello"]
         # nix-store --import was invoked (paths not locally present).
         assert any(c[:2] == ["nix-store", "--import"] for c in stub.calls)
-        # _dependency_graph.json was written.
-        loaded = json.loads(result.output_path.read_text(encoding="utf-8"))
-        assert len(loaded["phase4_descriptors"]) == 1
-        assert loaded["phase4_descriptors"][0]["task_id"] == "bv_hello"
+        # _dependency_graph.pkl was written.
+        from compiler_suit_runner.dependency_graph_planner import (
+            load_phase4_descriptors,
+        )
+        descriptors, _summary = load_phase4_descriptors(result.output_path)
+        assert len(descriptors) == 1
+        assert descriptors[0].task_id == "bv_hello"
 
     def test_skip_import_when_all_locally_present(
         self, tmp_path: pathlib.Path, monkeypatch,
@@ -713,10 +763,11 @@ class TestRunDependencyGraphTask:
         )
         # Only world was planned.
         assert result.binary_count == 1
-        loaded = json.loads(result.output_path.read_text(encoding="utf-8"))
-        assert {d["task_id"] for d in loaded["phase4_descriptors"]} == {
-            "bv_world",
-        }
+        from compiler_suit_runner.dependency_graph_planner import (
+            load_phase4_descriptors,
+        )
+        descriptors, _summary = load_phase4_descriptors(result.output_path)
+        assert {d.task_id for d in descriptors} == {"bv_world"}
 
 
 # ---------------------------------------------------------------------------
