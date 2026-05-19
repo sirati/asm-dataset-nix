@@ -7,6 +7,7 @@ The cowalk algorithm and orchestrator live in
 ``template_graph.streaming``.
 """
 
+from template_graph.graph.meta_template import MetaTemplate
 from template_graph.graph.template import (
     Template,
     TemplateNode,
@@ -17,6 +18,7 @@ from template_graph.graph.template import (
 from template_graph.graph.variant_array import VariantArray
 
 __all__ = [
+    "MetaTemplate",
     "Template",
     "TemplateNode",
     "TemplateGraphAssertError",
