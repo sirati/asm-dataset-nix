@@ -533,6 +533,22 @@ def _export_kept_closure(
 # ---------------------------------------------------------------------------
 
 
+_CONTAINER_FLAKE_MOUNT = "/app/src-network"
+
+
+def _resolve_flake_ref(flake_ref: str) -> str:
+    """When the worker runs inside the dynamic_runner secondary container
+    the CWD is ``/app`` (no flake.nix). The framework bind-mounts the
+    flake source at ``/app/src-network`` (Bug-F convention). A submitter-
+    side ``flake_ref="."`` therefore needs translating to the container
+    mount path; a non-default value is honoured verbatim.
+    """
+    if flake_ref == "." and os.path.isdir(_CONTAINER_FLAKE_MOUNT) and \
+            os.path.isfile(os.path.join(_CONTAINER_FLAKE_MOUNT, "flake.nix")):
+        return _CONTAINER_FLAKE_MOUNT
+    return flake_ref
+
+
 def run_eval_task(
     payload: dict,
     out_dir: pathlib.Path,
@@ -590,6 +606,7 @@ def run_eval_task(
     """
     clock = now or time.time
     runner = run_subprocess or _default_run_subprocess
+    flake_ref = _resolve_flake_ref(flake_ref)
     parsed = parse_payload(payload)
     binary = parsed["binary"]
     sys_name = parsed["sys"]
