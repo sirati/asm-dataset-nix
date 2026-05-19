@@ -1,0 +1,48 @@
+[
+  {
+    "key": [
+      "x86_64",
+      "hello__x86_64__gcc15-O0-baseline-default-san-off-march-default"
+    ],
+    "value": {
+      "arch": "x86_64",
+      "compiler_family": "gcc",
+      "compiler_id": "gcc15",
+      "compiler_version": "15",
+      "drv": "/nix/store/00000010arohmn4d2jg9efs5qb8167kt-hello-x86_64-gcc15-O0-baseline-default-san-off-march-default-elf-folder.drv",
+      "flag_set": "baseline",
+      "hardening": "default",
+      "label": "hello__x86_64__gcc15-O0-baseline-default-san-off-march-default",
+      "march": "default",
+      "metadata_name": "hello__x86_64__gcc15-O0-baseline-default-san-off-march-default.json",
+      "optimization": "O0",
+      "pkg": "hello",
+      "sanitizer": "off",
+      "tier": 1,
+      "variant_dir": "hello__x86_64__gcc15-O0-baseline-default-san-off-march-default_dir"
+    }
+  },
+  {
+    "key": [
+      "x86_64",
+      "hello__x86_64__gcc15-O2-baseline-default-san-off-march-default"
+    ],
+    "value": {
+      "arch": "x86_64",
+      "compiler_family": "gcc",
+      "compiler_id": "gcc15",
+      "compiler_version": "15",
+      "drv": "/nix/store/00000020kti30puvclarohmn4d2jg9ef-hello-x86_64-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv",
+      "flag_set": "baseline",
+      "hardening": "default",
+      "label": "hello__x86_64__gcc15-O2-baseline-default-san-off-march-default",
+      "march": "default",
+      "metadata_name": "hello__x86_64__gcc15-O2-baseline-default-san-off-march-default.json",
+      "optimization": "O2",
+      "pkg": "hello",
+      "sanitizer": "off",
+      "tier": 1,
+      "variant_dir": "hello__x86_64__gcc15-O2-baseline-default-san-off-march-default_dir"
+    }
+  }
+]
