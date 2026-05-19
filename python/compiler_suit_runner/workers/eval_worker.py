@@ -31,10 +31,10 @@ Resume marker
 
 The archive itself IS the resume marker. A short-circuit fires when
 the archive exists and is non-empty: re-execution skips eval +
-broadcast + export. The legacy ``<out_dir>/<binary>/manifest.json``
-marker and the post-A3 ``<binary>.nix-archive.json`` sidecar are no
-longer emitted — the hard-cutover design uses archive presence as
-the single source of truth.
+broadcast + export. The hard-cutover design uses archive presence as
+the single source of truth; the dependency_graph_worker derives
+variant_lookup from the imported .drv paths via ``parse_variant_path``,
+so no JSON sidecar is emitted.
 
 Error-type contract (framework integration)
 -------------------------------------------
