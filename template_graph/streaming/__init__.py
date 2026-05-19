@@ -22,12 +22,13 @@ This subpackage replaces the legacy single-file ``streaming.py``:
     finalize.py  — finalize + _build_and_drain_arch +
                    _close_current_matrix.
     entry.py     — plan_from_tree_streaming convenience entry.
-    _helpers.py  — drv_name_full, _classify_cross_arch_sharing,
-                   _ARCH_FAMILIES. (``_ARCH_TO_TRIPLE`` /
-                   ``_extract_triple`` / ``_extract_version`` /
-                   ``_classify_revisit_diff`` moved to
-                   ``template_graph.cowalk._helpers``; re-exported
-                   here for back-compat.)
+    _helpers.py  — drv_name_full. (``_classify_cross_arch_sharing`` /
+                   ``_ARCH_FAMILIES`` moved to
+                   ``template_graph.cowalk.cross_arch``;
+                   ``_ARCH_TO_TRIPLE`` / ``_extract_triple`` /
+                   ``_extract_version`` / ``_classify_revisit_diff``
+                   moved to ``template_graph.cowalk._helpers``. All
+                   re-exported here for back-compat.)
 
 Public surface (re-exported here for back-compat):
     StreamPlanner — instantiate, feed lines via .feed_line(), call .finalize().
