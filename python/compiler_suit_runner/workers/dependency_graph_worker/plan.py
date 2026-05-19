@@ -200,6 +200,9 @@ def _slice_streaming_result(
         "toolchain_node_ids_per_template": streaming_result.get(
             "toolchain_node_ids_per_template", {}
         ),
+        # Per-binary keyed; the adapter reads only ``[binary]`` so the
+        # entire dict is fine to pass through unsliced (Phase 5.4).
+        "meta_templates": streaming_result.get("meta_templates", {}),
     }
 
 

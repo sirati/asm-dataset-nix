@@ -123,12 +123,15 @@ def _mint_common_dep_descriptors(
     classes: Mapping[int, str],
     hashes: Sequence[Sequence[Any]],
     tc_node_id_set: set[int],
+    meta_skip_idents: Optional[set[str]] = None,
 ) -> list[Phase4Descriptor]:
     """Mint one ``build_common_dep`` descriptor per common-dep node in
-    this cell. Skips toolchain nodes (wired separately) and unclassified
-    nodes (subsumed into their variant's own build).
+    this cell. Skips toolchain nodes (wired separately), unclassified
+    nodes (subsumed into their variant's own build), and idents listed
+    in ``meta_skip_idents`` (a meta-level task already covers them).
     """
     out: list[Phase4Descriptor] = []
+    skip = meta_skip_idents or set()
     for node_id, node in enumerate(nodes):
         if node_id in tc_node_id_set:
             # Toolchain node -- wired via toolchain_node_ids elsewhere.
@@ -154,6 +157,10 @@ def _mint_common_dep_descriptors(
             # already raised if this is a real shape error.
             continue
         ident_str = _ident_to_str(representative)
+        if ident_str in skip:
+            # A meta-level (cross_arch / family) task already covers
+            # this ident; skip the per-cell duplicate.
+            continue
         node_name = str(_node_field(node, "name", f"node_{node_id}"))
         out.append(_common_dep_descriptor(
             binary=binary,
@@ -180,12 +187,24 @@ def _plan_cell(
     toolchain_task_ids: Mapping[str, str],
     variant_lookup: Mapping[tuple[str, str], Mapping[str, Any]],
     arch_indep_dep_task_ids: Sequence[str],
+    meta_extra_variant_deps: Optional[
+        Mapping[tuple[str, str], set[str]]
+    ] = None,
+    meta_skip_idents: Optional[set[str]] = None,
+    meta_toolchain_extras: Optional[
+        Mapping[tuple[str, str], set[str]]
+    ] = None,
 ) -> tuple[list[Phase4Descriptor], list[Phase4Descriptor]]:
     """Plan a single ``(tmpl_id, arch)`` cell, returning ``(common_dep
     descriptors, variant descriptors)`` for it.
 
     Variants without a lookup entry are skipped -- the caller's matrix
     may have filtered them out between graph generation and planning.
+
+    The ``meta_*`` keyword arguments wire in the MetaTemplate post-pass
+    (see :mod:`.plan_meta`): meta-level common_deps are merged into
+    each variant's ``depends_on`` and their idents short-circuit the
+    per-cell duplicate emission path.
     """
     if tmpl_id < 0 or tmpl_id >= len(templates):
         return [], []
@@ -224,6 +243,7 @@ def _plan_cell(
         classes=classes,
         hashes=hashes,
         tc_node_id_set=tc_node_id_set,
+        meta_skip_idents=meta_skip_idents,
     )
     # Every variant in this cell depends on every common-dep we just
     # minted (deduplicated by node_id -- one descriptor per common_dep
@@ -238,12 +258,17 @@ def _plan_cell(
         spec = variant_lookup.get((arch, label))
         if spec is None:
             continue
+        deps = per_variant_dep_ids[variant_idx]
+        if meta_extra_variant_deps:
+            deps = deps | meta_extra_variant_deps.get((arch, label), set())
+        if meta_toolchain_extras:
+            deps = deps | meta_toolchain_extras.get((arch, label), set())
         variant_descriptors.append(_variant_descriptor(
             binary=binary,
             arch=arch,
             sys_name=sys_name,
             label=label,
             variant_spec=spec,
-            depends_on=per_variant_dep_ids[variant_idx],
+            depends_on=deps,
         ))
     return common_dep_descriptors, variant_descriptors

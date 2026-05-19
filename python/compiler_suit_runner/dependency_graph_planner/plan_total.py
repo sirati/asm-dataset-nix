@@ -19,6 +19,10 @@ from .plan_cell import (
     _plan_cell,
     _resolve_arch_indep_descriptors,
 )
+from .plan_meta import (
+    _arch_to_labels_from_variant_arrays,
+    _plan_meta_for_binary,
+)
 from .shapes import (
     _coerce_toolchain_node_ids,
     _iter_classifications,
@@ -89,6 +93,43 @@ def plan_phase4_for_binary(
         )
     )
 
+    # MetaTemplate post-pass: emit cross_arch / family build_common_dep
+    # tasks (Phase 5.4). Runs BEFORE the per-cell walk so cell-level
+    # common_dep emission can short-circuit on ``meta_skip_idents`` and
+    # variants can wire to meta task_ids during their own minting.
+    meta_templates_by_binary = streaming_result.get(
+        "meta_templates", {},
+    ) or {}
+    meta_templates = (
+        meta_templates_by_binary.get(binary, [])
+        if isinstance(meta_templates_by_binary, Mapping)
+        else []
+    )
+    (
+        meta_descriptors,
+        meta_extra_variant_deps,
+        meta_skip_idents,
+        meta_toolchain_extras,
+    ) = ([], {}, set(), {})
+    if meta_templates:
+        is_source_terminal, drv_role = _load_source_terminal_predicate()
+        arch_to_labels = _arch_to_labels_from_variant_arrays(variant_arrays)
+        (
+            meta_descriptors,
+            meta_extra_variant_deps,
+            meta_skip_idents,
+            meta_toolchain_extras,
+        ) = _plan_meta_for_binary(
+            binary=binary,
+            sys_name=sys_name,
+            meta_templates=meta_templates,
+            arch_to_labels=arch_to_labels,
+            toolchain_idents_by_name=toolchain_idents_by_name,
+            toolchain_task_ids=toolchain_task_ids,
+            is_source_terminal=is_source_terminal,
+            drv_role=drv_role,
+        )
+
     common_dep_descriptors: list[Phase4Descriptor] = []
     variant_descriptors: list[Phase4Descriptor] = []
 
@@ -106,6 +147,9 @@ def plan_phase4_for_binary(
             toolchain_task_ids=toolchain_task_ids,
             variant_lookup=variant_lookup,
             arch_indep_dep_task_ids=arch_indep_dep_task_ids,
+            meta_extra_variant_deps=meta_extra_variant_deps,
+            meta_skip_idents=meta_skip_idents,
+            meta_toolchain_extras=meta_toolchain_extras,
         )
         common_dep_descriptors.extend(cell_common)
         variant_descriptors.extend(cell_variants)
@@ -116,11 +160,22 @@ def plan_phase4_for_binary(
     arch_indep_descriptors.sort(
         key=lambda d: (d.payload["node_name"], d.payload["ident"]),
     )
+    meta_descriptors.sort(
+        key=lambda d: (d.payload["arch"], d.payload["node_name"], d.payload["ident"]),
+    )
     variant_descriptors.sort(key=lambda d: (d.payload["arch"], d.payload["label"]))
-    # Order: arch-indep deps first (they gate every variant), then per-
-    # cell common_deps (which mostly gate intra-arch siblings), then
-    # variants. Mirrors the spawn-order the framework prefers.
-    return arch_indep_descriptors + common_dep_descriptors + variant_descriptors
+    # Order: arch-indep deps first (gate every variant), then meta-
+    # level cross_arch / family common_deps (span multiple archs), then
+    # per-cell common_deps (intra-arch siblings), then variants. The
+    # meta block lands between the arch-indep and per-cell blocks
+    # because it's broader-scoped than per-cell but narrower than
+    # arch-indep.
+    return (
+        arch_indep_descriptors
+        + meta_descriptors
+        + common_dep_descriptors
+        + variant_descriptors
+    )
 
 
 def plan_phase4_from_graph(
