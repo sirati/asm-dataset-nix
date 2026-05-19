@@ -4,95 +4,54 @@ Overlays every (template, arch) pair belonging to one binary into one
 DOT graph. Nodes are keyed by ``(role, enforce)`` so template splits
 stay visible. Common-dep nodes are coloured by their A/B/C/D cross-arch
 sharing pattern; see :func:`merge_binary_to_dot` for the taxonomy.
-The classifier ``_classify_cross_arch_sharing`` is imported lazily
-from :mod:`template_graph.streaming` (it moves out in a later phase).
+
+The role-merging primitives (collect-per-arch, build-merged-keymap)
+live in :mod:`template_graph.cowalk._role_merge` and are shared with
+``build_meta_templates``. The cross-arch sharing letter is read off
+the binary's pre-computed ``MetaTemplate`` (placed under
+``result["meta_templates"]`` by :func:`template_graph.streaming.finalize`),
+so this module never runs the classifier itself.
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-from template_graph.graph import Template, VariantArray
+from template_graph.cowalk._role_merge import (
+    ArchCell,
+    ByArch,
+    Key,
+    Merged,
+    build_merged_keymap,
+    collect_per_arch,
+)
+from template_graph.graph import MetaTemplate
 
 from .template import _enforce_label
 
 
-# (role-name, enforce). Plain nodes have enforce=None; template
-# splits share a role but differ in enforce, kept as separate boxes.
-Key = tuple[str, Optional[tuple[str, Optional[str]]]]
-# Per-key dict: arch -> (drv_path_v0_or_None, child_keys).
-ArchCell = tuple[Optional[tuple[str, str]], list[Key]]
-Merged = dict[Key, dict[str, ArchCell]]
-# arch -> (template, common-dep classifications by node-id, variant array)
-ByArch = dict[str, tuple[Template, dict[int, str], VariantArray]]
+def _build_letter_lookup(
+    meta_template: Optional[MetaTemplate],
+) -> dict[Key, Optional[str]]:
+    """Index a binary's ``MetaTemplate`` by ``(role, enforce)`` Key.
 
-
-def _collect_per_arch(result: dict, binary: str) -> ByArch:
-    """Pick every (template, arch) whose root belongs to ``binary``.
-
-    Match only on the ROOT node — a template "belongs to" binary X
-    iff its entry-point is X's elf-folder. Otherwise binaries that
-    *depend* on X (e.g. vips dep'ing on libxml2) get wrongly counted.
+    Returns ``{key -> A/B/C/D-letter-or-None}``. Each entry's letter
+    is ``None`` when the MetaTemplate marked the position
+    ``variant_specific`` — which is exactly when the renderer should
+    NOT emit a sharing label. Empty dict when no MetaTemplate is
+    available (caller falls back to "no shared idents → white"
+    rendering for any Key it doesn't find).
     """
-    by_arch: ByArch = {}
-    for (tid, arch), arr in result["variant_arrays"].items():
-        tmpl = result["templates"][tid]
-        root = tmpl.nodes[tmpl.root_id]
-        if not (
-            root.name.startswith(f"{binary}-")
-            and "-elf-folder" in root.name
-        ):
-            continue
-        classes = result["common_deps_per_arch_template"].get(
-            (tid, arch), {}
-        )
-        by_arch[arch] = (tmpl, classes, arr)
-    if not by_arch:
-        raise ValueError(f"binary {binary!r} not found in result")
-    return by_arch
-
-
-def _build_merged_keymap(
-    by_arch: ByArch, canonical_root_role: str,
-) -> tuple[Merged, dict[Key, str], dict[Key, bool]]:
-    """Fold each per-arch template into the (role, enforce)-keyed map.
-
-    Per arch we record the variant-0 drv-path (only for common-dep
-    nodes — variant-specific drvs are deliberately not surfaced) and
-    the child role keys. Class priority: variant_specific > common_dep
-    > '?' > toolchain — any arch seeing the role as variant-specific
-    dominates the merged view.
-    """
-    merged: Merged = {}
-    key_class: dict[Key, str] = {}
-    key_optional: dict[Key, bool] = {}
-    order = {"variant_specific": 3, "common_dep": 2, "?": 1, "toolchain": 0}
-    for arch, (tmpl, classes, arr) in by_arch.items():
-        for nid, node in enumerate(tmpl.nodes):
-            if nid == tmpl.root_id:
-                role = canonical_root_role
-                enforce = None
-            else:
-                role = node.name
-                enforce = node.enforce
-            k: Key = (role, enforce)
-            cls = (
-                "toolchain" if node.is_toolchain
-                else classes.get(nid, "?")
-            )
-            existing = key_class.get(k)
-            if existing is None or order.get(cls, 0) > order.get(existing, 0):
-                key_class[k] = cls
-            key_optional[k] = key_optional.get(k, False) or node.optional
-            drv = None
-            if cls == "common_dep" and arr.hashes[nid]:
-                drv = arr.hashes[nid][0]
-            child_keys: list[Key] = [
-                (tmpl.nodes[c].name, tmpl.nodes[c].enforce)
-                for c in node.child_ids
-            ]
-            merged.setdefault(k, {})[arch] = (drv, child_keys)
-    return merged, key_class, key_optional
+    if meta_template is None:
+        return {}
+    out: dict[Key, Optional[str]] = {}
+    for role, enforce, letter in zip(
+        meta_template.role_at_node,
+        meta_template.enforce_at_node,
+        meta_template.class_letter_at_node,
+    ):
+        out[(role, enforce)] = letter
+    return out
 
 
 def _resolve_visible(
@@ -152,25 +111,35 @@ def _missing_arch_tag(
 def _node_fill_and_sharing(
     cls: str,
     archs_dict: dict[str, ArchCell],
+    key: Key,
+    letter_by_key: dict[Key, Optional[str]],
 ) -> tuple[str, Optional[str]]:
-    """Fill colour + optional A/B/C/D sharing tag for one node."""
-    # Lazy import — streaming.py re-exports merge_binary_to_dot.
-    from template_graph.streaming import _classify_cross_arch_sharing
+    """Fill colour + optional A/B/C/D sharing tag for one node.
 
+    Looks the letter up by ``(role, enforce)`` Key in the binary's
+    pre-computed MetaTemplate via ``letter_by_key``; never re-runs
+    the cross-arch classifier here. When the MetaTemplate has no
+    entry for the Key (or the position is ``variant_specific``) the
+    node is rendered white with no sharing label.
+    """
     if cls == "toolchain":
         return "lightgray", None
     if cls == "variant_specific":
         return "lightcoral", None
     if cls == "common_dep":
-        drvs = {a: d for a, d in
-                ((a, archs_dict[a][0]) for a in archs_dict)
-                if d is not None}
-        if not drvs:
+        # Skip nodes where no arch has a variant-0 ident — the legacy
+        # renderer collapsed these to "white", we preserve that.
+        has_any_drv = any(
+            archs_dict[a][0] is not None for a in archs_dict
+        )
+        if not has_any_drv:
             return "white", None
-        cat = _classify_cross_arch_sharing(drvs)
+        letter = letter_by_key.get(key)
+        if letter is None:
+            return "white", None
         fill = {"A": "orange", "B": "yellow",
-                "C": "cyan", "D": "palegreen"}[cat]
-        return fill, cat
+                "C": "cyan", "D": "palegreen"}[letter]
+        return fill, letter
     return "white", None
 
 
@@ -181,6 +150,7 @@ def _render_nodes(
     visible: set[Key],
     all_archs: list[str],
     key_to_id: dict[Key, int],
+    letter_by_key: dict[Key, Optional[str]],
 ) -> list[str]:
     """Emit one DOT node line per visible key.
 
@@ -193,7 +163,9 @@ def _render_nodes(
         if k not in visible:
             continue
         role, enforce = k
-        fill, sharing = _node_fill_and_sharing(key_class[k], archs_dict)
+        fill, sharing = _node_fill_and_sharing(
+            key_class[k], archs_dict, k, letter_by_key,
+        )
         missing = len(archs_dict) < len(all_archs)
         is_optional = key_optional.get(k, False)
         style = "filled,dashed" if (missing or is_optional) else "filled"
@@ -241,6 +213,27 @@ def _render_edges(
     return lines
 
 
+def _pick_meta_template(
+    result: dict, binary: str,
+) -> Optional[MetaTemplate]:
+    """Return the binary's MetaTemplate from ``result``, or ``None``.
+
+    Result dicts produced by ``StreamPlanner.finalize`` since Phase 4.3
+    carry ``meta_templates: dict[binary, list[MetaTemplate]]``. Older
+    callers may pass a result without this key (back-compat), in which
+    case the renderer falls back to "no shared letter known" rendering
+    — every common-dep node renders white. New callers should ensure
+    ``meta_templates`` is populated.
+    """
+    raw = result.get("meta_templates")
+    if not raw:
+        return None
+    metas = raw.get(binary)
+    if not metas:
+        return None
+    return metas[0]
+
+
 def merge_binary_to_dot(
     result: dict,
     binary: str,
@@ -263,17 +256,23 @@ def merge_binary_to_dot(
       D — same drv across every arch that has the role
 
     Dashed border if some archs of the matrix don't surface the role.
+    The A/B/C/D letter comes from the binary's pre-computed
+    ``MetaTemplate`` in ``result["meta_templates"][binary]``; this
+    function never runs the classifier itself.
     """
-    by_arch = _collect_per_arch(result, binary)
+    by_arch: ByArch = collect_per_arch(result, binary)
+    if not by_arch:
+        raise ValueError(f"binary {binary!r} not found in result")
     all_archs = sorted(by_arch)
     canonical_root_role = f"{binary}-elf-folder.drv"
     canonical_root_key: Key = (canonical_root_role, None)
-    merged, key_class, key_optional = _build_merged_keymap(
+    merged, key_class, key_optional = build_merged_keymap(
         by_arch, canonical_root_role)
     visible = _resolve_visible(
         merged, key_class, canonical_root_key, collapse_common_deps)
     key_to_id: dict[Key, int] = {
         k: i for i, k in enumerate(k2 for k2 in merged if k2 in visible)}
+    letter_by_key = _build_letter_lookup(_pick_meta_template(result, binary))
     safe_label = (label or f"merged_{binary}").replace('"', '\\"')
     lines: list[str] = [
         f'digraph "{safe_label}" {{',
@@ -281,7 +280,9 @@ def merge_binary_to_dot(
         "  node [shape=box, style=filled, fontname=monospace];",
     ]
     lines.extend(_render_nodes(
-        merged, key_class, key_optional, visible, all_archs, key_to_id))
+        merged, key_class, key_optional, visible, all_archs, key_to_id,
+        letter_by_key,
+    ))
     lines.extend(_render_edges(
         merged, visible, key_class, collapse_common_deps, key_to_id))
     lines.append("}")
