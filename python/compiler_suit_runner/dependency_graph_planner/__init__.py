@@ -53,7 +53,8 @@ imports keep working unmodified.
                               :func:`plan_phase4_from_graph` -- the
                               per-binary and multi-binary drivers.
   * :mod:`.manifest_glue`  -- descriptor -> ``ManifestHeader`` translation,
-                              JSON roundtrip helper, drv-path label key.
+                              ``_dependency_graph.pkl`` reader, drv-path
+                              label key.
 
 Decoupling notes
 ----------------
@@ -92,8 +93,9 @@ from .descriptors import (
     _variant_task_id,
 )
 from .manifest_glue import (
+    DependencyGraphPickleError,
     headers_from_descriptors,
-    load_descriptors_from_json,
+    load_phase4_descriptors,
     variant_label_key,
 )
 from .plan_total import (
@@ -119,12 +121,13 @@ from .shapes import (
 
 __all__ = [
     "DependencyGraphCycleError",
+    "DependencyGraphPickleError",
     "Phase4Descriptor",
     "BinaryPlanInput",
     "convert_toolchain_drvs",
     "plan_phase4_for_binary",
     "plan_phase4_from_graph",
     "headers_from_descriptors",
-    "load_descriptors_from_json",
+    "load_phase4_descriptors",
     "variant_label_key",
 ]
