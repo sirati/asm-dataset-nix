@@ -90,6 +90,18 @@ def _meta_template(
     return _Mt()
 
 
+# ``parse_variant_path`` expects the post-hash basename to end with
+# ``-baseline-default-san-off-march-default-elf-folder.drv``; appending
+# the canonical tail to ``<pkg>-<arch>-<label>`` produces a synthesised
+# drv path the per-variant toolchain wiring can decode back to
+# ``(arch, comp, opt)`` when ``label`` is the canonical ``<comp>-<opt>``
+# shape. Non-conforming labels still produce a value; the wiring's
+# ``TreeWalkError`` swallow keeps those tests robust.
+_VARIANT_DRV_TAIL = (
+    "-baseline-default-san-off-march-default-elf-folder.drv"
+)
+
+
 def _variant_spec(label: str, pkg: str, arch: str, **extra) -> dict:
     """Minimal VariantSpec-like dict matching what the matrix
     enumerator emits."""
@@ -97,7 +109,9 @@ def _variant_spec(label: str, pkg: str, arch: str, **extra) -> dict:
         "label": label,
         "pkg": pkg,
         "arch": arch,
-        "drv": f"/nix/store/aaaa-{pkg}-{arch}-{label}.drv",
+        "drv": (
+            f"/nix/store/aaaa-{pkg}-{arch}-{label}{_VARIANT_DRV_TAIL}"
+        ),
         "variant_dir": f"{label}_dir",
         "metadata_name": f"{label}.json",
         "compiler_id": label.rsplit("-", 1)[0] if "-" in label else label,
@@ -507,7 +521,10 @@ class TestToolchainWiring:
         variant_lookup = {
             ("x86_64", "gcc15-O0"): _variant_spec("gcc15-O0", "hello", "x86_64"),
         }
-        toolchain_task_ids = {"ccwh-gcc-wrapper-15.drv": "build_compilers__x86_64__gcc15"}
+        toolchain_task_ids = {
+            "ccwh-gcc-wrapper-15.drv":
+                "build_compilers__x86_64-linux__x86_64__gcc15",
+        }
         descs = plan_phase4_for_binary(
             "hello",
             streaming,
@@ -516,7 +533,10 @@ class TestToolchainWiring:
         )
         variants = [d for d in descs if d.kind == "build_variant"]
         assert len(variants) == 1
-        assert "build_compilers__x86_64__gcc15" in variants[0].depends_on
+        assert (
+            "build_compilers__x86_64-linux__x86_64__gcc15"
+            in variants[0].depends_on
+        )
 
     def test_unknown_toolchain_ident_is_skipped(self):
         """A toolchain ident that's not in the task-id map is silently
@@ -558,14 +578,15 @@ class TestToolchainWiring:
         # Common-dep deps from the root may still be present.
         assert all(not dep.startswith("build_compilers__") for dep in variants[0].depends_on)
 
-    def test_unified_wrapper_role_wires_all_matching_compilers(self):
+    def test_unified_wrapper_role_wires_per_variant_compiler(self):
         """A toolchain node whose role unifies multiple compiler
-        versions (e.g. ``wrapped-compiler-suit.drv``) must wire ALL
-        matching ``toolchain_drvs`` idents into every variant's
-        ``depends_on``. Per-variant compiler selection is not visible
-        in the role-collapsed template, so over-wiring is the safe
-        choice (the variant waits on extra ``build_compilers__*``
-        tasks that would have been built regardless)."""
+        versions (e.g. ``wrapped-compiler-suit.drv``) must wire EACH
+        variant to its own compiler's ``build_compilers__*`` task,
+        not the union of every compiler that shares the cell. The
+        role-collapsed template node hides the per-variant compiler
+        choice, but the variant's drv basename carries it -- so
+        per-variant resolution recovers it via ``parse_variant_path``.
+        """
         template = _template([
             _node("hello-root", [1]),
             _node(
@@ -600,8 +621,10 @@ class TestToolchainWiring:
             ("x86_64", "gcc15-O2"): _variant_spec("gcc15-O2", "hello", "x86_64"),
         }
         toolchain_task_ids = {
-            "g14h-wrapped-compiler-suit.drv": "build_compilers__x86_64__gcc14",
-            "g15h-wrapped-compiler-suit.drv": "build_compilers__x86_64__gcc15",
+            "g14h-wrapped-compiler-suit.drv":
+                "build_compilers__x86_64-linux__x86_64__gcc14",
+            "g15h-wrapped-compiler-suit.drv":
+                "build_compilers__x86_64-linux__x86_64__gcc15",
         }
         descs = plan_phase4_for_binary(
             "hello", streaming, variant_lookup,
@@ -609,16 +632,26 @@ class TestToolchainWiring:
         )
         variants = [d for d in descs if d.kind == "build_variant"]
         assert len(variants) == 2
-        for v in variants:
-            assert "build_compilers__x86_64__gcc14" in v.depends_on, v
-            assert "build_compilers__x86_64__gcc15" in v.depends_on, v
+        by_label = {v.payload["label"]: v for v in variants}
+        # Each variant gets EXACTLY its own compiler's task_id, not the
+        # union -- the per-variant resolver reads ``(arch, comp)`` off
+        # the variant drv basename.
+        g14_id = "build_compilers__x86_64-linux__x86_64__gcc14"
+        g15_id = "build_compilers__x86_64-linux__x86_64__gcc15"
+        assert g14_id in by_label["gcc14-O2"].depends_on
+        assert g15_id not in by_label["gcc14-O2"].depends_on
+        assert g15_id in by_label["gcc15-O2"].depends_on
+        assert g14_id not in by_label["gcc15-O2"].depends_on
 
-    def test_no_toolchain_node_map_no_wiring(self):
-        """Without ``toolchain_node_ids_per_template`` in the streaming
-        snapshot, toolchain wiring is a no-op even if ``is_toolchain``
-        is set on a node — the new wiring path is the SOLE source of
-        truth (legacy ``arr.hashes`` scrape was removed). Existing
-        common-dep wiring must still fire."""
+    def test_unknown_toolchain_task_id_skipped(self):
+        """Per-variant wiring composes ``build_compilers__<sys>__<arch>__<comp>``
+        from the variant drv and looks it up in ``toolchain_task_ids``'s
+        VALUE set. A task_id not present in that set (e.g. an
+        operator-provided toolchain the framework never built) yields
+        no dep -- empty toolchain_task_ids maps to no toolchain wiring
+        at all. The old ``toolchain_node_ids_per_template`` gating is
+        gone; this test asserts the value-set lookup directly.
+        """
         template = _template([
             _node("hello-root", [1]),
             _node("gcc-wrapper-15.drv", [], is_toolchain=True),
@@ -641,8 +674,12 @@ class TestToolchainWiring:
         variant_lookup = {
             ("x86_64", "gcc15-O0"): _variant_spec("gcc15-O0", "hello", "x86_64"),
         }
+        # Phase-1 emitted a DIFFERENT compiler's task; the variant's
+        # composed id ``build_compilers__x86_64-linux__x86_64__gcc15``
+        # isn't present, so no wiring fires.
         toolchain_task_ids = {
-            "ccwh-gcc-wrapper-15.drv": "build_compilers__x86_64__gcc15",
+            "otherh-clang-wrapper-19.drv":
+                "build_compilers__x86_64-linux__x86_64__clang19",
         }
         descs = plan_phase4_for_binary(
             "hello", streaming, variant_lookup,
@@ -650,7 +687,10 @@ class TestToolchainWiring:
         )
         variants = [d for d in descs if d.kind == "build_variant"]
         assert len(variants) == 1
-        assert "build_compilers__x86_64__gcc15" not in variants[0].depends_on
+        assert all(
+            not dep.startswith("build_compilers__")
+            for dep in variants[0].depends_on
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -975,12 +1015,16 @@ class TestJsonRoundtrippedInput:
         descs = plan_phase4_for_binary(
             "hello", streaming, variant_lookup,
             toolchain_task_ids={
-                "ccwh-gcc-wrapper-15.drv": "build_compilers__x86_64__gcc15",
+                "ccwh-gcc-wrapper-15.drv":
+                    "build_compilers__x86_64-linux__x86_64__gcc15",
             },
         )
         variants = [d for d in descs if d.kind == "build_variant"]
         assert len(variants) == 1
-        assert "build_compilers__x86_64__gcc15" in variants[0].depends_on
+        assert (
+            "build_compilers__x86_64-linux__x86_64__gcc15"
+            in variants[0].depends_on
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1345,7 +1389,8 @@ class TestMetaTemplateShortCircuits:
             ),
         }
         toolchain_task_ids = {
-            "ccwh-gcc-wrapper-15.drv": "build_compilers__x86_64__gcc15",
+            "ccwh-gcc-wrapper-15.drv":
+                "build_compilers__x86_64-linux__x86_64__gcc15",
         }
         descs = plan_phase4_for_binary(
             "hello", streaming, lookup,
@@ -1359,7 +1404,10 @@ class TestMetaTemplateShortCircuits:
         assert cross == []
         variants = [d for d in descs if d.kind == "build_variant"]
         assert len(variants) == 1
-        assert "build_compilers__x86_64__gcc15" in variants[0].depends_on
+        assert (
+            "build_compilers__x86_64-linux__x86_64__gcc15"
+            in variants[0].depends_on
+        )
 
 
 class TestMetaTemplateNoOpCases:
