@@ -28,6 +28,7 @@ def plan_binary(
     variant_lookup: dict[tuple[str, str], dict],
     toolchain_task_ids: dict[str, str],
     sys_name: str,
+    lax: bool = True,
 ) -> list[Any]:
     """Run the streaming planner + dependency_graph_planner adapter
     against ``tree_text`` for one binary.
@@ -35,6 +36,14 @@ def plan_binary(
     Returns the list of :class:`Phase4Descriptor` records. Raises
     :class:`DependencyGraphCycleError` (from the adapter) on cycle
     detection; the caller logs + propagates.
+
+    ``lax`` defaults to ``True`` (Phase 6.1 production default): the
+    streaming planner records shape violations into
+    ``streaming_result["violations"]`` instead of raising on the first
+    calibration / cowalk mismatch. Worst case the planner emits
+    redundant rebuilds for affected templates; violations are surfaced
+    via :class:`DependencyGraphResult` so the run log preserves
+    visibility for follow-up investigation.
     """
     from template_graph.streaming import plan_from_tree_streaming  # noqa: PLC0415
     from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
@@ -42,7 +51,7 @@ def plan_binary(
         plan_phase4_from_graph,
     )
 
-    streaming_result = plan_from_tree_streaming(tree_text)
+    streaming_result = plan_from_tree_streaming(tree_text, lax=lax)
     inp = BinaryPlanInput(
         binary=binary,
         streaming_result=streaming_result,
@@ -59,6 +68,7 @@ def plan_total(
     variant_lookups: dict[str, dict[tuple[str, str], dict]],
     toolchain_task_ids: dict[str, str],
     sys_name: str,
+    lax: bool = True,
 ) -> list[Any]:
     """Run ONE streaming pass against ``tree_text`` and emit a single
     flat phase-4 descriptor list spanning all binaries.
@@ -76,6 +86,14 @@ def plan_total(
     each template's root role (``<binary>-...-elf-folder.drv``) so each
     binary's :class:`BinaryPlanInput` only sees its own variants.
 
+    ``lax`` defaults to ``True`` (Phase 6.1 production default): the
+    streaming planner records shape violations into
+    ``streaming_result["violations"]`` instead of raising on the first
+    calibration / cowalk mismatch. Worst case the planner emits
+    redundant rebuilds for affected templates; violations are surfaced
+    via :class:`DependencyGraphResult` so the run log preserves
+    visibility for follow-up investigation.
+
     Raises :class:`DependencyGraphCycleError` on cycle detection.
     """
     from template_graph.streaming import plan_from_tree_streaming  # noqa: PLC0415
@@ -84,7 +102,7 @@ def plan_total(
         plan_phase4_from_graph,
     )
 
-    streaming_result = plan_from_tree_streaming(tree_text)
+    streaming_result = plan_from_tree_streaming(tree_text, lax=lax)
 
     # Group templates by the binary their root role encodes. Each
     # binary's BinaryPlanInput consumes a sliced streaming_result
