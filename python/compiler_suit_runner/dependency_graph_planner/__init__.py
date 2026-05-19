@@ -46,6 +46,9 @@ imports keep working unmodified.
                               (arch-indep resolution, toolchain wiring,
                               common-dep minting) and the lazy
                               ``template_graph.parser`` predicate loader.
+  * :mod:`.plan_meta`      -- MetaTemplate post-pass (Phase 5.4):
+                              cross_arch / family ``build_common_dep``
+                              emission and per-variant wiring extras.
   * :mod:`.plan_total`     -- :func:`plan_phase4_for_binary` and
                               :func:`plan_phase4_from_graph` -- the
                               per-binary and multi-binary drivers.

@@ -68,6 +68,28 @@ def _variant_array(
     }
 
 
+def _meta_template(
+    template_id_per_arch: dict,
+    role_at_node: list,
+    cross_arch_classification: list,
+    drv_per_node: list,
+) -> dict:
+    """Shape-mirror of ``template_graph.graph.MetaTemplate`` as a dict;
+    the meta pass reads via ``getattr`` so a Mapping with the same
+    attribute names works as a stand-in for unit tests (consistent with
+    the existing template / VariantArray fabrication helpers)."""
+
+    class _Mt:
+        def __init__(self):
+            self.template_id_per_arch = dict(template_id_per_arch)
+            self.role_at_node = tuple(role_at_node)
+            self.cross_arch_classification = tuple(cross_arch_classification)
+            self.drv_per_node = tuple(drv_per_node)
+            self.enforce_at_node = tuple(None for _ in role_at_node)
+            self.class_letter_at_node = tuple(None for _ in role_at_node)
+    return _Mt()
+
+
 def _variant_spec(label: str, pkg: str, arch: str, **extra) -> dict:
     """Minimal VariantSpec-like dict matching what the matrix
     enumerator emits."""
@@ -985,3 +1007,463 @@ def dataclasses_exception():
     importing it indirectly keeps test imports tight."""
     import dataclasses
     return dataclasses.FrozenInstanceError
+
+
+# ---------------------------------------------------------------------------
+# MetaTemplate-driven cross_arch / family build_common_dep emission (5.4)
+# ---------------------------------------------------------------------------
+
+
+class TestMetaTemplateCrossArchEmission:
+    """A MetaTemplate position classified ``cross_arch_common_dep`` emits
+    ONE ``build_common_dep__cross_arch__<ident>`` descriptor; variants
+    in every covered arch list that task in their ``depends_on``. The
+    per-cell common_dep emission for the same ident is suppressed to
+    avoid duplicate dispatch."""
+
+    def _streaming(self, libfoo_ident: tuple[str, str]):
+        # Two archs, each with one variant; the libfoo node is the
+        # cross-arch shared dep — same ident across both. Per-cell
+        # classification keeps libfoo as common_dep so we can prove
+        # the meta-pass replaces (not augments) per-cell emission for
+        # this ident.
+        tmpl_x = _template([
+            _node("hello-x86_64-root", [1]),
+            _node("libfoo.drv", []),
+        ])
+        tmpl_a = _template([
+            _node("hello-aarch64-root", [1]),
+            _node("libfoo.drv", []),
+        ])
+        arr_x = _variant_array(
+            template_id=0, arch="x86_64",
+            variants=["gcc15-O2"],
+            hashes=[
+                [("rxh", "hello-x86_64.drv")],
+                [libfoo_ident],
+            ],
+        )
+        arr_a = _variant_array(
+            template_id=1, arch="aarch64",
+            variants=["gcc15-O2"],
+            hashes=[
+                [("rah", "hello-aarch64.drv")],
+                [libfoo_ident],
+            ],
+        )
+        meta = _meta_template(
+            template_id_per_arch={"x86_64": 0, "aarch64": 1},
+            role_at_node=["hello-elf-folder.drv", "libfoo.drv"],
+            cross_arch_classification=[
+                "variant_specific", "cross_arch_common_dep",
+            ],
+            drv_per_node=[None, libfoo_ident],
+        )
+        streaming = {
+            "templates": [tmpl_x, tmpl_a],
+            "variant_arrays": {
+                (0, "x86_64"): arr_x,
+                (1, "aarch64"): arr_a,
+            },
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "variant_specific", 1: "common_dep"},
+                (1, "aarch64"): {0: "variant_specific", 1: "common_dep"},
+            },
+            "toolchain_drvs": set(),
+            "arch_indep_deps": {},
+            "meta_templates": {"hello": [meta]},
+        }
+        variant_lookup = {
+            ("x86_64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "x86_64",
+            ),
+            ("aarch64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "aarch64",
+            ),
+        }
+        return streaming, variant_lookup
+
+    def test_emits_one_cross_arch_descriptor(self):
+        ident = ("shareh", "libfoo.drv")
+        streaming, lookup = self._streaming(ident)
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        cross = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.task_id.startswith("build_common_dep__cross_arch__")
+        ]
+        assert len(cross) == 1, [d.task_id for d in cross]
+        assert cross[0].task_id == "build_common_dep__cross_arch__shareh-libfoo.drv"
+        assert cross[0].payload["arch"] == "cross_arch"
+        assert cross[0].payload["ident"] == "shareh-libfoo.drv"
+        assert cross[0].payload["node_name"] == "libfoo.drv"
+
+    def test_both_arch_variants_depend_on_cross_arch_task(self):
+        ident = ("shareh", "libfoo.drv")
+        streaming, lookup = self._streaming(ident)
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        cross_id = "build_common_dep__cross_arch__shareh-libfoo.drv"
+        variants = [d for d in descs if d.kind == "build_variant"]
+        assert len(variants) == 2
+        for v in variants:
+            assert cross_id in v.depends_on, (v.task_id, v.depends_on)
+
+    def test_per_cell_duplicate_suppressed(self):
+        """The per-cell ``build_common_dep__<ident>`` task is dropped in
+        favour of the meta-level ``build_common_dep__cross_arch__<ident>``
+        so the descriptor list carries no duplicate dispatch for the
+        same content-addressed sub-drv."""
+        ident = ("shareh", "libfoo.drv")
+        streaming, lookup = self._streaming(ident)
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        per_cell_dup = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.task_id == "build_common_dep__shareh-libfoo.drv"
+        ]
+        assert per_cell_dup == [], [d.task_id for d in per_cell_dup]
+
+    def test_descriptor_order_meta_before_per_cell(self):
+        """Meta-level entries sit between arch-indep and per-cell blocks
+        in the returned list."""
+        ident = ("shareh", "libfoo.drv")
+        streaming, lookup = self._streaming(ident)
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        # First non-variant kind that's cross_arch should come before
+        # any variant_specific or per-cell common_dep with a concrete
+        # arch.
+        meta_idx = next(
+            (i for i, d in enumerate(descs)
+             if d.kind == "build_common_dep"
+             and d.payload.get("arch") == "cross_arch"),
+            None,
+        )
+        variant_idx = next(
+            (i for i, d in enumerate(descs) if d.kind == "build_variant"),
+            None,
+        )
+        assert meta_idx is not None
+        assert variant_idx is not None
+        assert meta_idx < variant_idx
+
+
+class TestMetaTemplateFamilyEmission:
+    """A MetaTemplate position classified ``family_common_dep`` emits one
+    ``build_common_dep__family__<family>__<ident>`` task per family;
+    archs in each family wire their variants to the matching family
+    task."""
+
+    def test_two_family_idents_emit_two_tasks(self):
+        x86_ident = ("xh", "libfam.drv")
+        arm_ident = ("ah", "libfam.drv")
+        tmpl_x = _template([
+            _node("hello-x86_64-root", [1]),
+            _node("libfam.drv", []),
+        ])
+        tmpl_a = _template([
+            _node("hello-aarch64-root", [1]),
+            _node("libfam.drv", []),
+        ])
+        arr_x = _variant_array(
+            template_id=0, arch="x86_64",
+            variants=["gcc15-O2"],
+            hashes=[
+                [("rxh", "hello-x86_64.drv")],
+                [x86_ident],
+            ],
+        )
+        arr_a = _variant_array(
+            template_id=1, arch="aarch64",
+            variants=["gcc15-O2"],
+            hashes=[
+                [("rah", "hello-aarch64.drv")],
+                [arm_ident],
+            ],
+        )
+        meta = _meta_template(
+            template_id_per_arch={"x86_64": 0, "aarch64": 1},
+            role_at_node=["hello-elf-folder.drv", "libfam.drv"],
+            cross_arch_classification=[
+                "variant_specific", "family_common_dep",
+            ],
+            drv_per_node=[None, {"x86": x86_ident, "arm": arm_ident}],
+        )
+        streaming = {
+            "templates": [tmpl_x, tmpl_a],
+            "variant_arrays": {
+                (0, "x86_64"): arr_x,
+                (1, "aarch64"): arr_a,
+            },
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "variant_specific", 1: "common_dep"},
+                (1, "aarch64"): {0: "variant_specific", 1: "common_dep"},
+            },
+            "toolchain_drvs": set(),
+            "arch_indep_deps": {},
+            "meta_templates": {"hello": [meta]},
+        }
+        lookup = {
+            ("x86_64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "x86_64",
+            ),
+            ("aarch64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "aarch64",
+            ),
+        }
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        family = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.task_id.startswith("build_common_dep__family__")
+        ]
+        ids = {d.task_id for d in family}
+        assert ids == {
+            "build_common_dep__family__x86__xh-libfam.drv",
+            "build_common_dep__family__arm__ah-libfam.drv",
+        }
+        variants = {v.payload["arch"]: v for v in descs if v.kind == "build_variant"}
+        assert (
+            "build_common_dep__family__x86__xh-libfam.drv"
+            in variants["x86_64"].depends_on
+        )
+        assert (
+            "build_common_dep__family__arm__ah-libfam.drv"
+            in variants["aarch64"].depends_on
+        )
+        # Per-cell duplicate emission is suppressed for both family idents.
+        per_cell_dups = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.task_id in (
+                "build_common_dep__xh-libfam.drv",
+                "build_common_dep__ah-libfam.drv",
+            )
+        ]
+        assert per_cell_dups == []
+
+
+class TestMetaTemplateShortCircuits:
+    """Source-terminal roles and toolchain roles must NOT emit
+    meta-level descriptors (plan §E2 branches 1 and 2)."""
+
+    def test_source_terminal_role_emits_no_descriptor(self):
+        # ``hello-2.12.tar.gz.drv`` matches the source-terminal pattern.
+        tar_ident = ("tarh", "hello-2.12.tar.gz.drv")
+        tmpl = _template([
+            _node("hello-x86_64-root", [1]),
+            _node("hello-2.12.tar.gz.drv", []),
+        ])
+        arr = _variant_array(
+            template_id=0, arch="x86_64",
+            variants=["gcc15-O2"],
+            hashes=[
+                [("rh", "hello.drv")],
+                [tar_ident],
+            ],
+        )
+        meta = _meta_template(
+            template_id_per_arch={"x86_64": 0},
+            role_at_node=[
+                "hello-elf-folder.drv", "hello-2.12.tar.gz.drv",
+            ],
+            cross_arch_classification=[
+                "variant_specific", "cross_arch_common_dep",
+            ],
+            drv_per_node=[None, tar_ident],
+        )
+        streaming = {
+            "templates": [tmpl],
+            "variant_arrays": {(0, "x86_64"): arr},
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "variant_specific", 1: "common_dep"},
+            },
+            "toolchain_drvs": set(),
+            "arch_indep_deps": {},
+            "meta_templates": {"hello": [meta]},
+        }
+        lookup = {
+            ("x86_64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "x86_64",
+            ),
+        }
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        # No meta-level task for the tarball ident.
+        cross = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.payload.get("arch") == "cross_arch"
+        ]
+        assert cross == []
+        # Per-cell emission is also suppressed (ident in
+        # meta_skip_idents) so the substituter fetches without a
+        # framework task.
+        all_common = [d for d in descs if d.kind == "build_common_dep"]
+        idents = {d.payload["ident"] for d in all_common}
+        assert "tarh-hello-2.12.tar.gz.drv" not in idents
+
+    def test_toolchain_role_wires_existing_task_id(self):
+        """A cross_arch position whose role is a toolchain name wires
+        the matching ``build_compilers__*`` task ids without minting a
+        new descriptor."""
+        cc_ident = ("ccwh", "gcc-wrapper-15.drv")
+        tmpl_x = _template([
+            _node("hello-x86_64-root", [1]),
+            _node("gcc-wrapper-15.drv", [], is_toolchain=True),
+        ])
+        arr_x = _variant_array(
+            template_id=0, arch="x86_64",
+            variants=["gcc15-O2"],
+            hashes=[
+                [("rxh", "hello-x86_64.drv")],
+                [],
+            ],
+        )
+        meta = _meta_template(
+            template_id_per_arch={"x86_64": 0},
+            role_at_node=[
+                "hello-elf-folder.drv", "gcc-wrapper-15.drv",
+            ],
+            cross_arch_classification=[
+                "variant_specific", "cross_arch_common_dep",
+            ],
+            drv_per_node=[None, cc_ident],
+        )
+        streaming = {
+            "templates": [tmpl_x],
+            "variant_arrays": {(0, "x86_64"): arr_x},
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "variant_specific"},
+            },
+            "toolchain_drvs": {cc_ident},
+            "toolchain_node_ids_per_template": {0: [1]},
+            "arch_indep_deps": {},
+            "meta_templates": {"hello": [meta]},
+        }
+        lookup = {
+            ("x86_64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "x86_64",
+            ),
+        }
+        toolchain_task_ids = {
+            "ccwh-gcc-wrapper-15.drv": "build_compilers__x86_64__gcc15",
+        }
+        descs = plan_phase4_for_binary(
+            "hello", streaming, lookup,
+            toolchain_task_ids=toolchain_task_ids,
+        )
+        cross = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.payload.get("arch") == "cross_arch"
+        ]
+        assert cross == []
+        variants = [d for d in descs if d.kind == "build_variant"]
+        assert len(variants) == 1
+        assert "build_compilers__x86_64__gcc15" in variants[0].depends_on
+
+
+class TestMetaTemplateNoOpCases:
+
+    def test_uni_arch_common_dep_no_meta_emission(self):
+        """``uni_arch_common_dep`` positions are handled per-cell; the
+        meta pass MUST NOT emit a duplicate task here."""
+        x_ident = ("xh", "libfoo.drv")
+        a_ident = ("ah", "libfoo.drv")
+        tmpl_x = _template([
+            _node("hello-x86_64-root", [1]),
+            _node("libfoo.drv", []),
+        ])
+        tmpl_a = _template([
+            _node("hello-aarch64-root", [1]),
+            _node("libfoo.drv", []),
+        ])
+        arr_x = _variant_array(
+            0, "x86_64", ["gcc15-O2"],
+            [[("rxh", "hello-x86_64.drv")], [x_ident]],
+        )
+        arr_a = _variant_array(
+            1, "aarch64", ["gcc15-O2"],
+            [[("rah", "hello-aarch64.drv")], [a_ident]],
+        )
+        meta = _meta_template(
+            template_id_per_arch={"x86_64": 0, "aarch64": 1},
+            role_at_node=["hello-elf-folder.drv", "libfoo.drv"],
+            cross_arch_classification=[
+                "variant_specific", "uni_arch_common_dep",
+            ],
+            drv_per_node=[
+                None,
+                {"x86_64": x_ident, "aarch64": a_ident},
+            ],
+        )
+        streaming = {
+            "templates": [tmpl_x, tmpl_a],
+            "variant_arrays": {
+                (0, "x86_64"): arr_x, (1, "aarch64"): arr_a,
+            },
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "variant_specific", 1: "common_dep"},
+                (1, "aarch64"): {0: "variant_specific", 1: "common_dep"},
+            },
+            "toolchain_drvs": set(),
+            "arch_indep_deps": {},
+            "meta_templates": {"hello": [meta]},
+        }
+        lookup = {
+            ("x86_64", "gcc15-O2"): _variant_spec("gcc15-O2", "hello", "x86_64"),
+            ("aarch64", "gcc15-O2"): _variant_spec("gcc15-O2", "hello", "aarch64"),
+        }
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        # No cross_arch / family descriptor; per-cell handles A/C.
+        meta_lvl = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and (
+                d.payload.get("arch") == "cross_arch"
+                or str(d.payload.get("arch", "")).startswith("family__")
+            )
+        ]
+        assert meta_lvl == []
+        # Per-cell emissions both fire — one per arch.
+        per_cell = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.payload.get("arch") in {"x86_64", "aarch64"}
+        ]
+        assert len(per_cell) == 2
+
+    def test_missing_meta_templates_key_is_a_noop(self):
+        """If the streaming result has no ``meta_templates`` key (older
+        snapshot), the planner falls back to per-cell-only emission and
+        produces the same shape as pre-5.4."""
+        template = _template([
+            _node("root", [1]),
+            _node("shared-lib.drv", []),
+        ])
+        arr = _variant_array(
+            0, "x86_64", ["gcc15-O2"],
+            [
+                [("rh", "hello.drv")],
+                [("shareh", "shared-lib.drv")],
+            ],
+        )
+        streaming = {
+            "templates": [template],
+            "variant_arrays": {(0, "x86_64"): arr},
+            "common_deps_per_arch_template": {
+                (0, "x86_64"): {0: "variant_specific", 1: "common_dep"},
+            },
+            # NO meta_templates key.
+        }
+        lookup = {
+            ("x86_64", "gcc15-O2"): _variant_spec(
+                "gcc15-O2", "hello", "x86_64",
+            ),
+        }
+        descs = plan_phase4_for_binary("hello", streaming, lookup)
+        per_cell = [
+            d for d in descs
+            if d.kind == "build_common_dep"
+            and d.task_id == "build_common_dep__shareh-shared-lib.drv"
+        ]
+        assert len(per_cell) == 1
