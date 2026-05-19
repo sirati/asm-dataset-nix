@@ -13,10 +13,15 @@ from typing import TYPE_CHECKING
 
 from template_graph.cowalk import (
     _classify_pair,
+    build_meta_templates,
     build_template,
     build_template_singleton,
 )
-from template_graph.graph import VariantArray, find_or_register_template
+from template_graph.graph import (
+    MetaTemplate,
+    VariantArray,
+    find_or_register_template,
+)
 from template_graph.tree_walker import TreeWalkError
 
 if TYPE_CHECKING:
@@ -29,6 +34,7 @@ def finalize(planner: "StreamPlanner") -> dict:
         from template_graph.streaming.dispatch import _finalise_current_variant
         _finalise_current_variant(planner)
     _close_current_matrix(planner)
+    meta_templates_by_binary = _build_meta_templates_post_pass(planner)
     return {
         "templates": planner.out.templates,
         "variant_arrays": planner.out.variant_arrays,
@@ -37,6 +43,25 @@ def finalize(planner: "StreamPlanner") -> dict:
         "toolchain_drvs": planner.out.toolchain_drvs,
         "arch_indep_deps": planner.out.arch_indep_deps,
         "stdenv_subtrees": planner.out.stdenv_subtrees,
+        "meta_templates": meta_templates_by_binary,
+    }
+
+
+def _build_meta_templates_post_pass(
+    planner: "StreamPlanner",
+) -> dict[str, list[MetaTemplate]]:
+    """Run :func:`build_meta_templates` once per binary the planner saw.
+
+    The binary set is taken from ``out.arch_indep_deps`` keys —
+    ``dispatch._on_depth1`` initialises an entry there for every matrix
+    wrapper, so this set covers every binary regardless of whether the
+    binary surfaced any arch-indep deps. Binaries whose per-arch cells
+    all dropped out (e.g. nothing matched the ``elf-folder`` root role)
+    map to an empty list.
+    """
+    return {
+        binary: build_meta_templates(planner.out, binary)
+        for binary in planner.out.arch_indep_deps
     }
 
 
