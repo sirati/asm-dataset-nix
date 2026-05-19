@@ -10,9 +10,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Optional
 
+from template_graph.cowalk._alloc_helpers import (
+    _capture_stdenv,
+    _record_source_terminal,
+)
 from template_graph.graph import Template, TemplateNode
 from template_graph.parser.role import (
     _is_compiler_wrapper_role,
+    _is_source_terminal_role,
     _is_stdenv_role,
 )
 from template_graph.tree_walker import TreeWalkError
@@ -21,39 +26,26 @@ if TYPE_CHECKING:
     from template_graph.streaming import RawTreeNode, StreamPlanner
 
 
-def _capture_stdenv(
-    planner: "StreamPlanner", raw_nodes: list["RawTreeNode"],
-    label_slots: list[str], eff_arch: Optional[str],
-) -> None:
-    """Siphon each unique stdenv raw root into ``out.stdenv_subtrees``."""
-    seen: set[tuple[str, str]] = set()
-    for rn, slot in zip(raw_nodes, label_slots):
-        if rn.ident in seen:
-            continue
-        seen.add(rn.ident)
-        planner.out.stdenv_subtrees.setdefault(rn.ident, {
-            "first_seen_in": {
-                "matrix": planner.mx.matrix_binary,
-                "arch": eff_arch, "label": slot,
-            },
-            "root": rn,
-        })
-
-
 def make_template_node(
     planner: "StreamPlanner", raw_nodes: list["RawTreeNode"], *,
     optional: bool, label_slots: list[str], arch: Optional[str] = None,
 ) -> TemplateNode:
     """Build a TemplateNode from one or two raw nodes; capture stdenv
-    subtrees; classify the toolchain bit."""
+    subtrees; classify the toolchain bit. Source-terminal roles fold
+    into ``is_toolchain`` so the walker discards their subtrees; the
+    counter + ``arch_indep_deps`` recording happen once per fresh alloc."""
     name = planner.name_extractor(raw_nodes[0].name)
     is_stdenv = _is_stdenv_role(name)
     eff_arch = arch if arch is not None else planner.vb.building_arch
     if is_stdenv:
         _capture_stdenv(planner, raw_nodes, label_slots, eff_arch)
+    is_src_terminal = _is_source_terminal_role(name)
+    if is_src_terminal:
+        _record_source_terminal(planner, raw_nodes)
     is_toolchain = (
         is_stdenv
         or _is_compiler_wrapper_role(name)
+        or is_src_terminal
         or any(rn.ident in planner.out.toolchain_drvs for rn in raw_nodes)
     )
     return TemplateNode(
@@ -247,15 +239,22 @@ def _alloc_singleton(
     planner: "StreamPlanner", template: Template,
     label: str, tn: "RawTreeNode",
 ) -> int:
-    """Find-or-allocate a singleton template node by extracted name."""
+    """Find-or-allocate a singleton template node by extracted name.
+    Source-terminal roles fold into ``is_toolchain`` so the walker
+    discards their subtrees; counter + ``arch_indep_deps`` recording
+    happens once per fresh alloc."""
     name = planner.name_extractor(tn.name)
     is_stdenv = _is_stdenv_role(name)
     if is_stdenv:
         _capture_stdenv(planner, [tn], [label], planner.vb.building_arch)
     if name in template.name_to_id:
         return template.name_to_id[name]
+    is_src_terminal = _is_source_terminal_role(name)
+    if is_src_terminal:
+        _record_source_terminal(planner, [tn])
     is_toolchain = (
         is_stdenv or _is_compiler_wrapper_role(name)
+        or is_src_terminal
         or tn.ident in planner.out.toolchain_drvs
     )
     node = TemplateNode(
