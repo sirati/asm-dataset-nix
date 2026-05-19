@@ -258,14 +258,29 @@ def test_phase3_debug_case(case_dir: pathlib.Path) -> None:
                 # dep present on this variant.
                 bad = [d for d in deps if d.startswith("build_compilers__")]
                 assert not bad, (
-                    f"fixture {case_name!r}: variant {label!r} carries "
-                    f"unexpected toolchain deps {bad!r}"
+                    f"fixture {case_name!r}: variant {label!r} expected "
+                    f"no toolchain dep, got {bad!r}"
                 )
             else:
                 assert expected_task_id in deps, (
                     f"fixture {case_name!r}: variant {label!r} missing "
                     f"toolchain dep {expected_task_id!r} "
                     f"(deps: {list(deps)})"
+                )
+                # Beyond presence: variant must carry EXACTLY this
+                # one toolchain dep, not also others. A regression
+                # over-wiring both gcc14 and clang20 task_ids into a
+                # gcc14-O2 variant would slip past a plain `in deps`
+                # check; this catches it.
+                bad = [
+                    d for d in deps
+                    if d.startswith("build_compilers__")
+                    and d != expected_task_id
+                ]
+                assert not bad, (
+                    f"fixture {case_name!r}: variant {label!r} has "
+                    f"unexpected toolchain deps {bad!r}; expected only "
+                    f"{expected_task_id!r}"
                 )
 
     # ── no_common_dep_for_terminals ────────────────────────────────
