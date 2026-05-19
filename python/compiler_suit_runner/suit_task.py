@@ -60,7 +60,6 @@ import json
 import logging
 import os
 import pathlib
-import pickle
 import subprocess
 import sys
 import threading
@@ -806,7 +805,7 @@ class _MatrixEvalQuiesceWatcher:
         descriptors_path = self._out_dir / "_dependency_graph.pkl"
         try:
             descriptors, _summary = load_phase4_descriptors(descriptors_path)
-        except (OSError, pickle.UnpicklingError, DependencyGraphPickleError) as exc:
+        except (OSError, DependencyGraphPickleError) as exc:
             self._logger.error(
                 "_MatrixEvalQuiesceWatcher: cannot read %s: %s",
                 descriptors_path, exc,

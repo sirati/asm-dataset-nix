@@ -94,6 +94,8 @@ from .descriptors import (
     _variant_task_id,
 )
 from .manifest_glue import (
+    PHASE4_PICKLE_FORMAT_VERSION,
+    PHASE4_PICKLE_MAGIC,
     DependencyGraphPickleError,
     headers_from_descriptors,
     load_phase4_descriptors,
@@ -123,6 +125,8 @@ from .shapes import (
 __all__ = [
     "DependencyGraphCycleError",
     "DependencyGraphPickleError",
+    "PHASE4_PICKLE_FORMAT_VERSION",
+    "PHASE4_PICKLE_MAGIC",
     "Phase4Descriptor",
     "BinaryPlanInput",
     "convert_toolchain_drvs",
