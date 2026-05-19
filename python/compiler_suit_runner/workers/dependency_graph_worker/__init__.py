@@ -20,8 +20,9 @@ Worker flow:
   5. ``dependency_graph_planner.plan_phase4_from_graph`` adapts the
      streaming result into a flat list of
      :class:`Phase4Descriptor` records.
-  6. The descriptor list is JSON-dumped to
-     ``<matrix_eval_out_dir>/_dependency_graph.json`` for the
+  6. The descriptor list is pickled to
+     ``<matrix_eval_out_dir>/_dependency_graph.pkl`` (with a companion
+     ``_dependency_graph_summary.txt`` for operator inspection) for the
      primary-side spawn-tasks step to pick up.
 
 Module layout
@@ -40,7 +41,8 @@ and test monkeypatches keep working unmodified:
                          presence probe + import.
   * :mod:`.sum_drv`   — sum-drv assembly + tree-walk.
   * :mod:`.plan`      — streaming-planner driver (single + multi-binary).
-  * :mod:`.output`    — atomic ``_dependency_graph.json`` writer.
+  * :mod:`.output`    — atomic ``_dependency_graph.pkl`` writer +
+                         ``_dependency_graph_summary.txt`` companion.
   * :mod:`.run`       — top-level driver function.
   * :mod:`.cli`       — argparse + ``main``.
 """
@@ -59,7 +61,14 @@ from .cli import build_cli_parser as _build_cli_parser
 from .cli import main
 from .cli import parse_task_id_mappings as _parse_task_id_mappings
 from .errors import DependencyGraphResult, DependencyGraphWorkerError
-from .output import DEPENDENCY_GRAPH_JSON, write_dependency_graph_json
+from .output import (
+    DEPENDENCY_GRAPH_PICKLE,
+    DEPENDENCY_GRAPH_SUMMARY,
+    PHASE4_PICKLE_FORMAT_VERSION,
+    PHASE4_PICKLE_MAGIC,
+    write_phase4_descriptors,
+    write_phase4_summary_text,
+)
 from .plan import (
     compute_dependency_graph_counters,
     plan_binary,
@@ -73,7 +82,10 @@ from .sum_drv import build_sum_drv, build_sum_drv_multi, query_drv_tree
 __all__ = [
     "DependencyGraphResult",
     "DependencyGraphWorkerError",
-    "DEPENDENCY_GRAPH_JSON",
+    "DEPENDENCY_GRAPH_PICKLE",
+    "DEPENDENCY_GRAPH_SUMMARY",
+    "PHASE4_PICKLE_FORMAT_VERSION",
+    "PHASE4_PICKLE_MAGIC",
     "build_sum_drv",
     "build_sum_drv_multi",
     "compute_dependency_graph_counters",
@@ -87,7 +99,8 @@ __all__ = [
     "plan_total_with_counters",
     "query_drv_tree",
     "run_dependency_graph_task",
-    "write_dependency_graph_json",
+    "write_phase4_descriptors",
+    "write_phase4_summary_text",
 ]
 
 
