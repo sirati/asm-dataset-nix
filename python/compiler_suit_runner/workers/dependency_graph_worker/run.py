@@ -64,6 +64,11 @@ def run_dependency_graph_task(
     clock_fn = clock or time.monotonic
     start = clock_fn()
 
+    # Unlink any stale output before planning so a mid-run crash cannot
+    # leave the watcher reading a previous run's artefact.
+    stale_out_path = matrix_eval_out_dir / "_dependency_graph.pkl"
+    stale_out_path.unlink(missing_ok=True)
+
     archives = _archive.discover_archives(matrix_eval_out_dir)
     if not archives:
         out_path = _output.write_dependency_graph_json(
