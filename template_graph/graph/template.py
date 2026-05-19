@@ -6,7 +6,12 @@ This module owns the shape-level primitives of the template graph:
   * ``Template`` — a structural shape (collection of nodes + root).
   * ``TemplateGraphAssertError`` — hard-assert failure carrying the
     anchor labels that locked the template plus the failing variant.
-  * ``_shape_equal`` — structural equality check between two templates.
+  * ``TemplateAlignment`` — role-aligned correspondence between two
+    same-shape templates, returned by ``_shape_equal``.
+  * ``_shape_equal`` — structural equality check between two
+    templates; returns a ``TemplateAlignment`` (with the recursive-
+    walk role-correspondence) iff the templates have matching shape,
+    otherwise ``None``.
   * ``find_or_register_template`` — re-use-or-append helper used when
     a candidate template's shape is computed from a calibration pair.
 
@@ -89,15 +94,47 @@ class TemplateGraphAssertError(Exception):
         self.details = dict(details or {})
 
 
-def _shape_equal(a: Template, b: Template) -> bool:
+@dataclass(frozen=True)
+class TemplateAlignment:
+    """Role-aligned correspondence between two same-shape templates.
+
+    ``node_pairs[i] = (node_id_in_a, node_id_in_b)`` for the i-th node
+    visited in canonical recursive-walk order starting at ``a.root_id``
+    / ``b.root_id``. The walk order matches the structural-equality
+    walk in ``_shape_equal`` — pre-order, child-index-aligned, with
+    each ``a``-node visited only on its first occurrence (DAG-revisits
+    on the ``a`` side are skipped, mirroring the equality check's
+    memoised recursion).
+
+    ``None`` is returned by ``_shape_equal`` in place of an alignment
+    when the templates don't have matching shape (was the ``False``
+    return of the previous ``bool``-returning version).
+    """
+
+    node_pairs: tuple[tuple[int, int], ...]
+
+
+def _shape_equal(a: Template, b: Template) -> Optional[TemplateAlignment]:
+    """Return a ``TemplateAlignment`` iff ``a`` and ``b`` have the
+    same shape (same node count, same per-node name/is_toolchain, same
+    child-index-aligned recursive structure starting from each root);
+    return ``None`` otherwise.
+
+    The alignment records ``(a_id, b_id)`` pairs in the order the
+    recursive walk first visits each ``a``-node, so callers (e.g.
+    ``MetaTemplate`` construction in Phase 4.2) can map ``a``-side
+    role-positions onto their ``b``-side counterparts.
+    """
     if len(a.nodes) != len(b.nodes):
-        return False
+        return None
     mapping: dict[int, int] = {}
+    pairs: list[tuple[int, int]] = []
 
     def _eq(an: int, bn: int) -> bool:
         if an in mapping:
             return mapping[an] == bn
         mapping[an] = bn
+        pairs.append((an, bn))
         na = a.nodes[an]
         nb = b.nodes[bn]
         if na.name != nb.name:
@@ -111,7 +148,9 @@ def _shape_equal(a: Template, b: Template) -> bool:
                 return False
         return True
 
-    return _eq(a.root_id, b.root_id)
+    if not _eq(a.root_id, b.root_id):
+        return None
+    return TemplateAlignment(node_pairs=tuple(pairs))
 
 
 def find_or_register_template(
@@ -119,7 +158,7 @@ def find_or_register_template(
 ) -> tuple[int, bool]:
     """Return (id, was_newly_registered)."""
     for i, t in enumerate(templates):
-        if _shape_equal(t, candidate):
+        if _shape_equal(t, candidate) is not None:
             return i, False
     templates.append(candidate)
     return len(templates) - 1, True

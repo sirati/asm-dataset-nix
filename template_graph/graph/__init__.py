@@ -2,13 +2,14 @@
 
 Hosts the structural primitives (``Template``, ``TemplateNode``,
 ``VariantArray``) and shape-level helpers (``_shape_equal``,
-``find_or_register_template``) plus the hard-assert error class.
-The cowalk algorithm and orchestrator live in
-``template_graph.streaming``.
+``TemplateAlignment``, ``find_or_register_template``) plus the
+hard-assert error class. The cowalk algorithm and orchestrator live
+in ``template_graph.streaming``.
 """
 
 from template_graph.graph.template import (
     Template,
+    TemplateAlignment,
     TemplateNode,
     TemplateGraphAssertError,
     _shape_equal,
@@ -18,6 +19,7 @@ from template_graph.graph.variant_array import VariantArray
 
 __all__ = [
     "Template",
+    "TemplateAlignment",
     "TemplateNode",
     "TemplateGraphAssertError",
     "VariantArray",
