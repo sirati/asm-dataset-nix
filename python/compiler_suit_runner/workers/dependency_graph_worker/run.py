@@ -5,15 +5,17 @@ Phase 5.2 collapse: every archive contributes ONE matrix wrapper to a
 single sum-drv; the streaming planner runs ONCE over the resulting
 tree so cross-binary template dedup fires automatically inside the
 single :class:`StreamPlanner` instance. A single descriptor list is
-emitted to ``_dependency_graph.json``.
+emitted to ``_dependency_graph.pkl`` (with a human-readable companion
+``_dependency_graph_summary.txt``).
 """
 
 from __future__ import annotations
 
+import collections
 import pathlib
 import time
-from collections.abc import Callable
-from typing import Any, Optional
+from collections.abc import Callable, Sequence
+from typing import Any, Optional, Union
 
 from . import archive as _archive
 from . import output as _output
@@ -66,8 +68,11 @@ def run_dependency_graph_task(
 
     archives = _archive.discover_archives(matrix_eval_out_dir)
     if not archives:
-        out_path = _output.write_dependency_graph_json(
-            matrix_eval_out_dir / _output.DEPENDENCY_GRAPH_JSON, []
+        out_path = _write_outputs(
+            matrix_eval_out_dir=matrix_eval_out_dir,
+            descriptors=[],
+            binaries=[],
+            counters={},
         )
         return DependencyGraphResult(
             output_path=out_path,
@@ -89,8 +94,11 @@ def run_dependency_graph_task(
     )
 
     if not plannable_binaries:
-        out_path = _output.write_dependency_graph_json(
-            matrix_eval_out_dir / _output.DEPENDENCY_GRAPH_JSON, []
+        out_path = _write_outputs(
+            matrix_eval_out_dir=matrix_eval_out_dir,
+            descriptors=[],
+            binaries=[],
+            counters={},
         )
         return DependencyGraphResult(
             output_path=out_path,
@@ -117,8 +125,11 @@ def run_dependency_graph_task(
     if counters.get("violations", 0) > 0:
         _summary.emit_violations_log(violation_entries)
 
-    out_path = _output.write_dependency_graph_json(
-        matrix_eval_out_dir / _output.DEPENDENCY_GRAPH_JSON, descriptors
+    out_path = _write_outputs(
+        matrix_eval_out_dir=matrix_eval_out_dir,
+        descriptors=descriptors,
+        binaries=plannable_binaries,
+        counters=counters,
     )
     return DependencyGraphResult(
         output_path=out_path,
@@ -284,3 +295,61 @@ def _plan_all_binaries(
             message=f"plan_phase4 failed: {exc}",
             cause=exc,
         ) from exc
+
+
+def _build_summary(
+    *,
+    descriptors: Sequence[Any],
+    binaries: Sequence[str],
+    counters: dict[str, int],
+) -> dict[str, Union[int, float, str]]:
+    """Build the ``summary`` dict embedded in the pickle payload and
+    serialised to ``_dependency_graph_summary.txt``.
+
+    Combines the planner-emitted counters (templates / meta_templates /
+    common_deps_* / violations / etc.) with descriptor-derived
+    aggregates (per-kind counts, per-priority_hint counts, binary list).
+    """
+    summary: dict[str, Union[int, float, str]] = dict(counters)
+    summary["binary_count"] = len(binaries)
+    summary["descriptor_count"] = len(descriptors)
+    summary["binaries"] = "/".join(binaries) if binaries else "<none>"
+
+    by_kind: collections.Counter = collections.Counter(
+        getattr(d, "kind", "<unknown>") for d in descriptors
+    )
+    for kind, count in by_kind.items():
+        summary[f"descriptors_by_kind.{kind}"] = count
+
+    by_priority: collections.Counter = collections.Counter(
+        getattr(d, "priority_hint", 0) for d in descriptors
+    )
+    for hint, count in by_priority.items():
+        summary[f"descriptors_by_priority_hint.{hint}"] = count
+
+    return summary
+
+
+def _write_outputs(
+    *,
+    matrix_eval_out_dir: pathlib.Path,
+    descriptors: Sequence[Any],
+    binaries: Sequence[str],
+    counters: dict[str, int],
+) -> pathlib.Path:
+    """Write the pickle + summary-text companion atomically and return
+    the pickle path (the canonical ``output_path`` reported in
+    :class:`DependencyGraphResult`).
+    """
+    summary = _build_summary(
+        descriptors=descriptors, binaries=binaries, counters=counters,
+    )
+    pickle_path = matrix_eval_out_dir / _output.DEPENDENCY_GRAPH_PICKLE
+    summary_path = matrix_eval_out_dir / _output.DEPENDENCY_GRAPH_SUMMARY
+    _output.write_phase4_descriptors(
+        descriptors=descriptors, summary=summary, out_path=pickle_path,
+    )
+    _output.write_phase4_summary_text(
+        summary=summary, out_path=summary_path,
+    )
+    return pickle_path
