@@ -433,42 +433,44 @@ class TestRunDependencyGraphTask:
         # No paths present locally → import must run.
         stub.tree_stdout = b"/nix/store/sum-drv.drv\n"
 
-        # Monkey-patch the sum-drv builder + planner to avoid touching
-        # template_graph or /nix/store. Both calls are recorded so we
-        # can assert on argument shape.
+        # Monkey-patch the multi-binary sum-drv builder + planner to
+        # avoid touching template_graph or /nix/store. Both calls are
+        # recorded so we can assert on argument shape.
         sum_drv_calls: list[dict] = []
         plan_calls: list[dict] = []
 
-        def fake_build_sum_drv(*, bash_path, toolchain_drvs,
-                                binary, variant_drvs, system):
+        def fake_build_sum_drv_multi(*, bash_path, toolchain_drvs,
+                                       matrix_drvs, system):
             sum_drv_calls.append({
                 "bash_path": bash_path,
                 "toolchain_drvs": list(toolchain_drvs),
-                "binary": binary,
-                "variant_drvs": list(variant_drvs),
+                "matrix_drvs": {k: list(v) for k, v in matrix_drvs.items()},
                 "system": system,
             })
-            return "/nix/store/sum-drv-for-" + binary
+            return "/nix/store/sum-drv-multi"
 
-        def fake_plan_binary(*, binary, tree_text, variant_lookup,
-                              toolchain_task_ids, sys_name):
+        def fake_plan_total(*, tree_text, binaries, variant_lookups,
+                             toolchain_task_ids, sys_name):
             plan_calls.append({
-                "binary": binary,
                 "tree_text": tree_text,
-                "variant_lookup": dict(variant_lookup),
+                "binaries": list(binaries),
+                "variant_lookups": {
+                    b: dict(lookup)
+                    for b, lookup in variant_lookups.items()
+                },
                 "toolchain_task_ids": dict(toolchain_task_ids),
                 "sys_name": sys_name,
             })
             return [Phase4Descriptor(
                 kind="build_variant",
-                task_id=f"bv_{binary}",
-                name=f"build_variant__{binary}",
-                payload={"binary": binary},
+                task_id=f"bv_{b}",
+                name=f"build_variant__{b}",
+                payload={"binary": b},
                 depends_on=(),
-            )]
+            ) for b in binaries]
 
-        monkeypatch.setattr(dgw, "build_sum_drv", fake_build_sum_drv)
-        monkeypatch.setattr(dgw, "plan_binary", fake_plan_binary)
+        monkeypatch.setattr(dgw, "build_sum_drv_multi", fake_build_sum_drv_multi)
+        monkeypatch.setattr(dgw, "plan_total", fake_plan_total)
 
         result = dgw.run_dependency_graph_task(
             matrix_eval_out_dir=matrix_dir,
@@ -483,17 +485,19 @@ class TestRunDependencyGraphTask:
         )
         assert result.binary_count == 1
         assert result.descriptor_count == 1
-        # sum_drv builder saw the kept drvs.
+        # sum_drv builder saw the kept drvs in matrix-hello.
         assert len(sum_drv_calls) == 1
-        assert sum_drv_calls[0]["binary"] == "hello"
-        assert sum_drv_calls[0]["variant_drvs"] == [
-            "/nix/store/aaa-hello-O0.drv",
-            "/nix/store/bbb-hello-O2.drv",
-        ]
-        # Planner saw the toolchain task ids.
+        assert sum_drv_calls[0]["matrix_drvs"] == {
+            "matrix-hello": [
+                "/nix/store/aaa-hello-O0.drv",
+                "/nix/store/bbb-hello-O2.drv",
+            ],
+        }
+        # Planner saw the toolchain task ids and the binary list.
         assert plan_calls[0]["toolchain_task_ids"] == {
             "zzzz-gcc15.drv": "build_compilers__aarch64__gcc15",
         }
+        assert plan_calls[0]["binaries"] == ["hello"]
         # nix-store --import was invoked (paths not locally present).
         assert any(c[:2] == ["nix-store", "--import"] for c in stub.calls)
         # _dependency_graph.json was written.
@@ -515,11 +519,11 @@ class TestRunDependencyGraphTask:
         stub.tree_stdout = b"/nix/store/sum.drv\n"
 
         monkeypatch.setattr(
-            dgw, "build_sum_drv",
+            dgw, "build_sum_drv_multi",
             lambda **kw: "/nix/store/sum.drv",
         )
         monkeypatch.setattr(
-            dgw, "plan_binary",
+            dgw, "plan_total",
             lambda **kw: [],
         )
 
@@ -549,9 +553,9 @@ class TestRunDependencyGraphTask:
         stub.import_stderr = b"borked"
 
         monkeypatch.setattr(
-            dgw, "build_sum_drv",
+            dgw, "build_sum_drv_multi",
             lambda **kw: pytest.fail(
-                "build_sum_drv should not be reached after import failure"
+                "build_sum_drv_multi should not be reached after import failure"
             ),
         )
         with pytest.raises(dgw.DependencyGraphWorkerError) as excinfo:
@@ -578,7 +582,7 @@ class TestRunDependencyGraphTask:
         stub.tree_rc = 1
 
         monkeypatch.setattr(
-            dgw, "build_sum_drv",
+            dgw, "build_sum_drv_multi",
             lambda **kw: "/nix/store/sum.drv",
         )
         with pytest.raises(dgw.DependencyGraphWorkerError) as excinfo:
@@ -590,6 +594,74 @@ class TestRunDependencyGraphTask:
                 run_subprocess=stub,
             )
         assert excinfo.value.stage == "query_tree"
+
+    def test_two_binaries_share_one_streaming_pass(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        """Two archives with kept drvs land in ONE sum-drv (one
+        matrix-<binary> wrapper each) and ONE planner call. The Phase
+        5.2 collapse means cross-binary template dedup fires inside
+        the single StreamPlanner instance; the worker observes that
+        only ONE `build_sum_drv_multi` and ONE `plan_total` are
+        invoked, with both binaries surfaced together.
+        """
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        self._seed_archive(matrix_dir, "hello", ["/nix/store/h-hello.drv"])
+        self._seed_archive(matrix_dir, "world", ["/nix/store/w-world.drv"])
+
+        stub = _SubprocessStub()
+        stub.path_info_present.update(
+            ["/nix/store/h-hello.drv", "/nix/store/w-world.drv"]
+        )
+        stub.tree_stdout = b"/nix/store/sum-drv.drv\n"
+
+        sum_drv_calls: list[dict] = []
+        plan_calls: list[dict] = []
+
+        def fake_build_sum_drv_multi(*, bash_path, toolchain_drvs,
+                                       matrix_drvs, system):
+            sum_drv_calls.append({
+                "matrix_drvs": {k: list(v) for k, v in matrix_drvs.items()},
+            })
+            return "/nix/store/sum-drv-multi"
+
+        def fake_plan_total(*, tree_text, binaries, variant_lookups,
+                             toolchain_task_ids, sys_name):
+            plan_calls.append({"binaries": list(binaries)})
+            return [Phase4Descriptor(
+                kind="build_variant", task_id=f"bv_{b}",
+                name=f"build_variant__{b}",
+                payload={"binary": b}, depends_on=(),
+            ) for b in binaries]
+
+        monkeypatch.setattr(dgw, "build_sum_drv_multi", fake_build_sum_drv_multi)
+        monkeypatch.setattr(dgw, "plan_total", fake_plan_total)
+
+        result = dgw.run_dependency_graph_task(
+            matrix_eval_out_dir=matrix_dir,
+            manifest_dir=None,
+            bash_path="/nix/store/bash",
+            toolchain_drvs=["/nix/store/tc.drv"],
+            run_subprocess=stub,
+        )
+        assert result.binary_count == 2
+        assert result.descriptor_count == 2
+        # Exactly ONE sum-drv build + ONE plan_total call, regardless
+        # of the two-binary input.
+        assert len(sum_drv_calls) == 1
+        assert len(plan_calls) == 1
+        # Both binaries surfaced together in the multi-binary matrix_drvs.
+        assert set(sum_drv_calls[0]["matrix_drvs"]) == {
+            "matrix-hello", "matrix-world",
+        }
+        # Both binaries handed to plan_total in sorted archive order.
+        assert plan_calls[0]["binaries"] == ["hello", "world"]
+        # Exactly ONE nix-store --query --tree call across both binaries.
+        tree_calls = [
+            c for c in stub.calls if c[:3] == ["nix-store", "--query", "--tree"]
+        ]
+        assert len(tree_calls) == 1
 
     def test_binary_with_no_kept_drvs_is_skipped(
         self, tmp_path: pathlib.Path, monkeypatch,
@@ -609,11 +681,11 @@ class TestRunDependencyGraphTask:
         stub.tree_stdout = b"/nix/store/sum.drv\n"
 
         monkeypatch.setattr(
-            dgw, "build_sum_drv",
+            dgw, "build_sum_drv_multi",
             lambda **kw: "/nix/store/sum.drv",
         )
         monkeypatch.setattr(
-            dgw, "plan_binary",
+            dgw, "plan_total",
             lambda **kw: [Phase4Descriptor(
                 kind="build_variant",
                 task_id="bv_world",
