@@ -540,13 +540,18 @@ def _resolve_flake_ref(flake_ref: str) -> str:
     """When the worker runs inside the dynamic_runner secondary container
     the CWD is ``/app`` and there is no flake.nix there. The image
     bakes the flake source at ``/app/flake`` (see
-    ``nix/docker-image.nix``'s ``flakeFiles`` stage). Translate a
-    submitter-side ``flake_ref="."`` to the in-container path; honour
-    non-default values verbatim.
+    ``nix/docker-image.nix``'s ``flakeFiles`` stage), but
+    ``/app/flake`` in a layered image is a symlink into ``/nix/store``;
+    nix-eval-jobs would otherwise treat the symlinked path as a fresh
+    flake source and copy-into-sandbox via the *target's* nested path,
+    yielding ``/nix/store/<copy>/nix/store/<flake>/app/flake/flake.nix``
+    which fails to resolve. Returning ``realpath`` (the underlying
+    store path) sidesteps the copy + nested-resolve entirely.
+    Non-default flake_ref values are honoured verbatim.
     """
     if flake_ref == "." and os.path.isdir(_CONTAINER_FLAKE_ROOT) and \
             os.path.isfile(os.path.join(_CONTAINER_FLAKE_ROOT, "flake.nix")):
-        return _CONTAINER_FLAKE_ROOT
+        return os.path.realpath(_CONTAINER_FLAKE_ROOT)
     return flake_ref
 
 
