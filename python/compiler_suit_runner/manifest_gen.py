@@ -214,7 +214,6 @@ def make_matrix_eval_header(
     binary: str,
     sys_name: str,
     archs: Iterable[str],
-    suffixes: Iterable[str],
     *,
     toolchain_aggregate_drv: str,
     variant_sample: Optional[int] = None,
@@ -248,12 +247,10 @@ def make_matrix_eval_header(
             f" a non-empty string, got {toolchain_aggregate_drv!r}"
         )
     archs_list = list(archs)
-    suffixes_list = list(suffixes)
     payload: dict = {
         "binary": binary,
         "sys": sys_name,
         "archs": archs_list,
-        "suffixes": suffixes_list,
         "attr": f"dataset.{sys_name}.{binary}",
         "toolchain_aggregate_drv": toolchain_aggregate_drv,
     }
@@ -619,7 +616,6 @@ def emit_matrix_eval_manifests(
 
         {
             "archs": ["x86_64", "aarch64", ...],
-            "suffixes": ["O0", "O2", ...],
             "toolchain_aggregate_drv": "/nix/store/...-toolchains.drv",
             "variant_sample": 64,    # optional
             "variant_seed": "...",   # optional
@@ -649,7 +645,6 @@ def emit_matrix_eval_manifests(
     for binary in sorted(per_binary_metadata.keys()):
         meta = per_binary_metadata[binary]
         archs = meta.get("archs", ())
-        suffixes = meta.get("suffixes", ())
         variant_sample = meta.get("variant_sample")
         variant_seed = meta.get("variant_seed")
         toolchain_aggregate_drv = meta.get("toolchain_aggregate_drv")
@@ -664,7 +659,6 @@ def emit_matrix_eval_manifests(
                 binary=binary,
                 sys_name=sys_name,
                 archs=archs,
-                suffixes=suffixes,
                 toolchain_aggregate_drv=toolchain_aggregate_drv,
                 variant_sample=variant_sample,
                 variant_seed=variant_seed,
