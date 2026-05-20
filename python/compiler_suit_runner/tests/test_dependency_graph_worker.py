@@ -7,8 +7,8 @@ template_graph eval, no /nix/store).
 Coverage:
 
   * archive discovery (sorted, file-only, suffix filter);
-  * kept-drv derivation from ``nix-store --import`` stdout
-    (filter, dedup, label compose);
+  * variant-lookup derivation from the matrix aggregate drv
+    (filter, label compose, collision detection);
   * import_archive happy + missing-file + subprocess-failure paths,
     including stdout-path capture;
   * write_phase4_descriptors roundtrip (descriptor + summary), including
@@ -114,7 +114,7 @@ class TestDiscoverArchives:
 
 
 # ---------------------------------------------------------------------------
-# Kept-drv derivation from ``nix-store --import`` stdout
+# Variant-lookup derivation from a matrix aggregate drv
 # ---------------------------------------------------------------------------
 
 
@@ -134,111 +134,6 @@ def _variant_drv(
     h = (hash_prefix + "a" * 32)[:32]
     name = f"{binary}-{arch}-{comp}-{opt}-{inner}-elf-folder.drv"
     return f"/nix/store/{h}-{name}"
-
-
-class TestDiscoverKeptDrvsFromImportedStore:
-
-    def test_filters_to_elf_folder_drvs(self):
-        v_hello = _variant_drv("hello", "x86_64", "O0", hash_prefix="hh1")
-        v_world = _variant_drv("world", "aarch64", "O2", hash_prefix="ww1")
-        imported = [
-            v_hello,
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.39.drv",
-            v_world,
-            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-source.tar",
-        ]
-        drvs, lookup = dgw.discover_kept_drvs_from_imported_store(imported)
-        assert drvs == [v_hello, v_world]
-        assert ("x86_64", lookup[("x86_64", lookup_key_for(v_hello))]["arch"]) == (
-            "x86_64", "x86_64"
-        )
-        # Direct sanity: the lookup is keyed by (arch, label) and the
-        # label is the streaming planner's ``cur_label`` (binary__arch__suffix).
-        h_label = (
-            "hello__x86_64__gcc15-O0-baseline-default-san-off-march-default"
-        )
-        w_label = (
-            "world__aarch64__gcc15-O2-baseline-default-san-off-march-default"
-        )
-        assert ("x86_64", h_label) in lookup
-        assert ("aarch64", w_label) in lookup
-        assert lookup[("x86_64", h_label)]["drv"] == v_hello
-        assert lookup[("aarch64", w_label)]["drv"] == v_world
-
-    def test_dedupes_preserving_order(self):
-        v = _variant_drv("hello", "x86_64", "O0", hash_prefix="dup")
-        v2 = _variant_drv("hello", "x86_64", "O2", hash_prefix="d22")
-        # Repeats removed; insertion order preserved.
-        drvs, _ = dgw.discover_kept_drvs_from_imported_store([
-            v, v2, v,
-        ])
-        assert drvs == [v, v2]
-
-    def test_empty_when_no_variant_drvs_in_stream(self):
-        drvs, lookup = dgw.discover_kept_drvs_from_imported_store([
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.39.drv",
-            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-source.tar",
-        ])
-        assert drvs == []
-        assert lookup == {}
-
-    def test_unparseable_variant_drv_skipped_with_warning(
-        self, caplog,
-    ):
-        """A path that ends in ``-elf-folder.drv`` but doesn't parse
-        as a variant (no arch / no compiler suffix) is dropped from
-        the lookup with a WARN log line. The drv still lands in the
-        ``variant_drvs`` list — the streaming planner is the
-        authoritative shape arbiter and will raise its own
-        TreeWalkError on the same tree."""
-        import logging  # noqa: PLC0415
-        bad = (
-            "/nix/store/cccccccccccccccccccccccccccccccc-"
-            "not-a-variant-elf-folder.drv"
-        )
-        good = _variant_drv("hello", "x86_64", "O0", hash_prefix="hh1")
-        with caplog.at_level(
-            logging.WARNING,
-            logger="compiler_suit_runner.dependency_graph_worker",
-        ):
-            drvs, lookup = dgw.discover_kept_drvs_from_imported_store([
-                bad, good,
-            ])
-        # Both drvs are kept (filter is suffix-only).
-        assert drvs == [bad, good]
-        # Only the parseable variant lands in the lookup.
-        assert len(lookup) == 1
-        assert any(
-            "unparseable variant drv" in r.message
-            for r in caplog.records
-        )
-
-
-class TestDeriveVariantLookupFromDrvs:
-
-    def test_label_matches_streaming_planner_cur_label(self):
-        """``derive_variant_lookup_from_drvs`` composes the label the
-        same way ``StreamPlanner._on_matrix_depth2`` does:
-        ``f"{binary}__{arch}__{suffix}"`` where ``suffix`` is the
-        substring between ``<binary>-<arch>-`` and ``-elf-folder.drv``.
-        """
-        v = _variant_drv(
-            "busybox", "aarch64", "O2", comp="clang19",
-            hash_prefix="bbx",
-            inner="size-pie-on-san-off-march-armv8",
-        )
-        lookup = dgw.derive_variant_lookup_from_drvs([v])
-        label = "busybox__aarch64__clang19-O2-size-pie-on-san-off-march-armv8"
-        assert lookup[("aarch64", label)] == {
-            "drv": v, "arch": "aarch64", "label": label,
-            "suffix": "clang19-O2-size-pie-on-san-off-march-armv8",
-        }
-
-    def test_non_elf_folder_inputs_ignored(self):
-        lookup = dgw.derive_variant_lookup_from_drvs([
-            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.39.drv",
-        ])
-        assert lookup == {}
 
 
 # ---------------------------------------------------------------------------

@@ -14,11 +14,9 @@ other reference (toolchain aggregate, bash, ...) is dropped.
 
 The earlier ``<binary>.nix-archive.json`` sidecar and the
 ``matrix_eval__<binary>.json`` defensive secondary discovery have
-been retired. The legacy
-:func:`discover_kept_drvs_from_imported_store` helper (which scanned
-``nix-store --import`` stdout for variant leaves) remains as a
-deprecation shim until D.1b migrates ``run.py`` to the aggregate-drv
-flow; new callers MUST use :func:`derive_variant_lookup_from_aggregate`.
+been retired, along with the legacy stdout-walking
+``discover_kept_drvs_from_imported_store`` helper; callers MUST use
+:func:`derive_variant_lookup_from_aggregate`.
 """
 
 from __future__ import annotations
@@ -26,8 +24,6 @@ from __future__ import annotations
 import logging
 import pathlib
 import subprocess
-import warnings
-from collections.abc import Sequence
 from typing import Optional
 
 from template_graph.tree_walker import VARIANT_SUFFIX, parse_variant_path
@@ -37,9 +33,7 @@ from .subproc import RunSubprocess, default_run_subprocess
 
 __all__ = [
     "derive_variant_lookup_from_aggregate",
-    "derive_variant_lookup_from_drvs",
     "discover_archives",
-    "discover_kept_drvs_from_imported_store",
     "import_archive",
     "is_path_locally_present",
 ]
@@ -155,102 +149,8 @@ def _split_import_stdout(stdout: bytes) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Kept-drv derivation from imported store paths
+# Variant-lookup derivation from a matrix aggregate drv
 # ---------------------------------------------------------------------------
-
-
-def derive_variant_lookup_from_drvs(
-    imported_drvs: Sequence[str],
-) -> dict[tuple[str, str], dict[str, str]]:
-    """Build the ``(arch, label) -> {drv, arch, label, suffix}`` mapping.
-
-    Filters ``imported_drvs`` to ``*-elf-folder.drv`` paths, runs
-    :func:`template_graph.tree_walker.parse_variant_path` on the
-    post-hash drv basename, then composes the label exactly the way
-    the streaming planner's ``cur_label`` does:
-    ``f"{binary}__{arch}__{suffix}"`` where ``suffix`` is the
-    substring between ``<binary>-<arch>-`` and ``-elf-folder.drv``.
-
-    Drv names that ``parse_variant_path`` rejects (shape mismatch)
-    are skipped with a warning — they are not legitimate variant
-    roots, so they cannot land in the lookup.
-    """
-    lookup: dict[tuple[str, str], dict[str, str]] = {}
-    for path in imported_drvs:
-        if not path.endswith(VARIANT_SUFFIX):
-            continue
-        drv_basename = _post_hash_basename(path)
-        if drv_basename is None:
-            continue
-        try:
-            binary, arch, _comp, _opt = parse_variant_path(drv_basename)
-        except Exception as exc:  # noqa: BLE001 - TreeWalkError + future kinds
-            logger.warning(
-                "skipping unparseable variant drv %r: %s", path, exc,
-            )
-            continue
-        # Mirror StreamPlanner._on_matrix_depth2 (template_graph
-        # streaming/dispatch.py): label = "<binary>__<arch>__<suffix>"
-        # where <suffix> is drv_basename[len(binary)+1+len(arch)+1 :
-        # -len(VARIANT_SUFFIX)].
-        suffix = drv_basename[
-            len(binary) + 1 + len(arch) + 1 : -len(VARIANT_SUFFIX)
-        ]
-        label = f"{binary}__{arch}__{suffix}"
-        lookup[(arch, label)] = {
-            "drv": path,
-            "arch": arch,
-            "label": label,
-            "suffix": suffix,
-        }
-    return lookup
-
-
-def discover_kept_drvs_from_imported_store(
-    import_paths: Sequence[str],
-) -> tuple[list[str], dict[tuple[str, str], dict[str, str]]]:
-    """Pick the kept variant drvs out of ``nix-store --import`` stdout.
-
-    .. deprecated:: D.1a
-       The phase-3 worker now receives the matrix aggregate drv path
-       on argv and enumerates leaves via
-       :func:`derive_variant_lookup_from_aggregate` (one local
-       ``nix-store --query --references``). This stdout-walking helper
-       is kept only so the unmigrated ``run.py`` driver still links;
-       D.1b migrates ``run.py`` to the aggregate flow at which point
-       this function is removed.
-
-    Filters ``import_paths`` to ``*-elf-folder.drv`` (the variant
-    root drvs preserved by matrix_eval's keep-policy), deduplicates
-    while preserving order, and derives the per-binary
-    ``variant_lookup`` mapping via
-    :func:`derive_variant_lookup_from_drvs`.
-
-    Returns ``(variant_drvs, variant_lookup)``. The caller treats an
-    empty ``variant_drvs`` list as "binary has no plannable variants"
-    and skips it in the multi-binary sum-drv.
-    """
-    # TODO(D.1b): drop this helper once run.py consumes the matrix
-    # aggregate drv path directly and uses
-    # derive_variant_lookup_from_aggregate.
-    warnings.warn(
-        "discover_kept_drvs_from_imported_store is deprecated; use "
-        "derive_variant_lookup_from_aggregate (migration target: D.1b "
-        "run.py rewrite).",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    seen: set[str] = set()
-    drvs: list[str] = []
-    for path in import_paths:
-        if not path.endswith(VARIANT_SUFFIX):
-            continue
-        if path in seen:
-            continue
-        seen.add(path)
-        drvs.append(path)
-    lookup = derive_variant_lookup_from_drvs(drvs)
-    return drvs, lookup
 
 
 def derive_variant_lookup_from_aggregate(
