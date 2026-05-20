@@ -2,37 +2,38 @@
 
 Complements the hand-built ``phase3_debug_cases`` corpus (sibling D.3)
 by exercising the FULL discoverable compiler / arch matrix through real
-``nix-instantiate``. Scope:
+``nix-instantiate`` AND the aggregate-wrapper flow the production code
+path now uses (phase 1 ``toolchains`` aggregate, phase 2
+``matrix-<binary>`` aggregate, phase 3 ``make_sum_drv_from_paths``).
+Scope:
 
   * 1 binary (``hello``), x86_64-linux primary, all 7 opt levels;
-  * all compilers from ``_debug.compilers`` + all archs from
+  * all compilers from ``_crossToolchainMap.<sys>`` + all archs from
     ``_debug.targets`` (overrideable via ``ASM_PHASE3_SMOKE_ARCHS``;
     default: ``x86_64`` + ``aarch64``);
   * two inner-axis combos per ``(comp, opt)`` cell (``baseline-default``
     + ``noinline-default``, both ``san-off`` ``march-default``) so the
-    streaming planner's calibration pair fires.
+    streaming planner's calibration pair fires;
+  * matrix variants are deterministically sampled by the same
+    per-(compiler, optimization) sampler the eval_worker uses.
 
 Validation contract (mirrors ``test_phase3_debug_cases.py``):
 
   * ``len(descriptors) > 0``, ``len(build_variants) > 0``;
   * every ``build_variant`` carries EXACTLY the canonical
-    ``build_compilers__<sys>__<arch>__<comp>`` task_id (composed via
-    ``parse_variant_path`` on the variant's drv basename) in
+    ``build_compilers__<sys>__<arch>__<comp>`` task_id in
     ``depends_on`` — pins ``plan_cell._variant_toolchain_dep`` to the
     RIGHT toolchain, not just SOME toolchain;
   * descriptor task_ids unique across the plan;
   * ``counters["source_terminal_skipped"] >= 1``;
   * ``len(violations) == 0`` in lax mode.
 
-The nix-introspection + stage-plumbing helpers live in
-``_phase3_smoke_helpers`` so this file stays well under the 300-LOC cap.
-
 Marked ``@pytest.mark.nix``; excluded from the default ``pytest``
 invocation. Run explicitly:
 
     pytest -m nix python/compiler_suit_runner/tests/test_phase3_smoke.py -v
 
-Skips cleanly when ``nix-instantiate`` isn't on PATH.
+Skips cleanly when ``nix-instantiate`` / ``nix-eval-jobs`` aren't on PATH.
 """
 
 from __future__ import annotations
@@ -47,11 +48,15 @@ from compiler_suit_runner.tests._phase3_smoke_helpers import (
     BINARY,
     STORE_HASH_RE,
     SYS_NAME,
-    build_sum_drv,
+    build_matrix_aggregate,
+    build_sum_drv_from_aggregates,
+    build_toolchain_aggregate,
     build_variant_lookup,
     discover_archs,
-    discover_compilers,
-    discover_compilers_per_arch,
+    discover_compilers_per_arch_from_leaves,
+    eval_bash_drv_path,
+    eval_sampled_matrix_leaves,
+    eval_toolchain_leaves,
     plan_from_tree,
     query_tree,
     resolved_smoke_archs,
@@ -62,6 +67,12 @@ from compiler_suit_runner.tests._phase3_smoke_helpers import (
 pytestmark = pytest.mark.nix
 
 
+# Sample size matches the production default the eval_worker uses for
+# the smoke; deterministic seed keeps the wrapper-drv hash stable.
+_SAMPLE_SIZE = 2
+_SAMPLE_SEED = "phase3-smoke-42"
+
+
 def _flake_root() -> Path:
     """Repo root — same ``parents[3]`` walk used by ``conftest.py``."""
     return Path(__file__).resolve().parents[3]
@@ -69,7 +80,7 @@ def _flake_root() -> Path:
 
 def _skip_unless_nix_available() -> None:
     """Skip cleanly when the required nix binaries aren't on PATH."""
-    for tool in ("nix-instantiate", "nix-store", "nix"):
+    for tool in ("nix-instantiate", "nix-store", "nix", "nix-eval-jobs"):
         if shutil.which(tool) is None:
             pytest.skip(f"{tool} not in PATH")
     if not (_flake_root() / "flake.nix").is_file():
@@ -82,8 +93,7 @@ def _canonical_toolchain_task_id_for(descriptor) -> str:
 
     Phase-A per-variant resolver uses the same composition; mirroring
     it here means a regression that wires "a" toolchain instead of
-    "the right" toolchain fails this assertion, not just the looser
-    prefix probe.
+    "the right" toolchain fails this assertion.
     """
     from template_graph.tree_walker import parse_variant_path  # noqa: PLC0415
 
@@ -93,9 +103,6 @@ def _canonical_toolchain_task_id_for(descriptor) -> str:
         f"payload field; cannot derive canonical toolchain task id"
     )
     basename = STORE_HASH_RE.sub("", drv)
-    # parse_variant_path expects the post-hash drv name (with the
-    # `-elf-folder.drv` suffix); STORE_HASH_RE only strips the
-    # `/nix/store/<hash>-` prefix.
     binary, arch_v, comp, _opt = parse_variant_path(basename)
     assert binary == BINARY, (
         f"descriptor drv {basename!r} parsed binary={binary!r} != {BINARY!r}"
@@ -118,9 +125,6 @@ def _assert_descriptors_contract(
     assert len(build_variant_descs) > 0, (
         "no build_variant descriptors — variant_lookup never matched"
     )
-    # Exactly one ``build_variant`` per lookup entry -- the planner
-    # must mint a descriptor for every variant the matrix discovered
-    # (no extras, no drops between graph generation and planning).
     assert len(build_variant_descs) == len(variant_lookup), (
         f"build_variant_count {len(build_variant_descs)} != "
         f"len(variant_lookup) {len(variant_lookup)}"
@@ -132,9 +136,6 @@ def _assert_descriptors_contract(
         + repr([t for t in task_ids if task_ids.count(t) > 1][:5])
     )
 
-    # Every non-toolchain dep task must dedup (>= 2 dependents).
-    # ``build_compilers__*`` (toolchain pull-to-node) is the
-    # documented exception -- emit on presence, not on dedup.
     counts: dict[str, int] = {}
     for d in descriptors:
         for dep in (d.depends_on or ()):
@@ -152,10 +153,6 @@ def _assert_descriptors_contract(
         f"{violators}"
     )
 
-    # Canonical-form toolchain wiring (Finding 3): each build_variant's
-    # depends_on must contain the EXACT
-    # ``build_compilers__<sys>__<arch>__<comp>`` composed from its drv,
-    # not merely SOME build_compilers__*-prefixed id.
     wrong_tc: list[tuple[str, str, tuple[str, ...]]] = []
     for d in build_variant_descs:
         expected_id = _canonical_toolchain_task_id_for(d)
@@ -185,31 +182,61 @@ def _assert_descriptors_contract(
 
 
 def test_phase3_smoke_live_matrix():
-    """End-to-end probe: live matrix → streaming planner →
+    """End-to-end probe: bulk-eval toolchain + matrix leaves, build the
+    aggregate wrapper drvs the production code path does, glue them with
+    ``make_sum_drv_from_paths``, then run streaming planner +
     ``plan_phase4_for_binary``. Stage helpers narrow failures."""
     _skip_unless_nix_available()
     root = _flake_root()
 
-    discovered_compilers = discover_compilers(root)
-    assert discovered_compilers, "no compilers discovered from _debug.compilers"
-
-    discovered_archs = discover_archs(root)
-    compilers_per_arch_all = discover_compilers_per_arch(root)
+    discovered_archs = discover_archs(root=root)
     smoke_archs = resolved_smoke_archs(discovered_archs)
     assert smoke_archs, (
         f"no smoke archs resolved from "
         f"ASM_PHASE3_SMOKE_ARCHS={os.environ.get('ASM_PHASE3_SMOKE_ARCHS')!r}; "
         f"discovered={discovered_archs}"
     )
-    compilers_per_arch = {
-        arch: compilers_per_arch_all.get(arch, []) for arch in smoke_archs
-    }
 
-    sum_drv = build_sum_drv(
-        root=root,
+    # Phase 1 mirror: bulk-eval toolchain leaves, build the single
+    # ``toolchains`` aggregate wrapper drv.
+    toolchain_leaves = eval_toolchain_leaves(root=root, archs=smoke_archs)
+    assert toolchain_leaves, "no toolchain leaves discovered"
+    compilers_per_arch = discover_compilers_per_arch_from_leaves(
+        root=root, archs=smoke_archs,
+    )
+    assert any(compilers_per_arch.values()), (
+        "no (arch, compiler) combos discovered from _crossToolchainMap"
+    )
+    toolchain_agg = build_toolchain_aggregate(
+        toolchain_leaves, sys_name=SYS_NAME,
+    )
+    assert toolchain_agg.endswith(".drv"), toolchain_agg
+
+    # Phase 2 mirror: bulk-eval the sampled matrix leaves, build the
+    # ``matrix-<binary>`` aggregate wrapper drv (toolchain + leaves).
+    matrix_leaves = eval_sampled_matrix_leaves(
+        root=root, binary=BINARY,
         smoke_archs=smoke_archs,
         compilers_per_arch=compilers_per_arch,
+        sample_size=_SAMPLE_SIZE,
+        sample_seed=_SAMPLE_SEED,
     )
+    assert matrix_leaves, (
+        "no matrix leaves discovered — sampler emptied everything?"
+    )
+    matrix_agg = build_matrix_aggregate(
+        toolchain_agg, matrix_leaves, binary=BINARY, sys_name=SYS_NAME,
+    )
+    assert matrix_agg.endswith(".drv"), matrix_agg
+
+    # Phase 3 mirror: assemble the sum-root via the post-aggregate
+    # entry point and walk the resulting tree.
+    bash_path = eval_bash_drv_path(root)
+    sum_drv = build_sum_drv_from_aggregates(
+        toolchain_agg, {BINARY: matrix_agg},
+        bash_path=bash_path, sys_name=SYS_NAME,
+    )
+    assert sum_drv.endswith(".drv"), sum_drv
     tree_text = query_tree(sum_drv)
     assert tree_text, "empty tree text from nix-store --query --tree"
 
