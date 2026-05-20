@@ -28,7 +28,14 @@ _HEX = "0123456789abcdefghijklmnopqrstuv"
 
 
 def make_hash(seed: int) -> str:
-    """Deterministic 32-char hash from an integer seed."""
+    """Deterministic 32-char hash from an integer seed.
+
+    Returned as ``str`` because the synthetic ``Node`` tree-renderer
+    splices it into an f-string when emitting ``nix-store --query
+    --tree`` text. Use :func:`make_hash_bytes` (or call ``.encode``)
+    when asserting against planner-produced ``(hash, name)`` tuples,
+    which carry the hash as ``bytes`` after the str→bytes migration.
+    """
     out = []
     s = seed
     for _ in range(32):
@@ -39,6 +46,11 @@ def make_hash(seed: int) -> str:
     return f"{seed:08d}".rjust(8, "0") + "".join(out)[:24]
 
 
+def make_hash_bytes(seed: int) -> bytes:
+    """Bytes view of :func:`make_hash` for asserting against planner state."""
+    return make_hash(seed).encode("ascii")
+
+
 @dataclass
 class Node:
     """A synthetic drv node for tree construction.
@@ -46,12 +58,20 @@ class Node:
     Each Node is a (hash, name) pair plus children. ``hash`` is unique
     per logical drv; if you reference the SAME hash twice the second
     occurrence will render as a backref ``[...]`` (nix-store's DAG
-    deduplication convention).
+    deduplication convention). ``hash`` is held as ``str`` for the
+    text-rendering path (``render_tree`` splices it into an f-string);
+    use :attr:`ident` to get the post-parse ``(bytes, str)`` tuple the
+    planner stores after parsing.
     """
 
     hash: str
     name: str
     children: list["Node"] = field(default_factory=list)
+
+    @property
+    def ident(self) -> tuple[bytes, str]:
+        """Planner-side identity: ``(hash_bytes, name)``."""
+        return (self.hash.encode("ascii"), self.name)
 
 
 _VARIANT_BASELINE_INNER = "baseline-default-san-off-march-default"

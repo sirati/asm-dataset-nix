@@ -54,8 +54,8 @@ def _extract_version(name: str) -> str:
 
 
 def _classify_revisit_diff(
-    stored: tuple[str, str],
-    observed: tuple[str, str],
+    stored: tuple[bytes, str],
+    observed: tuple[bytes, str],
 ) -> Optional[tuple[str, tuple[str, Optional[str]], tuple[str, Optional[str]]]]:
     """Decide whether two distinct (hash, name) values at the same DAG
     position differ purely by target-triple or purely by version. Returns

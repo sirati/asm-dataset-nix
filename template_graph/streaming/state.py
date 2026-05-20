@@ -32,16 +32,17 @@ class RawTreeNode:
     """A raw-tree drv reference. ``(hash, name)`` is the canonical
     identity — the ``/nix/store/`` prefix is implied and never stored.
     Read ``rn.ident`` for set/dict keys; read ``rn.name`` for
-    name-extraction (role / package name).
+    name-extraction (role / package name). ``hash`` is the raw 32-byte
+    base32 ASCII hash as produced by the line parsers.
     """
-    hash: str
+    hash: bytes
     name: str
     is_backref: bool
     depth: int
     children: list["RawTreeNode"] = field(default_factory=list)
 
     @property
-    def ident(self) -> tuple[str, str]:
+    def ident(self) -> tuple[bytes, str]:
         return (self.hash, self.name)
 
 
@@ -72,15 +73,16 @@ class OutputState:
     )
     # All identity-bearing collections use ``(hash, name)`` tuples.
     # The ``/nix/store/`` prefix is implied; never reconstructed.
-    toolchain_drvs: set[tuple[str, str]] = field(default_factory=set)
+    # ``hash`` is the raw 32-byte ASCII base32 hash from the line parsers.
+    toolchain_drvs: set[tuple[bytes, str]] = field(default_factory=set)
     # Per-binary arch-indep deps surfaced at matrix depth 2.
-    arch_indep_deps: dict[str, set[tuple[str, str]]] = field(
+    arch_indep_deps: dict[str, set[tuple[bytes, str]]] = field(
         default_factory=dict
     )
     # Stdenv raw subtrees, siphoned during template construction and
     # cowalk. Keyed by the stdenv root ``(hash, name)`` so a stdenv
     # referenced from many variants captures once.
-    stdenv_subtrees: dict[tuple[str, str], dict] = field(default_factory=dict)
+    stdenv_subtrees: dict[tuple[bytes, str], dict] = field(default_factory=dict)
     # Per-template list of node_ids whose ``TemplateNode.is_toolchain``
     # flag is set. Computed post-pass in ``finalize()`` (the cowalk
     # short-circuits toolchain subtrees, so ``arr.hashes`` rows at
@@ -112,7 +114,7 @@ class MatrixState:
     # Drvs encountered (non-backref) in this matrix's variants that
     # haven't been placed into any bucket. Should drain to empty by
     # end-of-matrix; non-empty surfaces a missing edge case.
-    unclassified_nodes: set[tuple[str, str]] = field(default_factory=set)
+    unclassified_nodes: set[tuple[bytes, str]] = field(default_factory=set)
 
 
 @dataclass
@@ -130,12 +132,12 @@ class VariantBuilderState:
     cur_root: Optional[RawTreeNode] = None
     cur_arch: Optional[str] = None
     cur_label: Optional[str] = None
-    cur_drv: Optional[tuple[str, str]] = None
+    cur_drv: Optional[tuple[bytes, str]] = None
     cur_stack: list[RawTreeNode] = field(default_factory=list)
     # ``(hash, name)`` → RawTreeNode within the variant currently being
     # built. Collapses re-encountered idents onto the existing node
     # (DAG via nix's [...] back-refs).
-    cur_path_to_node: dict[tuple[str, str], RawTreeNode] = field(
+    cur_path_to_node: dict[tuple[bytes, str], RawTreeNode] = field(
         default_factory=dict
     )
     building_arch: Optional[str] = None
@@ -195,7 +197,7 @@ class StreamPlanner:
     def feed_parsed(
         self,
         depth: int,
-        drv_hash: str,
+        drv_hash: bytes,
         drv_name: str,
         is_backref: bool,
     ) -> None:
@@ -248,7 +250,7 @@ class StreamPlanner:
         template = self.out.templates[tmpl_id]
         arr = self.out.variant_arrays[(tmpl_id, arch)]
         label = arr.variants[v_pos]
-        local_path_to_nid: dict[tuple[str, str], int] = {}
+        local_path_to_nid: dict[tuple[bytes, str], int] = {}
 
         def _alloc(rn: RawTreeNode) -> tuple[int, bool]:
             if rn.ident in local_path_to_nid:

@@ -128,10 +128,11 @@ def test_stdenv_subtrees_recorded_when_stdenv_role_appears():
     result = planner.finalize()
 
     stdenv_subtrees = result["stdenv_subtrees"]
-    assert (stdenv_hash, "stdenv-linux.drv") in stdenv_subtrees, (
+    stdenv_ident = (stdenv_hash.encode("ascii"), "stdenv-linux.drv")
+    assert stdenv_ident in stdenv_subtrees, (
         f"expected stdenv ident in stdenv_subtrees; "
         f"got keys={list(stdenv_subtrees)}"
     )
-    entry = stdenv_subtrees[(stdenv_hash, "stdenv-linux.drv")]
+    entry = stdenv_subtrees[stdenv_ident]
     assert entry["first_seen_in"]["matrix"] == "hello"
     assert entry["first_seen_in"]["arch"] == "x86_64"

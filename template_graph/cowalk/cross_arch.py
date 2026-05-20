@@ -126,15 +126,15 @@ _CLASS_NAME: dict[str, str] = {
 
 
 def _by_family(
-    arch_to_drv: Mapping[str, tuple[str, str]],
-) -> dict[str, tuple[str, str]]:
+    arch_to_drv: Mapping[str, tuple[bytes, str]],
+) -> dict[str, tuple[bytes, str]]:
     """Collapse ``arch_to_drv`` to one ident per arch family.
 
     Pre-condition: the A/B/C/D classifier already returned ``B``, which
     guarantees every family is realised by a single ident across its
     archs. Used to shape ``drv_per_node`` for ``family_common_dep``.
     """
-    out: dict[str, tuple[str, str]] = {}
+    out: dict[str, tuple[bytes, str]] = {}
     for arch, ident in arch_to_drv.items():
         fam = _ARCH_FAMILIES.get(arch, "other")
         out[fam] = ident
@@ -142,7 +142,7 @@ def _by_family(
 
 
 def _drv_value_for_class(
-    letter: str, arch_to_drv: Mapping[str, tuple[str, str]],
+    letter: str, arch_to_drv: Mapping[str, tuple[bytes, str]],
 ) -> object:
     """Shape ``drv_per_node`` payload per the A/B/C/D class letter."""
     if letter == "D":
@@ -155,7 +155,7 @@ def _drv_value_for_class(
 
 
 def _classify_position(
-    arch_to_drv: dict[str, tuple[str, str]],
+    arch_to_drv: dict[str, tuple[bytes, str]],
     is_variant_specific: bool,
 ) -> tuple[str, Optional[str], object]:
     """Return ``(classification, class_letter, drv_value)`` for one role.
@@ -179,7 +179,7 @@ def _classify_position(
 
 def _arch_idents_at_key(
     merged: Merged, k: Key,
-) -> dict[str, tuple[str, str]]:
+) -> dict[str, tuple[bytes, str]]:
     """Read each arch's variant-0 ident at Key ``k``.
 
     The role-merged keymap stores the variant-0 drv (or ``None`` for
@@ -187,7 +187,7 @@ def _arch_idents_at_key(
     whose cell is ``None`` so the classifier only sees archs that
     actually realise the role at variant 0.
     """
-    out: dict[str, tuple[str, str]] = {}
+    out: dict[str, tuple[bytes, str]] = {}
     for arch, (drv, _children) in merged[k].items():
         if drv is None:
             continue

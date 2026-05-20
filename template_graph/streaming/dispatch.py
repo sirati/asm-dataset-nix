@@ -38,7 +38,7 @@ def feed_line(planner: "StreamPlanner", line: str) -> None:
 def feed_parsed(
     planner: "StreamPlanner",
     depth: int,
-    drv_hash: str,
+    drv_hash: bytes,
     drv_name: str,
     is_backref: bool,
 ) -> None:
@@ -74,7 +74,7 @@ def feed_parsed(
 
 def _on_depth1(
     planner: "StreamPlanner",
-    drv_hash: str,
+    drv_hash: bytes,
     drv_name: str,
     is_backref: bool,
 ) -> None:
@@ -118,7 +118,7 @@ def _on_depth1(
 def _on_matrix_inner(
     planner: "StreamPlanner",
     depth: int,
-    drv_hash: str,
+    drv_hash: bytes,
     drv_name: str,
     is_backref: bool,
 ) -> None:
@@ -133,8 +133,8 @@ def _on_matrix_inner(
 
 def _on_matrix_depth2(
     planner: "StreamPlanner",
-    ident: tuple[str, str],
-    drv_hash: str,
+    ident: tuple[bytes, str],
+    drv_hash: bytes,
     drv_name: str,
     is_backref: bool,
 ) -> None:
@@ -184,8 +184,8 @@ def _on_matrix_depth2(
 def _on_matrix_depth_inner(
     planner: "StreamPlanner",
     depth: int,
-    ident: tuple[str, str],
-    drv_hash: str,
+    ident: tuple[bytes, str],
+    drv_hash: bytes,
     drv_name: str,
     is_backref: bool,
 ) -> None:

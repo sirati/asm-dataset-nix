@@ -38,8 +38,9 @@ from template_graph.graph import Template, VariantArray
 # Key: (role, enforce). Plain nodes have enforce=None; template
 # splits share a role but differ in enforce, kept as separate keys.
 Key = tuple[str, Optional[tuple[str, Optional[str]]]]
-# Per-key dict: arch -> (drv_path_v0_or_None, child_keys).
-ArchCell = tuple[Optional[tuple[str, str]], list[Key]]
+# Per-key dict: arch -> (drv_path_v0_or_None, child_keys). The ident
+# carries a ``bytes`` hash (planner-native after the str→bytes migration).
+ArchCell = tuple[Optional[tuple[bytes, str]], list[Key]]
 Merged = dict[Key, dict[str, ArchCell]]
 # arch -> (template, common-dep classifications by node-id, variant array).
 ByArch = dict[str, tuple[Template, dict[int, str], VariantArray]]

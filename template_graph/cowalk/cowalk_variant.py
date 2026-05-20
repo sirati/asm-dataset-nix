@@ -53,7 +53,7 @@ def _split_dag_revisit(
     ctx: CowalkCtx,
     parent_nid: int,
     cid: int,
-    observed_ident: tuple[str, str],
+    observed_ident: tuple[bytes, str],
     diff: tuple[str, tuple[str, Optional[str]], tuple[str, Optional[str]]],
 ) -> int:
     """Clone the original template node, re-point the parent at the

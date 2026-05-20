@@ -43,13 +43,14 @@ _STORE_PREFIX_LEN = len(_STORE_PREFIX)
 _HASH_LEN = 32  # nix base32 hash is always 32 chars + dash
 
 
-def _parse_line(line: str) -> tuple[int, str, str, bool]:
+def _parse_line(line: str) -> tuple[int, bytes, str, bool]:
     """Return ``(depth, drv_hash, drv_name, is_backref)``. Root line → depth 0.
 
-    ``drv_hash`` is the 32-char store-path hash; ``drv_name`` is the
-    post-hash basename. The ``/nix/store/`` prefix is implied. For
-    lines that don't start with the store prefix (only the root in
-    practice), ``drv_hash=""`` and ``drv_name`` carries the raw rest.
+    ``drv_hash`` is the 32-byte ASCII base32 store-path hash; ``drv_name``
+    is the post-hash basename string. The ``/nix/store/`` prefix is
+    implied. For lines that don't start with the store prefix (only the
+    root in practice), ``drv_hash=b""`` and ``drv_name`` carries the raw
+    rest.
     """
     i = 0
     depth = 0
@@ -70,10 +71,10 @@ def _parse_line(line: str) -> tuple[int, str, str, bool]:
         rest = rest[: -len(BACKREF_SUFFIX)]
     if rest.startswith(_STORE_PREFIX):
         body_start = _STORE_PREFIX_LEN
-        drv_hash = rest[body_start : body_start + _HASH_LEN]
+        drv_hash = rest[body_start : body_start + _HASH_LEN].encode("ascii")
         drv_name = rest[body_start + _HASH_LEN + 1 :]
     else:
-        drv_hash = ""
+        drv_hash = b""
         drv_name = rest
     return depth, drv_hash, drv_name, is_backref
 

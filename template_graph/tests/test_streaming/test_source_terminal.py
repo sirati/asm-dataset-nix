@@ -163,8 +163,8 @@ def test_planner_source_terminal_short_circuits() -> None:
 
     # Both idents end up in arch_indep_deps[hello] for diagnostics.
     indep = result["arch_indep_deps"]["hello"]
-    assert (inner_tarball.hash, inner_tarball.name) in indep
-    assert (inner_patch.hash, inner_patch.name) in indep
+    assert inner_tarball.ident in indep
+    assert inner_patch.ident in indep
 
     # Children of the source-terminal raw nodes must NOT appear as
     # template nodes — the subtree under a source-terminal alloc is

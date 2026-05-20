@@ -100,8 +100,8 @@ def test_class_B_family_common_dep_for_intra_family_sharing():
     drv = mt.drv_per_node[libfoo_i]
     assert isinstance(drv, dict)
     assert drv == {
-        "x86": (x86_hash, "libfoo-1.0.drv"),
-        "arm": (arm_hash, "libfoo-1.0.drv"),
+        "x86": (x86_hash.encode("ascii"), "libfoo-1.0.drv"),
+        "arm": (arm_hash.encode("ascii"), "libfoo-1.0.drv"),
     }
 
 
@@ -139,11 +139,13 @@ def test_class_C_mixed_classification_folds_to_uni_arch():
     assert mt.class_letter_at_node[libfoo_i] == "C"
     drv = mt.drv_per_node[libfoo_i]
     assert isinstance(drv, dict)
+    drv_a_b = drv_a.encode("ascii")
+    drv_b_b = drv_b.encode("ascii")
     assert drv == {
-        "x86_64": (drv_a, "libfoo-1.0.drv"),
-        "aarch64": (drv_a, "libfoo-1.0.drv"),
-        "i686": (drv_b, "libfoo-1.0.drv"),
-        "armv7l-hf": (drv_b, "libfoo-1.0.drv"),
+        "x86_64": (drv_a_b, "libfoo-1.0.drv"),
+        "aarch64": (drv_a_b, "libfoo-1.0.drv"),
+        "i686": (drv_b_b, "libfoo-1.0.drv"),
+        "armv7l-hf": (drv_b_b, "libfoo-1.0.drv"),
     }
 
 

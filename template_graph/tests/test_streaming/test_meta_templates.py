@@ -106,7 +106,7 @@ def test_build_meta_templates_non_empty_for_multi_arch_binary():
     assert mt.cross_arch_classification[libfoo_i] == "cross_arch_common_dep"
     assert mt.class_letter_at_node[libfoo_i] == "D"
     drv = mt.drv_per_node[libfoo_i]
-    assert drv == (shared, "libfoo-1.0.drv")
+    assert drv == (shared.encode("ascii"), "libfoo-1.0.drv")
 
 
 def test_build_meta_templates_class_a_per_arch_distinct():
@@ -128,8 +128,8 @@ def test_build_meta_templates_class_a_per_arch_distinct():
     drv = mt.drv_per_node[libfoo_i]
     assert isinstance(drv, dict)
     assert drv == {
-        "x86_64": (x86, "libfoo-1.0.drv"),
-        "aarch64": (aar, "libfoo-1.0.drv"),
+        "x86_64": (x86.encode("ascii"), "libfoo-1.0.drv"),
+        "aarch64": (aar.encode("ascii"), "libfoo-1.0.drv"),
     }
 
 
