@@ -881,6 +881,27 @@ class TestCliParser:
         assert args.toolchain_task_id == ["tc1.drv=task1"]
         assert args.sys_name == "aarch64-linux"
 
+    def test_system_flag_default(self):
+        """``--system`` defaults to ``x86_64-linux`` so the watcher's
+        invocation works without an explicit value on the common case."""
+        parser = dgw._build_cli_parser()
+        args = parser.parse_args([
+            "--matrix-eval-out-dir", "/tmp/me",
+            "--bash-path", "/nix/store/aaaa-bash",
+        ])
+        assert args.sys_name == "x86_64-linux"
+
+    def test_system_flag_overrides_default(self):
+        """``--system aarch64-linux`` parses onto ``args.sys_name`` so
+        the worker's ``run_dependency_graph_task`` sees the override."""
+        parser = dgw._build_cli_parser()
+        args = parser.parse_args([
+            "--matrix-eval-out-dir", "/tmp/me",
+            "--bash-path", "/nix/store/aaaa-bash",
+            "--system", "aarch64-linux",
+        ])
+        assert args.sys_name == "aarch64-linux"
+
 
 # ---------------------------------------------------------------------------
 # Phase 6.1 lax-mode default smoke test

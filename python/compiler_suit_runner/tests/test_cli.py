@@ -199,6 +199,80 @@ def test_build_parser_submit_allow_toolchain_build_flag_removed(
         )
 
 
+def test_build_parser_submit_system_defaults_to_x86_64_linux(
+    tmp_path: pathlib.Path,
+):
+    """``--system`` defaults to ``x86_64-linux`` so submitters on the
+    common case don't have to spell it out."""
+    parser = build_parser()
+    args = parser.parse_args(
+        ["submit", "--shared-fs", str(tmp_path),
+         "--multi-computer", "single-process"],
+    )
+    assert args.sys_name == "x86_64-linux"
+
+
+def test_build_parser_submit_system_overrides_default(
+    tmp_path: pathlib.Path,
+):
+    """``--system aarch64-linux`` must land on ``args.sys_name`` so the
+    submit-side manifest emission and worker dispatch see the override."""
+    parser = build_parser()
+    args = parser.parse_args(
+        ["submit", "--shared-fs", str(tmp_path),
+         "--multi-computer", "single-process",
+         "--system", "aarch64-linux"],
+    )
+    assert args.sys_name == "aarch64-linux"
+
+
+def test_build_parser_submit_sys_alias_still_accepted(
+    tmp_path: pathlib.Path,
+):
+    """``--sys`` remains a back-compat alias for ``--system`` so existing
+    operator scripts and forwarded-argv stripping logic keep working."""
+    parser = build_parser()
+    args = parser.parse_args(
+        ["submit", "--shared-fs", str(tmp_path),
+         "--multi-computer", "single-process",
+         "--sys", "aarch64-linux"],
+    )
+    assert args.sys_name == "aarch64-linux"
+
+
+def test_cmd_submit_system_propagates_to_manifest_emit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    stub_submit_helpers: dict,
+):
+    """``cmd_submit`` must thread the parsed ``--system`` value into the
+    matrix-eval manifest emission (so the manifest header's ``sys_name``
+    field matches the submitter's CLI choice)."""
+
+    class _MissCache(IncrementalCache):
+        def lookup(self, input_hash: str):  # type: ignore[override]
+            return None
+
+        def store(self, input_hash, partition_path, manifests_dir, meta_path):  # type: ignore[override]
+            return CacheEntry(
+                input_hash=input_hash,
+                partition_path=partition_path,
+                manifests_archive=manifests_dir.parent / "manifests.tar",
+                meta_path=meta_path,
+            )
+
+    monkeypatch.setattr(cli_module, "IncrementalCache", _MissCache)
+    args = _make_args(tmp_path, sys_name="aarch64-linux")
+    rc = cmd_submit(args)
+    assert rc == 0
+    # preflight (enumerate_toolchains_only) saw the override.
+    assert stub_submit_helpers["preflight_calls"]
+    assert stub_submit_helpers["preflight_calls"][0][1] == "aarch64-linux"
+    # emit_all_manifests saw the override.
+    assert stub_submit_helpers["emit_calls"]
+    assert stub_submit_helpers["emit_calls"][0][1] == "aarch64-linux"
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
