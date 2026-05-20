@@ -1,18 +1,16 @@
-"""Local pre-flight: enumerate the variant matrix via ``nix eval``.
+"""Local pre-flight: discover packages + cross toolchains via ``nix eval``.
 
-The runner needs the full superset of (pkg, arch, variant_suffix) tuples
-*before* it submits anything, because the dynamic_runner framework's
-queue is fixed at coord.run() time (see plan §"How to inject Phase 2 +
-Phase 3 items into the queue", option A). This module implements the
-local pre-flight: it shells out to ``nix eval`` against this repo's
-flake to read
+The submitter only enumerates the cheap, top-level shape of the matrix
+locally: the package list under ``dataset.<sys>`` (via ``attrNames``)
+and the leaf drv paths of ``_crossToolchainMap.<sys>`` (via
+``nix-eval-jobs``, with a single-call fallback). Per-suffix variant
+enumeration — the expensive part — runs on the cluster inside the
+matrix_eval worker, which evaluates ``_meta.<sys>.<pkg>.<arch>`` one
+arch at a time via ``_eval_meta_for_arch`` and applies
+``is_known_bad_combo`` there.
 
-* ``.#_meta.<sys>``  — instant; pure metadata only.
-* ``.#_drvPaths.<sys>`` — slow; forces drv instantiation.
-* ``.#_crossToolchainsMeta.<sys>`` — instant.
-
-and assembles a :class:`PreflightResult` that downstream code (CLI,
-manifest_gen) can feed to ``emit_all_manifests``.
+The output is a :class:`PreflightResult` that downstream code (CLI,
+manifest_gen) feeds to ``emit_all_manifests``.
 
 Subprocess invocation is dependency-injected via ``run_subprocess`` so
 unit tests stay hermetic — the real flake never has to be evaluated.
@@ -23,7 +21,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import random
 import re
 import shutil
 import subprocess
@@ -129,134 +126,6 @@ def _default_run_subprocess(argv: list[str]) -> tuple[bytes, bytes, int]:
 # ---------------------------------------------------------------------------
 
 
-def _eval_drv_paths_for_suffixes(
-    flake_ref: str,
-    sys_name: str,
-    pkg: str,
-    arch: str,
-    suffixes: list[str],
-    *,
-    workers: int = 8,
-    run_subprocess: Optional[RunSubprocess] = None,
-) -> dict[str, str]:
-    """Evaluate drv paths for a specific list of suffixes in parallel.
-
-    Uses ``nix-eval-jobs`` (a parallel multi-attr nix evaluator) over
-    ``dataset.<sys>.<pkg>.<arch>`` with a ``--select`` lambda that
-    projects to just the sampled suffixes. ``nix-eval-jobs`` spawns
-    ``workers`` parallel evaluator threads sharing one process, so
-    each compiler's cross-toolchain closure gets walked once and
-    drv instantiation parallelises across compilers.
-
-    Output is JSONL — one line per attr with ``drvPath``. We collect
-    them into a ``{suffix: drv_path}`` dict.
-
-    Suffix names come from the matrix and are made of
-    ``[A-Za-z0-9._-]``; we validate before splicing into the
-    --select lambda so future schema drift surfaces loudly instead
-    of letting an injected nix fragment slip through.
-
-    Falls back to the inline ``nix eval --apply`` path if
-    ``nix-eval-jobs`` isn't on PATH (e.g. in the test harness with a
-    stubbed ``run_subprocess``).
-    """
-    runner = run_subprocess or _default_run_subprocess
-    safe = re.compile(r"^[A-Za-z0-9._-]+$")
-    for s in suffixes:
-        if not safe.match(s):
-            raise RuntimeError(
-                f"unexpected character in matrix suffix {s!r}"
-                " — refusing to splice into nix-eval-jobs --select"
-            )
-
-    if shutil.which("nix-eval-jobs") is None:
-        return _eval_drv_paths_for_suffixes_fallback(
-            flake_ref, sys_name, pkg, arch, suffixes, run_subprocess=runner,
-        )
-
-    # Build the --select lambda. Form:
-    #   m: builtins.intersectAttrs { S1 = null; S2 = null; ... } m
-    keys = " ".join(f'"{s}" = null;' for s in suffixes)
-    select_expr = f"m: builtins.intersectAttrs {{ {keys} }} m"
-
-    argv: list[str] = [
-        "nix-eval-jobs",
-        "--flake",
-        f"{flake_ref}#dataset.{sys_name}.{pkg}.{arch}",
-        "--select",
-        select_expr,
-        "--workers",
-        str(max(1, workers)),
-    ]
-    stdout, stderr, rc = runner(argv)
-    if rc != 0:
-        decoded_err = stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"nix-eval-jobs {flake_ref}#dataset.{sys_name}.{pkg}.{arch}"
-            f" failed (rc={rc}): {decoded_err}"
-        )
-    drvs: dict[str, str] = {}
-    for line in stdout.decode("utf-8", errors="replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            # nix-eval-jobs interleaves status/error lines; ignore
-            # anything that isn't a valid JSON object.
-            continue
-        if not isinstance(entry, dict):
-            continue
-        attr = entry.get("attr")
-        drv = entry.get("drvPath")
-        if isinstance(attr, str) and isinstance(drv, str) and drv:
-            drvs[attr] = drv
-    return drvs
-
-
-def _eval_drv_paths_for_suffixes_fallback(
-    flake_ref: str,
-    sys_name: str,
-    pkg: str,
-    arch: str,
-    suffixes: list[str],
-    *,
-    run_subprocess: Optional[RunSubprocess] = None,
-) -> dict[str, str]:
-    """Single-threaded fallback used when ``nix-eval-jobs`` isn't on
-    PATH (mostly: the test harness with a stubbed ``run_subprocess``).
-
-    Form:  ``nix eval --apply 'm: { "S1" = m."S1"; ... }' .#_drvPaths.<...>``
-    """
-    runner = run_subprocess or _default_run_subprocess
-    body = "; ".join(f'"{s}" = m."{s}"' for s in suffixes)
-    apply_expr = f"m: {{ {body}; }}"
-    argv: list[str] = [
-        "nix",
-        "eval",
-        "--extra-experimental-features",
-        "nix-command flakes",
-        "--json",
-        f"{flake_ref}#_drvPaths.{sys_name}.{pkg}.{arch}",
-        "--apply",
-        apply_expr,
-    ]
-    stdout, stderr, rc = runner(argv)
-    if rc != 0:
-        decoded_err = stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"nix eval (apply fallback) {flake_ref}#_drvPaths.{sys_name}.{pkg}.{arch}"
-            f" failed (rc={rc}): {decoded_err}"
-        )
-    parsed = json.loads(stdout.decode("utf-8", errors="replace"))
-    if not isinstance(parsed, dict):
-        raise RuntimeError(
-            f"nix eval (apply fallback) returned non-object: {type(parsed).__name__}"
-        )
-    return parsed  # type: ignore[return-value]
-
-
 def run_nix_eval(
     flake_ref: str,
     attr: str,
@@ -329,49 +198,6 @@ def _tier_from_pkg(pkg: str) -> int:
     if pkg in ("coreutils", "gawk"):
         return 3
     return 2
-
-
-def _build_variant_spec(
-    *,
-    pkg: str,
-    arch: str,
-    suffix: str,
-    meta_entry: dict,
-    drv_path: str,
-) -> VariantSpec:
-    """Assemble one :class:`VariantSpec` from the meta + drvPaths slices.
-
-    ``variant_dir`` is the per-variant subdir name
-    (``<compiler>_<arch>_<opt>_<hash>``) under ``dataset/<pkg>/``;
-    each variant's ELFs land at ``<variant_dir>/<elf>`` and the
-    sidecar JSON sits beside it as ``<variant_dir>.json``.
-    """
-    label = meta_entry.get("variantLabel", suffix)
-    compiler_id = meta_entry.get("compiler", "")
-    optimization = meta_entry.get("optimization", "")
-    short = _short_dataset_name(
-        compiler_id=compiler_id,
-        arch=arch,
-        optimization=optimization,
-        full_label=label,
-    )
-    return {
-        "label": label,
-        "drv": drv_path,
-        "variant_dir": short,
-        "metadata_name": f"{short}.json",
-        "compiler_id": compiler_id,
-        "compiler_family": meta_entry.get("compilerFamily", ""),
-        "compiler_version": meta_entry.get("compilerVersion", ""),
-        "optimization": optimization,
-        "flag_set": meta_entry.get("flags", ""),
-        "hardening": meta_entry.get("hardening", ""),
-        "sanitizer": meta_entry.get("sanitizer", ""),
-        "march": meta_entry.get("march", ""),
-        "tier": _tier_from_pkg(pkg),
-        "pkg": pkg,
-        "arch": arch,
-    }
 
 
 def _parse_compiler_major(version: str) -> Optional[int]:
@@ -571,161 +397,6 @@ def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# (pkg, arch) availability gate — pure consumer of the nix-side gate
-# ---------------------------------------------------------------------------
-#
-# Counterpart to ``pkgIsBuildableForTarget`` in ``lib/matrix.nix``. The nix
-# matrix returns an empty attrset for any (pkg, arch) cell whose underlying
-# nixpkgs derivation declares itself unavailable on the requested host
-# platform (``meta.available = false`` — combines
-# ``meta.platforms``/``meta.badPlatforms`` with ``meta.broken`` and
-# nixpkgs' insecure-allowlist check). Cells excluded for stdenv reasons
-# (e.g. nanopb-only-stdenvNoCC packages on archs where the override
-# wrapper isn't applicable) also come back empty.
-#
-# Rather than mirror the platform metadata in a separate Python table
-# (which would drift), this helper asks the nix matrix directly: a
-# (pkg, arch) is "supported" iff ``_meta.<sys>.<pkg>.<arch>`` has any
-# suffix attrs at all. The result is cached per (flake_ref, sys_name,
-# pkg, arch) so a sampler can probe thousands of tuples without
-# re-shelling out.
-
-
-_PKG_SUPPORTS_ARCH_CACHE: dict[tuple[str, str, str, str], bool] = {}
-
-
-def pkg_supports_arch(
-    pkg: str,
-    arch: str,
-    *,
-    flake_ref: str = ".",
-    sys_name: str = "x86_64-linux",
-    run_subprocess: Optional[RunSubprocess] = None,
-) -> bool:
-    """Return ``True`` iff the matrix exposes any variants for ``(pkg, arch)``.
-
-    Mirrors the nix-side ``pkgIsBuildableForTarget`` gate (see
-    ``lib/matrix.nix``) by querying ``_meta.<sys>.<pkg>.<arch>`` and
-    checking whether its attribute-name list is non-empty. Cells that
-    nix dropped — because the underlying package's ``meta.available``
-    is ``false`` on that platform, or the package doesn't take a
-    ``stdenv`` argument — return ``False``.
-
-    Results are memoised so a Python sampler can call this once per
-    (pkg, arch) tuple without re-shelling out to nix. Cache key
-    includes ``flake_ref`` and ``sys_name`` so callers querying
-    different flakes / systems stay isolated.
-
-    Failures (no such pkg attr, nix eval crashes, missing flake) all
-    map to ``False`` — the caller's contract is "drop the tuple", and
-    a missing/broken cell is operationally equivalent to "unsupported".
-    """
-    key = (flake_ref, sys_name, pkg, arch)
-    cached = _PKG_SUPPORTS_ARCH_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    try:
-        attr_names = run_nix_eval(
-            flake_ref,
-            f"_meta.{sys_name}.{pkg}.{arch}",
-            run_subprocess=run_subprocess,
-            apply="m: builtins.attrNames m",
-        )
-    except RuntimeError:
-        _PKG_SUPPORTS_ARCH_CACHE[key] = False
-        return False
-
-    supported = isinstance(attr_names, list) and len(attr_names) > 0
-    _PKG_SUPPORTS_ARCH_CACHE[key] = supported
-    return supported
-
-
-def supported_archs_for_pkg(
-    pkg: str,
-    *,
-    flake_ref: str = ".",
-    sys_name: str = "x86_64-linux",
-    run_subprocess: Optional[RunSubprocess] = None,
-) -> tuple[str, ...]:
-    """Return every arch label for which ``pkg`` has at least one variant.
-
-    Batched companion to :func:`pkg_supports_arch`: one ``nix eval``
-    asks for the per-arch attribute-name counts in a single call, then
-    populates the per-(pkg, arch) cache with the result so subsequent
-    point queries hit the cache.
-
-    Returns ``()`` if the pkg doesn't appear in ``_meta`` at all (eg
-    typo or pkg not in ``lib/packages.nix``); the per-(pkg, arch) cache
-    entries are still written so repeated calls don't re-shell out.
-    """
-    try:
-        per_arch_counts = run_nix_eval(
-            flake_ref,
-            f"_meta.{sys_name}.{pkg}",
-            run_subprocess=run_subprocess,
-            apply="m: builtins.mapAttrs (_: a: builtins.length (builtins.attrNames a)) m",
-        )
-    except RuntimeError:
-        return ()
-    if not isinstance(per_arch_counts, dict):
-        return ()
-    supported: list[str] = []
-    for arch, count in per_arch_counts.items():
-        if not isinstance(arch, str) or not isinstance(count, int):
-            continue
-        is_supported = count > 0
-        _PKG_SUPPORTS_ARCH_CACHE[(flake_ref, sys_name, pkg, arch)] = is_supported
-        if is_supported:
-            supported.append(arch)
-    supported.sort()
-    return tuple(supported)
-
-
-def _sample_suffix_attrs(
-    suffix_attrs: dict,
-    *,
-    arch: str,
-    sample_size: int,
-    seed: str,
-) -> dict:
-    """Down-sample ``{suffix: meta_entry}`` to ``sample_size`` per
-    ``(compiler, optimization)`` group, seeded deterministically.
-
-    The seed for each group is ``f"{seed}:{compiler}:{arch}:{opt}"`` so
-    changing the operator-supplied seed reshuffles every group, while
-    holding the seed fixed gives identical samples across runs (skip-
-    existing then guarantees we don't rebuild).
-
-    Suffixes lacking ``compiler`` / ``optimization`` in their meta entry
-    are passed through unchanged (we can't group them).
-    """
-    if sample_size <= 0:
-        return suffix_attrs
-    groups: dict[tuple[str, str], list[tuple[str, dict]]] = {}
-    passthrough: dict[str, dict] = {}
-    for suffix, meta_entry in suffix_attrs.items():
-        if not isinstance(meta_entry, dict):
-            passthrough[suffix] = meta_entry
-            continue
-        compiler = meta_entry.get("compiler")
-        opt = meta_entry.get("optimization")
-        if not isinstance(compiler, str) or not isinstance(opt, str):
-            passthrough[suffix] = meta_entry
-            continue
-        groups.setdefault((compiler, opt), []).append((suffix, meta_entry))
-
-    sampled: dict[str, dict] = dict(passthrough)
-    for (compiler, opt), candidates in groups.items():
-        candidates.sort(key=lambda kv: kv[0])
-        rng = random.Random(f"{seed}:{compiler}:{arch}:{opt}")
-        chosen = rng.sample(candidates, min(sample_size, len(candidates)))
-        for suffix, meta_entry in chosen:
-            sampled[suffix] = meta_entry
-    return sampled
-
-
 def enumerate_variants(
     flake_ref: str,
     sys_name: str,
@@ -736,26 +407,21 @@ def enumerate_variants(
     sample_seed: str = "42",
     run_subprocess: Optional[RunSubprocess] = None,
 ) -> dict[str, dict]:
-    """Enumerate every ``(pkg, arch, suffix)`` variant the matrix exposes,
-    returning per-binary metadata that the matrix_eval worker uses to
-    drive its own ``nix-eval-jobs`` invocation.
+    """Enumerate every ``(pkg, arch)`` cell the matrix exposes.
 
-    Filters by ``packages`` and ``archs`` if provided (each is an inclusion
-    list — None means "all").
+    The submitter only discovers the package list and echoes the
+    operator's arch filter. Per-suffix enumeration AND the
+    ``is_supported`` + ``is_known_bad_combo`` filter run on the
+    cluster inside the matrix_eval worker (one
+    ``_meta.<sys>.<binary>.<arch>`` call per arch via
+    ``_eval_meta_for_arch``). ``nix-eval-jobs`` silently swallows any
+    combos the predicate misses.
 
-    ``sample_size`` / ``sample_seed`` are echoed back in the per-binary
-    metadata so the matrix_eval worker on a secondary re-applies the
-    deterministic sample with the same seed — the submitter never needs
-    to know the sampled subset and the slow drv-instantiation never runs
-    on the submit host. Suffixes are filtered against the support table
-    and the known-bad-combo list *before* being emitted.
-
-    The return shape is::
+    Return shape::
 
         {
           <pkg>: {
             "archs": [arch, ...],
-            "suffixes_by_arch": {arch: [suffix, ...], ...},
             "sample_size": int,
             "sample_seed": str,
             "tier": int,
@@ -766,115 +432,53 @@ def enumerate_variants(
     pkg_filter = set(packages) if packages else None
     arch_filter = set(archs) if archs else None
 
-    # Scope the ``_meta`` eval the same way ``_drvPaths`` is scoped
-    # below: when the operator asks for a subset, only force the
-    # requested cells. The full ``_meta.<sys>`` eval iterates every
-    # (pkg, arch, suffix) combo into JSON; with ~250 packages × 6
-    # archs × ~280 combos per cell that's ~420k entries and tips
-    # nix into a multi-minute eval that the daemon eventually
-    # interrupts. Per-(pkg, arch) eval keeps each call ~instant.
-    meta: dict = {}
-    if pkg_filter is None or arch_filter is None:
-        # Need a list of all (pkg, arch) labels first. ``builtins.attrNames``
-        # is cheap because it doesn't force values.
-        full_meta_keys = run_nix_eval(
+    all_pkgs_raw = run_nix_eval(
+        flake_ref,
+        f"dataset.{sys_name}",
+        run_subprocess=run_subprocess,
+        apply="m: builtins.attrNames m",
+    )
+    if not isinstance(all_pkgs_raw, list):
+        raise RuntimeError(
+            f"dataset.{sys_name} attrNames is not a JSON array "
+            f"(got {type(all_pkgs_raw).__name__})"
+        )
+    all_pkgs = [p for p in all_pkgs_raw if isinstance(p, str)]
+
+    if arch_filter is None:
+        per_pkg_archs_raw = run_nix_eval(
             flake_ref,
-            f"_meta.{sys_name}",
+            f"dataset.{sys_name}",
             run_subprocess=run_subprocess,
             apply="m: builtins.mapAttrs (_: a: builtins.attrNames a) m",
         )
-        if not isinstance(full_meta_keys, dict):
+        if not isinstance(per_pkg_archs_raw, dict):
             raise RuntimeError(
-                f"_meta.{sys_name} is not a JSON object "
-                f"(got {type(full_meta_keys).__name__})"
+                f"dataset.{sys_name} per-pkg attrNames is not a JSON object "
+                f"(got {type(per_pkg_archs_raw).__name__})"
             )
-        pkg_arch_pairs = [
-            (pkg, arch)
-            for pkg, archs_list in full_meta_keys.items()
-            if pkg_filter is None or pkg in pkg_filter
-            for arch in (archs_list if isinstance(archs_list, list) else [])
-            if arch_filter is None or arch in arch_filter
-        ]
     else:
-        pkg_arch_pairs = [
-            (pkg, arch) for pkg in pkg_filter for arch in arch_filter
-        ]
+        per_pkg_archs_raw = None
 
-    for pkg, arch in pkg_arch_pairs:
-        try:
-            cell = run_nix_eval(
-                flake_ref,
-                f"_meta.{sys_name}.{pkg}.{arch}",
-                run_subprocess=run_subprocess,
-            )
-        except RuntimeError:
-            # Cell may not exist (e.g. arch not configured for this
-            # package); skip silently.
-            continue
-        if not isinstance(cell, dict):
-            continue
-        meta.setdefault(pkg, {})[arch] = cell
-
-    # We have the per-(pkg, arch) meta but skip the drv-instantiation
-    # step entirely. The matrix_eval worker on a secondary does the
-    # slow ``nix-eval-jobs`` work itself, seeded with the same
-    # ``sample_seed`` so the resulting variant set is deterministic
-    # without the submitter ever forcing drv paths.
-    from compiler_suit_runner.support_table import (  # noqa: PLC0415
-        is_supported,
-        load_support_table,
-    )
-    support = load_support_table()
     out: dict[str, dict] = {}
-    for pkg, arch_attrs in sorted(meta.items()):
+    for pkg in sorted(all_pkgs):
         if pkg_filter is not None and pkg not in pkg_filter:
             continue
-        if not isinstance(arch_attrs, dict):
+        if arch_filter is not None:
+            pkg_archs = sorted(arch_filter)
+        else:
+            raw_archs = per_pkg_archs_raw.get(pkg) if per_pkg_archs_raw else None
+            if not isinstance(raw_archs, list):
+                continue
+            pkg_archs = sorted(a for a in raw_archs if isinstance(a, str))
+        if not pkg_archs:
             continue
-        per_arch: dict[str, list[str]] = {}
-        for arch, suffix_attrs in sorted(arch_attrs.items()):
-            if arch_filter is not None and arch not in arch_filter:
-                continue
-            if not isinstance(suffix_attrs, dict):
-                continue
-            kept_map: dict[str, dict] = {}
-            for suffix, meta_entry in sorted(suffix_attrs.items()):
-                if not isinstance(meta_entry, dict):
-                    continue
-                if not is_supported(
-                    support, meta_entry.get("compiler", ""), arch
-                ):
-                    continue
-                if is_known_bad_combo(meta_entry):
-                    continue
-                kept_map[suffix] = meta_entry
-            # Pre-apply sampling here so manifests stay small enough
-            # to transit the framework's ClusterMutation wire (a 8 MB
-            # suffix list for 150 k+ variants causes the SSH tunnel
-            # to reset before InitialAssignment arrives). The eval
-            # worker then uses the already-sampled list directly
-            # (variant_sample=None in payload → no re-sampling step).
-            if sample_size > 0 and sample_seed and kept_map:
-                kept_map = _sample_suffix_attrs(
-                    kept_map,
-                    arch=arch,
-                    sample_size=sample_size,
-                    seed=sample_seed,
-                )
-            if kept_map:
-                per_arch[arch] = sorted(kept_map.keys())
-        if per_arch:
-            out[pkg] = {
-                "archs": sorted(per_arch.keys()),
-                "suffixes_by_arch": per_arch,
-                # Signal to eval_worker that no re-sampling is needed:
-                # suffixes are already the final sampled subset.
-                # eval_worker skips the _meta lookup + re-sampling
-                # step when sample_size is falsy.
-                "sample_size": 0,
-                "sample_seed": sample_seed,
-                "tier": _tier_from_pkg(pkg),
-            }
+        out[pkg] = {
+            "archs": pkg_archs,
+            "sample_size": int(sample_size or 0),
+            "sample_seed": sample_seed,
+            "tier": _tier_from_pkg(pkg),
+        }
     return out
 
 
