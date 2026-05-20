@@ -575,6 +575,9 @@ def test_build_variant_header_without_placement_kwargs_omits_fields():
 # ---------------------------------------------------------------------------
 
 
+_DEFAULT_TC_AGGREGATE_DRV = "/nix/store/aaaa-toolchains.drv"
+
+
 def _matrix_eval_metadata() -> dict[str, dict]:
     return {
         "hello": {
@@ -582,12 +585,14 @@ def _matrix_eval_metadata() -> dict[str, dict]:
             "suffixes": ["O0", "O2"],
             "variant_sample": 64,
             "variant_seed": "seed-hello",
+            "toolchain_aggregate_drv": _DEFAULT_TC_AGGREGATE_DRV,
         },
         "busybox": {
             "archs": ["x86_64"],
             "suffixes": ["O2", "O3"],
             "variant_sample": 32,
             "variant_seed": "seed-busybox",
+            "toolchain_aggregate_drv": _DEFAULT_TC_AGGREGATE_DRV,
         },
     }
 
@@ -598,6 +603,7 @@ def test_matrix_eval_header_payload_shape():
         "x86_64-linux",
         archs=["x86_64", "aarch64"],
         suffixes=["O0", "O2"],
+        toolchain_aggregate_drv=_DEFAULT_TC_AGGREGATE_DRV,
         variant_sample=64,
         variant_seed="abc123",
     )
@@ -614,6 +620,7 @@ def test_matrix_eval_header_payload_shape():
     assert h.payload["variant_sample"] == 64
     assert h.payload["variant_seed"] == "abc123"
     assert h.payload["attr"] == "dataset.x86_64-linux.hello"
+    assert h.payload["toolchain_aggregate_drv"] == _DEFAULT_TC_AGGREGATE_DRV
 
 
 def test_matrix_eval_header_omits_optional_fields():
@@ -622,9 +629,52 @@ def test_matrix_eval_header_omits_optional_fields():
         "x86_64-linux",
         archs=["x86_64"],
         suffixes=["O2"],
+        toolchain_aggregate_drv=_DEFAULT_TC_AGGREGATE_DRV,
     )
     assert "variant_sample" not in h.payload
     assert "variant_seed" not in h.payload
+    # toolchain_aggregate_drv is required — must be present even when
+    # the optional sample/seed knobs are absent.
+    assert h.payload["toolchain_aggregate_drv"] == _DEFAULT_TC_AGGREGATE_DRV
+
+
+def test_matrix_eval_header_requires_toolchain_aggregate_drv():
+    """Empty/missing ``toolchain_aggregate_drv`` is treated as a
+    schema-version mismatch and raises at construction time."""
+    for bad in ("", None):
+        with pytest.raises(ValueError, match="toolchain_aggregate_drv"):
+            make_matrix_eval_header(
+                "hello",
+                "x86_64-linux",
+                archs=["x86_64"],
+                suffixes=["O0"],
+                toolchain_aggregate_drv=bad,  # type: ignore[arg-type]
+            )
+
+
+def test_matrix_eval_header_round_trips_toolchain_aggregate_drv(
+    tmp_path: pathlib.Path,
+):
+    """The toolchain_aggregate_drv field survives the
+    write_manifest -> read_manifest JSON round-trip intact."""
+    drv = "/nix/store/bbbb-toolchains.drv"
+    h = make_matrix_eval_header(
+        "hello",
+        "x86_64-linux",
+        archs=["x86_64"],
+        suffixes=["O0", "O2"],
+        toolchain_aggregate_drv=drv,
+        variant_sample=16,
+        variant_seed="seed",
+    )
+    written = write_manifest(tmp_path, h)
+    # Inspect the raw JSON too so we know the field made it onto disk
+    # and is not just being re-synthesised by ManifestHeader's defaults.
+    raw = json.loads(written.read_text())
+    assert raw["payload"]["toolchain_aggregate_drv"] == drv
+    loaded = read_manifest(written)
+    assert loaded == h
+    assert loaded.payload["toolchain_aggregate_drv"] == drv
 
 
 def test_emit_matrix_eval_manifests_one_per_binary():
@@ -642,6 +692,23 @@ def test_emit_matrix_eval_manifests_one_per_binary():
         assert "binary" in h.payload
         assert "archs" in h.payload
         assert "suffixes" in h.payload
+        assert h.payload["toolchain_aggregate_drv"] == (
+            _DEFAULT_TC_AGGREGATE_DRV
+        )
+
+
+def test_emit_matrix_eval_manifests_rejects_missing_toolchain_aggregate_drv():
+    """Metadata without ``toolchain_aggregate_drv`` is rejected loudly
+    — that's the schema-mismatch signal for stale preflight outputs."""
+    metadata = {
+        "hello": {
+            "archs": ["x86_64"],
+            "suffixes": ["O0"],
+            # toolchain_aggregate_drv deliberately omitted.
+        },
+    }
+    with pytest.raises(ValueError, match="toolchain_aggregate_drv"):
+        emit_matrix_eval_manifests(metadata, sys_name="x86_64-linux")
 
 
 def test_emit_matrix_eval_manifests_empty():
