@@ -216,6 +216,7 @@ def make_matrix_eval_header(
     archs: Iterable[str],
     suffixes: Iterable[str],
     *,
+    toolchain_aggregate_drv: str,
     variant_sample: Optional[int] = None,
     variant_seed: Optional[str] = None,
 ) -> ManifestHeader:
@@ -228,11 +229,24 @@ def make_matrix_eval_header(
     broadcasts each drv to all peers via the
     ``/peer/path-broadcast-offer`` primitive.
 
+    ``toolchain_aggregate_drv`` is the store path of the phase-1
+    ``toolchains`` aggregate drv (one per dispatch, produced by
+    pre-flight). It is required: every matrix_eval header carries
+    it so eval_worker can ``appendContext`` it into the per-binary
+    matrix aggregate without re-evaluating the toolchain attr set.
+    Manifests built before this field was wired are rejected by
+    schema validation, forcing a clean fresh preflight.
+
     ``task_depends_on`` is left empty for now — once the
     ``build_compilers`` stage is wired (gated by ``--build-compilers``),
     matrix_eval should depend on every build_compilers task whose
     outputs it needs in order to walk the flake's dataset attrs.
     """
+    if not isinstance(toolchain_aggregate_drv, str) or not toolchain_aggregate_drv:
+        raise ValueError(
+            "make_matrix_eval_header: 'toolchain_aggregate_drv' must be"
+            f" a non-empty string, got {toolchain_aggregate_drv!r}"
+        )
     archs_list = list(archs)
     suffixes_list = list(suffixes)
     payload: dict = {
@@ -241,6 +255,7 @@ def make_matrix_eval_header(
         "archs": archs_list,
         "suffixes": suffixes_list,
         "attr": f"dataset.{sys_name}.{binary}",
+        "toolchain_aggregate_drv": toolchain_aggregate_drv,
     }
     if variant_sample is not None:
         payload["variant_sample"] = variant_sample
@@ -605,6 +620,7 @@ def emit_matrix_eval_manifests(
         {
             "archs": ["x86_64", "aarch64", ...],
             "suffixes": ["O0", "O2", ...],
+            "toolchain_aggregate_drv": "/nix/store/...-toolchains.drv",
             "variant_sample": 64,    # optional
             "variant_seed": "...",   # optional
         }
@@ -612,6 +628,11 @@ def emit_matrix_eval_manifests(
     This shape is what :func:`compiler_suit_runner.preflight
     .enumerate_variants` returns (per-binary metadata for matrix_eval
     workers; submitter never instantiates variant drvs).
+
+    ``toolchain_aggregate_drv`` is required on each metadata entry —
+    a missing/empty value is treated as a schema-version mismatch
+    (manifests built before the field was wired need a fresh
+    preflight) and raises :class:`ValueError`.
 
     Each emitted header has ``task_depends_on=()`` for now. Once
     ``build_compilers`` is wired (gated by ``--build-compilers``),
@@ -631,12 +652,20 @@ def emit_matrix_eval_manifests(
         suffixes = meta.get("suffixes", ())
         variant_sample = meta.get("variant_sample")
         variant_seed = meta.get("variant_seed")
+        toolchain_aggregate_drv = meta.get("toolchain_aggregate_drv")
+        if not toolchain_aggregate_drv:
+            raise ValueError(
+                f"emit_matrix_eval_manifests: binary {binary!r} metadata"
+                " is missing required 'toolchain_aggregate_drv' field;"
+                " re-run pre-flight to regenerate manifests."
+            )
         headers.append(
             make_matrix_eval_header(
                 binary=binary,
                 sys_name=sys_name,
                 archs=archs,
                 suffixes=suffixes,
+                toolchain_aggregate_drv=toolchain_aggregate_drv,
                 variant_sample=variant_sample,
                 variant_seed=variant_seed,
             )
