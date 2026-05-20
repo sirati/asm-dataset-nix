@@ -1103,6 +1103,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "suffixes": sorted(suffix_union),
                 "variant_sample": meta.get("sample_size"),
                 "variant_seed": meta.get("sample_seed"),
+                "toolchain_aggregate_drv": tc_aggregate_drv,
             }
         log.info(
             "submit pre-flight: %d toolchains, %d binaries queued for matrix_eval",
