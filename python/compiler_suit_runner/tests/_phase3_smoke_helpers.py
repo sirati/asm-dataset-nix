@@ -1,16 +1,18 @@
 """Nix-introspection helpers for the Phase-3 live-matrix smoke test.
 
-Extracted out of ``test_phase3_smoke.py`` to keep the test module
-within the 300-LOC cap. Only imported by ``test_phase3_smoke.py``;
-no production callers.
+Mirrors the production code path end-to-end:
 
-Drives ``nix eval --json`` against the worktree flake to discover
-compilers / archs / (arch, comp) pairs, composes flake-attr lists for
-the matrix and toolchain map, assembles the sum-drv via
-``template_graph.make_sum_drv``, walks the ``nix-store --query --tree``
-output to build the variant lookup, and runs the streaming planner +
-``plan_phase4_for_binary``. The assertion contract lives in the
-test module so semantics stay co-located with the test function.
+* phase 1: ``toolchains`` aggregate via
+  :func:`template_graph.make_sum_drv.make_wrapper_drv_from_paths` from
+  toolchain leaf drvs discovered by ONE
+  ``nix-eval-jobs --force-recurse`` over ``_crossToolchainMap.<sys>``;
+* phase 2: ``matrix-<binary>`` aggregate the same way from variant
+  leaf drvs discovered by ONE ``nix-eval-jobs --select`` over
+  ``dataset.<sys>.<binary>``;
+* phase 3: :func:`make_sum_drv_from_paths` over the pre-built
+  aggregates, then ``nix-store --query --tree`` + streaming planner.
+
+ZERO per-leaf ``nix eval --apply`` calls.
 """
 
 from __future__ import annotations
@@ -21,9 +23,9 @@ import re
 import subprocess
 from pathlib import Path
 
+from compiler_suit_runner.workers.eval_worker import sample_suffix_attrs
 
-# Configuration knobs (kept here so the test module just references them).
-# _meta decides which suffixes exist per arch; no local guesswork.
+
 DEFAULT_SMOKE_ARCHS: tuple[str, ...] = ("x86_64", "aarch64")
 SYS_NAME = "x86_64-linux"
 BINARY = "hello"
@@ -32,18 +34,15 @@ SUFFIX_MATCH_PATTERN = (
     ".*-(baseline-default|noinline-default)-san-off-march-default"
 )
 STORE_HASH_RE = re.compile(r"^/nix/store/[^-]+-")
-
-
-# --- nix eval / nix-store wrappers -----------------------------------------
+_SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _nix_eval_json(attr: str, *, root: Path, apply: str | None = None) -> object:
-    """Single ``nix eval --json`` against the worktree flake."""
-    argv: list[str] = [
+    """One ``nix eval --json``; tiny scalar/list reads only."""
+    argv = [
         "nix", "eval",
         "--extra-experimental-features", "nix-command flakes",
-        "--json",
-        f"{root}#{attr}",
+        "--json", f"{root}#{attr}",
     ]
     if apply is not None:
         argv += ["--apply", apply]
@@ -70,110 +69,202 @@ def query_tree(sum_drv: str) -> str:
     return proc.stdout.decode("utf-8", errors="replace")
 
 
-# --- Discovery -------------------------------------------------------------
+def _run_jobs(argv: list[str]) -> list[dict]:
+    proc = subprocess.run(argv, capture_output=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"nix-eval-jobs failed (rc={proc.returncode}): "
+            + proc.stderr.decode("utf-8", errors="replace").strip()
+        )
+    out: list[dict] = []
+    for line in proc.stdout.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            out.append(entry)
+    return out
+
+
+def _validate(tok: str, *, kind: str) -> None:
+    if not _SAFE.match(tok):
+        raise RuntimeError(f"phase3-smoke: unsafe {kind} {tok!r}")
+
+
+def _depth2(entries: list[dict], *, archs: set[str] | None = None):
+    """Yield ``(a, b, drv)`` from depth-2 JSONL leaves."""
+    for entry in entries:
+        ap = entry.get("attrPath")
+        drv = entry.get("drvPath")
+        if (
+            isinstance(ap, list) and len(ap) == 2
+            and isinstance(ap[0], str) and isinstance(ap[1], str)
+            and isinstance(drv, str) and drv.endswith(".drv")
+            and (archs is None or ap[0] in archs)
+        ):
+            yield ap[0], ap[1], drv
 
 
 def resolved_smoke_archs(discovered: list[str]) -> list[str]:
-    """``ASM_PHASE3_SMOKE_ARCHS`` resolver. ``all`` → every discovered
-    arch; comma-list → intersection with ``discovered``; unset →
-    ``DEFAULT_SMOKE_ARCHS``."""
+    """Resolve ``ASM_PHASE3_SMOKE_ARCHS`` against the discovered archs."""
     raw = os.environ.get("ASM_PHASE3_SMOKE_ARCHS", "").strip()
     if not raw:
         return [a for a in DEFAULT_SMOKE_ARCHS if a in discovered]
     if raw == "all":
         return list(discovered)
-    wanted = [tok.strip() for tok in raw.split(",") if tok.strip()]
+    wanted = [t.strip() for t in raw.split(",") if t.strip()]
     return [a for a in wanted if a in discovered]
 
 
-def discover_compilers(root: Path) -> list[str]:
-    """``_debug.compilers`` → flat sorted list of compiler labels."""
-    payload = _nix_eval_json(f"_debug.{SYS_NAME}.compilers", root=root)
-    assert isinstance(payload, dict)
-    return sorted({
-        entry["label"]
-        for family in ("gcc", "clang")
-        for entry in payload.get(family, [])
-        if isinstance(entry, dict) and isinstance(entry.get("label"), str)
-    })
-
-
-def discover_archs(root: Path) -> list[str]:
+def discover_archs(*, root: Path) -> list[str]:
     """``_debug.targets`` → list of arch labels."""
     raw = _nix_eval_json(f"_debug.{SYS_NAME}.targets", root=root)
     assert isinstance(raw, list) and raw
     return [a for a in raw if isinstance(a, str)]
 
 
-def discover_compilers_per_arch(root: Path) -> dict[str, list[str]]:
-    """``_crossToolchainsMeta`` → ``{arch: [comp_label, ...]}`` (every
-    (arch, compiler) pair the matrix considers valid)."""
-    raw = _nix_eval_json(f"_crossToolchainsMeta.{SYS_NAME}", root=root)
-    assert isinstance(raw, dict)
-    return {
-        arch: sorted({
-            entry["compiler"]
-            for entry in entries
-            if isinstance(entry, dict)
-            and isinstance(entry.get("compiler"), str)
-        })
-        for arch, entries in raw.items()
-        if isinstance(entries, list)
-    }
+def eval_bash_drv_path(root: Path) -> str:
+    """ONE nix-eval --json for bash's store outPath."""
+    payload = _nix_eval_json(FLAKE_BASH_ATTR, root=root)
+    assert isinstance(payload, str) and payload.startswith("/nix/store/")
+    return payload
 
 
-def _enumerate_valid_suffixes_for_arch(
-    *, arch: str, root: Path,
-) -> list[str]:
-    """``_meta.<sys>.<binary>.<arch>`` → suffixes matching the inner-axis
-    pattern (string list — ``--apply`` keeps JSON small)."""
+def _eval_toolchain_pairs(*, root: Path, archs: list[str]):
+    """ONE ``nix-eval-jobs --force-recurse`` walk; (arch, comp, drv) list."""
+    for arch in archs:
+        _validate(arch, kind="arch")
+    entries = _run_jobs([
+        "nix-eval-jobs",
+        "--flake", f"{root}#_crossToolchainMap.{SYS_NAME}",
+        "--force-recurse", "--workers", "8",
+    ])
+    return list(_depth2(entries, archs=set(archs)))
+
+
+def eval_toolchain_leaves(*, root: Path, archs: list[str]) -> list[str]:
+    return sorted({d for _a, _c, d in _eval_toolchain_pairs(root=root, archs=archs)})
+
+
+def discover_compilers_per_arch_from_leaves(
+    *, root: Path, archs: list[str],
+) -> dict[str, list[str]]:
+    """``{arch: [comp, ...]}`` from the same bulk eval-jobs walk."""
+    per: dict[str, set[str]] = {a: set() for a in archs}
+    for arch, comp, _drv in _eval_toolchain_pairs(root=root, archs=archs):
+        per[arch].add(comp)
+    return {arch: sorted(per[arch]) for arch in archs}
+
+
+def _meta_suffixes_for_arch(*, arch: str, root: Path) -> dict[str, dict]:
     apply_expr = (
-        f'm: builtins.filter '
+        f'm: builtins.listToAttrs (builtins.map '
+        f'(s: {{ name = s; value = m.${{s}}; }}) '
+        f'(builtins.filter '
         f'(s: builtins.match "{SUFFIX_MATCH_PATTERN}" s != null) '
-        f'(builtins.attrNames m)'
+        f'(builtins.attrNames m)))'
     )
     raw = _nix_eval_json(
-        f"_meta.{SYS_NAME}.{BINARY}.{arch}",
-        root=root, apply=apply_expr,
+        f"_meta.{SYS_NAME}.{BINARY}.{arch}", root=root, apply=apply_expr,
     )
-    if not isinstance(raw, list):
-        raise RuntimeError(
-            f"_meta enumeration for {arch} returned non-list: "
-            f"{type(raw).__name__}"
-        )
-    return [s for s in raw if isinstance(s, str)]
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"_meta {arch} returned non-dict: {type(raw).__name__}")
+    return raw
 
 
-# --- Attr-list composition -------------------------------------------------
-
-
-def matrix_attrs_for(smoke_archs: list[str], root: Path) -> list[str]:
-    """Compose ``dataset.<sys>.<binary>.<arch>.<suffix>`` attrs for every
-    arch in ``smoke_archs``, sourcing the valid suffix list from ``_meta``."""
-    out: list[str] = []
-    for arch in smoke_archs:
-        for suffix in _enumerate_valid_suffixes_for_arch(arch=arch, root=root):
-            out.append(f"dataset.{SYS_NAME}.{BINARY}.{arch}.{suffix}")
-    return out
-
-
-def toolchain_attrs_for(
-    smoke_archs: list[str], compilers_per_arch: dict[str, list[str]],
+def eval_sampled_matrix_leaves(
+    *,
+    root: Path,
+    binary: str,
+    smoke_archs: list[str],
+    compilers_per_arch: dict[str, list[str]],  # noqa: ARG001 — API symmetry
+    sample_size: int,
+    sample_seed: str,
 ) -> list[str]:
-    """``_crossToolchainMap.<sys>.<arch>.<comp>`` attrs for every valid
-    (arch, compiler) pair in the smoke archs."""
-    return [
-        f"_crossToolchainMap.{SYS_NAME}.{arch}.{comp}"
-        for arch in smoke_archs
-        for comp in compilers_per_arch.get(arch, [])
+    """ONE bulk ``nix-eval-jobs --select`` over ``dataset.<sys>.<binary>``."""
+    for arch in smoke_archs:
+        _validate(arch, kind="arch")
+    sampled_by_arch: dict[str, list[str]] = {}
+    for arch in smoke_archs:
+        meta = _meta_suffixes_for_arch(arch=arch, root=root)
+        chosen = sample_suffix_attrs(
+            meta, arch=arch, sample_size=sample_size, seed=sample_seed,
+        )
+        if chosen:
+            sampled_by_arch[arch] = sorted(chosen.keys())
+    if not sampled_by_arch:
+        return []
+    for suffixes in sampled_by_arch.values():
+        for s in suffixes:
+            _validate(s, kind="suffix")
+    arch_blocks = [
+        f'"{a}" = {{ ' + " ".join(f'"{s}" = null;' for s in sampled_by_arch[a]) + ' };'
+        for a in sorted(sampled_by_arch)
     ]
+    select_expr = (
+        f"m: let filter = {{ {' '.join(arch_blocks)} }}; in "
+        "builtins.mapAttrs (a: v: builtins.intersectAttrs filter.${a} v) "
+        "(builtins.intersectAttrs filter m)"
+    )
+    entries = _run_jobs([
+        "nix-eval-jobs",
+        "--flake", f"{root}#dataset.{SYS_NAME}.{binary}",
+        "--select", select_expr,
+        "--force-recurse", "--workers", "8",
+    ])
+    return sorted({d for _a, _s, d in _depth2(entries)})
+
+
+def build_toolchain_aggregate(leaves: list[str], *, sys_name: str) -> str:
+    """Phase-1 mirror: single ``toolchains`` wrapper drv."""
+    from template_graph.make_sum_drv import (  # noqa: PLC0415
+        make_wrapper_drv_from_paths,
+    )
+    return make_wrapper_drv_from_paths(
+        drvs=sorted(leaves), name="toolchains", system=sys_name,
+    )
+
+
+def build_matrix_aggregate(
+    toolchain_agg: str, leaves: list[str], *, binary: str, sys_name: str,
+) -> str:
+    """Phase-2 mirror: ``matrix-<binary>`` wrapper drv (toolchain + leaves)."""
+    from template_graph.make_sum_drv import (  # noqa: PLC0415
+        make_wrapper_drv_from_paths,
+    )
+    return make_wrapper_drv_from_paths(
+        drvs=[toolchain_agg, *sorted(leaves)],
+        name=f"matrix-{binary}", system=sys_name,
+    )
+
+
+def build_sum_drv_from_aggregates(
+    toolchain_agg: str,
+    matrix_aggs: dict[str, str],
+    *,
+    bash_path: str,
+    sys_name: str,
+) -> str:
+    """Phase-3 mirror: ONE ``make_sum_drv_from_paths`` call."""
+    from template_graph.make_sum_drv import (  # noqa: PLC0415
+        make_sum_drv_from_paths,
+    )
+    return make_sum_drv_from_paths(
+        bash_path=bash_path,
+        toolchain_drvs=[toolchain_agg],
+        matrix_drvs={f"matrix-{b}": [agg] for b, agg in matrix_aggs.items()},
+        system=sys_name,
+    )
 
 
 def toolchain_task_ids_for_combos(
     compilers_per_arch: dict[str, list[str]],
 ) -> dict[str, str]:
-    """``ident -> build_compilers__*`` map. ``plan_cell._variant_toolchain_dep``
-    only reads ``set(values)``, so synthetic idents are fine here."""
+    """``ident -> build_compilers__*`` map (synthetic ident keys)."""
     return {
         f"__synth__{arch}__{comp}":
             f"build_compilers__{SYS_NAME}__{arch}__{comp}"
@@ -182,12 +273,8 @@ def toolchain_task_ids_for_combos(
     }
 
 
-# --- Tree walking — variant lookup -----------------------------------------
-
-
 def extract_store_path(raw_line: str, variant_suffix: str) -> str | None:
-    """Return the ``/nix/store/...`` segment of ``raw_line`` iff the line
-    is a matrix-depth2 variant root, else ``None``."""
+    """``/nix/store/...`` segment iff the line is a matrix-depth2 root."""
     stripped = raw_line.rstrip()
     if not stripped.endswith(variant_suffix):
         return None
@@ -202,10 +289,7 @@ def extract_store_path(raw_line: str, variant_suffix: str) -> str | None:
 
 
 def build_variant_lookup(tree_text: str) -> dict[tuple[str, str], dict]:
-    """Scan the tree text for matrix-depth2 entries; compose
-    ``(arch, label) -> spec`` the way streaming's ``cur_label`` does.
-    Mirrors ``archive.derive_variant_lookup_from_drvs`` but reads the
-    tree directly so the test doesn't need a ``nix-store --import``."""
+    """``(arch, label) -> spec`` mirroring streaming's ``cur_label``."""
     from template_graph.tree_walker import (  # noqa: PLC0415
         VARIANT_SUFFIX, parse_variant_path,
     )
@@ -227,47 +311,11 @@ def build_variant_lookup(tree_text: str) -> dict[tuple[str, str], dict]:
         suffix = basename[head_len : -len(VARIANT_SUFFIX)]
         label = f"{binary}__{arch}__{suffix}"
         lookup[(arch, label)] = {
-            "drv": store_path,
-            "arch": arch,
-            "label": label,
-            "suffix": suffix,
-            "compiler_id": comp,
-            "optimization": opt,
-            "pkg": BINARY,
+            "drv": store_path, "arch": arch, "label": label,
+            "suffix": suffix, "compiler_id": comp,
+            "optimization": opt, "pkg": BINARY,
         }
     return lookup
-
-
-# --- Sum-drv + planner stages ----------------------------------------------
-
-
-def build_sum_drv(
-    *,
-    root: Path,
-    smoke_archs: list[str],
-    compilers_per_arch: dict[str, list[str]],
-) -> str:
-    """Stage 1: build flake-attr lists + assemble the sum-drv via the
-    flake-form ``make_sum_drv``. Returns the sum-root drv path."""
-    from template_graph.make_sum_drv import make_sum_drv  # noqa: PLC0415
-
-    matrix_attrs = matrix_attrs_for(smoke_archs, root)
-    toolchain_attrs = toolchain_attrs_for(smoke_archs, compilers_per_arch)
-    assert matrix_attrs, "matrix_attrs empty after smoke-arch filtering"
-    assert toolchain_attrs, "toolchain_attrs empty — no valid (arch, comp)"
-
-    sum_drv = make_sum_drv(
-        flake_ref=f"git+file://{root}",
-        bash_attr=FLAKE_BASH_ATTR,
-        toolchain_attrs=toolchain_attrs,
-        matrices={f"matrix-{BINARY}": matrix_attrs},
-        root_name="phase3-smoke-sum-root",
-        toolchains_name="toolchains",
-        system=SYS_NAME,
-        tolerate_missing=False,
-    )
-    assert sum_drv.endswith(".drv"), f"unexpected sum-drv path: {sum_drv}"
-    return sum_drv
 
 
 def plan_from_tree(
@@ -276,20 +324,16 @@ def plan_from_tree(
     variant_lookup: dict[tuple[str, str], dict],
     toolchain_task_ids: dict[str, str],
 ):
-    """Stage 2: stream-parse + plan. Returns ``(descriptors, streaming_result)``."""
+    """Stream-parse + plan. Returns ``(descriptors, streaming_result)``."""
     from template_graph.streaming import (  # noqa: PLC0415
         plan_from_tree_streaming,
     )
     from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
         plan_phase4_for_binary,
     )
-
     streaming_result = plan_from_tree_streaming(tree_text, lax=True)
     descriptors = plan_phase4_for_binary(
-        BINARY,
-        streaming_result,
-        variant_lookup,
-        sys_name=SYS_NAME,
-        toolchain_task_ids=toolchain_task_ids,
+        BINARY, streaming_result, variant_lookup,
+        sys_name=SYS_NAME, toolchain_task_ids=toolchain_task_ids,
     )
     return descriptors, streaming_result
