@@ -1097,8 +1097,9 @@ def enumerate_toolchains_only(
       no leaves resolve, the aggregate is an empty string.
 
     ``sys_name`` defaults to ``"x86_64-linux"`` for callers that do
-    not yet thread a system literal; the CLI passes its own
-    ``--sys-name`` value through.
+    not yet thread a system literal; the submitter CLI passes its own
+    ``--system`` value through (the ``dependency_graph_worker`` CLI
+    accepts ``--sys-name`` as a back-compat alias).
     """
     pairs = enumerate_toolchains(
         flake_ref, sys_name, archs=archs, run_subprocess=run_subprocess,
