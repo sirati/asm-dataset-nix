@@ -23,7 +23,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import random
 import re
 import shutil
 import subprocess
@@ -683,49 +682,6 @@ def supported_archs_for_pkg(
     return tuple(supported)
 
 
-def _sample_suffix_attrs(
-    suffix_attrs: dict,
-    *,
-    arch: str,
-    sample_size: int,
-    seed: str,
-) -> dict:
-    """Down-sample ``{suffix: meta_entry}`` to ``sample_size`` per
-    ``(compiler, optimization)`` group, seeded deterministically.
-
-    The seed for each group is ``f"{seed}:{compiler}:{arch}:{opt}"`` so
-    changing the operator-supplied seed reshuffles every group, while
-    holding the seed fixed gives identical samples across runs (skip-
-    existing then guarantees we don't rebuild).
-
-    Suffixes lacking ``compiler`` / ``optimization`` in their meta entry
-    are passed through unchanged (we can't group them).
-    """
-    if sample_size <= 0:
-        return suffix_attrs
-    groups: dict[tuple[str, str], list[tuple[str, dict]]] = {}
-    passthrough: dict[str, dict] = {}
-    for suffix, meta_entry in suffix_attrs.items():
-        if not isinstance(meta_entry, dict):
-            passthrough[suffix] = meta_entry
-            continue
-        compiler = meta_entry.get("compiler")
-        opt = meta_entry.get("optimization")
-        if not isinstance(compiler, str) or not isinstance(opt, str):
-            passthrough[suffix] = meta_entry
-            continue
-        groups.setdefault((compiler, opt), []).append((suffix, meta_entry))
-
-    sampled: dict[str, dict] = dict(passthrough)
-    for (compiler, opt), candidates in groups.items():
-        candidates.sort(key=lambda kv: kv[0])
-        rng = random.Random(f"{seed}:{compiler}:{arch}:{opt}")
-        chosen = rng.sample(candidates, min(sample_size, len(candidates)))
-        for suffix, meta_entry in chosen:
-            sampled[suffix] = meta_entry
-    return sampled
-
-
 def enumerate_variants(
     flake_ref: str,
     sys_name: str,
@@ -736,26 +692,21 @@ def enumerate_variants(
     sample_seed: str = "42",
     run_subprocess: Optional[RunSubprocess] = None,
 ) -> dict[str, dict]:
-    """Enumerate every ``(pkg, arch, suffix)`` variant the matrix exposes,
-    returning per-binary metadata that the matrix_eval worker uses to
-    drive its own ``nix-eval-jobs`` invocation.
+    """Enumerate every ``(pkg, arch)`` cell the matrix exposes.
 
-    Filters by ``packages`` and ``archs`` if provided (each is an inclusion
-    list — None means "all").
+    The submitter only discovers the package list and echoes the
+    operator's arch filter. Per-suffix enumeration AND the
+    ``is_supported`` + ``is_known_bad_combo`` filter run on the
+    cluster inside the matrix_eval worker (one
+    ``_meta.<sys>.<binary>.<arch>`` call per arch via
+    ``_eval_meta_for_arch``). ``nix-eval-jobs`` silently swallows any
+    combos the predicate misses.
 
-    ``sample_size`` / ``sample_seed`` are echoed back in the per-binary
-    metadata so the matrix_eval worker on a secondary re-applies the
-    deterministic sample with the same seed — the submitter never needs
-    to know the sampled subset and the slow drv-instantiation never runs
-    on the submit host. Suffixes are filtered against the support table
-    and the known-bad-combo list *before* being emitted.
-
-    The return shape is::
+    Return shape::
 
         {
           <pkg>: {
             "archs": [arch, ...],
-            "suffixes_by_arch": {arch: [suffix, ...], ...},
             "sample_size": int,
             "sample_seed": str,
             "tier": int,
@@ -766,115 +717,53 @@ def enumerate_variants(
     pkg_filter = set(packages) if packages else None
     arch_filter = set(archs) if archs else None
 
-    # Scope the ``_meta`` eval the same way ``_drvPaths`` is scoped
-    # below: when the operator asks for a subset, only force the
-    # requested cells. The full ``_meta.<sys>`` eval iterates every
-    # (pkg, arch, suffix) combo into JSON; with ~250 packages × 6
-    # archs × ~280 combos per cell that's ~420k entries and tips
-    # nix into a multi-minute eval that the daemon eventually
-    # interrupts. Per-(pkg, arch) eval keeps each call ~instant.
-    meta: dict = {}
-    if pkg_filter is None or arch_filter is None:
-        # Need a list of all (pkg, arch) labels first. ``builtins.attrNames``
-        # is cheap because it doesn't force values.
-        full_meta_keys = run_nix_eval(
+    all_pkgs_raw = run_nix_eval(
+        flake_ref,
+        f"dataset.{sys_name}",
+        run_subprocess=run_subprocess,
+        apply="m: builtins.attrNames m",
+    )
+    if not isinstance(all_pkgs_raw, list):
+        raise RuntimeError(
+            f"dataset.{sys_name} attrNames is not a JSON array "
+            f"(got {type(all_pkgs_raw).__name__})"
+        )
+    all_pkgs = [p for p in all_pkgs_raw if isinstance(p, str)]
+
+    if arch_filter is None:
+        per_pkg_archs_raw = run_nix_eval(
             flake_ref,
-            f"_meta.{sys_name}",
+            f"dataset.{sys_name}",
             run_subprocess=run_subprocess,
             apply="m: builtins.mapAttrs (_: a: builtins.attrNames a) m",
         )
-        if not isinstance(full_meta_keys, dict):
+        if not isinstance(per_pkg_archs_raw, dict):
             raise RuntimeError(
-                f"_meta.{sys_name} is not a JSON object "
-                f"(got {type(full_meta_keys).__name__})"
+                f"dataset.{sys_name} per-pkg attrNames is not a JSON object "
+                f"(got {type(per_pkg_archs_raw).__name__})"
             )
-        pkg_arch_pairs = [
-            (pkg, arch)
-            for pkg, archs_list in full_meta_keys.items()
-            if pkg_filter is None or pkg in pkg_filter
-            for arch in (archs_list if isinstance(archs_list, list) else [])
-            if arch_filter is None or arch in arch_filter
-        ]
     else:
-        pkg_arch_pairs = [
-            (pkg, arch) for pkg in pkg_filter for arch in arch_filter
-        ]
+        per_pkg_archs_raw = None
 
-    for pkg, arch in pkg_arch_pairs:
-        try:
-            cell = run_nix_eval(
-                flake_ref,
-                f"_meta.{sys_name}.{pkg}.{arch}",
-                run_subprocess=run_subprocess,
-            )
-        except RuntimeError:
-            # Cell may not exist (e.g. arch not configured for this
-            # package); skip silently.
-            continue
-        if not isinstance(cell, dict):
-            continue
-        meta.setdefault(pkg, {})[arch] = cell
-
-    # We have the per-(pkg, arch) meta but skip the drv-instantiation
-    # step entirely. The matrix_eval worker on a secondary does the
-    # slow ``nix-eval-jobs`` work itself, seeded with the same
-    # ``sample_seed`` so the resulting variant set is deterministic
-    # without the submitter ever forcing drv paths.
-    from compiler_suit_runner.support_table import (  # noqa: PLC0415
-        is_supported,
-        load_support_table,
-    )
-    support = load_support_table()
     out: dict[str, dict] = {}
-    for pkg, arch_attrs in sorted(meta.items()):
+    for pkg in sorted(all_pkgs):
         if pkg_filter is not None and pkg not in pkg_filter:
             continue
-        if not isinstance(arch_attrs, dict):
+        if arch_filter is not None:
+            pkg_archs = sorted(arch_filter)
+        else:
+            raw_archs = per_pkg_archs_raw.get(pkg) if per_pkg_archs_raw else None
+            if not isinstance(raw_archs, list):
+                continue
+            pkg_archs = sorted(a for a in raw_archs if isinstance(a, str))
+        if not pkg_archs:
             continue
-        per_arch: dict[str, list[str]] = {}
-        for arch, suffix_attrs in sorted(arch_attrs.items()):
-            if arch_filter is not None and arch not in arch_filter:
-                continue
-            if not isinstance(suffix_attrs, dict):
-                continue
-            kept_map: dict[str, dict] = {}
-            for suffix, meta_entry in sorted(suffix_attrs.items()):
-                if not isinstance(meta_entry, dict):
-                    continue
-                if not is_supported(
-                    support, meta_entry.get("compiler", ""), arch
-                ):
-                    continue
-                if is_known_bad_combo(meta_entry):
-                    continue
-                kept_map[suffix] = meta_entry
-            # Pre-apply sampling here so manifests stay small enough
-            # to transit the framework's ClusterMutation wire (a 8 MB
-            # suffix list for 150 k+ variants causes the SSH tunnel
-            # to reset before InitialAssignment arrives). The eval
-            # worker then uses the already-sampled list directly
-            # (variant_sample=None in payload → no re-sampling step).
-            if sample_size > 0 and sample_seed and kept_map:
-                kept_map = _sample_suffix_attrs(
-                    kept_map,
-                    arch=arch,
-                    sample_size=sample_size,
-                    seed=sample_seed,
-                )
-            if kept_map:
-                per_arch[arch] = sorted(kept_map.keys())
-        if per_arch:
-            out[pkg] = {
-                "archs": sorted(per_arch.keys()),
-                "suffixes_by_arch": per_arch,
-                # Signal to eval_worker that no re-sampling is needed:
-                # suffixes are already the final sampled subset.
-                # eval_worker skips the _meta lookup + re-sampling
-                # step when sample_size is falsy.
-                "sample_size": 0,
-                "sample_seed": sample_seed,
-                "tier": _tier_from_pkg(pkg),
-            }
+        out[pkg] = {
+            "archs": pkg_archs,
+            "sample_size": int(sample_size or 0),
+            "sample_seed": sample_seed,
+            "tier": _tier_from_pkg(pkg),
+        }
     return out
 
 
