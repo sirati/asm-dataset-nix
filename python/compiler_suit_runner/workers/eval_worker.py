@@ -4,27 +4,39 @@ Runs on a cluster secondary. Given a manifest payload built by
 :func:`compiler_suit_runner.manifest_gen.make_matrix_eval_header`, the
 worker:
 
-1. Resolves the per-(arch, suffix) drv set by invoking
-   ``nix-eval-jobs --flake <attr>.<arch>`` against the local
-   /nix/store, re-applying the same deterministic
-   ``_sample_suffix_attrs`` sampling as the submitter (keyed on the
-   payload's ``variant_seed``) so primary and secondaries agree on
-   the variant subset without the submitter ever shipping the list.
+1. Resolves the per-(arch, suffix) drv set by invoking a SINGLE
+   ``nix-eval-jobs --flake <attr>`` against the local /nix/store
+   that intersects every requested arch AND every sampled suffix
+   in one pass (``builtins.intersectAttrs`` at both the arch and
+   suffix levels, plus ``--force-recurse`` so the walker descends
+   through both nested levels). The worker re-applies the same
+   deterministic ``_sample_suffix_attrs`` sampling as the submitter
+   (keyed on the payload's ``variant_seed``) BEFORE the bulk eval
+   so primary and secondaries agree on the variant subset without
+   the submitter ever shipping the list.
 2. Broadcasts each produced ``.drv`` path to every peer in the
    cluster via :class:`peer_replication.BroadcastSender` (which
    posts ``/peer/path-broadcast-offer`` and lets the receiver flood
    onward). Each receiver substitutes the drv into its local store
    so Phase 1+ tasks scheduled anywhere in the cluster can read the
    graph immediately.
-3. Exports the kept-variant closure to
+3. Builds the per-binary ``matrix-<binary>`` aggregate drv via
+   :func:`template_graph.make_sum_drv.make_wrapper_drv_from_paths`,
+   passing the phase-1 toolchain aggregate AND every sampled leaf
+   as inputDrvs. The aggregate is a trivial ``bash -c true`` wrapper
+   whose only purpose is to carry the input set so phase 3's
+   ``nix-store --query --tree`` refcount-sort floats the toolchain
+   layer to a sensible position relative to the matrix layer.
+4. Exports the aggregate closure to
    ``<matrix_eval_out_dir>/<binary>.nix-archive`` via
    ``nix-store --query --requisites`` + ``nix-store --export`` so the
    primary's ``_MatrixEvalQuiesceWatcher`` + ``dependency_graph_worker``
-   can re-import the full drv graph into the primary's local store
-   without re-evaluating the flake. The
-   ``dependency_graph_worker`` discovers the ROOT (kept) drvs by
-   parsing the variant path of each imported .drv directly
-   (``parse_variant_path``) — no JSON sidecar is emitted.
+   can re-import the full drv graph (toolchain aggregate + matrix
+   aggregate + every leaf) into the primary's local store without
+   re-evaluating the flake. The ``dependency_graph_worker`` discovers
+   the ROOT (kept) drvs by parsing the variant path of each imported
+   .drv directly (``parse_variant_path``) — no JSON sidecar is
+   emitted.
 
 Resume marker
 -------------
@@ -63,12 +75,14 @@ Why one task per binary (not one per arch)
 ------------------------------------------
 
 The plan deliberately keeps the partition coarse: each binary's
-eval walks every requested arch in a single ``nix-eval-jobs`` pass
-per arch, but stays inside one task. Two reasons:
+eval walks every requested arch in a single bulk ``nix-eval-jobs``
+invocation, all inside one task. Two reasons:
 
 * The cross-arch toolchain closures share enormous overlap; a
-  single worker process inside one task can let ``nix-eval-jobs``
-  reuse the in-memory eval cache across archs.
+  single ``nix-eval-jobs`` process can reuse the in-memory eval
+  cache across archs. The matrix-aggregate refactor collapsed the
+  earlier per-arch loop into one bulk eval per binary so that
+  sharing is realised.
 * Phase 1 task spawn waits for the per-binary marker file; a
   binary's resume marker is single-writer so we never race on it.
 
@@ -230,6 +244,21 @@ def parse_payload(payload: dict) -> dict[str, Any]:
             f"matrix_eval payload: invalid 'variant_seed' ({variant_seed!r})"
         )
 
+    # Phase B wired the phase-1 toolchain aggregate drv path into every
+    # matrix_eval header. eval_worker now uses it as an inputDrv when
+    # building the per-binary ``matrix-<binary>`` aggregate so phase 3's
+    # ``nix-store --query --tree`` refcount-sorts the toolchain layer
+    # next to the matrix layer rather than burying it under one leaf.
+    toolchain_aggregate_drv = payload.get("toolchain_aggregate_drv")
+    if (
+        not isinstance(toolchain_aggregate_drv, str)
+        or not toolchain_aggregate_drv
+    ):
+        raise ValueError(
+            "matrix_eval payload: invalid 'toolchain_aggregate_drv'"
+            f" ({toolchain_aggregate_drv!r})"
+        )
+
     return {
         "binary": binary,
         "sys": sys_name,
@@ -238,6 +267,7 @@ def parse_payload(payload: dict) -> dict[str, Any]:
         "attr": attr,
         "variant_sample": variant_sample,
         "variant_seed": variant_seed,
+        "toolchain_aggregate_drv": toolchain_aggregate_drv,
     }
 
 
@@ -246,47 +276,97 @@ def parse_payload(payload: dict) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _eval_jobs_for_arch(
+def _eval_jobs_for_binary(
     attr: str,
-    arch: str,
-    suffixes: list[str],
+    sampled_by_arch: dict[str, list[str]],
     *,
     flake_ref: str,
     run_subprocess: RunSubprocess,
-) -> dict[str, str]:
-    """Run ``nix-eval-jobs`` for ``<flake_ref>#<attr>.<arch>`` filtered
-    by ``suffixes`` and return ``{suffix: drvPath}``.
+) -> dict[tuple[str, str], str]:
+    """Run ONE ``nix-eval-jobs`` invocation against ``<flake_ref>#<attr>``
+    that intersects every requested ``(arch, suffix)`` pair in a single
+    pass and returns ``{(arch, suffix): drvPath}``.
 
-    Mirrors the ``--select intersectAttrs`` pattern from
-    ``preflight._eval_drv_paths_for_suffixes`` so the wire form
-    nix-eval-jobs receives is identical on submitter and secondary.
+    ``sampled_by_arch`` is the per-arch sampled-suffix map: archs with
+    an empty suffix list are dropped from the select expression entirely
+    (a missing key matches no cells).
 
-    On any non-zero exit code or stdout that decodes to no drvs at
-    all, raises :class:`RuntimeError`. The framework worker harness
-    converts that into ``ErrorType::Errored`` (retry-eligible).
+    The ``--select`` lambda walks the nested ``{ arch: { suffix: drv } }``
+    layout and filters BOTH levels in one go:
+
+    * outer ``intersectAttrs`` against the arch keys we want;
+    * inner ``mapAttrs`` per surviving arch that intersectAttrs against
+      that arch's sampled suffixes (i.e. each arch can keep a different
+      sample, which the deterministic group-aware sampler routinely
+      produces).
+
+    ``--force-recurse`` makes nix-eval-jobs descend through the two
+    nested levels and emit one JSONL line per surviving leaf with
+    ``attrPath = [arch, suffix]`` plus ``drvPath``.
+
+    The collapse to a single subprocess invocation is the core of the
+    matrix-aggregate refactor: previously the worker ran one
+    ``nix-eval-jobs`` per arch, each paying the flake-closure
+    re-evaluation cost; now the entire ``dataset.<sys>.<binary>``
+    subtree is walked once and the eval cache is shared across archs
+    inside that single process.
+
+    On any non-zero exit code raises :class:`RuntimeError`; the
+    framework worker harness converts that into
+    ``ErrorType::Errored`` (retry-eligible). Per-leaf eval errors are
+    surfaced via JSONL ``{"error": ...}`` lines from nix-eval-jobs and
+    silently skipped here — they would already have been gated out by
+    support-table / known-bad filtering on the submitter side.
     """
-    if not suffixes:
+    # Drop archs with no sampled suffixes — nothing to ask for.
+    effective: dict[str, list[str]] = {
+        a: sorted(set(s)) for a, s in sampled_by_arch.items() if s
+    }
+    if not effective:
         return {}
 
-    # Validate every suffix before splicing — the originator already
-    # validated, but a worker should never trust a manifest payload
-    # blindly when it's about to construct a nix expression.
-    for s in suffixes:
-        if not _SAFE_SUFFIX_RE.match(s):
+    # Validate every (arch, suffix) before splicing — the originator
+    # already validated, but a worker should never trust a manifest
+    # payload blindly when it's about to construct a nix expression.
+    for arch, suffixes in effective.items():
+        if not _SAFE_SUFFIX_RE.match(arch):
             raise RuntimeError(
-                f"eval_worker: unsafe suffix {s!r} in payload — refusing to"
-                " splice into nix-eval-jobs --select"
+                f"eval_worker: unsafe arch {arch!r} in payload — refusing"
+                " to splice into nix-eval-jobs --select"
             )
+        for s in suffixes:
+            if not _SAFE_SUFFIX_RE.match(s):
+                raise RuntimeError(
+                    f"eval_worker: unsafe suffix {s!r} in payload — refusing"
+                    " to splice into nix-eval-jobs --select"
+                )
 
-    keys = " ".join(f'"{s}" = null;' for s in suffixes)
-    select_expr = f"m: builtins.intersectAttrs {{ {keys} }} m"
+    # Build the per-arch suffix filter map, e.g.
+    #   { "x86_64" = { "O0" = null; "O2" = null; };
+    #     "aarch64" = { "O0" = null; }; }
+    arch_blocks: list[str] = []
+    for arch in sorted(effective):
+        keys = " ".join(f'"{s}" = null;' for s in effective[arch])
+        arch_blocks.append(f'"{arch}" = {{ {keys} }};')
+    arch_filter = "{ " + " ".join(arch_blocks) + " }"
+
+    # The select lambda: filter outer archs first, then per surviving
+    # arch intersectAttrs against THAT arch's sampled suffixes. The
+    # ``filter`` attrset lookup ``filter.${a}`` is safe because the
+    # outer intersectAttrs guarantees ``a`` is one of our keys.
+    select_expr = (
+        f"m: let filter = {arch_filter}; in "
+        "builtins.mapAttrs (a: v: builtins.intersectAttrs filter.${a} v) "
+        "(builtins.intersectAttrs filter m)"
+    )
 
     argv: list[str] = [
         "nix-eval-jobs",
         "--flake",
-        f"{flake_ref}#{attr}.{arch}",
+        f"{flake_ref}#{attr}",
         "--select",
         select_expr,
+        "--force-recurse",
         "--max-jobs",
         "1",
     ]
@@ -298,10 +378,10 @@ def _eval_jobs_for_arch(
         # nix-eval-jobs failures are typically transient (eval-time
         # OOM, transient substituter network failure, etc).
         raise RuntimeError(
-            f"nix-eval-jobs {attr}.{arch} failed (rc={rc}): {decoded_err}"
+            f"nix-eval-jobs {attr} failed (rc={rc}): {decoded_err}"
         )
 
-    drvs: dict[str, str] = {}
+    drvs: dict[tuple[str, str], str] = {}
     for line in stdout.decode("utf-8", errors="replace").splitlines():
         line = line.strip()
         if not line:
@@ -314,10 +394,17 @@ def _eval_jobs_for_arch(
             continue
         if not isinstance(entry, dict):
             continue
-        attr_name = entry.get("attr")
+        attr_path = entry.get("attrPath")
         drv = entry.get("drvPath")
-        if isinstance(attr_name, str) and isinstance(drv, str) and drv:
-            drvs[attr_name] = drv
+        if (
+            isinstance(attr_path, list)
+            and len(attr_path) == 2
+            and isinstance(attr_path[0], str)
+            and isinstance(attr_path[1], str)
+            and isinstance(drv, str)
+            and drv
+        ):
+            drvs[(attr_path[0], attr_path[1])] = drv
     return drvs
 
 
@@ -589,6 +676,7 @@ def run_eval_task(
     attr = parsed["attr"]
     variant_sample = parsed["variant_sample"]
     variant_seed = parsed["variant_seed"]
+    toolchain_aggregate_drv = parsed["toolchain_aggregate_drv"]
 
     archive = _archive_path(out_dir, binary)
 
@@ -603,6 +691,11 @@ def run_eval_task(
     # imported .drv paths directly, so re-running this worker would
     # only duplicate work.
     if archive.exists() and archive.stat().st_size > 0:
+        # Resumed runs do not re-build the matrix aggregate (the archive
+        # already carries it). The downstream watcher derives variant
+        # lookup from the imported .drv paths via parse_variant_path so
+        # the aggregate-drv field is informational here; we omit it so
+        # callers don't misread a non-empty value as "freshly built".
         return {
             "binary": binary,
             "sys": sys_name,
@@ -610,17 +703,17 @@ def run_eval_task(
             "variant_drvs": [],
             "variants": [],
             "broadcasts": [],
+            "matrix_aggregate_drv": None,
             "resumed": True,
         }
 
-    # Step 1: enumerate drvs per arch. Each arch is one
-    # ``nix-eval-jobs`` invocation. If sampling is in play we first
-    # read ``_meta`` to drive the deterministic group-aware sample
+    # Step 1: sample per arch. If sampling is in play we first read
+    # ``_meta`` to drive the deterministic group-aware sample
     # (matching the submitter's ``_sample_suffix_attrs`` logic), so
     # the sampled subset stays consistent across re-runs and across
-    # peers without the submitter shipping the list.
-    variants: list[dict[str, str]] = []
-    broadcast_ids: list[tuple[str, str]] = []
+    # peers without the submitter shipping the list. Each arch may
+    # end up with a different sample.
+    sampled_by_arch: dict[str, list[str]] = {}
     for arch in archs:
         if variant_sample and variant_sample > 0 and variant_seed:
             meta = _eval_meta_for_arch(
@@ -640,36 +733,41 @@ def run_eval_task(
                 sample_size=variant_sample,
                 seed=variant_seed,
             )
-            sampled_suffixes = sorted(sampled.keys())
+            sampled_by_arch[arch] = sorted(sampled.keys())
         else:
-            sampled_suffixes = list(suffixes)
+            sampled_by_arch[arch] = list(suffixes)
 
-        if not sampled_suffixes:
-            continue
+    # Step 2: one bulk ``nix-eval-jobs`` invocation that intersects
+    # every requested (arch, suffix) pair in a single pass. This
+    # replaces the previous per-arch loop and is the central
+    # performance win of the matrix-aggregate refactor — the
+    # ``dataset.<sys>.<binary>`` subtree is evaluated once, sharing
+    # the eval cache across archs inside that single nix-eval-jobs
+    # process.
+    bulk_drvs = _eval_jobs_for_binary(
+        attr,
+        sampled_by_arch,
+        flake_ref=flake_ref,
+        run_subprocess=runner,
+    )
 
-        arch_drvs = _eval_jobs_for_arch(
-            attr,
-            arch,
-            sampled_suffixes,
-            flake_ref=flake_ref,
-            run_subprocess=runner,
+    # Step 3: enqueue a broadcast for each (arch, suffix → drv). The
+    # broadcast is non-blocking; the worker thread inside
+    # BroadcastSender fans the offer out to every peer.
+    variants: list[dict[str, str]] = []
+    broadcast_ids: list[tuple[str, str]] = []
+    for (arch, suffix), drv in sorted(bulk_drvs.items()):
+        label = f"{binary}__{arch}__{suffix}"
+        variants.append({"label": label, "drv": drv, "arch": arch,
+                         "suffix": suffix})
+        bid = broadcast_sender.enqueue_broadcast(
+            drv,
+            _drv_size(drv),
+            item_class=ITEM_CLASS_MATRIX_EVAL_DRV,
         )
+        broadcast_ids.append((label, bid))
 
-        # Step 2: enqueue a broadcast for each (suffix → drv). The
-        # broadcast is non-blocking; the worker thread inside
-        # BroadcastSender fans the offer out to every peer.
-        for suffix, drv in sorted(arch_drvs.items()):
-            label = f"{binary}__{arch}__{suffix}"
-            variants.append({"label": label, "drv": drv, "arch": arch,
-                             "suffix": suffix})
-            bid = broadcast_sender.enqueue_broadcast(
-                drv,
-                _drv_size(drv),
-                item_class=ITEM_CLASS_MATRIX_EVAL_DRV,
-            )
-            broadcast_ids.append((label, bid))
-
-    # Step 3: wait for each broadcast to complete (or time out).
+    # Step 4: wait for each broadcast to complete (or time out).
     # Timeout is non-fatal: the flood-fill protocol is best-effort
     # and a slow peer will eventually pull via substitution when
     # the Phase 1 task lands on it. We still record the result so
@@ -689,20 +787,52 @@ def run_eval_task(
             entry["failed_peers"] = list(result.failed_peers)
         broadcast_results.append(entry)
 
-    # Step 4: export the kept-variant closure into the per-binary
-    # archive. The closure walks ``inputDrvs`` so the primary's
-    # ``nix-store --import`` makes the whole drv graph available
-    # locally without re-evaluating the flake.
+    # Step 5: build the per-binary ``matrix-<binary>`` aggregate drv.
+    # The aggregate carries the phase-1 toolchain aggregate AND every
+    # sampled variant leaf as inputDrvs. Downstream phase 3 walks
+    # ``nix-store --query --tree <matrix_agg>`` whose refcount-sort
+    # then floats the toolchain layer to a sensible position relative
+    # to the matrix layer instead of burying it under a single leaf.
+    # Same ``variant_seed`` + ``variant_sample`` + ``sampled_by_arch``
+    # → same sorted leaf list → same wrapper-drv hash.
     kept_drvs: list[str] = sorted({v["drv"] for v in variants})
-    _export_kept_closure(archive, kept_drvs, run_subprocess=runner)
+    matrix_aggregate_drv: Optional[str] = None
+    if kept_drvs:
+        # Imported lazily so unit tests that monkeypatch this symbol
+        # see the indirection (and so the heavy nix-instantiate
+        # subprocess only runs when there is actually a non-empty
+        # matrix to wrap).
+        from template_graph.make_sum_drv import (  # noqa: PLC0415
+            make_wrapper_drv_from_paths,
+        )
+        matrix_aggregate_drv = make_wrapper_drv_from_paths(
+            drvs=[toolchain_aggregate_drv, *kept_drvs],
+            name=f"matrix-{binary}",
+            system=sys_name,
+        )
 
-    # Step 5: return an in-process summary for caller introspection.
+    # Step 6: export the matrix-aggregate closure into the per-binary
+    # archive. Because the aggregate carries every kept leaf AND the
+    # toolchain aggregate as inputDrvs, exporting its closure via
+    # ``nix-store --query --requisites`` + ``nix-store --export``
+    # carries the whole drv graph in a single archive — phase 3 can
+    # ``nix-store --import`` the archive on the primary and walk the
+    # full graph without re-evaluating the flake. When ``kept_drvs``
+    # is empty (a binary with all archs gated out) we still write an
+    # empty archive so the primary's presence-based resume marker
+    # stays consistent.
+    export_seeds = [matrix_aggregate_drv] if matrix_aggregate_drv else []
+    _export_kept_closure(archive, export_seeds, run_subprocess=runner)
+
+    # Step 7: return an in-process summary for caller introspection.
     # No sidecar JSON is written — the archive itself is the resume
     # marker, and the dependency_graph worker derives variant lookup
     # from the imported .drv paths via ``parse_variant_path``. The
     # primary's _MatrixEvalQuiesceWatcher uses archive-presence as the
-    # matrix_eval-quiesce gate. variants + broadcasts are kept in the
-    # return value for operator-visible diagnostics.
+    # matrix_eval-quiesce gate. ``matrix_aggregate_drv`` is the new
+    # field consumed by the watcher (D.1d) to pass into phase 3 via
+    # argv; ``variant_drvs`` is kept for backwards compatibility with
+    # legacy consumers and will be retired once D.1b lands.
     return {
         "binary": binary,
         "sys": sys_name,
@@ -710,6 +840,7 @@ def run_eval_task(
         "variant_drvs": kept_drvs,
         "variants": variants,
         "broadcasts": broadcast_results,
+        "matrix_aggregate_drv": matrix_aggregate_drv,
     }
 
 
