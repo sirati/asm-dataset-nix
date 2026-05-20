@@ -1,18 +1,16 @@
-"""Local pre-flight: enumerate the variant matrix via ``nix eval``.
+"""Local pre-flight: discover packages + cross toolchains via ``nix eval``.
 
-The runner needs the full superset of (pkg, arch, variant_suffix) tuples
-*before* it submits anything, because the dynamic_runner framework's
-queue is fixed at coord.run() time (see plan §"How to inject Phase 2 +
-Phase 3 items into the queue", option A). This module implements the
-local pre-flight: it shells out to ``nix eval`` against this repo's
-flake to read
+The submitter only enumerates the cheap, top-level shape of the matrix
+locally: the package list under ``dataset.<sys>`` (via ``attrNames``)
+and the leaf drv paths of ``_crossToolchainMap.<sys>`` (via
+``nix-eval-jobs``, with a single-call fallback). Per-suffix variant
+enumeration — the expensive part — runs on the cluster inside the
+matrix_eval worker, which evaluates ``_meta.<sys>.<pkg>.<arch>`` one
+arch at a time via ``_eval_meta_for_arch`` and applies
+``is_known_bad_combo`` there.
 
-* ``.#_meta.<sys>``  — instant; pure metadata only.
-* ``.#_drvPaths.<sys>`` — slow; forces drv instantiation.
-* ``.#_crossToolchainsMeta.<sys>`` — instant.
-
-and assembles a :class:`PreflightResult` that downstream code (CLI,
-manifest_gen) can feed to ``emit_all_manifests``.
+The output is a :class:`PreflightResult` that downstream code (CLI,
+manifest_gen) feeds to ``emit_all_manifests``.
 
 Subprocess invocation is dependency-injected via ``run_subprocess`` so
 unit tests stay hermetic — the real flake never has to be evaluated.
