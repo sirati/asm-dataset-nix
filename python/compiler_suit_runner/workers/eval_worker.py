@@ -211,7 +211,6 @@ def parse_payload(payload: dict) -> dict[str, Any]:
     binary = payload.get("binary")
     sys_name = payload.get("sys")
     archs = payload.get("archs")
-    suffixes = payload.get("suffixes")
     attr = payload.get("attr")
     if not isinstance(binary, str) or not binary:
         raise ValueError(f"matrix_eval payload: invalid 'binary' ({binary!r})")
@@ -219,19 +218,24 @@ def parse_payload(payload: dict) -> dict[str, Any]:
         raise ValueError(f"matrix_eval payload: invalid 'sys' ({sys_name!r})")
     if not isinstance(archs, list) or not all(isinstance(a, str) for a in archs):
         raise ValueError(f"matrix_eval payload: invalid 'archs' ({archs!r})")
-    if not isinstance(suffixes, list) or not all(
-        isinstance(s, str) for s in suffixes
+    suffixes_raw = payload.get("suffixes")
+    if suffixes_raw is None:
+        suffixes = []
+    elif isinstance(suffixes_raw, list) and all(
+        isinstance(s, str) for s in suffixes_raw
     ):
+        for s in suffixes_raw:
+            if not _SAFE_SUFFIX_RE.match(s):
+                raise ValueError(
+                    f"matrix_eval payload: unsafe suffix {s!r} — refusing to splice"
+                )
+        suffixes = list(suffixes_raw)
+    else:
         raise ValueError(
-            f"matrix_eval payload: invalid 'suffixes' ({suffixes!r})"
+            f"matrix_eval payload: invalid 'suffixes' ({suffixes_raw!r})"
         )
     if not isinstance(attr, str) or not attr:
         raise ValueError(f"matrix_eval payload: invalid 'attr' ({attr!r})")
-    for s in suffixes:
-        if not _SAFE_SUFFIX_RE.match(s):
-            raise ValueError(
-                f"matrix_eval payload: unsafe suffix {s!r} — refusing to splice"
-            )
 
     variant_sample = payload.get("variant_sample")
     if variant_sample is not None and not isinstance(variant_sample, int):
@@ -619,39 +623,57 @@ def _sample_per_arch(
     flake_ref: str,
     run_subprocess: RunSubprocess,
 ) -> dict[str, list[str]]:
-    """Step 1: build the per-arch sampled-suffix map.
+    """Step 1: per-arch sampled-suffix map.
 
-    If sampling is in play we first read ``_meta`` to drive the
-    deterministic group-aware sample (matching the submitter's
-    ``_sample_suffix_attrs`` logic), so the sampled subset stays
-    consistent across re-runs and across peers without the submitter
-    shipping the list. Each arch may end up with a different sample.
-    Without sampling the per-arch list is just the payload's suffix
-    list verbatim.
+    Reads ``_meta.<sys>.<binary>.<arch>`` ONCE per arch via
+    :func:`_eval_meta_for_arch`, applies ``is_supported`` +
+    ``is_known_bad_combo`` to drop combos the matrix predicate
+    surfaces but the Python filter rejects, then deterministically
+    samples via :func:`sample_suffix_attrs` when ``variant_sample > 0``.
+
+    When ``variant_sample`` is falsy the (filtered) full set passes
+    through. When ``suffixes`` is non-empty (legacy payload) it is
+    honoured as a ceiling — only suffixes present in the legacy list
+    survive the filter; this preserves rolling-restart behaviour.
     """
+    from compiler_suit_runner.support_table import (  # noqa: PLC0415
+        is_supported,
+        load_support_table,
+    )
+    from compiler_suit_runner.preflight import is_known_bad_combo  # noqa: PLC0415
+
+    support = load_support_table()
+    legacy_ceiling = set(suffixes) if suffixes else None
     sampled_by_arch: dict[str, list[str]] = {}
     for arch in archs:
+        meta = _eval_meta_for_arch(
+            sys_name, binary, arch,
+            flake_ref=flake_ref,
+            run_subprocess=run_subprocess,
+        )
+        filtered: dict[str, dict] = {}
+        for suffix, meta_entry in meta.items():
+            if legacy_ceiling is not None and suffix not in legacy_ceiling:
+                continue
+            if not isinstance(meta_entry, dict):
+                continue
+            if not is_supported(
+                support, meta_entry.get("compiler", ""), arch
+            ):
+                continue
+            if is_known_bad_combo(meta_entry) is not None:
+                continue
+            filtered[suffix] = meta_entry
         if variant_sample and variant_sample > 0 and variant_seed:
-            meta = _eval_meta_for_arch(
-                sys_name, binary, arch,
-                flake_ref=flake_ref,
-                run_subprocess=run_subprocess,
-            )
-            # Filter meta to the suffixes named in the payload — the
-            # submitter has already applied support-table + known-bad
-            # filtering, so a meta entry NOT in payload['suffixes']
-            # means the submitter has dropped it for that arch.
-            allowed = set(suffixes)
-            scoped = {s: m for s, m in meta.items() if s in allowed}
             sampled = sample_suffix_attrs(
-                scoped,
+                filtered,
                 arch=arch,
                 sample_size=variant_sample,
                 seed=variant_seed,
             )
             sampled_by_arch[arch] = sorted(sampled.keys())
         else:
-            sampled_by_arch[arch] = list(suffixes)
+            sampled_by_arch[arch] = sorted(filtered.keys())
     return sampled_by_arch
 
 
