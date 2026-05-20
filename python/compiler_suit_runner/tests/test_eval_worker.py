@@ -1186,6 +1186,123 @@ def test_matrix_aggregate_is_export_seed_for_archive(
 
 
 # ---------------------------------------------------------------------------
+# Nix-marked round-trip — guard the transitive-export contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.nix
+def test_matrix_archive_round_trips_leaves(tmp_path: pathlib.Path) -> None:
+    """Round-trip a synthetic matrix-<binary> aggregate through
+    nix-store --export / --import in an isolated store, verify every
+    leaf path is present in the imported store post-import.
+
+    Guards against a future regression where wrapper_drv.nix loses its
+    string-context side-channel (``refs = builtins.toString drvs``) and
+    exports drop leaves silently. The production flow (eval_worker
+    ``_export_kept_closure`` / ``_export_matrix_archive``) is
+    ``nix-store --query --requisites <aggregate>`` followed by
+    ``nix-store --export <requisites...>``; this test mirrors that
+    sequence end-to-end against three cheap nixpkgs leaves.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    for tool in ("nix-instantiate", "nix-store"):
+        if shutil.which(tool) is None:
+            pytest.skip(f"{tool} not in PATH")
+
+    from template_graph.make_sum_drv import make_wrapper_drv_from_paths
+
+    def _instantiate(expr: str) -> str:
+        proc = subprocess.run(
+            ["nix-instantiate", "-E", expr],
+            capture_output=True, text=True, check=True,
+        )
+        lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+        assert lines, f"nix-instantiate produced no output for {expr!r}"
+        return lines[-1].strip()
+
+    # Three cheap, distinct, non-bash leaves. We avoid using `bash` as a
+    # leaf because ``wrapper_drv.nix`` already pulls bash in as its
+    # builder, and the collapsed reference would hide a leaf-drop bug.
+    leaf_drvs = [
+        _instantiate("(import <nixpkgs> {}).coreutils"),
+        _instantiate("(import <nixpkgs> {}).findutils"),
+        _instantiate("(import <nixpkgs> {}).gnused"),
+    ]
+    for path in leaf_drvs:
+        assert path.startswith("/nix/store/") and path.endswith(".drv"), (
+            f"unexpected leaf path shape: {path!r}"
+        )
+
+    matrix_agg = make_wrapper_drv_from_paths(
+        drvs=leaf_drvs,
+        name="matrix-synthetic",
+        system="x86_64-linux",
+    )
+    assert matrix_agg.startswith("/nix/store/") and matrix_agg.endswith(".drv")
+
+    # Direct-reference sanity check in the primary store: this is the
+    # property the aggregate is supposed to carry — exporting / importing
+    # the closure cannot magically reintroduce a leaf that the wrapper
+    # itself failed to reference. If THIS fails, the regression sits in
+    # ``wrapper_drv.nix`` or ``make_wrapper_drv_from_paths`` and the
+    # round-trip below would only be a noisier symptom.
+    primary_refs = subprocess.run(
+        ["nix-store", "--query", "--references", matrix_agg],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    for leaf in leaf_drvs:
+        assert leaf in primary_refs, (
+            f"leaf {leaf} missing from aggregate references in primary "
+            f"store — wrapper_drv.nix likely lost its string-context "
+            f"side-channel"
+        )
+
+    # End-to-end round-trip: enumerate closure, export, import into an
+    # isolated sandbox store, requery references. Mirrors what phase 3
+    # does on the primary after pulling the per-binary archive from a
+    # secondary.
+    requisites = subprocess.run(
+        ["nix-store", "--query", "--requisites", matrix_agg],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    assert matrix_agg in requisites, (
+        "aggregate must appear in its own --requisites output"
+    )
+
+    archive_path = tmp_path / "synthetic.nix-archive"
+    with archive_path.open("wb") as fp:
+        subprocess.run(
+            ["nix-store", "--export", *requisites],
+            stdout=fp, check=True,
+        )
+    assert archive_path.stat().st_size > 0, "empty archive produced"
+
+    sandbox_root = tmp_path / "store"
+    sandbox_root.mkdir()
+    store_uri = f"local?root={sandbox_root}"
+    with archive_path.open("rb") as fp:
+        subprocess.run(
+            ["nix-store", "--store", store_uri, "--import"],
+            stdin=fp, check=True, capture_output=True,
+        )
+
+    sandbox_refs = subprocess.run(
+        ["nix-store", "--store", store_uri,
+         "--query", "--references", matrix_agg],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    for leaf in leaf_drvs:
+        assert leaf in sandbox_refs, (
+            f"leaf {leaf} not present in imported store — "
+            f"nix-store --export dropped a transitively-referenced "
+            f"inputDrv from the aggregate's closure"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
 
