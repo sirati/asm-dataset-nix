@@ -67,7 +67,10 @@ from template_graph.streaming.state import (
 )
 
 # Public convenience entry.
-from template_graph.streaming.entry import plan_from_tree_streaming
+from template_graph.streaming.entry import (
+    plan_from_drv_tree,
+    plan_from_tree_streaming,
+)
 
 # ── back-compat re-exports of dependencies imported through here ─────
 #
@@ -89,6 +92,7 @@ __all__ = [
     # Planner class + entry.
     "StreamPlanner",
     "plan_from_tree_streaming",
+    "plan_from_drv_tree",
     # State groupings.
     "OutputState",
     "MatrixState",

@@ -32,3 +32,28 @@ def plan_from_tree_streaming(
     result = planner.finalize()
     result["violations"] = planner.violations
     return result
+
+
+def plan_from_drv_tree(
+    stream,
+    *,
+    archs: tuple[str, ...] = DEFAULT_ARCHS,
+    name_extractor=drv_role,
+    logger=None,
+    lax: bool = False,
+) -> dict:
+    """Stream-plan a parsed byte stream from nix-store --query --tree.
+
+    ``stream`` is any iterator yielding ``(depth, drv_hash, drv_name,
+    is_backref)`` tuples — typically ``drv_tree_stream(popen.stdout)``.
+    Lets the planner run concurrently with the producer.
+    """
+    planner = StreamPlanner(
+        archs=archs, name_extractor=name_extractor,
+        logger=logger, lax=lax,
+    )
+    for depth, drv_hash, drv_name, is_backref in stream:
+        planner.feed_parsed(depth, drv_hash, drv_name, is_backref)
+    result = planner.finalize()
+    result["violations"] = planner.violations
+    return result

@@ -34,6 +34,7 @@ from template_graph.streaming import (
     RawTreeNode,
     StreamPlanner,
     VariantBuilderState,
+    plan_from_drv_tree,
     plan_from_tree_streaming,
 )
 
@@ -74,6 +75,7 @@ __all__ = [
     # streaming
     "StreamPlanner",
     "plan_from_tree_streaming",
+    "plan_from_drv_tree",
     "OutputState",
     "MatrixState",
     "VariantBuilderState",
