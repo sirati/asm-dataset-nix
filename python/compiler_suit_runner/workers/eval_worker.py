@@ -608,118 +608,34 @@ def _resolve_flake_ref(flake_ref: str) -> str:
     return flake_ref
 
 
-def run_eval_task(
-    payload: dict,
-    out_dir: pathlib.Path,
-    broadcast_sender: BroadcastSender,
-    run_subprocess: Optional[RunSubprocess] = None,
+def _sample_per_arch(
+    archs: list[str],
+    suffixes: list[str],
+    variant_sample: Optional[int],
+    variant_seed: Optional[str],
+    sys_name: str,
+    binary: str,
     *,
-    flake_ref: str = ".",
-    broadcast_timeout: float = 10.0,
-    now: Optional[Callable[[], float]] = None,
-) -> dict:
-    """Matrix-eval per-binary eval dispatch entry point.
+    flake_ref: str,
+    run_subprocess: RunSubprocess,
+) -> dict[str, list[str]]:
+    """Step 1: build the per-arch sampled-suffix map.
 
-    See the module docstring for the protocol. The function returns
-    an in-process summary dict (binary/sys/variant_drvs/variants/
-    broadcasts/produced_at) for caller introspection; the only on-disk
-    artefact is the binary archive at ``out_dir/<binary>.nix-archive``.
-    The dependency_graph_worker derives variant lookup from the
-    imported .drv paths via ``parse_variant_path`` — no JSON sidecar
-    is written.
-
-    Failure modes raise :class:`RuntimeError` — the framework worker
-    harness then surfaces ``ErrorType::Errored`` to the primary,
-    which charges the failure to the retry-pass budget. We
-    deliberately do NOT raise ``Unfulfillable`` from this layer; a
-    secondary that cannot fulfil matrix_eval (e.g. permanently missing
-    toolchain) should signal that via toolchain-validate's task-dispatch
-    refusal, not by mutating a matrix_eval task's error type.
-
-    Parameters
-    ----------
-    payload :
-        The matrix_eval manifest payload (see
-        :func:`manifest_gen.make_matrix_eval_header`).
-    out_dir :
-        Matrix-eval-specific output directory (the bind-mounted shared
-        path). The archive is written to
-        ``out_dir / <binary>.nix-archive``.
-    broadcast_sender :
-        :class:`peer_replication.BroadcastSender` instance owned by
-        the worker process — lifecycle management (start/stop) is
-        the caller's responsibility.
-    run_subprocess :
-        Optional injected subprocess runner; defaults to a real
-        ``subprocess.run``. Tests override.
-    flake_ref :
-        Flake reference passed to ``nix eval`` for the ``_meta``
-        lookup. Defaults to ``.`` (current directory) so the
-        worker resolves against the flake checkout shipped by the
-        framework into the secondary's working directory.
-    broadcast_timeout :
-        Seconds to wait on each :meth:`BroadcastSender.wait_for_completion`
-        call. A timeout is non-fatal — we record the broadcast id
-        and continue. The flood-fill protocol is opportunistic.
-    now :
-        Injected clock for the ``produced_at`` timestamp. Defaults
-        to :func:`time.time`.
+    If sampling is in play we first read ``_meta`` to drive the
+    deterministic group-aware sample (matching the submitter's
+    ``_sample_suffix_attrs`` logic), so the sampled subset stays
+    consistent across re-runs and across peers without the submitter
+    shipping the list. Each arch may end up with a different sample.
+    Without sampling the per-arch list is just the payload's suffix
+    list verbatim.
     """
-    clock = now or time.time
-    runner = run_subprocess or _default_run_subprocess
-    flake_ref = _resolve_flake_ref(flake_ref)
-    parsed = parse_payload(payload)
-    binary = parsed["binary"]
-    sys_name = parsed["sys"]
-    archs = parsed["archs"]
-    suffixes = parsed["suffixes"]
-    attr = parsed["attr"]
-    variant_sample = parsed["variant_sample"]
-    variant_seed = parsed["variant_seed"]
-    toolchain_aggregate_drv = parsed["toolchain_aggregate_drv"]
-
-    archive = _archive_path(out_dir, binary)
-
-    # Step 0: resume short-circuit. If the archive exists and is
-    # non-empty we trust that some prior run of this task (perhaps on
-    # a different secondary that previously held it) already broadcast
-    # every drv to the cluster AND exported the kept-variant closure.
-    # The primary's _MatrixEvalQuiesceWatcher uses archive presence as
-    # the matrix_eval-quiesce signal, so the contract is "archive
-    # present == matrix_eval done". The consumer
-    # (dependency_graph_worker) derives variant lookup from the
-    # imported .drv paths directly, so re-running this worker would
-    # only duplicate work.
-    if archive.exists() and archive.stat().st_size > 0:
-        # Resumed runs do not re-build the matrix aggregate (the archive
-        # already carries it). The downstream watcher derives variant
-        # lookup from the imported .drv paths via parse_variant_path so
-        # the aggregate-drv field is informational here; we omit it so
-        # callers don't misread a non-empty value as "freshly built".
-        return {
-            "binary": binary,
-            "sys": sys_name,
-            "produced_at": float(clock()),
-            "variant_drvs": [],
-            "variants": [],
-            "broadcasts": [],
-            "matrix_aggregate_drv": None,
-            "resumed": True,
-        }
-
-    # Step 1: sample per arch. If sampling is in play we first read
-    # ``_meta`` to drive the deterministic group-aware sample
-    # (matching the submitter's ``_sample_suffix_attrs`` logic), so
-    # the sampled subset stays consistent across re-runs and across
-    # peers without the submitter shipping the list. Each arch may
-    # end up with a different sample.
     sampled_by_arch: dict[str, list[str]] = {}
     for arch in archs:
         if variant_sample and variant_sample > 0 and variant_seed:
             meta = _eval_meta_for_arch(
                 sys_name, binary, arch,
                 flake_ref=flake_ref,
-                run_subprocess=runner,
+                run_subprocess=run_subprocess,
             )
             # Filter meta to the suffixes named in the payload — the
             # submitter has already applied support-table + known-bad
@@ -736,24 +652,24 @@ def run_eval_task(
             sampled_by_arch[arch] = sorted(sampled.keys())
         else:
             sampled_by_arch[arch] = list(suffixes)
+    return sampled_by_arch
 
-    # Step 2: one bulk ``nix-eval-jobs`` invocation that intersects
-    # every requested (arch, suffix) pair in a single pass. This
-    # replaces the previous per-arch loop and is the central
-    # performance win of the matrix-aggregate refactor — the
-    # ``dataset.<sys>.<binary>`` subtree is evaluated once, sharing
-    # the eval cache across archs inside that single nix-eval-jobs
-    # process.
-    bulk_drvs = _eval_jobs_for_binary(
-        attr,
-        sampled_by_arch,
-        flake_ref=flake_ref,
-        run_subprocess=runner,
-    )
 
-    # Step 3: enqueue a broadcast for each (arch, suffix → drv). The
-    # broadcast is non-blocking; the worker thread inside
-    # BroadcastSender fans the offer out to every peer.
+def _enqueue_broadcasts(
+    bulk_drvs: dict[tuple[str, str], str],
+    broadcast_sender: BroadcastSender,
+    binary: str,
+) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
+    """Step 3: enqueue a broadcast for each (arch, suffix → drv).
+
+    Returns ``(variants, broadcast_ids)``: ``variants`` is the
+    per-leaf summary list surfaced on the result dict; ``broadcast_ids``
+    pairs each label with the BroadcastSender-assigned id so Step 4
+    can collect completion results in the same order.
+
+    The broadcast is non-blocking; the worker thread inside
+    BroadcastSender fans the offer out to every peer.
+    """
     variants: list[dict[str, str]] = []
     broadcast_ids: list[tuple[str, str]] = []
     for (arch, suffix), drv in sorted(bulk_drvs.items()):
@@ -766,12 +682,24 @@ def run_eval_task(
             item_class=ITEM_CLASS_MATRIX_EVAL_DRV,
         )
         broadcast_ids.append((label, bid))
+    return variants, broadcast_ids
 
-    # Step 4: wait for each broadcast to complete (or time out).
-    # Timeout is non-fatal: the flood-fill protocol is best-effort
-    # and a slow peer will eventually pull via substitution when
-    # the Phase 1 task lands on it. We still record the result so
-    # operators can diagnose churn.
+
+def _wait_for_broadcasts(
+    broadcast_ids: list[tuple[str, str]],
+    broadcast_sender: BroadcastSender,
+    *,
+    broadcast_timeout: float,
+) -> list[dict[str, Any]]:
+    """Step 4: wait for each broadcast to complete (or time out).
+
+    Timeout is non-fatal: the flood-fill protocol is best-effort and
+    a slow peer will eventually pull via substitution when the Phase
+    1 task lands on it. We still record the result so operators can
+    diagnose churn — this function never raises on timeout, the only
+    failure mode here is the BroadcastSender itself raising (which
+    propagates).
+    """
     broadcast_results: list[dict[str, Any]] = []
     for label, bid in broadcast_ids:
         result = broadcast_sender.wait_for_completion(
@@ -786,53 +714,137 @@ def run_eval_task(
             entry["fail_count"] = result.fail_count
             entry["failed_peers"] = list(result.failed_peers)
         broadcast_results.append(entry)
+    return broadcast_results
 
-    # Step 5: build the per-binary ``matrix-<binary>`` aggregate drv.
-    # The aggregate carries the phase-1 toolchain aggregate AND every
-    # sampled variant leaf as inputDrvs. Downstream phase 3 walks
-    # ``nix-store --query --tree <matrix_agg>`` whose refcount-sort
-    # then floats the toolchain layer to a sensible position relative
-    # to the matrix layer instead of burying it under a single leaf.
-    # Same ``variant_seed`` + ``variant_sample`` + ``sampled_by_arch``
-    # → same sorted leaf list → same wrapper-drv hash.
-    kept_drvs: list[str] = sorted({v["drv"] for v in variants})
-    matrix_aggregate_drv: Optional[str] = None
-    if kept_drvs:
-        # Imported lazily so unit tests that monkeypatch this symbol
-        # see the indirection (and so the heavy nix-instantiate
-        # subprocess only runs when there is actually a non-empty
-        # matrix to wrap).
-        from template_graph.make_sum_drv import (  # noqa: PLC0415
-            make_wrapper_drv_from_paths,
-        )
-        matrix_aggregate_drv = make_wrapper_drv_from_paths(
-            drvs=[toolchain_aggregate_drv, *kept_drvs],
-            name=f"matrix-{binary}",
-            system=sys_name,
-        )
 
-    # Step 6: export the matrix-aggregate closure into the per-binary
-    # archive. Because the aggregate carries every kept leaf AND the
-    # toolchain aggregate as inputDrvs, exporting its closure via
-    # ``nix-store --query --requisites`` + ``nix-store --export``
-    # carries the whole drv graph in a single archive — phase 3 can
-    # ``nix-store --import`` the archive on the primary and walk the
-    # full graph without re-evaluating the flake. When ``kept_drvs``
-    # is empty (a binary with all archs gated out) we still write an
-    # empty archive so the primary's presence-based resume marker
-    # stays consistent.
+def _build_matrix_aggregate(
+    toolchain_aggregate_drv: str,
+    kept_drvs: list[str],
+    binary: str,
+    sys_name: str,
+) -> Optional[str]:
+    """Step 5: build the per-binary ``matrix-<binary>`` aggregate drv.
+
+    The aggregate carries the phase-1 toolchain aggregate AND every
+    sampled variant leaf as inputDrvs. Downstream phase 3 walks
+    ``nix-store --query --tree <matrix_agg>`` whose refcount-sort
+    then floats the toolchain layer to a sensible position relative
+    to the matrix layer instead of burying it under a single leaf.
+    Same ``variant_seed`` + ``variant_sample`` + ``sampled_by_arch``
+    → same sorted leaf list → same wrapper-drv hash.
+
+    Returns ``None`` when ``kept_drvs`` is empty (binary with all
+    archs gated out) — the wrapper helper would otherwise raise on
+    an empty drv list.
+    """
+    if not kept_drvs:
+        return None
+    # Imported lazily so unit tests that monkeypatch this symbol see
+    # the indirection (and so the heavy nix-instantiate subprocess
+    # only runs when there is actually a non-empty matrix to wrap).
+    from template_graph.make_sum_drv import (  # noqa: PLC0415
+        make_wrapper_drv_from_paths,
+    )
+    return make_wrapper_drv_from_paths(
+        drvs=[toolchain_aggregate_drv, *kept_drvs],
+        name=f"matrix-{binary}",
+        system=sys_name,
+    )
+
+
+def _export_matrix_archive(
+    matrix_aggregate_drv: Optional[str],
+    archive: pathlib.Path,
+    *,
+    run_subprocess: RunSubprocess,
+) -> None:
+    """Step 6: export the matrix-aggregate closure into the per-binary
+    archive.
+
+    Because the aggregate carries every kept leaf AND the toolchain
+    aggregate as inputDrvs, exporting its closure via ``nix-store
+    --query --requisites`` + ``nix-store --export`` carries the whole
+    drv graph in a single archive — phase 3 can ``nix-store --import``
+    the archive on the primary and walk the full graph without
+    re-evaluating the flake. When ``matrix_aggregate_drv`` is ``None``
+    (a binary with all archs gated out) we still write an empty archive
+    so the primary's presence-based resume marker stays consistent.
+    """
     export_seeds = [matrix_aggregate_drv] if matrix_aggregate_drv else []
-    _export_kept_closure(archive, export_seeds, run_subprocess=runner)
+    _export_kept_closure(archive, export_seeds, run_subprocess=run_subprocess)
 
-    # Step 7: return an in-process summary for caller introspection.
-    # No sidecar JSON is written — the archive itself is the resume
-    # marker, and the dependency_graph worker derives variant lookup
-    # from the imported .drv paths via ``parse_variant_path``. The
-    # primary's _MatrixEvalQuiesceWatcher uses archive-presence as the
-    # matrix_eval-quiesce gate. ``matrix_aggregate_drv`` is the new
-    # field consumed by the watcher (D.1d) to pass into phase 3 via
-    # argv; ``variant_drvs`` is kept for backwards compatibility with
-    # legacy consumers and will be retired once D.1b lands.
+
+def run_eval_task(
+    payload: dict,
+    out_dir: pathlib.Path,
+    broadcast_sender: BroadcastSender,
+    run_subprocess: Optional[RunSubprocess] = None,
+    *,
+    flake_ref: str = ".",
+    broadcast_timeout: float = 10.0,
+    now: Optional[Callable[[], float]] = None,
+) -> dict:
+    """Matrix-eval per-binary eval dispatch entry point.
+
+    See the module docstring for the protocol and the Step-1..7 layout
+    each helper handles. The only on-disk artefact is the binary
+    archive at ``out_dir/<binary>.nix-archive``; the returned dict is
+    an in-process summary. Failure modes raise :class:`RuntimeError`
+    so the harness surfaces ``ErrorType::Errored`` (retry-pass) —
+    never ``Unfulfillable`` (that belongs to toolchain-validate).
+    """
+    clock = now or time.time
+    runner = run_subprocess or _default_run_subprocess
+    flake_ref = _resolve_flake_ref(flake_ref)
+    parsed = parse_payload(payload)
+    binary = parsed["binary"]
+    sys_name = parsed["sys"]
+    archive = _archive_path(out_dir, binary)
+
+    # Step 0: resume short-circuit — archive presence is the watcher's
+    # matrix_eval-quiesce signal; a prior run already broadcast every
+    # drv AND exported the closure, so re-running would only duplicate
+    # work. We omit matrix_aggregate_drv on resume so callers don't
+    # misread a non-empty value as "freshly built".
+    if archive.exists() and archive.stat().st_size > 0:
+        return {
+            "binary": binary, "sys": sys_name,
+            "produced_at": float(clock()),
+            "variant_drvs": [], "variants": [], "broadcasts": [],
+            "matrix_aggregate_drv": None, "resumed": True,
+        }
+
+    # Step 1: sample per arch.
+    sampled_by_arch = _sample_per_arch(
+        parsed["archs"], parsed["suffixes"],
+        parsed["variant_sample"], parsed["variant_seed"],
+        sys_name, binary,
+        flake_ref=flake_ref, run_subprocess=runner,
+    )
+    # Step 2: bulk nix-eval-jobs for every (arch, suffix) in one pass.
+    bulk_drvs = _eval_jobs_for_binary(
+        parsed["attr"], sampled_by_arch,
+        flake_ref=flake_ref, run_subprocess=runner,
+    )
+    # Step 3 + Step 4: broadcast enqueue then wait.
+    variants, broadcast_ids = _enqueue_broadcasts(
+        bulk_drvs, broadcast_sender, binary,
+    )
+    broadcast_results = _wait_for_broadcasts(
+        broadcast_ids, broadcast_sender,
+        broadcast_timeout=broadcast_timeout,
+    )
+    # Step 5: build the per-binary matrix-aggregate drv.
+    kept_drvs: list[str] = sorted({v["drv"] for v in variants})
+    matrix_aggregate_drv = _build_matrix_aggregate(
+        parsed["toolchain_aggregate_drv"], kept_drvs, binary, sys_name,
+    )
+    # Step 6: export the matrix-aggregate closure into the archive.
+    _export_matrix_archive(
+        matrix_aggregate_drv, archive, run_subprocess=runner,
+    )
+    # Step 7: in-process summary. ``variant_drvs`` is kept for
+    # backwards compatibility with legacy consumers (retired by D.1b).
     return {
         "binary": binary,
         "sys": sys_name,

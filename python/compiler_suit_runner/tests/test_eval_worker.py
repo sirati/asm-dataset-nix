@@ -854,6 +854,39 @@ def test_run_eval_task_export_failure_raises_and_cleans_up(
     assert not (tmp_path / "hello.nix-archive.tmp").exists()
 
 
+def test_run_eval_task_wrapper_failure_leaves_no_archive(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If :func:`make_wrapper_drv_from_paths` raises (e.g. nix-instantiate
+    OOM during the matrix-aggregate build), the failure must propagate
+    as :class:`RuntimeError`-shaped exit (matching the framework's
+    Errored/retry-pass mapping for nix subprocess failures) and the
+    output archive must NOT exist — re-execution must re-run the whole
+    pipeline. Defensive: any ``.tmp`` partial archive must also be
+    absent, even though Step 6 hasn't run, so a future atomic-rename
+    refactor cannot regress this invariant silently.
+    """
+    def _raise(*args, **kwargs):
+        raise RuntimeError("synthetic nix-instantiate failure")
+
+    monkeypatch.setattr(
+        "template_graph.make_sum_drv.make_wrapper_drv_from_paths",
+        _raise,
+    )
+    payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
+    runner = _EvalJobsStub(
+        drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
+    )
+    sender = _make_broadcast_sender()
+
+    with pytest.raises(RuntimeError, match="synthetic nix-instantiate failure"):
+        run_eval_task(payload, tmp_path, sender, run_subprocess=runner)
+
+    archive = tmp_path / "hello.nix-archive"
+    assert not archive.exists()
+    assert not archive.with_suffix(".nix-archive.tmp").exists()
+
+
 def test_run_eval_task_empty_kept_drvs_writes_empty_archive(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
