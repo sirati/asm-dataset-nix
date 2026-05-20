@@ -54,6 +54,9 @@ from pathlib import Path
 
 
 SUM_DRV_NIX = Path(__file__).parent / "sum_drv.nix"
+SUM_DRV_FROM_AGGREGATES_NIX = (
+    Path(__file__).parent / "sum_drv_from_aggregates.nix"
+)
 WRAPPER_DRV_NIX = Path(__file__).parent / "wrapper_drv.nix"
 
 
@@ -274,43 +277,85 @@ def make_sum_drv_from_paths(
     system: str = "x86_64-linux",
     extra_nix_args: list[str] | None = None,
 ) -> str:
-    """Path-based variant of :func:`make_sum_drv`: takes already-instantiated
-    raw store paths (toolchain + matrix .drvs + a bash store path) and
-    assembles the same layered sum-root via ``builtins.appendContext`` —
-    no flake eval, no re-instantiation of the inputs.
+    """Assemble a sum-root .drv from PRE-BUILT aggregate drv paths.
 
-    Validates that every ``toolchain_drvs`` entry's basename contains
-    ``toolchain`` and every ``matrix_drvs`` entry's basename contains
-    ``matrix``. If a caller hands in leaf drvs (e.g. ``-elf-folder.drv``
-    variant leaves or ``-wrapper-`` compiler-wrapper leaves), raise
-    ``ValueError`` — the contract is that these are AGGREGATE wrapper
-    drv paths sourced from one bulk evaluator pass; constructing the
-    wrappers from leaf lists is the slow per-leaf flake-eval pattern
-    that this function exists to forbid.
+    Imports :data:`SUM_DRV_FROM_AGGREGATES_NIX` (the post-aggregate
+    assembler) and splices the supplied store paths in via
+    ``builtins.appendContext`` — no flake eval, no internal re-wrapping
+    of the inputs. The toolchains aggregate and every matrix-<binary>
+    aggregate are produced upstream (phase 1 / phase 2) by
+    :func:`make_wrapper_drv_from_paths`; this helper merely glues them
+    together into one sum-root.
+
+    Length-1 aggregate invariants (enforced here):
+
+    * ``toolchain_drvs`` must be a list of EXACTLY ONE element — the
+      single toolchains aggregate drv path. The public signature stays
+      ``list[str]`` for source compatibility, but a length other than 1
+      raises :class:`ValueError`.
+    * Each ``matrix_drvs[binary]`` list must also have EXACTLY ONE
+      element — the single matrix-<binary> aggregate drv path. A
+      length other than 1 raises :class:`ValueError`.
+
+    ``toolchains_name`` is kept for source-compat with older callers
+    but is no longer threaded into the nix expression: the aggregate
+    name comes from the toolchains drv's own basename (it was set when
+    :func:`make_wrapper_drv_from_paths` built the aggregate).
+
+    Validates that the toolchains drv's basename contains ``toolchain``
+    and every matrix drv's basename contains ``matrix``. Leaf drvs
+    (``-elf-folder.drv`` variants, ``-wrapper-`` compiler-wrappers,
+    etc.) are rejected — the contract is that these are AGGREGATE
+    wrapper drv paths sourced from one bulk evaluator pass.
     """
+    del toolchains_name  # kept for source-compat; no longer threaded in
     if not toolchain_drvs:
         raise ValueError("at least one toolchain drv path is required")
+    if len(toolchain_drvs) != 1:
+        raise ValueError(
+            "make_sum_drv_from_paths requires exactly ONE toolchains "
+            f"aggregate drv path, got {len(toolchain_drvs)}: "
+            f"{toolchain_drvs!r}. Production wraps every compiler "
+            "into a single 'toolchains' aggregate upstream; passing a "
+            "list of bare toolchain leaves is the legacy small-eval "
+            "pattern this helper forbids."
+        )
     if not matrix_drvs:
         raise ValueError("at least one matrix is required")
-    for tc in toolchain_drvs:
-        _validate_marker(
-            tc, marker=_TOOLCHAIN_AGGREGATE_MARKER, role="toolchain",
-        )
     for name, paths in matrix_drvs.items():
         if not paths:
             raise ValueError(f"matrix {name!r} has no drv paths")
-        for p in paths:
-            _validate_marker(
-                p, marker=_MATRIX_AGGREGATE_MARKER, role=f"matrix-{name}",
+        if len(paths) != 1:
+            raise ValueError(
+                f"make_sum_drv_from_paths requires exactly ONE matrix "
+                f"aggregate drv path per binary, got {len(paths)} for "
+                f"matrix {name!r}: {paths!r}. Production wraps every "
+                "variant of a binary into a single 'matrix-<binary>' "
+                "aggregate upstream; passing a list of bare variant "
+                "leaves is the legacy small-eval pattern this helper "
+                "forbids."
             )
 
+    (toolchains_drv,) = toolchain_drvs
+    _validate_marker(
+        toolchains_drv,
+        marker=_TOOLCHAIN_AGGREGATE_MARKER,
+        role="toolchain",
+    )
+    matrix_aggregates: list[str] = []
+    for name, paths in matrix_drvs.items():
+        (one,) = paths
+        _validate_marker(
+            one, marker=_MATRIX_AGGREGATE_MARKER, role=f"matrix-{name}",
+        )
+        matrix_aggregates.append(one)
+
     expr = (
-        f"import {SUM_DRV_NIX} {{\n"
+        f"import {SUM_DRV_FROM_AGGREGATES_NIX} {{\n"
         f"  bash = builtins.storePath {_q(bash_path)};\n"
-        f"  toolchains = {_join_drvs(toolchain_drvs)};\n"
-        f"  matrices = {_join_matrix_drvs(matrix_drvs)};\n"
+        f"  toolchainsDrv = {_shallow_ref(toolchains_drv)};\n"
+        f"  matrixDrvs = {_join_drvs(matrix_aggregates)};\n"
         f"  rootName = {_q(root_name)};\n"
-        f"  toolchainsName = {_q(toolchains_name)};\n"
         f"  system = {_q(system)};\n"
         f"}}\n"
     )
