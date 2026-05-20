@@ -651,11 +651,19 @@ def test_run_eval_task_determinism_same_seed(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Two runs with the same ``variant_seed`` produce identical
-    variants[] lists AND identical matrix_aggregate_drv paths. Each
-    run uses a fresh out_dir so no resume short-circuit hides drift
-    between runs.
+    variants[] lists AND identical ``drvs=`` arguments to
+    ``make_wrapper_drv_from_paths``. Each run uses a fresh out_dir so
+    no resume short-circuit hides drift between runs.
+
+    Asserting wrapper-call equality (rather than just the synthetic
+    ``matrix_aggregate_drv`` path) is what makes this test
+    non-tautological: the stub returns ``/nix/store/wrap-{name}.drv``
+    by construction, so matching paths only prove the binary name
+    didn't change. The genuine determinism evidence is that the worker
+    fed the wrapper the SAME sorted leaf list (same order, same drvs)
+    on both runs.
     """
-    _install_wrapper_stub(monkeypatch)
+    wrapper = _install_wrapper_stub(monkeypatch)
     payload = _make_payload(
         archs=["x86_64"],
         suffixes=[f"S{i:03d}" for i in range(20)],
@@ -693,8 +701,21 @@ def test_run_eval_task_determinism_same_seed(
     assert labels_a == labels_b
     assert drvs_a == drvs_b
     # The matrix aggregate drv depends on the sorted leaf set; same
-    # seed → same leaves → same aggregate identifier.
+    # seed → same leaves → same aggregate identifier. (This equality
+    # is tautological at the stub layer — see below for the real
+    # worker-side determinism assertion.)
     assert a["matrix_aggregate_drv"] == b["matrix_aggregate_drv"]
+    # Worker-side determinism: both runs pushed the SAME ordered drvs
+    # list (toolchain aggregate + sorted leaves) into the wrapper
+    # helper. The wrapper-output equality above is tautological because
+    # the stub keys solely off ``name``; this assertion is what proves
+    # the run-to-run determinism lives in the worker, not the stub.
+    assert len(wrapper.calls) == 2
+    assert wrapper.calls[0]["drvs"] == wrapper.calls[1]["drvs"]
+    # Also pin the surrounding kwargs so a future regression that
+    # reshuffles name/system silently can't pass this test.
+    assert wrapper.calls[0]["name"] == wrapper.calls[1]["name"]
+    assert wrapper.calls[0]["system"] == wrapper.calls[1]["system"]
 
 
 def test_run_eval_task_determinism_different_seed(
