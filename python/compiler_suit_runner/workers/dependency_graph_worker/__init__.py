@@ -78,7 +78,12 @@ from .plan import (
     plan_total_with_counters,
 )
 from .run import run_dependency_graph_task
-from .sum_drv import build_sum_drv, build_sum_drv_multi, query_drv_tree
+from .sum_drv import (
+    build_sum_drv,
+    build_sum_drv_multi,
+    query_drv_tree,
+    stream_drv_tree,
+)
 
 
 __all__ = [
@@ -101,6 +106,7 @@ __all__ = [
     "plan_total_with_counters",
     "query_drv_tree",
     "run_dependency_graph_task",
+    "stream_drv_tree",
     "write_phase4_descriptors",
     "write_phase4_summary_text",
 ]
