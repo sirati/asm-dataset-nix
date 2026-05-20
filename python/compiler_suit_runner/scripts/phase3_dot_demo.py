@@ -3,7 +3,7 @@ production code path.
 
 Pipeline (no dynamic_runner framework): ``enumerate_toolchains_only``
 → ``make_matrix_eval_header`` → ``run_eval_task`` →
-``run_dependency_graph_task`` → ``plan_from_tree_streaming`` →
+``run_dependency_graph_task`` → ``plan_from_drv_tree`` →
 ``save_binary_merged_dot``. Writes ``/tmp/phase3-dots/<binary>-merged.dot``
 per binary and prints the wall time so the matrix-aggregate refactor's
 "trivially fast phase 3" guarantee is regression-testable.
@@ -23,8 +23,8 @@ from typing import Optional
 from compiler_suit_runner.preflight import enumerate_toolchains_only
 from compiler_suit_runner.workers.dependency_graph_worker import (
     build_sum_drv_multi,
-    query_drv_tree,
     run_dependency_graph_task,
+    stream_drv_tree,
 )
 
 from compiler_suit_runner.scripts._phase3_dot_helpers import (
@@ -56,12 +56,11 @@ def _render_dot(
     out_path: pathlib.Path,
 ) -> int:
     """Stream-plan per-binary sum-drv tree, emit merged dot, return size.
-    A second ``plan_from_tree_streaming`` pass (after the descriptor
-    pickle) is needed because the renderer wants ``meta_templates``
-    keys the pickle does not carry; the cost is wall-negligible on a
-    warm tree."""
+    A second ``plan_from_drv_tree`` pass (after the descriptor pickle)
+    is needed because the renderer wants ``meta_templates`` keys the
+    pickle does not carry; the cost is wall-negligible on a warm tree."""
     from template_graph.dot import save_binary_merged_dot
-    from template_graph.streaming import plan_from_tree_streaming
+    from template_graph.streaming import plan_from_drv_tree
 
     sum_drv = build_sum_drv_multi(
         bash_path=bash_path,
@@ -69,8 +68,7 @@ def _render_dot(
         matrix_drvs={f"matrix-{binary}": [matrix_agg]},
         system=sys_name,
     )
-    tree_text = query_drv_tree(sum_drv)
-    result = plan_from_tree_streaming(tree_text, lax=True)
+    result = plan_from_drv_tree(stream_drv_tree(sum_drv), lax=True)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_binary_merged_dot(result, binary, str(out_path))
     return out_path.stat().st_size
