@@ -237,6 +237,32 @@ def _join_matrix_drvs(matrix_drvs: dict[str, list[str]]) -> str:
     return "[ " + " ".join(items) + " ]"
 
 
+_TOOLCHAIN_AGGREGATE_MARKER = "toolchain"
+_MATRIX_AGGREGATE_MARKER = "matrix"
+
+_SMALL_EVAL_FORBIDDEN_MSG = (
+    "make_sum_drv_from_paths rejects {role} path {path!r}: basename "
+    "{basename!r} does not contain the expected aggregate marker "
+    "{marker!r}. Callers MUST pass the aggregate wrapper drv paths "
+    "(the single 'toolchains' drv containing every compiler wrapper, "
+    "and one 'matrix-<binary>' drv per binary containing every variant "
+    "leaf) — NOT the leaf drvs themselves. Constructing the wrappers "
+    "from leaf lists requires a per-leaf flake evaluation, which "
+    "re-evaluates the entire flake closure per leaf and takes minutes "
+    "instead of seconds on real matrices. The expected contract: ONE "
+    "bulk evaluator pass (e.g. ``nix-eval-jobs --force-recurse``) "
+    "exposes the aggregate wrappers, and those paths are fed here."
+)
+
+
+def _validate_marker(path: str, *, marker: str, role: str) -> None:
+    basename = path.rsplit("/", 1)[-1]
+    if marker not in basename:
+        raise ValueError(_SMALL_EVAL_FORBIDDEN_MSG.format(
+            role=role, path=path, basename=basename, marker=marker,
+        ))
+
+
 def make_sum_drv_from_paths(
     *,
     bash_path: str,
@@ -251,14 +277,31 @@ def make_sum_drv_from_paths(
     raw store paths (toolchain + matrix .drvs + a bash store path) and
     assembles the same layered sum-root via ``builtins.appendContext`` —
     no flake eval, no re-instantiation of the inputs.
+
+    Validates that every ``toolchain_drvs`` entry's basename contains
+    ``toolchain`` and every ``matrix_drvs`` entry's basename contains
+    ``matrix``. If a caller hands in leaf drvs (e.g. ``-elf-folder.drv``
+    variant leaves or ``-wrapper-`` compiler-wrapper leaves), raise
+    ``ValueError`` — the contract is that these are AGGREGATE wrapper
+    drv paths sourced from one bulk evaluator pass; constructing the
+    wrappers from leaf lists is the slow per-leaf flake-eval pattern
+    that this function exists to forbid.
     """
     if not toolchain_drvs:
         raise ValueError("at least one toolchain drv path is required")
     if not matrix_drvs:
         raise ValueError("at least one matrix is required")
+    for tc in toolchain_drvs:
+        _validate_marker(
+            tc, marker=_TOOLCHAIN_AGGREGATE_MARKER, role="toolchain",
+        )
     for name, paths in matrix_drvs.items():
         if not paths:
             raise ValueError(f"matrix {name!r} has no drv paths")
+        for p in paths:
+            _validate_marker(
+                p, marker=_MATRIX_AGGREGATE_MARKER, role=f"matrix-{name}",
+            )
 
     expr = (
         f"import {SUM_DRV_NIX} {{\n"
