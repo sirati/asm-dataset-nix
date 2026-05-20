@@ -1190,14 +1190,19 @@ class TestCliParser:
         args = parser.parse_args([
             "--matrix-eval-out-dir", "/tmp/me",
             "--bash-path", "/nix/store/aaaa-bash",
-            "--toolchain-drv", "/nix/store/tc1.drv",
-            "--toolchain-drv", "/nix/store/tc2.drv",
+            "--toolchain-drv", "/nix/store/aaaa-toolchains.drv",
+            "--matrix-drv", "hello=/nix/store/bbbb-matrix-hello.drv",
             "--toolchain-task-id", "tc1.drv=task1",
             "--sys-name", "aarch64-linux",
         ])
         assert args.matrix_eval_out_dir == "/tmp/me"
-        assert args.toolchain_drv == [
-            "/nix/store/tc1.drv", "/nix/store/tc2.drv",
+        # New single-value semantics; dest is ``toolchain_aggregate_drv``
+        # to match the run_dependency_graph_task kwarg name.
+        assert args.toolchain_aggregate_drv == (
+            "/nix/store/aaaa-toolchains.drv"
+        )
+        assert args.matrix_drv_raw == [
+            "hello=/nix/store/bbbb-matrix-hello.drv",
         ]
         assert args.toolchain_task_id == ["tc1.drv=task1"]
         assert args.sys_name == "aarch64-linux"
@@ -1209,6 +1214,8 @@ class TestCliParser:
         args = parser.parse_args([
             "--matrix-eval-out-dir", "/tmp/me",
             "--bash-path", "/nix/store/aaaa-bash",
+            "--toolchain-drv", "/nix/store/aaaa-toolchains.drv",
+            "--matrix-drv", "hello=/nix/store/bbbb-matrix-hello.drv",
         ])
         assert args.sys_name == "x86_64-linux"
 
@@ -1219,9 +1226,107 @@ class TestCliParser:
         args = parser.parse_args([
             "--matrix-eval-out-dir", "/tmp/me",
             "--bash-path", "/nix/store/aaaa-bash",
+            "--toolchain-drv", "/nix/store/aaaa-toolchains.drv",
+            "--matrix-drv", "hello=/nix/store/bbbb-matrix-hello.drv",
             "--system", "aarch64-linux",
         ])
         assert args.sys_name == "aarch64-linux"
+
+    def test_cli_parses_toolchain_drv_and_matrix_drvs(self):
+        """The watcher passes the pre-built aggregate drv paths via two
+        new flags: ``--toolchain-drv <path>`` (single) and
+        ``--matrix-drv <binary>=<path>`` (repeated)."""
+        parser = dgw._build_cli_parser()
+        args = parser.parse_args([
+            "--matrix-eval-out-dir", "/tmp/me",
+            "--bash-path", "/nix/store/aaaa-bash",
+            "--toolchain-drv", "/nix/store/x-t.drv",
+            "--matrix-drv", "hello=/nix/store/y-mh.drv",
+            "--matrix-drv", "busybox=/nix/store/z-mb.drv",
+            "--system", "x86_64-linux",
+        ])
+        assert args.toolchain_aggregate_drv == "/nix/store/x-t.drv"
+        # Raw list is preserved; the helper turns it into a dict.
+        assert args.matrix_drv_raw == [
+            "hello=/nix/store/y-mh.drv",
+            "busybox=/nix/store/z-mb.drv",
+        ]
+        # The dict-builder helper produces the kwarg-shape dict.
+        captured: list[str] = []
+        mapping = dgw.cli.parse_matrix_drv_mappings(
+            args.matrix_drv_raw, on_error=captured.append,
+        )
+        assert mapping == {
+            "hello": "/nix/store/y-mh.drv",
+            "busybox": "/nix/store/z-mb.drv",
+        }
+        assert captured == []
+
+    def test_cli_rejects_repeated_matrix_drv_for_same_binary(self):
+        """Two ``--matrix-drv`` entries for the same binary name must
+        fail with ``parser.error`` (SystemExit). The watcher is meant
+        to emit one aggregate per binary; a duplicate is a wiring bug."""
+        parser = dgw._build_cli_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args([
+                "--matrix-eval-out-dir", "/tmp/me",
+                "--bash-path", "/nix/store/aaaa-bash",
+                "--toolchain-drv", "/nix/store/x-t.drv",
+                "--matrix-drv", "hello=/nix/store/A.drv",
+                "--matrix-drv", "hello=/nix/store/B.drv",
+            ])
+            # Argparse only stores the raw repeats; the duplicate-check
+            # fires inside main()'s parse_matrix_drv_mappings call via
+            # parser.error → SystemExit.
+            # Exercise the helper directly here for an explicit fail.
+            dgw.cli.parse_matrix_drv_mappings(
+                ["hello=/nix/store/A.drv", "hello=/nix/store/B.drv"],
+                on_error=parser.error,
+            )
+
+    def test_cli_requires_matrix_drv_and_toolchain_drv(self):
+        """Both new flags are required: omitting either is a hard
+        SystemExit. ``--matrix-drv`` is checked in main() (argparse's
+        ``action='append'`` cannot mark "at least one occurrence" by
+        itself); ``--toolchain-drv`` is ``required=True`` directly."""
+        parser = dgw._build_cli_parser()
+        # Missing --toolchain-drv → argparse SystemExit at parse time.
+        with pytest.raises(SystemExit):
+            parser.parse_args([
+                "--matrix-eval-out-dir", "/tmp/me",
+                "--bash-path", "/nix/store/aaaa-bash",
+                "--matrix-drv", "hello=/nix/store/y.drv",
+            ])
+        # Missing --matrix-drv → main() raises SystemExit via
+        # parser.error. We invoke main() with a tmp matrix-eval dir
+        # that doesn't matter (argparse exits before run.py runs).
+        with pytest.raises(SystemExit):
+            dgw.main([
+                "--matrix-eval-out-dir", "/tmp/me",
+                "--bash-path", "/nix/store/aaaa-bash",
+                "--toolchain-drv", "/nix/store/x-t.drv",
+            ])
+
+    def test_cli_rejects_malformed_matrix_drv(self):
+        """An entry that doesn't contain ``=`` (or has empty halves)
+        is rejected with SystemExit, surfacing the usage banner rather
+        than a stack trace deep in main()."""
+        parser = dgw._build_cli_parser()
+        # Helper-level: malformed entry triggers on_error. parser.error
+        # raises SystemExit; we wrap to capture that.
+        with pytest.raises(SystemExit):
+            dgw.cli.parse_matrix_drv_mappings(
+                ["hello"],  # no '=' — malformed
+                on_error=parser.error,
+            )
+        # End-to-end via main(): same SystemExit surfaces to the caller.
+        with pytest.raises(SystemExit):
+            dgw.main([
+                "--matrix-eval-out-dir", "/tmp/me",
+                "--bash-path", "/nix/store/aaaa-bash",
+                "--toolchain-drv", "/nix/store/x-t.drv",
+                "--matrix-drv", "hello",
+            ])
 
 
 # ---------------------------------------------------------------------------
