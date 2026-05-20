@@ -54,6 +54,7 @@ from __future__ import annotations
 import sys
 
 from .archive import (
+    derive_variant_lookup_from_aggregate,
     derive_variant_lookup_from_drvs,
     discover_archives,
     discover_kept_drvs_from_imported_store,
@@ -92,6 +93,7 @@ __all__ = [
     "build_sum_drv",
     "build_sum_drv_multi",
     "compute_dependency_graph_counters",
+    "derive_variant_lookup_from_aggregate",
     "derive_variant_lookup_from_drvs",
     "discover_archives",
     "discover_kept_drvs_from_imported_store",
