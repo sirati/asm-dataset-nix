@@ -669,11 +669,19 @@ class _MatrixEvalQuiesceWatcher:
         run_subprocess: Optional[_SubprocessRunner] = None,
         dependency_graph_command_override: Optional[list[str]] = None,
         bash_path: Optional[str] = None,
+        toolchain_aggregate_drv: str = "",
     ) -> None:
         self._expected: frozenset[str] = frozenset(expected_task_ids)
         self._completed: set[str] = set()
         self._out_dir = pathlib.Path(out_dir)
         self._toolchain_task_ids: dict[str, str] = dict(toolchain_task_ids)
+        self._toolchain_aggregate_drv: str = toolchain_aggregate_drv or ""
+        # Collected at on_task_completed time from each matrix_eval task's
+        # result dict. Keyed by ``binary`` (the matrix_eval payload's
+        # ``binary`` field, also derivable from the ``matrix_eval__<binary>``
+        # task_id shape). Used at _fire time to emit ``--matrix-drv
+        # <binary>=<path>`` arguments to the dependency_graph_worker.
+        self._matrix_aggregates: dict[str, str] = {}
         self._primary_handle = primary_handle
         self._sys_name = sys_name
         self._flake_ref = flake_ref
@@ -717,13 +725,14 @@ class _MatrixEvalQuiesceWatcher:
     ) -> None:
         """Process one task-completion notification.
 
-        ``result`` is forwarded by the framework's hook (eventual API);
-        we don't currently inspect it because the matrix_eval worker
-        writes its archive to
-        ``<matrix_eval_out_dir>/<binary>.nix-archive`` and the
-        dependency_graph worker re-reads them. The result slot is
-        kept on the signature so the framework's call site doesn't
-        need a wrapper.
+        ``result`` is the matrix_eval worker's per-binary return dict
+        (see :func:`workers.eval_worker.run_eval_task`). When present
+        we extract its ``matrix_aggregate_drv`` field and stash it
+        keyed by ``binary`` so :meth:`_build_dependency_graph_argv`
+        can emit ``--matrix-drv <binary>=<path>`` at fire time.
+        Resumed tasks return ``matrix_aggregate_drv: None`` (the
+        archive already carries the wrapper-drv closure); those are
+        logged at WARNING but do NOT break the watcher.
 
         No-op when:
 
@@ -733,7 +742,6 @@ class _MatrixEvalQuiesceWatcher:
         * The watcher has already fired (``self._fired``).
         * The task_id has already been marked complete (idempotent).
         """
-        del result  # see docstring
         if not task_id:
             return
         with self._lock:
@@ -744,6 +752,7 @@ class _MatrixEvalQuiesceWatcher:
             if task_id in self._completed:
                 return
             self._completed.add(task_id)
+            self._record_matrix_aggregate(task_id, result)
             if self._completed < self._expected:
                 # Still waiting on more matrix_eval tasks.
                 return
@@ -757,6 +766,61 @@ class _MatrixEvalQuiesceWatcher:
                     "_MatrixEvalQuiesceWatcher._fire raised; build phase"
                     " will not be scheduled (operator-visible stall)"
                 )
+
+    def _record_matrix_aggregate(
+        self, task_id: str, result: Any,
+    ) -> None:
+        """Extract ``matrix_aggregate_drv`` from a matrix_eval result dict.
+
+        Resolves the binary key by preferring ``result["binary"]`` and
+        falling back to parsing the ``matrix_eval__<binary>`` task_id
+        shape. Stores ``{binary: drv_path}`` in
+        :attr:`_matrix_aggregates`; missing or ``None`` payloads are
+        logged at WARNING and skipped (resumed tasks legitimately
+        return ``matrix_aggregate_drv=None``).
+
+        Caller MUST hold :attr:`_lock`.
+        """
+        binary = self._binary_from_task_id(task_id)
+        if not isinstance(result, dict):
+            # Framework hook may forward ``None`` while the
+            # task-result API is still in flight (today only the
+            # task_id is delivered). Logging at debug level keeps
+            # operator output quiet for the common path.
+            self._logger.debug(
+                "_MatrixEvalQuiesceWatcher: no result dict for task_id=%s"
+                " (binary=%s); skipping matrix_aggregate_drv capture",
+                task_id, binary,
+            )
+            return
+        if isinstance(result.get("binary"), str) and result["binary"]:
+            binary = result["binary"]
+        matrix_drv = result.get("matrix_aggregate_drv")
+        if not isinstance(matrix_drv, str) or not matrix_drv:
+            self._logger.warning(
+                "_MatrixEvalQuiesceWatcher: matrix_eval task %s"
+                " (binary=%s) returned no matrix_aggregate_drv"
+                " (resumed? value=%r); dgw --matrix-drv entry omitted",
+                task_id, binary, matrix_drv,
+            )
+            return
+        if not binary:
+            self._logger.warning(
+                "_MatrixEvalQuiesceWatcher: matrix_eval task %s"
+                " returned matrix_aggregate_drv but no binary key"
+                " (result keys=%r); dgw --matrix-drv entry omitted",
+                task_id, sorted(result.keys()),
+            )
+            return
+        self._matrix_aggregates[binary] = matrix_drv
+
+    @staticmethod
+    def _binary_from_task_id(task_id: str) -> str:
+        """Recover ``<binary>`` from a ``matrix_eval__<binary>`` task_id."""
+        prefix = "matrix_eval__"
+        if task_id.startswith(prefix):
+            return task_id[len(prefix):]
+        return ""
 
     # ── Plan invocation ────────────────────────────────────────────────
 
@@ -789,6 +853,30 @@ class _MatrixEvalQuiesceWatcher:
             " starting dependency_graph subprocess",
             len(self._expected),
         )
+        # Phase 3 cannot run without (a) the toolchain aggregate drv
+        # that anchors the sum-drv graph, AND (b) at least one
+        # matrix_eval task contributing a per-binary aggregate. Bail
+        # early with an explicit error so the operator-visible failure
+        # mode is "no dgw spawn", not "dgw spawned with empty inputs
+        # then crashed mid-run".
+        if not self._toolchain_aggregate_drv:
+            self._logger.error(
+                "_MatrixEvalQuiesceWatcher: toolchain_aggregate_drv is"
+                " empty; phase 3 has no anchor drv to walk and will be"
+                " skipped (operator-visible stall — restart with a"
+                " preflight that produces the toolchains aggregate)"
+            )
+            return
+        if not self._matrix_aggregates:
+            self._logger.error(
+                "_MatrixEvalQuiesceWatcher: no matrix_aggregate_drv"
+                " entries collected from %d matrix_eval task(s); phase 3"
+                " has no producers and will be skipped (every task may"
+                " have been resumed — re-run from a clean state if a"
+                " build phase is required)",
+                len(self._expected),
+            )
+            return
         self._import_matrix_eval_archives()
         try:
             self._invoke_dependency_graph_worker()
@@ -950,16 +1038,28 @@ class _MatrixEvalQuiesceWatcher:
             "compiler_suit_runner.workers.dependency_graph_worker",
             "--matrix-eval-out-dir", str(self._out_dir),
             "--bash-path", bash_path,
-            "--sys-name", self._sys_name,
+            "--system", self._sys_name,
             "--flake-ref", self._flake_ref,
+            # Single toolchain aggregate drv anchors the phase-3
+            # sum-drv graph. Replaces the legacy per-toolchain
+            # ``--toolchain-drv`` repetition; the dgw now walks the
+            # aggregate's input closure instead of enumerating each
+            # toolchain leaf at argv-construction time.
+            "--toolchain-drv", self._toolchain_aggregate_drv,
         ]
-        # Per-toolchain drv paths + their phase-1 task ids (so the
-        # planner can wire build_compilers → build_variant deps). The
-        # subprocess expects ``--toolchain-task-id <ident>=<task_id>``;
-        # ``<ident>`` is the ``<hash>-<name>`` shape derived from the
-        # drv basename.
+        # Per-binary matrix aggregate drv paths collected at
+        # ``on_task_completed`` time. The dgw consumes
+        # ``--matrix-drv <binary>=<path>`` repeats and pairs each with
+        # the binary's archive on disk. Sorted iteration keeps the
+        # argv deterministic across runs.
+        for binary, matrix_agg in sorted(self._matrix_aggregates.items()):
+            argv += ["--matrix-drv", f"{binary}={matrix_agg}"]
+        # Per-toolchain phase-1 task-id mappings still pass through
+        # so the planner can wire build_compilers → build_variant
+        # depends_on. The subprocess expects
+        # ``--toolchain-task-id <ident>=<task_id>``; ``<ident>`` is
+        # the ``<hash>-<name>`` shape derived from the drv basename.
         for drv, task_id in sorted(self._toolchain_task_ids.items()):
-            argv += ["--toolchain-drv", drv]
             ident = self._drv_to_ident(drv)
             if ident and task_id:
                 argv += ["--toolchain-task-id", f"{ident}={task_id}"]
@@ -2669,6 +2769,12 @@ class SuitTask:
 
         expected_ids: set[str] = set()
         toolchain_task_ids: dict[str, str] = {}
+        # Every matrix_eval manifest header carries the same
+        # ``toolchain_aggregate_drv`` (stamped by preflight before
+        # manifest emit). Capture the first one we see and surface
+        # an inconsistency at WARNING so a hand-edited manifest dir
+        # doesn't silently use the wrong anchor.
+        toolchain_aggregate_drv: str = ""
 
         for entry in entries:
             if not entry.is_file():
@@ -2687,6 +2793,19 @@ class SuitTask:
                     expected_ids.add(
                         header.task_id or matrix_eval_task_id(binary)
                     )
+                drv_agg = header.payload.get("toolchain_aggregate_drv")
+                if isinstance(drv_agg, str) and drv_agg:
+                    if (toolchain_aggregate_drv
+                            and toolchain_aggregate_drv != drv_agg):
+                        self._logger.warning(
+                            "_build_matrix_eval_watcher: matrix_eval"
+                            " manifests disagree on"
+                            " toolchain_aggregate_drv (%s vs %s);"
+                            " keeping the first observed value",
+                            toolchain_aggregate_drv, drv_agg,
+                        )
+                    elif not toolchain_aggregate_drv:
+                        toolchain_aggregate_drv = drv_agg
                 continue
             if header.item_class in (
                 "build_compilers",
@@ -2727,6 +2846,7 @@ class SuitTask:
             logger=self._logger,
             sys_name=self.config.sys_name,
             flake_ref=self.config.flake_ref,
+            toolchain_aggregate_drv=toolchain_aggregate_drv,
         )
 
     def _register_matrix_eval_watcher(

@@ -82,7 +82,14 @@ def _make_config(tmp_path: pathlib.Path) -> SuitTaskConfig:
     )
 
 
-def _matrix_eval_header(binary: str) -> ManifestHeader:
+_TC_AGG_DRV_FIXTURE = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-toolchains.drv"
+
+
+def _matrix_eval_header(
+    binary: str,
+    *,
+    toolchain_aggregate_drv: str = _TC_AGG_DRV_FIXTURE,
+) -> ManifestHeader:
     return ManifestHeader(
         item_class="matrix_eval",
         name=f"matrix_eval__{binary}",
@@ -93,6 +100,7 @@ def _matrix_eval_header(binary: str) -> ManifestHeader:
             "archs": ["x86_64"],
             "suffixes": ["O0"],
             "attr": f"dataset.{_SYS}.{binary}",
+            "toolchain_aggregate_drv": toolchain_aggregate_drv,
         },
         task_id=matrix_eval_task_id(binary),
         task_depends_on=(),
@@ -489,6 +497,7 @@ def test_fire_invokes_dependency_graph_subprocess_and_spawns(
         expected_task_ids={hello},
         out_dir=out_dir,
         toolchain_task_ids={},
+        toolchain_aggregate_drv="/nix/store/zzzz-toolchains.drv",
         primary_handle=handle,
         sys_name=_SYS,
         run_subprocess=fake_run,
@@ -497,7 +506,13 @@ def test_fire_invokes_dependency_graph_subprocess_and_spawns(
         logger=logger,
     )
     with caplog.at_level(logging.INFO, logger="test_fire_happy"):
-        w.on_task_completed(hello)
+        w.on_task_completed(
+            hello,
+            result={
+                "binary": "hello",
+                "matrix_aggregate_drv": "/nix/store/yyyy-matrix-hello.drv",
+            },
+        )
 
     # Subprocess was invoked exactly once.
     assert runs == [["true"]]
@@ -531,6 +546,7 @@ def test_fire_logs_and_degrades_on_subprocess_failure(
         expected_task_ids={hello},
         out_dir=out_dir,
         toolchain_task_ids={},
+        toolchain_aggregate_drv="/nix/store/zzzz-toolchains.drv",
         primary_handle=handle,
         run_subprocess=lambda _argv: _fake_completed(
             2, stderr=b"boom"
@@ -540,7 +556,13 @@ def test_fire_logs_and_degrades_on_subprocess_failure(
         logger=logger,
     )
     with caplog.at_level(logging.ERROR, logger="test_fire_subprocess_fail"):
-        w.on_task_completed(hello)
+        w.on_task_completed(
+            hello,
+            result={
+                "binary": "hello",
+                "matrix_aggregate_drv": "/nix/store/yyyy-matrix-hello.drv",
+            },
+        )
     assert w.fired is True
     handle.spawn_tasks.assert_not_called()
     assert any(
@@ -565,6 +587,7 @@ def test_fire_logs_and_degrades_when_descriptors_missing(
         expected_task_ids={hello},
         out_dir=out_dir,
         toolchain_task_ids={},
+        toolchain_aggregate_drv="/nix/store/zzzz-toolchains.drv",
         primary_handle=handle,
         run_subprocess=lambda _argv: _fake_completed(0),
         dependency_graph_command_override=["true"],
@@ -572,7 +595,13 @@ def test_fire_logs_and_degrades_when_descriptors_missing(
         logger=logger,
     )
     with caplog.at_level(logging.ERROR, logger="test_fire_no_descriptors"):
-        w.on_task_completed(hello)
+        w.on_task_completed(
+            hello,
+            result={
+                "binary": "hello",
+                "matrix_aggregate_drv": "/nix/store/yyyy-matrix-hello.drv",
+            },
+        )
     handle.spawn_tasks.assert_not_called()
     assert any(
         "cannot read" in rec.message and "_dependency_graph.pkl" in rec.message
@@ -583,9 +612,8 @@ def test_fire_logs_and_degrades_when_descriptors_missing(
 def test_fire_argv_includes_toolchain_drv_and_task_id_mappings(
     tmp_path: pathlib.Path,
 ) -> None:
-    """The watcher assembles ``--toolchain-drv`` /
-    ``--toolchain-task-id`` flags per (drv, task_id) entry, in
-    sorted-drv order for determinism."""
+    """The watcher assembles ``--toolchain-drv`` (single aggregate) +
+    ``--toolchain-task-id`` mappings + ``--system`` in the dgw argv."""
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     _seed_empty_dependency_graph_pickle(out_dir)
@@ -596,6 +624,7 @@ def test_fire_argv_includes_toolchain_drv_and_task_id_mappings(
         return _fake_completed(0)
 
     hello = matrix_eval_task_id("hello")
+    tc_agg = "/nix/store/aaaa-toolchains.drv"
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={hello},
         out_dir=out_dir,
@@ -605,13 +634,20 @@ def test_fire_argv_includes_toolchain_drv_and_task_id_mappings(
                 "toolchain__lx__x86_64__clang20"
             ),
         },
+        toolchain_aggregate_drv=tc_agg,
         sys_name=_SYS,
         bash_path="/nix/store/fake-bash",
         run_subprocess=fake_run,
         # Do NOT pass dependency_graph_command_override — exercise the
         # real argv assembly.
     )
-    w.on_task_completed(hello)
+    w.on_task_completed(
+        hello,
+        result={
+            "binary": "hello",
+            "matrix_aggregate_drv": "/nix/store/bbbb-matrix-hello.drv",
+        },
+    )
 
     assert len(runs) == 1
     argv = runs[0]
@@ -619,12 +655,222 @@ def test_fire_argv_includes_toolchain_drv_and_task_id_mappings(
     assert "--matrix-eval-out-dir" in argv
     assert "--bash-path" in argv
     assert "/nix/store/fake-bash" in argv
-    assert "--sys-name" in argv and _SYS in argv
-    # Per-toolchain markers.
-    assert "/nix/store/aa-gcc15.drv" in argv
-    assert "/nix/store/bb-clang20.drv" in argv
+    # ``--system`` is the dgw flag spelling; argparse aliases it to
+    # ``--sys-name`` internally.
+    assert "--system" in argv and _SYS in argv
+    # Single toolchain aggregate (NOT per-toolchain).
+    tc_idx = argv.index("--toolchain-drv")
+    assert argv[tc_idx + 1] == tc_agg
+    assert argv.count("--toolchain-drv") == 1
+    # Per-toolchain task-id mappings still pass through.
     assert "aa-gcc15=toolchain__lx__x86_64__gcc15" in argv
     assert "bb-clang20=toolchain__lx__x86_64__clang20" in argv
+
+
+def test_watcher_emits_toolchain_and_matrix_argv_on_quiesce(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Feeds two matrix_eval completions then asserts the dgw argv
+    carries ``--toolchain-drv <agg>``, ``--matrix-drv <bin>=<path>``
+    pairs for each binary, and ``--system <sys>``."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _seed_empty_dependency_graph_pickle(out_dir)
+    runs: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess:
+        runs.append(list(argv))
+        return _fake_completed(0)
+
+    hello = matrix_eval_task_id("hello")
+    busybox = matrix_eval_task_id("busybox")
+    tc_agg = "/nix/store/aaaa-toolchains.drv"
+    mat_hello = "/nix/store/bbbb-matrix-hello.drv"
+    mat_busybox = "/nix/store/cccc-matrix-busybox.drv"
+
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello, busybox},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+        toolchain_aggregate_drv=tc_agg,
+        sys_name="x86_64-linux",
+        bash_path="/nix/store/fake-bash",
+        run_subprocess=fake_run,
+    )
+    w.on_task_completed(
+        hello,
+        result={"binary": "hello", "matrix_aggregate_drv": mat_hello},
+    )
+    w.on_task_completed(
+        busybox,
+        result={"binary": "busybox", "matrix_aggregate_drv": mat_busybox},
+    )
+
+    assert len(runs) == 1
+    argv = runs[0]
+    # --toolchain-drv carries the SINGLE aggregate.
+    tc_idx = argv.index("--toolchain-drv")
+    assert argv[tc_idx + 1] == tc_agg
+    assert argv.count("--toolchain-drv") == 1
+    # Two --matrix-drv pairs, sorted alphabetically by binary.
+    matrix_pairs = [
+        argv[i + 1] for i, tok in enumerate(argv) if tok == "--matrix-drv"
+    ]
+    assert matrix_pairs == [
+        f"busybox={mat_busybox}",
+        f"hello={mat_hello}",
+    ]
+    # --system flag with the configured sys_name.
+    sys_idx = argv.index("--system")
+    assert argv[sys_idx + 1] == "x86_64-linux"
+
+
+def test_watcher_skips_dgw_when_no_matrix_aggregates(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With every matrix_eval task resumed (matrix_aggregate_drv=None),
+    the aggregates map is empty at quiesce and dgw is NOT spawned;
+    an ERROR log explains the skip."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    runs: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess:
+        runs.append(list(argv))
+        return _fake_completed(0)
+
+    hello = matrix_eval_task_id("hello")
+    logger = logging.getLogger("test_no_matrix_aggregates")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+        toolchain_aggregate_drv="/nix/store/zzzz-toolchains.drv",
+        bash_path="/nix/store/fake-bash",
+        run_subprocess=fake_run,
+        logger=logger,
+    )
+    with caplog.at_level(
+        logging.ERROR, logger="test_no_matrix_aggregates"
+    ):
+        # Every completion is a "resumed" one — matrix_aggregate_drv is
+        # None so the watcher records no aggregate for that binary.
+        w.on_task_completed(
+            hello,
+            result={"binary": "hello", "matrix_aggregate_drv": None,
+                    "resumed": True},
+        )
+    assert w.fired is True
+    # No subprocess invocation.
+    assert runs == []
+    assert any(
+        "no matrix_aggregate_drv" in rec.message
+        and rec.levelno == logging.ERROR
+        for rec in caplog.records
+    )
+
+
+def test_watcher_skips_dgw_when_toolchain_aggregate_drv_empty(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Missing toolchain_aggregate_drv → no dgw spawn, ERROR logged."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    runs: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess:
+        runs.append(list(argv))
+        return _fake_completed(0)
+
+    hello = matrix_eval_task_id("hello")
+    logger = logging.getLogger("test_no_tc_agg")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+        # toolchain_aggregate_drv defaulted to ""
+        bash_path="/nix/store/fake-bash",
+        run_subprocess=fake_run,
+        logger=logger,
+    )
+    with caplog.at_level(logging.ERROR, logger="test_no_tc_agg"):
+        w.on_task_completed(
+            hello,
+            result={
+                "binary": "hello",
+                "matrix_aggregate_drv": "/nix/store/bb-matrix-hello.drv",
+            },
+        )
+    assert w.fired is True
+    assert runs == []
+    assert any(
+        "toolchain_aggregate_drv is" in rec.message
+        and rec.levelno == logging.ERROR
+        for rec in caplog.records
+    )
+
+
+def test_watcher_skips_resumed_tasks(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A resumed task (matrix_aggregate_drv=None) is recorded as
+    completed but does NOT populate _matrix_aggregates. A WARNING
+    is logged so operators see the skip; the watcher then proceeds
+    with whatever aggregates the non-resumed tasks contributed."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    _seed_empty_dependency_graph_pickle(out_dir)
+    runs: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess:
+        runs.append(list(argv))
+        return _fake_completed(0)
+
+    hello = matrix_eval_task_id("hello")
+    busybox = matrix_eval_task_id("busybox")
+    tc_agg = "/nix/store/aaaa-toolchains.drv"
+    mat_busybox = "/nix/store/cccc-matrix-busybox.drv"
+
+    logger = logging.getLogger("test_skips_resumed")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello, busybox},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+        toolchain_aggregate_drv=tc_agg,
+        bash_path="/nix/store/fake-bash",
+        run_subprocess=fake_run,
+        logger=logger,
+    )
+    with caplog.at_level(logging.WARNING, logger="test_skips_resumed"):
+        w.on_task_completed(
+            hello,
+            result={"binary": "hello", "matrix_aggregate_drv": None,
+                    "resumed": True},
+        )
+        w.on_task_completed(
+            busybox,
+            result={"binary": "busybox",
+                    "matrix_aggregate_drv": mat_busybox},
+        )
+
+    # Watcher fired; subprocess invoked because at least one aggregate
+    # came through.
+    assert w.fired is True
+    assert len(runs) == 1
+    argv = runs[0]
+    matrix_pairs = [
+        argv[i + 1] for i, tok in enumerate(argv) if tok == "--matrix-drv"
+    ]
+    assert matrix_pairs == [f"busybox={mat_busybox}"]
+    # Warning about the resumed task was emitted.
+    assert any(
+        "no matrix_aggregate_drv" in rec.message
+        and "hello" in rec.message
+        and rec.levelno == logging.WARNING
+        for rec in caplog.records
+    )
+    # Internal aggregates dict only carries the non-resumed binary.
+    assert w._matrix_aggregates == {"busybox": mat_busybox}
 
 
 # ---------------------------------------------------------------------------
@@ -880,6 +1126,10 @@ def test_build_matrix_eval_watcher_collects_expected_and_toolchains(
     }
     # out_dir falls through directly from the caller.
     assert w._out_dir == tmp_path / "out"
+    # toolchain_aggregate_drv is read from the matrix_eval manifest
+    # payload (preflight stamps the same value on every matrix_eval
+    # header in a single dispatch).
+    assert w._toolchain_aggregate_drv == _TC_AGG_DRV_FIXTURE
 
 
 def test_build_matrix_eval_watcher_falls_back_to_shared_fs(
