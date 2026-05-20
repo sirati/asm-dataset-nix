@@ -44,5 +44,5 @@ derivation {
   # ends up in this wrapper's inputDrvs. Toolchains first so the
   # streaming planner sees it as the first depth-1 child (highest
   # refcount due to every matrix wrapper also referencing it).
-  inputs = builtins.toString ([ toolchainsDrv ] ++ matrixDrvs);
+  refs = builtins.toString ([ toolchainsDrv ] ++ matrixDrvs);
 }
