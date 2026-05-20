@@ -381,7 +381,9 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
     ):
         state["preflight_calls"].append((flake_ref, sys_name, None, archs))
         # Empty toolchain set keeps downstream branches simple.
-        return (), {}
+        # Third element is the aggregate drv path; empty string here
+        # mirrors the "no leaves resolved → no aggregate" return shape.
+        return (), {}, ""
 
     monkeypatch.setattr(
         cli_module, "enumerate_toolchains_only", fake_enumerate_toolchains_only,
@@ -633,6 +635,7 @@ def test_serialize_then_restore_preflight_roundtrip(tmp_path: pathlib.Path):
         toolchain_specs=(("x86_64", "gcc15"),),
         common_dep_drvs=(),
         toolchain_drvs=frozenset({"/nix/store/tc.drv"}),
+        toolchain_aggregate_drv="/nix/store/aaaa-toolchains.drv",
     )
 
     preflight_path = tmp_path / "_preflight.json"
@@ -641,6 +644,17 @@ def test_serialize_then_restore_preflight_roundtrip(tmp_path: pathlib.Path):
         num_workers=1,
         target_path=preflight_path,
         toolchain_drvs_by_pair={("x86_64", "gcc15"): "/nix/store/tc.drv"},
+    )
+
+    # The aggregate drv path round-trips through the cache JSON
+    # verbatim: same handle written → same handle readable. Read it
+    # off-disk before the archive packs it, so we cover the
+    # write-side contract (the read side is exercised by
+    # _restore_manifests_from_archive below not crashing on the
+    # new field).
+    cached_payload = json.loads(preflight_path.read_text())
+    assert cached_payload["toolchain_aggregate_drv"] == (
+        "/nix/store/aaaa-toolchains.drv"
     )
 
     archive = tmp_path / "manifests.tar"
