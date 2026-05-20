@@ -55,9 +55,7 @@ import sys
 
 from .archive import (
     derive_variant_lookup_from_aggregate,
-    derive_variant_lookup_from_drvs,
     discover_archives,
-    discover_kept_drvs_from_imported_store,
     import_archive,
     is_path_locally_present,
 )
@@ -94,9 +92,7 @@ __all__ = [
     "build_sum_drv_multi",
     "compute_dependency_graph_counters",
     "derive_variant_lookup_from_aggregate",
-    "derive_variant_lookup_from_drvs",
     "discover_archives",
-    "discover_kept_drvs_from_imported_store",
     "import_archive",
     "is_path_locally_present",
     "main",
