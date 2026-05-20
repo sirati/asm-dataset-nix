@@ -29,7 +29,6 @@ from compiler_suit_runner.workers.eval_worker import sample_suffix_attrs
 DEFAULT_SMOKE_ARCHS: tuple[str, ...] = ("x86_64", "aarch64")
 SYS_NAME = "x86_64-linux"
 BINARY = "hello"
-FLAKE_BASH_ATTR = f"inputs.nixpkgs.legacyPackages.{SYS_NAME}.bash"
 SUFFIX_MATCH_PATTERN = (
     ".*-(baseline-default|noinline-default)-san-off-march-default"
 )
@@ -128,9 +127,32 @@ def discover_archs(*, root: Path) -> list[str]:
 
 
 def eval_bash_drv_path(root: Path) -> str:
-    """ONE nix-eval --json for bash's store outPath."""
-    payload = _nix_eval_json(FLAKE_BASH_ATTR, root=root)
-    assert isinstance(payload, str) and payload.startswith("/nix/store/")
+    """``nix eval --raw nixpkgs#bash.outPath`` — the production probe.
+
+    ``suit_task._resolve_bash_store_path`` resolves bash this way for
+    the dependency_graph worker subprocess; mirroring it here keeps
+    the smoke test pointed at the same store object the production
+    sum-drv assembly will consume. ``inputs.nixpkgs.<...>`` is NOT a
+    valid flake-output attr on this repo's ``flake.nix`` (only
+    ``packages`` / ``legacyPackages`` and a few ``_-`` debug outputs
+    are exposed), so the eval has to go via the nixpkgs flake's own
+    legacyPackages namespace.
+    """
+    del root  # nixpkgs flake handle is global; root unused
+    argv = [
+        "nix", "eval", "--raw",
+        "--extra-experimental-features", "nix-command flakes",
+        "nixpkgs#bash.outPath",
+    ]
+    proc = subprocess.run(argv, capture_output=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "nix eval --raw nixpkgs#bash.outPath failed "
+            f"(rc={proc.returncode}): "
+            + proc.stderr.decode("utf-8", errors="replace").strip()
+        )
+    payload = proc.stdout.decode("utf-8", errors="replace").strip()
+    assert payload.startswith("/nix/store/"), payload
     return payload
 
 
