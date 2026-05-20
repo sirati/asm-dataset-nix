@@ -32,7 +32,16 @@ if TYPE_CHECKING:
 
 
 def feed_line(planner: "StreamPlanner", line: str) -> None:
-    depth, drv_hash, drv_name, is_backref = _parse_line(line)
+    feed_parsed(planner, *_parse_line(line))
+
+
+def feed_parsed(
+    planner: "StreamPlanner",
+    depth: int,
+    drv_hash: str,
+    drv_name: str,
+    is_backref: bool,
+) -> None:
     # Root line — no further work; the calling driver dispatches
     # the line index, we just need to stay consistent.
     if depth == 0:

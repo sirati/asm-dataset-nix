@@ -192,6 +192,16 @@ class StreamPlanner:
         from template_graph.streaming.dispatch import feed_line
         feed_line(self, line)
 
+    def feed_parsed(
+        self,
+        depth: int,
+        drv_hash: str,
+        drv_name: str,
+        is_backref: bool,
+    ) -> None:
+        from template_graph.streaming.dispatch import feed_parsed
+        feed_parsed(self, depth, drv_hash, drv_name, is_backref)
+
     def finalize(self) -> dict:
         """Drain the last variant and the last matrix's pending buffers."""
         from template_graph.streaming.finalize import finalize
