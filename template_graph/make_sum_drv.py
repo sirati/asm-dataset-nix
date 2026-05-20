@@ -232,15 +232,6 @@ def _join_drvs(paths: list[str]) -> str:
     return "[ " + " ".join(_shallow_ref(p) for p in paths) + " ]"
 
 
-def _join_matrix_drvs(matrix_drvs: dict[str, list[str]]) -> str:
-    items = []
-    for name, paths in matrix_drvs.items():
-        items.append(
-            "{ name = " + _q(name) + "; drvs = " + _join_drvs(paths) + "; }"
-        )
-    return "[ " + " ".join(items) + " ]"
-
-
 _TOOLCHAIN_AGGREGATE_MARKER = "toolchain"
 _MATRIX_AGGREGATE_MARKER = "matrix"
 
@@ -273,7 +264,6 @@ def make_sum_drv_from_paths(
     toolchain_drvs: list[str],
     matrix_drvs: dict[str, list[str]],
     root_name: str = "sum-root",
-    toolchains_name: str = "toolchains",
     system: str = "x86_64-linux",
     extra_nix_args: list[str] | None = None,
 ) -> str:
@@ -297,10 +287,11 @@ def make_sum_drv_from_paths(
       element — the single matrix-<binary> aggregate drv path. A
       length other than 1 raises :class:`ValueError`.
 
-    ``toolchains_name`` is kept for source-compat with older callers
-    but is no longer threaded into the nix expression: the aggregate
-    name comes from the toolchains drv's own basename (it was set when
-    :func:`make_wrapper_drv_from_paths` built the aggregate).
+    The toolchains aggregate's wrapper name is whatever
+    :func:`make_wrapper_drv_from_paths` set when it built the aggregate
+    upstream — this helper does NOT expose a caller-controllable
+    aggregate-name knob, because the post-aggregate
+    :data:`SUM_DRV_FROM_AGGREGATES_NIX` assembler doesn't take one.
 
     Validates that the toolchains drv's basename contains ``toolchain``
     and every matrix drv's basename contains ``matrix``. Leaf drvs
@@ -308,7 +299,6 @@ def make_sum_drv_from_paths(
     etc.) are rejected — the contract is that these are AGGREGATE
     wrapper drv paths sourced from one bulk evaluator pass.
     """
-    del toolchains_name  # kept for source-compat; no longer threaded in
     if not toolchain_drvs:
         raise ValueError("at least one toolchain drv path is required")
     if len(toolchain_drvs) != 1:
