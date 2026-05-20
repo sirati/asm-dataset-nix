@@ -582,16 +582,16 @@ def _matrix_eval_metadata() -> dict[str, dict]:
     return {
         "hello": {
             "archs": ["x86_64", "aarch64"],
-            "suffixes": ["O0", "O2"],
             "variant_sample": 64,
             "variant_seed": "seed-hello",
+            "tier": 1,
             "toolchain_aggregate_drv": _DEFAULT_TC_AGGREGATE_DRV,
         },
         "busybox": {
             "archs": ["x86_64"],
-            "suffixes": ["O2", "O3"],
             "variant_sample": 32,
             "variant_seed": "seed-busybox",
+            "tier": 1,
             "toolchain_aggregate_drv": _DEFAULT_TC_AGGREGATE_DRV,
         },
     }
@@ -602,7 +602,6 @@ def test_matrix_eval_header_payload_shape():
         "hello",
         "x86_64-linux",
         archs=["x86_64", "aarch64"],
-        suffixes=["O0", "O2"],
         toolchain_aggregate_drv=_DEFAULT_TC_AGGREGATE_DRV,
         variant_sample=64,
         variant_seed="abc123",
@@ -616,7 +615,7 @@ def test_matrix_eval_header_payload_shape():
     assert h.payload["binary"] == "hello"
     assert h.payload["sys"] == "x86_64-linux"
     assert h.payload["archs"] == ["x86_64", "aarch64"]
-    assert h.payload["suffixes"] == ["O0", "O2"]
+    assert "suffixes" not in h.payload
     assert h.payload["variant_sample"] == 64
     assert h.payload["variant_seed"] == "abc123"
     assert h.payload["attr"] == "dataset.x86_64-linux.hello"
@@ -628,11 +627,11 @@ def test_matrix_eval_header_omits_optional_fields():
         "zlib",
         "x86_64-linux",
         archs=["x86_64"],
-        suffixes=["O2"],
         toolchain_aggregate_drv=_DEFAULT_TC_AGGREGATE_DRV,
     )
     assert "variant_sample" not in h.payload
     assert "variant_seed" not in h.payload
+    assert "suffixes" not in h.payload
     # toolchain_aggregate_drv is required — must be present even when
     # the optional sample/seed knobs are absent.
     assert h.payload["toolchain_aggregate_drv"] == _DEFAULT_TC_AGGREGATE_DRV
@@ -647,7 +646,6 @@ def test_matrix_eval_header_requires_toolchain_aggregate_drv():
                 "hello",
                 "x86_64-linux",
                 archs=["x86_64"],
-                suffixes=["O0"],
                 toolchain_aggregate_drv=bad,  # type: ignore[arg-type]
             )
 
@@ -662,7 +660,6 @@ def test_matrix_eval_header_round_trips_toolchain_aggregate_drv(
         "hello",
         "x86_64-linux",
         archs=["x86_64"],
-        suffixes=["O0", "O2"],
         toolchain_aggregate_drv=drv,
         variant_sample=16,
         variant_seed="seed",
@@ -691,7 +688,7 @@ def test_emit_matrix_eval_manifests_one_per_binary():
         assert isinstance(h.payload, dict)
         assert "binary" in h.payload
         assert "archs" in h.payload
-        assert "suffixes" in h.payload
+        assert "suffixes" not in h.payload
         assert h.payload["toolchain_aggregate_drv"] == (
             _DEFAULT_TC_AGGREGATE_DRV
         )
@@ -703,7 +700,6 @@ def test_emit_matrix_eval_manifests_rejects_missing_toolchain_aggregate_drv():
     metadata = {
         "hello": {
             "archs": ["x86_64"],
-            "suffixes": ["O0"],
             # toolchain_aggregate_drv deliberately omitted.
         },
     }
