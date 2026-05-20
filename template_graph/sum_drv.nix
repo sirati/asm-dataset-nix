@@ -1,3 +1,16 @@
+# DEPRECATED — kept only for legacy callers that have not yet migrated
+# to ``sum_drv_from_aggregates.nix``. New code (and
+# ``make_sum_drv_from_paths`` in particular) now expects the toolchains
+# and per-binary matrix WRAPPERS to be built upstream (phase 1 / phase
+# 2 of the pipeline, via ``make_wrapper_drv_from_paths`` →
+# ``wrapper_drv.nix``); the post-aggregate assembler
+# ``sum_drv_from_aggregates.nix`` then just splices those aggregates
+# into the sum-root. This file's internal ``mkWrapper`` is therefore a
+# redundant extra layer.
+#
+# Do not remove — older tests / external callers may still import it.
+# New work should import ``sum_drv_from_aggregates.nix`` instead.
+#
 # Build a "sum" derivation that bundles toolchains + per-binary
 # matrices into one top-level .drv:
 #
