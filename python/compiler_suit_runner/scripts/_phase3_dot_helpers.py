@@ -9,11 +9,12 @@ driver composes.
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import pathlib
-import subprocess
-from typing import Any, Optional
 
+from compiler_suit_runner._nix_eval_utils import (
+    nix_eval_json,
+    resolve_bash_drv_path,
+)
 from compiler_suit_runner.manifest_gen import make_matrix_eval_header
 from compiler_suit_runner.peer_replication import BroadcastSender
 from compiler_suit_runner.workers.eval_worker import (
@@ -30,42 +31,15 @@ SUFFIX_MATCH_PATTERN = (
 )
 
 
-def nix_eval_json(attr: str, *, root: pathlib.Path,
-                  apply: Optional[str] = None) -> Any:
-    """One ``nix eval --json``; raises on non-zero exit."""
-    argv = [
-        "nix", "eval",
-        "--extra-experimental-features", "nix-command flakes",
-        "--json", f"{root}#{attr}",
-    ]
-    if apply is not None:
-        argv += ["--apply", apply]
-    proc = subprocess.run(argv, capture_output=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"nix eval --json {attr} failed (rc={proc.returncode}): "
-            + proc.stderr.decode("utf-8", errors="replace").strip()
-        )
-    return json.loads(proc.stdout.decode("utf-8", errors="replace"))
-
-
 def resolve_bash_path() -> str:
     """Production probe: ``nix eval --raw nixpkgs#bash.outPath``.
 
-    Mirrors ``suit_task._resolve_bash_store_path`` so the in-process
-    driver consumes the exact same bash store object production does.
+    Thin wrapper over
+    :func:`compiler_suit_runner._nix_eval_utils.resolve_bash_drv_path`
+    kept under the original name so the phase3-dot-demo driver script
+    keeps importing it as ``resolve_bash_path``.
     """
-    proc = subprocess.run(
-        ["nix", "eval", "--raw", "nixpkgs#bash.outPath"],
-        capture_output=True, check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "nix eval --raw nixpkgs#bash.outPath failed "
-            f"(rc={proc.returncode}): "
-            + proc.stderr.decode("utf-8", errors="replace").strip()
-        )
-    return proc.stdout.decode("utf-8", errors="replace").strip()
+    return resolve_bash_drv_path()
 
 
 def sampled_suffixes_for_binary(

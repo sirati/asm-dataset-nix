@@ -23,7 +23,29 @@ import re
 import subprocess
 from pathlib import Path
 
+from compiler_suit_runner._nix_eval_utils import (
+    nix_eval_json as _nix_eval_json,
+    resolve_bash_drv_path,
+)
+from compiler_suit_runner.tests._phase3_build_helpers import (
+    build_matrix_aggregate,
+    build_sum_drv_from_aggregates,
+    build_toolchain_aggregate,
+    query_tree,
+)
 from compiler_suit_runner.workers.eval_worker import sample_suffix_attrs
+
+
+__all__ = [
+    "BINARY", "DEFAULT_SMOKE_ARCHS", "STORE_HASH_RE",
+    "SUFFIX_MATCH_PATTERN", "SYS_NAME",
+    "build_matrix_aggregate", "build_sum_drv_from_aggregates",
+    "build_toolchain_aggregate", "build_variant_lookup",
+    "discover_archs", "discover_compilers_per_arch_from_leaves",
+    "eval_bash_drv_path", "eval_sampled_matrix_leaves",
+    "eval_toolchain_leaves", "extract_store_path", "plan_from_tree",
+    "query_tree", "resolved_smoke_archs", "toolchain_task_ids_for_combos",
+]
 
 
 DEFAULT_SMOKE_ARCHS: tuple[str, ...] = ("x86_64", "aarch64")
@@ -34,38 +56,6 @@ SUFFIX_MATCH_PATTERN = (
 )
 STORE_HASH_RE = re.compile(r"^/nix/store/[^-]+-")
 _SAFE = re.compile(r"^[A-Za-z0-9._-]+$")
-
-
-def _nix_eval_json(attr: str, *, root: Path, apply: str | None = None) -> object:
-    """One ``nix eval --json``; tiny scalar/list reads only."""
-    argv = [
-        "nix", "eval",
-        "--extra-experimental-features", "nix-command flakes",
-        "--json", f"{root}#{attr}",
-    ]
-    if apply is not None:
-        argv += ["--apply", apply]
-    proc = subprocess.run(argv, capture_output=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"nix eval --json {attr} failed (rc={proc.returncode}): "
-            + proc.stderr.decode("utf-8", errors="replace").strip()
-        )
-    return json.loads(proc.stdout.decode("utf-8", errors="replace"))
-
-
-def query_tree(sum_drv: str) -> str:
-    """``nix-store --query --tree <sum_drv>`` → decoded text."""
-    proc = subprocess.run(
-        ["nix-store", "--query", "--tree", sum_drv],
-        capture_output=True, check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"nix-store --query --tree failed (rc={proc.returncode}): "
-            + proc.stderr.decode("utf-8", errors="replace").strip()
-        )
-    return proc.stdout.decode("utf-8", errors="replace")
 
 
 def _run_jobs(argv: list[str]) -> list[dict]:
@@ -129,31 +119,11 @@ def discover_archs(*, root: Path) -> list[str]:
 def eval_bash_drv_path(root: Path) -> str:
     """``nix eval --raw nixpkgs#bash.outPath`` — the production probe.
 
-    ``suit_task._resolve_bash_store_path`` resolves bash this way for
-    the dependency_graph worker subprocess; mirroring it here keeps
-    the smoke test pointed at the same store object the production
-    sum-drv assembly will consume. ``inputs.nixpkgs.<...>`` is NOT a
-    valid flake-output attr on this repo's ``flake.nix`` (only
-    ``packages`` / ``legacyPackages`` and a few ``_-`` debug outputs
-    are exposed), so the eval has to go via the nixpkgs flake's own
-    legacyPackages namespace.
+    Thin wrapper over :func:`compiler_suit_runner._nix_eval_utils.resolve_bash_drv_path`;
+    kept under the original name + ``root`` parameter so existing
+    smoke-test imports stay stable.
     """
-    del root  # nixpkgs flake handle is global; root unused
-    argv = [
-        "nix", "eval", "--raw",
-        "--extra-experimental-features", "nix-command flakes",
-        "nixpkgs#bash.outPath",
-    ]
-    proc = subprocess.run(argv, capture_output=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "nix eval --raw nixpkgs#bash.outPath failed "
-            f"(rc={proc.returncode}): "
-            + proc.stderr.decode("utf-8", errors="replace").strip()
-        )
-    payload = proc.stdout.decode("utf-8", errors="replace").strip()
-    assert payload.startswith("/nix/store/"), payload
-    return payload
+    return resolve_bash_drv_path(root_unused=root)
 
 
 def _eval_toolchain_pairs(*, root: Path, archs: list[str]):
@@ -239,48 +209,6 @@ def eval_sampled_matrix_leaves(
         "--force-recurse", "--workers", "8",
     ])
     return sorted({d for _a, _s, d in _depth2(entries)})
-
-
-def build_toolchain_aggregate(leaves: list[str], *, sys_name: str) -> str:
-    """Phase-1 mirror: single ``toolchains`` wrapper drv."""
-    from template_graph.make_sum_drv import (  # noqa: PLC0415
-        make_wrapper_drv_from_paths,
-    )
-    return make_wrapper_drv_from_paths(
-        drvs=sorted(leaves), name="toolchains", system=sys_name,
-    )
-
-
-def build_matrix_aggregate(
-    toolchain_agg: str, leaves: list[str], *, binary: str, sys_name: str,
-) -> str:
-    """Phase-2 mirror: ``matrix-<binary>`` wrapper drv (toolchain + leaves)."""
-    from template_graph.make_sum_drv import (  # noqa: PLC0415
-        make_wrapper_drv_from_paths,
-    )
-    return make_wrapper_drv_from_paths(
-        drvs=[toolchain_agg, *sorted(leaves)],
-        name=f"matrix-{binary}", system=sys_name,
-    )
-
-
-def build_sum_drv_from_aggregates(
-    toolchain_agg: str,
-    matrix_aggs: dict[str, str],
-    *,
-    bash_path: str,
-    sys_name: str,
-) -> str:
-    """Phase-3 mirror: ONE ``make_sum_drv_from_paths`` call."""
-    from template_graph.make_sum_drv import (  # noqa: PLC0415
-        make_sum_drv_from_paths,
-    )
-    return make_sum_drv_from_paths(
-        bash_path=bash_path,
-        toolchain_drvs=[toolchain_agg],
-        matrix_drvs={f"matrix-{b}": [agg] for b, agg in matrix_aggs.items()},
-        system=sys_name,
-    )
 
 
 def toolchain_task_ids_for_combos(
