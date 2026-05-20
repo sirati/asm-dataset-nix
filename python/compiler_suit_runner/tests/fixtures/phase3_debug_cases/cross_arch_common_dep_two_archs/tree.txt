@@ -3,5 +3,9 @@
 └───/nix/store/000000022jg9efs5qb8167kti30puvcl-matrix-hello.drv
     ├───/nix/store/00000010arohmn4d2jg9efs5qb8167kt-hello-x86_64-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv
     │   └───/nix/store/00000700s5qb8167kti30puvclarohmn-glibc-2.40.drv
-    └───/nix/store/00000030uvclarohmn4d2jg9efs5qb81-hello-aarch64-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv
+    ├───/nix/store/00000011rohmn4d2jg9efs5qb8167kti-hello-x86_64-gcc15-O0-baseline-default-san-off-march-default-elf-folder.drv
+    │   └───/nix/store/00000700s5qb8167kti30puvclarohmn-glibc-2.40.drv [...]
+    ├───/nix/store/00000030uvclarohmn4d2jg9efs5qb81-hello-aarch64-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv
+    │   └───/nix/store/00000700s5qb8167kti30puvclarohmn-glibc-2.40.drv [...]
+    └───/nix/store/00000031vclarohmn4d2jg9efs5qb812-hello-aarch64-gcc15-O0-baseline-default-san-off-march-default-elf-folder.drv
         └───/nix/store/00000700s5qb8167kti30puvclarohmn-glibc-2.40.drv [...]

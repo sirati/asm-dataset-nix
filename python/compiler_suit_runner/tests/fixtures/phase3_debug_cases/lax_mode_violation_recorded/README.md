@@ -59,6 +59,13 @@ versions, so both sides collapse to a single common-name bucket
     ``{v["kind"] for v in result["violations"]}``. Also a new field;
     documents which specific invariant the fixture exercises so the
     test pins THE pinned violation rather than "any violation at all".
+  - ``relax_dependent_count: true`` — opt-out of the harness's >= 2
+    dependents-per-non-toolchain-dep rule. The lax cowalk records
+    violations and walks a SHORTER prefix on the mismatched side, so
+    common_deps emitted from the truncated walk may legitimately have
+    fewer dependents than the architectural rule normally requires.
+    This is the ONLY fixture allowed the exemption; all others must
+    expand their variant set rather than relax.
 
 The harness MUST run the planner with ``lax=True`` and assert the
 result is non-None (no exception). With ``lax=False`` (the strict

@@ -1,26 +1,27 @@
 """Parameterised regression harness for the phase-3 debug-case fixtures.
 
-The fixtures under ``tests/fixtures/phase3_debug_cases/`` each pin one
-specific behaviour of the dependency-graph planner. Every fixture
-carries ``tree.txt``, ``variant_lookup.json`` (list-of-records, JSON-
-serialisable form of the tuple-keyed mapping), ``toolchain_task_ids.json``,
-and ``expected.json``. The harness runs
-``plan_from_tree_streaming(tree_text, lax=True)`` followed by
+Each fixture under ``tests/fixtures/phase3_debug_cases/`` carries
+``tree.txt``, ``variant_lookup.json`` (list-of-records), and
+``toolchain_task_ids.json`` + ``expected.json``. The harness runs
+``plan_from_tree_streaming(lax=True)`` followed by
 ``plan_phase4_for_binary(...)`` (matching the production
-``dependency_graph_worker`` default) and asserts each present expected
-field. Assertion failure messages always include the fixture name.
+``dependency_graph_worker`` default) and asserts each present
+``expected`` field. Assertion messages always include the fixture name.
 
-Expected.json schema (every field optional; unknown fields ignored for
-forward-compat):
+Two cross-fixture invariants are also enforced:
 
-  build_variant_count: int
-  common_deps_cross_arch_min: int|null
-  source_terminal_skipped_min: int|null
-  violations_max: int|null
-  violations_min: int|null
-  violations_at_least_kinds: list[str]
-  per_variant_toolchain_task: dict[label_str, task_id_or_null]
-  no_common_dep_for_terminals: list[drv_basename_str]
+  * one ``build_variant`` per lookup entry, and
+  * every non-toolchain dep task has >= 2 dependents -- a one-consumer
+    dep should have been inlined; emitting it as its own task wastes
+    dispatch. ``build_compilers__*`` (pull-to-node) is exempt; per-
+    fixture opt-out via ``relax_dependent_count: true``.
+
+Expected.json fields (all optional, unknown ignored):
+
+  build_variant_count, common_deps_cross_arch_min,
+  source_terminal_skipped_min, violations_min/max,
+  violations_at_least_kinds, per_variant_toolchain_task,
+  no_common_dep_for_terminals, relax_dependent_count.
 """
 
 from __future__ import annotations
@@ -51,11 +52,8 @@ _FIXTURE_BINARY = "hello"
 
 
 def _discover_cases() -> list[pathlib.Path]:
-    """Enumerate fixture sub-directories under ``_CASES_DIR``.
-
-    Sorted to keep pytest's parameter-id ordering stable across
-    platforms / filesystems.
-    """
+    """Fixture sub-directories under ``_CASES_DIR``, sorted for
+    deterministic pytest parameter ids."""
     return sorted(p for p in _CASES_DIR.iterdir() if p.is_dir())
 
 
@@ -101,24 +99,11 @@ def _maybe_inject_toolchain_task_ids(
     toolchain_task_ids: dict[str, str],
     expected: dict[str, Any],
 ) -> dict[str, str]:
-    """When ``toolchain_task_ids.json`` is empty but the fixture's
-    ``per_variant_toolchain_task`` expects non-null task ids, synthesise
-    a mapping that puts those task_ids into the planner's
-    ``known_task_ids`` set.
-
-    ``_variant_toolchain_dep`` composes
-    ``build_compilers__<sys>__<arch>__<comp>`` from the variant drv's
-    basename and only emits the wiring when the composed id is present
-    in ``known_task_ids = frozenset(toolchain_task_ids.values())``. We
-    therefore only need the VALUES of the mapping to contain the
-    expected task_ids -- the keys are irrelevant for the wiring path
-    exercised by these fixtures (they would matter only if the planner
-    were also resolving role-name → ident → task_id via the toolchain
-    drv set, which these debug-case fixtures do not pin).
-
-    Fixtures whose ``per_variant_toolchain_task`` values are all
-    ``null`` (e.g. ``cross_arch_common_dep_two_archs``) document the
-    "no wiring expected" case and need no injection.
+    """When ``toolchain_task_ids.json`` is empty but the fixture
+    expects non-null ``per_variant_toolchain_task`` values, synthesise
+    a mapping so the planner's ``known_task_ids`` (a frozenset over
+    the VALUES only) contains the expected task_ids. Keys are
+    irrelevant for the wiring path exercised here.
     """
     if toolchain_task_ids:
         return toolchain_task_ids
@@ -143,6 +128,50 @@ def _find_variant_descriptor(descriptors, label: str):
     return None
 
 
+def _dependent_counts(descriptors) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for d in descriptors:
+        for dep_task_id in (d.depends_on or ()):
+            counts[dep_task_id] = counts.get(dep_task_id, 0) + 1
+    return counts
+
+
+def _assert_planner_invariants(
+    case_name: str,
+    descriptors,
+    variant_lookup,
+    expected: dict[str, Any],
+) -> None:
+    """Cross-fixture invariants: exactly one ``build_variant`` per
+    lookup entry, and every non-toolchain dep task carries >= 2
+    dependents. Toolchain pull-to-node tasks (``build_compilers__*``)
+    are the documented exception (emit on presence, not on dedup).
+    Fixtures may opt out of the dedup check via
+    ``relax_dependent_count: true`` in ``expected.json``.
+    """
+    variants = [d for d in descriptors if d.kind == "build_variant"]
+    assert len(variants) == len(variant_lookup), (
+        f"fixture {case_name!r}: expected len(variant_lookup)="
+        f"{len(variant_lookup)} build_variant descriptors, got "
+        f"{len(variants)}"
+    )
+    if expected.get("relax_dependent_count"):
+        return
+    counts = _dependent_counts(descriptors)
+    variant_task_ids = {d.task_id for d in variants}
+    violators = sorted(
+        d.task_id for d in descriptors
+        if d.task_id not in variant_task_ids
+        and not d.task_id.startswith("build_compilers__")
+        and counts.get(d.task_id, 0) < 2
+    )
+    assert not violators, (
+        f"fixture {case_name!r}: non-toolchain dep tasks with < 2 "
+        f"dependents (one-consumer dep should have been inlined): "
+        f"{violators}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Parameterised test
 # ---------------------------------------------------------------------------
@@ -154,58 +183,47 @@ def _find_variant_descriptor(descriptors, label: str):
     ids=lambda p: p.name,
 )
 def test_phase3_debug_case(case_dir: pathlib.Path) -> None:
-    """Run one phase-3 debug-case fixture through the planner and
-    assert against ``expected.json``.
-
-    Each present field in ``expected.json`` adds one assertion;
-    missing fields leave that aspect unchecked (fixtures pin one
-    behaviour each on purpose). Assertion messages always include the
-    fixture name so a regression points at the right case.
+    """One assertion per present ``expected.json`` field plus the two
+    cross-fixture invariants. Missing fields are left unchecked.
     """
     case_name = case_dir.name
-
     tree_text = _load_tree(case_dir)
     variant_lookup = _load_variant_lookup(case_dir)
-    raw_toolchain_task_ids = _load_toolchain_task_ids(case_dir)
     expected = _load_expected(case_dir)
-
     toolchain_task_ids = _maybe_inject_toolchain_task_ids(
-        raw_toolchain_task_ids, expected,
+        _load_toolchain_task_ids(case_dir), expected,
     )
-
     # Match the production default (``dependency_graph_worker`` runs
-    # with ``lax=True``); strict mode would raise TreeWalkError on the
+    # with ``lax=True``); strict mode raises TreeWalkError on the
     # lax_mode_violation_recorded fixture.
     result = plan_from_tree_streaming(tree_text, lax=True)
     descriptors = plan_phase4_for_binary(
-        _FIXTURE_BINARY,
-        result,
-        variant_lookup,
+        _FIXTURE_BINARY, result, variant_lookup,
         toolchain_task_ids=toolchain_task_ids,
+    )
+    _assert_planner_invariants(
+        case_name, descriptors, variant_lookup, expected,
     )
 
     # ── build_variant_count ────────────────────────────────────────
     if "build_variant_count" in expected:
-        expected_count = expected["build_variant_count"]
-        variant_count = sum(
-            1 for d in descriptors if d.kind == "build_variant"
-        )
-        assert variant_count == expected_count, (
-            f"fixture {case_name!r}: build_variant_count "
-            f"expected {expected_count}, got {variant_count}"
+        n_var = sum(1 for d in descriptors if d.kind == "build_variant")
+        assert n_var == expected["build_variant_count"], (
+            f"fixture {case_name!r}: build_variant_count expected "
+            f"{expected['build_variant_count']}, got {n_var}"
         )
 
     # ── common_deps_cross_arch_min ─────────────────────────────────
     if expected.get("common_deps_cross_arch_min") is not None:
         threshold = expected["common_deps_cross_arch_min"]
-        cross_arch_count = sum(
+        n_x = sum(
             1 for d in descriptors
             if d.kind == "build_common_dep"
             and d.task_id.startswith("build_common_dep__cross_arch__")
         )
-        assert cross_arch_count >= threshold, (
-            f"fixture {case_name!r}: cross-arch common_dep count "
-            f"expected >= {threshold}, got {cross_arch_count}"
+        assert n_x >= threshold, (
+            f"fixture {case_name!r}: cross-arch common_dep expected "
+            f">= {threshold}, got {n_x}"
         )
 
     # ── source_terminal_skipped_min ────────────────────────────────
@@ -213,91 +231,67 @@ def test_phase3_debug_case(case_dir: pathlib.Path) -> None:
         threshold = expected["source_terminal_skipped_min"]
         skipped = result.get("source_terminal_skipped", 0)
         assert skipped >= threshold, (
-            f"fixture {case_name!r}: source_terminal_skipped "
-            f"expected >= {threshold}, got {skipped}"
+            f"fixture {case_name!r}: source_terminal_skipped expected "
+            f">= {threshold}, got {skipped}"
         )
 
-    # ── violations_min / violations_max ────────────────────────────
+    # ── violations_min / violations_max / violations_at_least_kinds ─
     violations = result.get("violations", []) or []
     if expected.get("violations_min") is not None:
-        v_min = expected["violations_min"]
-        assert len(violations) >= v_min, (
-            f"fixture {case_name!r}: violations count expected >= "
-            f"{v_min}, got {len(violations)} ({violations!r})"
+        assert len(violations) >= expected["violations_min"], (
+            f"fixture {case_name!r}: violations >= "
+            f"{expected['violations_min']}, got {len(violations)}"
         )
     if expected.get("violations_max") is not None:
-        v_max = expected["violations_max"]
-        assert len(violations) <= v_max, (
-            f"fixture {case_name!r}: violations count expected <= "
-            f"{v_max}, got {len(violations)} ({violations!r})"
+        assert len(violations) <= expected["violations_max"], (
+            f"fixture {case_name!r}: violations <= "
+            f"{expected['violations_max']}, got {len(violations)}"
         )
-
-    # ── violations_at_least_kinds ─────────────────────────────────
     if expected.get("violations_at_least_kinds"):
-        required_kinds = expected["violations_at_least_kinds"]
-        seen_kinds = {v.get("kind") for v in violations}
-        for kind in required_kinds:
-            assert kind in seen_kinds, (
-                f"fixture {case_name!r}: required violation kind "
-                f"{kind!r} not in {sorted(k for k in seen_kinds if k)}"
+        seen = {v.get("kind") for v in violations}
+        for kind in expected["violations_at_least_kinds"]:
+            assert kind in seen, (
+                f"fixture {case_name!r}: missing violation kind {kind!r} "
+                f"(seen: {sorted(k for k in seen if k)})"
             )
 
     # ── per_variant_toolchain_task ─────────────────────────────────
     if "per_variant_toolchain_task" in expected:
-        per_variant = expected["per_variant_toolchain_task"]
-        for label, expected_task_id in per_variant.items():
+        for label, expected_task_id in expected["per_variant_toolchain_task"].items():
             descriptor = _find_variant_descriptor(descriptors, label)
             assert descriptor is not None, (
                 f"fixture {case_name!r}: no build_variant descriptor "
-                f"with label {label!r} (have: "
-                f"{sorted(d.payload.get('label') for d in descriptors if d.kind == 'build_variant')})"
+                f"with label {label!r}"
             )
             deps = descriptor.depends_on
-            if expected_task_id is None:
-                # No toolchain wiring expected: no build_compilers__*
-                # dep present on this variant.
-                bad = [d for d in deps if d.startswith("build_compilers__")]
-                assert not bad, (
-                    f"fixture {case_name!r}: variant {label!r} expected "
-                    f"no toolchain dep, got {bad!r}"
-                )
-            else:
+            # ``bad`` is the set of build_compilers__* deps OTHER than
+            # the expected one (or any, when expected is None). Catches
+            # over-wiring (a regression mixing gcc14 + clang20 task ids
+            # into a gcc14-O2 variant would slip past `in deps` alone).
+            bad = [
+                d for d in deps
+                if d.startswith("build_compilers__")
+                and d != expected_task_id
+            ]
+            if expected_task_id is not None:
                 assert expected_task_id in deps, (
                     f"fixture {case_name!r}: variant {label!r} missing "
-                    f"toolchain dep {expected_task_id!r} "
-                    f"(deps: {list(deps)})"
+                    f"toolchain dep {expected_task_id!r} (deps: {list(deps)})"
                 )
-                # Beyond presence: variant must carry EXACTLY this
-                # one toolchain dep, not also others. A regression
-                # over-wiring both gcc14 and clang20 task_ids into a
-                # gcc14-O2 variant would slip past a plain `in deps`
-                # check; this catches it.
-                bad = [
-                    d for d in deps
-                    if d.startswith("build_compilers__")
-                    and d != expected_task_id
-                ]
-                assert not bad, (
-                    f"fixture {case_name!r}: variant {label!r} has "
-                    f"unexpected toolchain deps {bad!r}; expected only "
-                    f"{expected_task_id!r}"
-                )
+            assert not bad, (
+                f"fixture {case_name!r}: variant {label!r} has unexpected "
+                f"toolchain deps {bad!r} (expected: {expected_task_id!r})"
+            )
 
     # ── no_common_dep_for_terminals ────────────────────────────────
     if expected.get("no_common_dep_for_terminals"):
-        forbidden_names = expected["no_common_dep_for_terminals"]
-        common_dep_idents = [
+        idents = [
             d.payload.get("ident", "")
-            for d in descriptors
-            if d.kind == "build_common_dep"
+            for d in descriptors if d.kind == "build_common_dep"
         ]
-        for forbidden in forbidden_names:
-            leaked = [
-                ident for ident in common_dep_idents
-                if forbidden in ident
-            ]
+        for forbidden in expected["no_common_dep_for_terminals"]:
+            leaked = [i for i in idents if forbidden in i]
             assert not leaked, (
-                f"fixture {case_name!r}: source-terminal "
-                f"{forbidden!r} leaked into build_common_dep "
-                f"descriptors: {leaked!r}"
+                f"fixture {case_name!r}: source-terminal {forbidden!r} "
+                f"leaked into build_common_dep descriptors: {leaked!r}"
             )
