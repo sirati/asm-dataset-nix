@@ -1093,30 +1093,26 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
             return 1
 
-        # Flatten the {pkg: {"archs": [...], "suffixes_by_arch":
-        # {arch: [...]}, "sample_size": ..., "sample_seed": ...}} shape
-        # returned by enumerate_variants into the {binary: {"archs":
-        # [...], "suffixes": [...], "variant_sample": ...,
-        # "variant_seed": ...}} shape that emit_matrix_eval_manifests /
-        # eval_worker.parse_payload expect. ``suffixes`` is the union
-        # across archs because the matrix_eval worker re-applies
-        # per-(arch, compiler, opt) sampling with the same seed.
+        # Flatten the {pkg: {"archs": [...], "sample_size": ...,
+        # "sample_seed": ..., "tier": ...}} shape returned by
+        # enumerate_variants into the {binary: {"archs": [...],
+        # "variant_sample": ..., "variant_seed": ..., "tier": ...,
+        # "toolchain_aggregate_drv": ...}} shape that
+        # emit_matrix_eval_manifests / eval_worker.parse_payload expect.
+        # Per-arch suffix selection now happens inside the matrix_eval
+        # worker (eval_worker._sample_per_arch) with the same seed.
         per_binary_metadata: dict[str, dict] = {}
         for pkg, meta in per_binary_meta_raw.items():
             if not isinstance(meta, dict):
                 continue
             archs_list = list(meta.get("archs", ()))
-            suffix_union: set[str] = set()
-            suffixes_by_arch = meta.get("suffixes_by_arch") or {}
-            if isinstance(suffixes_by_arch, dict):
-                for sfx_list in suffixes_by_arch.values():
-                    if isinstance(sfx_list, list):
-                        suffix_union.update(s for s in sfx_list if isinstance(s, str))
+            if not archs_list:
+                continue
             per_binary_metadata[pkg] = {
                 "archs": archs_list,
-                "suffixes": sorted(suffix_union),
                 "variant_sample": meta.get("sample_size"),
                 "variant_seed": meta.get("sample_seed"),
+                "tier": meta.get("tier"),
                 "toolchain_aggregate_drv": tc_aggregate_drv,
             }
         log.info(
