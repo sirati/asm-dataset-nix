@@ -1643,3 +1643,104 @@ class TestDependencyGraphCounters:
             and "violation" in r.message
         ]
         assert len(warn_records) == 1, [r.message for r in caplog.records]
+
+
+# ---------------------------------------------------------------------------
+# stream_drv_tree
+# ---------------------------------------------------------------------------
+
+
+class _FakePopen:
+    """Minimal ``subprocess.Popen`` stand-in for ``stream_drv_tree``.
+
+    Holds a ``BytesIO`` stdout / ``BytesIO`` stderr and a configurable
+    ``returncode``; ``wait()`` returns it. The constructor records the
+    argv it was called with so the test can assert the argv shape.
+    """
+
+    last_argv: Optional[list[str]] = None
+
+    def __init__(
+        self,
+        stdout_bytes: bytes,
+        stderr_bytes: bytes = b"",
+        returncode: int = 0,
+    ) -> None:
+        import io  # noqa: PLC0415
+        self.stdout = io.BytesIO(stdout_bytes)
+        self.stderr = io.BytesIO(stderr_bytes)
+        self._rc = returncode
+
+    def wait(self) -> int:
+        return self._rc
+
+
+def _make_popen_factory(
+    stdout_bytes: bytes,
+    stderr_bytes: bytes = b"",
+    returncode: int = 0,
+):
+    """Build a ``subprocess.Popen``-compatible factory that records argv."""
+    calls: list[list[str]] = []
+
+    def _factory(argv, **_kwargs):
+        calls.append(list(argv))
+        return _FakePopen(stdout_bytes, stderr_bytes, returncode)
+
+    return _factory, calls
+
+
+class TestStreamDrvTree:
+
+    _HASH = b"abc123def456ghi789jkl012mno345pq"  # 32 chars
+
+    def _corpus_bytes(self) -> bytes:
+        """3-line tree: root + child + backref leaf (mirrors the
+        template_graph drv_tree_stream minimal corpus)."""
+        lines = [
+            b"/nix/store/" + self._HASH + b"-sum-root.drv",
+            b"\xe2\x94\x9c\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
+            b"/nix/store/" + self._HASH + b"-toolchains.drv",
+            b"\xe2\x94\x94\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80"
+            b"/nix/store/" + self._HASH + b"-matrix-hello.drv [...]",
+        ]
+        return b"\n".join(lines) + b"\n"
+
+    def test_yields_tuples_matching_drv_tree_stream(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        import io  # noqa: PLC0415
+        from template_graph.tree_walker import drv_tree_stream  # noqa: PLC0415
+
+        corpus = self._corpus_bytes()
+        expected = list(drv_tree_stream(io.BytesIO(corpus)))
+        # Sanity: corpus shape is what the docstring promises.
+        assert len(expected) == 3
+        assert expected[-1][3] is True  # backref leaf
+        factory, calls = _make_popen_factory(corpus)
+        with patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".sum_drv.subprocess.Popen",
+            side_effect=factory,
+        ):
+            got = list(dgw.stream_drv_tree("/nix/store/zzzz-sum.drv"))
+        assert got == expected
+        assert calls == [[
+            "nix-store", "--query", "--tree",
+            "/nix/store/zzzz-sum.drv",
+        ]]
+
+    def test_nonzero_exit_raises_runtime_error_with_stderr(self):
+        from unittest.mock import patch  # noqa: PLC0415
+
+        factory, _calls = _make_popen_factory(
+            stdout_bytes=b"",
+            stderr_bytes=b"no such derivation\n",
+            returncode=1,
+        )
+        with patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".sum_drv.subprocess.Popen",
+            side_effect=factory,
+        ):
+            with pytest.raises(RuntimeError, match="no such derivation"):
+                list(dgw.stream_drv_tree("/nix/store/zzzz-sum.drv"))

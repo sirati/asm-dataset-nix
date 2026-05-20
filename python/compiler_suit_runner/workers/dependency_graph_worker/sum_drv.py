@@ -7,7 +7,8 @@ sum-drv into the indented tree text the streaming planner consumes.
 
 from __future__ import annotations
 
-from typing import Optional
+import subprocess
+from typing import Iterator, Optional
 
 from .subproc import RunSubprocess, default_run_subprocess
 
@@ -16,6 +17,7 @@ __all__ = [
     "build_sum_drv",
     "build_sum_drv_multi",
     "query_drv_tree",
+    "stream_drv_tree",
 ]
 
 
@@ -89,3 +91,34 @@ def query_drv_tree(
             + stderr.decode("utf-8", errors="replace").strip()
         )
     return stdout.decode("utf-8", errors="replace")
+
+
+def stream_drv_tree(sum_drv: str) -> Iterator[tuple[int, bytes, str, bool]]:
+    """Yield ``(depth, drv_hash, drv_name, is_backref)`` streamed from
+    ``nix-store --query --tree <sum_drv>``.
+
+    Spawns ``nix-store``, wraps stdout with
+    :func:`template_graph.tree_walker.drv_tree_stream`, and raises
+    :class:`RuntimeError` on non-zero exit after stdout drains.
+    Letting the planner consume tuples as they're produced overlaps
+    nix-store's tree walk with template construction.
+    """
+    from template_graph.tree_walker import drv_tree_stream  # noqa: PLC0415
+
+    proc = subprocess.Popen(
+        ["nix-store", "--query", "--tree", sum_drv],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=-1,
+    )
+    assert proc.stdout is not None and proc.stderr is not None
+    try:
+        yield from drv_tree_stream(proc.stdout)
+    finally:
+        rc = proc.wait()
+        if rc != 0:
+            err = proc.stderr.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"nix-store --query --tree {sum_drv} failed "
+                f"(rc={rc}): " + err.strip()
+            )
