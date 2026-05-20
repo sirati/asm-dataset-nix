@@ -160,7 +160,7 @@ VARIANT_SAMPLE = 1
 DEFAULT_TIMEOUT_S = 1500.0
 
 # Item class the broadcast sender tags matrix_eval drv emissions
-# with. Mirrors ``workers.eval_worker._eval_jobs_for_arch ->
+# with. Mirrors ``workers.eval_worker._eval_jobs_for_binary ->
 # enqueue_broadcast`` (``item_class="matrix_eval_drv"``); duplicated
 # here as a literal so this test doesn't pull eval_worker in just
 # for the constant.
