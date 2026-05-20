@@ -54,6 +54,7 @@ from pathlib import Path
 
 
 SUM_DRV_NIX = Path(__file__).parent / "sum_drv.nix"
+WRAPPER_DRV_NIX = Path(__file__).parent / "wrapper_drv.nix"
 
 
 def _q(s: str) -> str:
@@ -310,6 +311,53 @@ def make_sum_drv_from_paths(
         f"  matrices = {_join_matrix_drvs(matrix_drvs)};\n"
         f"  rootName = {_q(root_name)};\n"
         f"  toolchainsName = {_q(toolchains_name)};\n"
+        f"  system = {_q(system)};\n"
+        f"}}\n"
+    )
+    return _run_nix_instantiate(
+        expr, extra_nix_args=extra_nix_args, with_flakes=False,
+    )
+
+
+def make_wrapper_drv_from_paths(
+    *,
+    drvs: list[str],
+    name: str,
+    system: str = "x86_64-linux",
+    extra_nix_args: list[str] | None = None,
+) -> str:
+    """Build an aggregate wrapper derivation at runtime via nix-instantiate.
+
+    Calls ``template_graph/wrapper_drv.nix`` with the supplied drv
+    paths and returns the resulting .drv path. The wrapper itself is a
+    trivial ``bash -c true`` derivation; its only purpose is to carry
+    the supplied drv paths as inputDrvs so ``nix-store --export``
+    follows them transitively and ``nix-store --query --tree`` sorts
+    the aggregate above its members by refcount.
+
+    Used by phase 1 to build the ``toolchains`` aggregate drv, and by
+    phase 2 (eval_worker) to build the ``matrix-<binary>`` aggregate
+    drv.
+
+    No basename validation here — this is the construction site.
+    Validation belongs in :func:`make_sum_drv_from_paths` (the
+    assembly site).
+
+    Note: there is no ``bash_path`` parameter. ``wrapper_drv.nix``
+    sources ``bash`` from its embedded ``pkgs`` (default nixpkgs)
+    rather than taking it as a caller-supplied store path; the
+    assembly site (:func:`make_sum_drv_from_paths`) is where a
+    specific bash store path gets pinned into the sum-root.
+    """
+    if not drvs:
+        raise ValueError("at least one drv path is required")
+    if not name:
+        raise ValueError("name is required")
+
+    expr = (
+        f"import {WRAPPER_DRV_NIX} {{\n"
+        f"  drvs = {_join_drvs(drvs)};\n"
+        f"  name = {_q(name)};\n"
         f"  system = {_q(system)};\n"
         f"}}\n"
     )
