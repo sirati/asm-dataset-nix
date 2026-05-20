@@ -241,6 +241,157 @@ class TestDeriveVariantLookupFromDrvs:
         assert lookup == {}
 
 
+# ---------------------------------------------------------------------------
+# derive_variant_lookup_from_aggregate
+# ---------------------------------------------------------------------------
+
+
+class _RefsStub:
+    """Argv-sniffing stub for ``nix-store --query --references <drv>``.
+
+    Returns the configured ``(stdout, stderr, rc)`` for every
+    ``nix-store --query --references`` argv; raises on any other argv
+    so the production helper can't accidentally fan out into extra
+    nix calls.
+    """
+
+    def __init__(
+        self,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        rc: int = 0,
+    ) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.rc = rc
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str]) -> tuple[bytes, bytes, int]:
+        self.calls.append(list(argv))
+        if argv[:3] == ["nix-store", "--query", "--references"]:
+            return self.stdout, self.stderr, self.rc
+        raise AssertionError(f"unexpected argv to refs stub: {argv!r}")
+
+
+class TestDeriveVariantLookupFromAggregate:
+
+    AGG_DRV = (
+        "/nix/store/ffffffffffffffffffffffffffffffff-matrix-hello.drv"
+    )
+
+    def test_filters_elf_folder_and_parses_variants(self):
+        v_hello = _variant_drv("hello", "x86_64", "O0", hash_prefix="hh1")
+        v_world = _variant_drv("hello", "aarch64", "O2", hash_prefix="ww1")
+        toolchain = (
+            "/nix/store/cccccccccccccccccccccccccccccccc-toolchains.drv"
+        )
+        bash_drv = (
+            "/nix/store/dddddddddddddddddddddddddddddddd-bash-5.2.drv"
+        )
+        stub = _RefsStub(
+            stdout=(
+                v_hello + "\n"
+                + toolchain + "\n"
+                + v_world + "\n"
+                + bash_drv + "\n"
+            ).encode("utf-8"),
+        )
+        lookup = dgw.derive_variant_lookup_from_aggregate(
+            self.AGG_DRV, run_subprocess=stub,
+        )
+        # Exactly the two elf-folder leaves landed in the lookup;
+        # toolchain + bash references were filtered out.
+        assert len(lookup) == 2
+        h_label = (
+            "hello__x86_64__gcc15-O0-baseline-default-san-off-march-default"
+        )
+        w_label = (
+            "hello__aarch64__gcc15-O2-baseline-default-san-off-march-default"
+        )
+        assert ("x86_64", h_label) in lookup
+        assert ("aarch64", w_label) in lookup
+        assert lookup[("x86_64", h_label)] == {
+            "drv": v_hello,
+            "arch": "x86_64",
+            "label": h_label,
+            "suffix": "gcc15-O0-baseline-default-san-off-march-default",
+        }
+        # The helper made exactly one nix-store call.
+        assert len(stub.calls) == 1
+        assert stub.calls[0] == [
+            "nix-store", "--query", "--references", self.AGG_DRV,
+        ]
+
+    def test_only_non_elf_folder_references_yields_empty_lookup(self):
+        stub = _RefsStub(
+            stdout=(
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc.drv\n"
+                "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bash-5.2.drv\n"
+                "/nix/store/cccccccccccccccccccccccccccccccc-toolchains.drv\n"
+            ).encode("utf-8"),
+        )
+        lookup = dgw.derive_variant_lookup_from_aggregate(
+            self.AGG_DRV, run_subprocess=stub,
+        )
+        assert lookup == {}
+
+    def test_collision_raises_value_error(self):
+        v_a = _variant_drv("hello", "x86_64", "O0", hash_prefix="aa1")
+        v_b = _variant_drv("hello", "x86_64", "O0", hash_prefix="bb2")
+        # Same (binary, arch, comp, opt, inner) — distinct hashes only
+        # (which the lookup deliberately does NOT separate on).
+        stub = _RefsStub(
+            stdout=(v_a + "\n" + v_b + "\n").encode("utf-8"),
+        )
+        with pytest.raises(ValueError, match="duplicate variant key"):
+            dgw.derive_variant_lookup_from_aggregate(
+                self.AGG_DRV, run_subprocess=stub,
+            )
+
+    def test_subprocess_failure_surfaces_runtime_error(self):
+        stub = _RefsStub(
+            stdout=b"", stderr=b"no such path", rc=1,
+        )
+        with pytest.raises(RuntimeError, match="no such path"):
+            dgw.derive_variant_lookup_from_aggregate(
+                self.AGG_DRV, run_subprocess=stub,
+            )
+
+    def test_unparseable_variant_skipped_with_warning(self, caplog):
+        import logging  # noqa: PLC0415
+        bad = (
+            "/nix/store/cccccccccccccccccccccccccccccccc-"
+            "not-a-variant-elf-folder.drv"
+        )
+        good = _variant_drv("hello", "x86_64", "O0", hash_prefix="hh1")
+        stub = _RefsStub(
+            stdout=(bad + "\n" + good + "\n").encode("utf-8"),
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger="compiler_suit_runner.dependency_graph_worker",
+        ):
+            lookup = dgw.derive_variant_lookup_from_aggregate(
+                self.AGG_DRV, run_subprocess=stub,
+            )
+        # The good variant landed; the unparseable one was dropped.
+        assert len(lookup) == 1
+        assert any(
+            "unparseable variant drv" in r.message
+            for r in caplog.records
+        )
+
+    def test_blank_lines_in_stdout_ignored(self):
+        v = _variant_drv("hello", "x86_64", "O0", hash_prefix="hh1")
+        stub = _RefsStub(
+            stdout=("\n" + v + "\n\n").encode("utf-8"),
+        )
+        lookup = dgw.derive_variant_lookup_from_aggregate(
+            self.AGG_DRV, run_subprocess=stub,
+        )
+        assert len(lookup) == 1
+
+
 def lookup_key_for(drv_path: str) -> str:
     """Reconstruct the planner-form label for a synthetic variant drv.
 
