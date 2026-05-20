@@ -23,7 +23,7 @@ Coverage:
 from __future__ import annotations
 
 import pathlib
-from typing import Any, Optional
+from typing import Optional
 
 import pytest
 
@@ -490,36 +490,88 @@ class TestParseTaskIdMappings:
 
 
 class TestRunDependencyGraphTask:
+    """End-to-end ``run_dependency_graph_task`` exercises with the
+    D.1b aggregate-drv entry-point signature.
+
+    Phase 3 no longer rediscovers leaves from the archive import
+    stdout: the watcher hands the worker one ``matrix-<binary>``
+    aggregate drv per binary plus one ``toolchains`` aggregate drv,
+    and the variant_lookup comes from D.1a's
+    ``derive_variant_lookup_from_aggregate``. Tests below mock that
+    helper to keep the suite pure-Python; the regression test below
+    additionally asserts ``_run_nix_instantiate`` is called at most
+    once (inside ``make_sum_drv_from_paths``) so future drift back to
+    per-leaf eval is caught immediately.
+    """
+
+    _TC_AGG = "/nix/store/zzzz-toolchains.drv"
 
     def _seed_archive(
         self,
         matrix_dir: pathlib.Path,
         binary: str,
-        _kept_drvs: list[str],
     ) -> pathlib.Path:
         """Drop a placeholder ``<binary>.nix-archive`` in ``matrix_dir``.
 
-        The kept-drv list is no longer read from a sidecar JSON; the
-        ``import_stdout`` field on :class:`_SubprocessStub` drives
-        the post-import kept-drv derivation instead. ``_kept_drvs`` is
-        kept on the signature so tests stay legible at the call site.
+        Phase 3 still imports the archive (so the leaf closure
+        materialises in the local store for the tree walk), but the
+        kept-drv list no longer comes from the import stdout — D.1a's
+        ``derive_variant_lookup_from_aggregate`` owns it now.
         """
         archive = matrix_dir / f"{binary}.nix-archive"
         archive.write_bytes(b"fake")
         return archive
 
-    def _stub_import_stdout(
-        self, *binaries_with_drvs: tuple[str, list[str]],
-    ) -> bytes:
-        """Render the synthetic ``nix-store --import`` stdout for a
-        set of per-binary kept drv lists. Empty input → empty stdout.
+    def _matrix_agg(self, binary: str, *, hash_prefix: str = "ma") -> str:
+        """Synthetic aggregate drv path for ``binary``."""
+        h = (hash_prefix + "a" * 32)[:32]
+        return f"/nix/store/{h}-matrix-{binary}.drv"
+
+    def _stub_lookup_for(self, binary: str) -> dict[tuple[str, str], dict]:
+        """Build a minimal variant_lookup the planner expects.
+
+        The shape is ``{(arch, label): variant_spec}`` and only the
+        ``drv`` / ``arch`` / ``label`` / ``suffix`` keys are inspected
+        by downstream code in these tests. The synthetic leaf drv is
+        not actually walked because ``build_sum_drv_multi`` is
+        monkey-patched.
         """
-        lines: list[str] = []
-        for _binary, drvs in binaries_with_drvs:
-            lines.extend(drvs)
-        if not lines:
-            return b""
-        return ("\n".join(lines) + "\n").encode("utf-8")
+        arch = "x86_64"
+        suffix = "gcc15-O0-baseline-default-san-off-march-default"
+        label = f"{binary}__{arch}__{suffix}"
+        h = ("vv" + "a" * 32)[:32]
+        return {
+            (arch, label): {
+                "drv": f"/nix/store/{h}-{binary}-{arch}-{suffix}-elf-folder.drv",
+                "arch": arch,
+                "label": label,
+                "suffix": suffix,
+            },
+        }
+
+    def _patch_derive(
+        self,
+        monkeypatch,
+        lookups: dict[str, dict[tuple[str, str], dict]],
+    ) -> None:
+        """Install a stub for ``archive.derive_variant_lookup_from_aggregate``
+        keyed by aggregate-drv path.
+
+        ``raising=False`` keeps the patch working pre-D.1a (the
+        function lands in the sibling task); once D.1a merges this
+        becomes a normal monkeypatch.setattr.
+        """
+        from compiler_suit_runner.workers.dependency_graph_worker import (
+            archive as _archive_mod,
+        )
+
+        def fake(agg_drv: str) -> dict[tuple[str, str], dict]:
+            return lookups.get(agg_drv, {})
+
+        monkeypatch.setattr(
+            _archive_mod, "derive_variant_lookup_from_aggregate",
+            fake, raising=False,
+        )
 
     def test_empty_matrix_dir_writes_empty_graph(
         self, tmp_path: pathlib.Path,
@@ -532,7 +584,8 @@ class TestRunDependencyGraphTask:
         result = dgw.run_dependency_graph_task(
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/aaaa-bash",
-            toolchain_drvs=["/nix/store/zzzz-gcc15.drv"],
+            toolchain_aggregate_drv=self._TC_AGG,
+            matrix_aggregate_drvs={"hello": self._matrix_agg("hello")},
         )
         assert result.binary_count == 0
         assert result.descriptor_count == 0
@@ -543,18 +596,52 @@ class TestRunDependencyGraphTask:
         assert summary["binary_count"] == 0
         assert summary["descriptor_count"] == 0
 
+    def test_empty_toolchain_aggregate_raises(
+        self, tmp_path: pathlib.Path,
+    ):
+        """Phase 3 cannot run without the producer's toolchain
+        aggregate drv — an empty string raises ValueError loudly so a
+        watcher misconfig surfaces immediately instead of crashing
+        deep inside make_sum_drv_from_paths.
+        """
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        with pytest.raises(ValueError, match="toolchain_aggregate_drv"):
+            dgw.run_dependency_graph_task(
+                matrix_eval_out_dir=matrix_dir,
+                bash_path="/nix/store/aaaa-bash",
+                toolchain_aggregate_drv="",
+                matrix_aggregate_drvs={"hello": self._matrix_agg("hello")},
+            )
+
+    def test_empty_matrix_aggregate_drvs_raises(
+        self, tmp_path: pathlib.Path,
+    ):
+        """Same loud-fail for the matrix side: an empty
+        ``matrix_aggregate_drvs`` map means the bulk-eval producer
+        emitted nothing for this run.
+        """
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        with pytest.raises(ValueError, match="matrix_aggregate_drvs"):
+            dgw.run_dependency_graph_task(
+                matrix_eval_out_dir=matrix_dir,
+                bash_path="/nix/store/aaaa-bash",
+                toolchain_aggregate_drv=self._TC_AGG,
+                matrix_aggregate_drvs={},
+            )
+
     def test_end_to_end_single_binary(
         self, tmp_path: pathlib.Path, monkeypatch,
     ):
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        v_o0 = _variant_drv("hello", "x86_64", "O0", hash_prefix="hh1")
-        v_o2 = _variant_drv("hello", "x86_64", "O2", hash_prefix="hh2")
-        self._seed_archive(matrix_dir, "hello", [v_o0, v_o2])
+        self._seed_archive(matrix_dir, "hello")
+        matrix_agg = self._matrix_agg("hello", hash_prefix="hh")
+        hello_lookup = self._stub_lookup_for("hello")
+        self._patch_derive(monkeypatch, {matrix_agg: hello_lookup})
 
         stub = _SubprocessStub()
-        # ``nix-store --import`` stdout carries the kept-drv list now.
-        stub.import_stdout = self._stub_import_stdout(("hello", [v_o0, v_o2]))
         stub.tree_stdout = b"/nix/store/sum-drv.drv\n"
 
         # Monkey-patch the multi-binary sum-drv builder + planner to
@@ -599,7 +686,8 @@ class TestRunDependencyGraphTask:
         result = dgw.run_dependency_graph_task(
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/aaaa-bash",
-            toolchain_drvs=["/nix/store/zzzz-gcc15.drv"],
+            toolchain_aggregate_drv=self._TC_AGG,
+            matrix_aggregate_drvs={"hello": matrix_agg},
             toolchain_task_ids={
                 "zzzz-gcc15.drv": "build_compilers__aarch64__gcc15",
             },
@@ -608,17 +696,23 @@ class TestRunDependencyGraphTask:
         )
         assert result.binary_count == 1
         assert result.descriptor_count == 1
-        # sum_drv builder saw the kept drvs in matrix-hello.
+        # sum_drv builder saw length-1 lists for both sides — the
+        # post-Phase-A.2 invariant the path-form helper requires.
         assert len(sum_drv_calls) == 1
+        assert sum_drv_calls[0]["toolchain_drvs"] == [self._TC_AGG]
         assert sum_drv_calls[0]["matrix_drvs"] == {
-            "matrix-hello": [v_o0, v_o2],
+            "matrix-hello": [matrix_agg],
         }
         # Planner saw the toolchain task ids and the binary list.
         assert plan_calls[0]["toolchain_task_ids"] == {
             "zzzz-gcc15.drv": "build_compilers__aarch64__gcc15",
         }
         assert plan_calls[0]["binaries"] == ["hello"]
-        # nix-store --import was invoked (paths not locally present).
+        # Variant lookup the planner sees is the stubbed one
+        # (proves derive_variant_lookup_from_aggregate is wired in).
+        assert plan_calls[0]["variant_lookups"] == {"hello": hello_lookup}
+        # nix-store --import was invoked (leaves need to be local for
+        # the tree walk inside build_sum_drv_multi / query_drv_tree).
         assert any(c[:2] == ["nix-store", "--import"] for c in stub.calls)
         # _dependency_graph.pkl was written.
         from compiler_suit_runner.dependency_graph_planner import (
@@ -631,22 +725,22 @@ class TestRunDependencyGraphTask:
     def test_import_runs_unconditionally(
         self, tmp_path: pathlib.Path, monkeypatch,
     ):
-        """Post-cutover, the worker always imports the archive — the
-        ``nix-store --import`` stdout IS the kept-drv source, so the
-        old "skip if all drvs locally present" probe-then-skip
-        optimisation cannot fire.
+        """The worker still imports every archive — the leaves the
+        aggregate drv references must be resident locally before
+        ``nix-store --query --tree`` runs. Even when the aggregate
+        itself is "locally present" the import still fires (we do not
+        probe-and-skip on the closure).
         """
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        v = _variant_drv("hello", "x86_64", "O0", hash_prefix="sk1")
-        self._seed_archive(matrix_dir, "hello", [v])
+        self._seed_archive(matrix_dir, "hello")
+        matrix_agg = self._matrix_agg("hello", hash_prefix="sk")
+        self._patch_derive(
+            monkeypatch, {matrix_agg: self._stub_lookup_for("hello")},
+        )
 
         stub = _SubprocessStub()
-        # Even with the kept drv "locally present", the worker must
-        # call --import because it learns the kept-drv list FROM the
-        # import output.
-        stub.path_info_present.add(v)
-        stub.import_stdout = self._stub_import_stdout(("hello", [v]))
+        stub.path_info_present.add(matrix_agg)
         stub.tree_stdout = b"/nix/store/sum.drv\n"
 
         monkeypatch.setattr(
@@ -661,10 +755,11 @@ class TestRunDependencyGraphTask:
         dgw.run_dependency_graph_task(
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/bash",
-            toolchain_drvs=["/nix/store/tc.drv"],
+            toolchain_aggregate_drv=self._TC_AGG,
+            matrix_aggregate_drvs={"hello": matrix_agg},
             run_subprocess=stub,
         )
-        # --import runs once even though the kept drv is "present".
+        # --import runs once even though the aggregate is "present".
         import_calls = [
             c for c in stub.calls if c[:2] == ["nix-store", "--import"]
         ]
@@ -675,8 +770,10 @@ class TestRunDependencyGraphTask:
     ):
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        self._seed_archive(
-            matrix_dir, "hello", ["/nix/store/aaa-hello.drv"],
+        self._seed_archive(matrix_dir, "hello")
+        matrix_agg = self._matrix_agg("hello", hash_prefix="if")
+        self._patch_derive(
+            monkeypatch, {matrix_agg: self._stub_lookup_for("hello")},
         )
 
         stub = _SubprocessStub()
@@ -693,7 +790,8 @@ class TestRunDependencyGraphTask:
             dgw.run_dependency_graph_task(
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/bash",
-                toolchain_drvs=["/nix/store/tc.drv"],
+                toolchain_aggregate_drv=self._TC_AGG,
+                matrix_aggregate_drvs={"hello": matrix_agg},
                 run_subprocess=stub,
             )
         assert excinfo.value.binary == "hello"
@@ -704,10 +802,12 @@ class TestRunDependencyGraphTask:
     ):
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        v = _variant_drv("hello", "x86_64", "O0", hash_prefix="qt1")
-        self._seed_archive(matrix_dir, "hello", [v])
+        self._seed_archive(matrix_dir, "hello")
+        matrix_agg = self._matrix_agg("hello", hash_prefix="qt")
+        self._patch_derive(
+            monkeypatch, {matrix_agg: self._stub_lookup_for("hello")},
+        )
         stub = _SubprocessStub()
-        stub.import_stdout = self._stub_import_stdout(("hello", [v]))
         stub.tree_rc = 1
 
         monkeypatch.setattr(
@@ -718,7 +818,8 @@ class TestRunDependencyGraphTask:
             dgw.run_dependency_graph_task(
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/bash",
-                toolchain_drvs=["/nix/store/tc.drv"],
+                toolchain_aggregate_drv=self._TC_AGG,
+                matrix_aggregate_drvs={"hello": matrix_agg},
                 run_subprocess=stub,
             )
         assert excinfo.value.stage == "query_tree"
@@ -726,29 +827,24 @@ class TestRunDependencyGraphTask:
     def test_two_binaries_share_one_streaming_pass(
         self, tmp_path: pathlib.Path, monkeypatch,
     ):
-        """Two archives with kept drvs land in ONE sum-drv (one
-        matrix-<binary> wrapper each) and ONE planner call. The Phase
-        5.2 collapse means cross-binary template dedup fires inside
-        the single StreamPlanner instance; the worker observes that
-        only ONE `build_sum_drv_multi` and ONE `plan_total` are
-        invoked, with both binaries surfaced together.
+        """Two aggregates land in ONE sum-drv (one ``matrix-<binary>``
+        wrapper each, with length-1 lists) and ONE planner call. The
+        worker observes that ``build_sum_drv_multi`` and ``plan_total``
+        are each invoked exactly once, with both binaries surfaced
+        together in sorted order.
         """
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        v_hello = _variant_drv("hello", "x86_64", "O0", hash_prefix="tb1")
-        v_world = _variant_drv("world", "aarch64", "O0", hash_prefix="tb2")
-        self._seed_archive(matrix_dir, "hello", [v_hello])
-        self._seed_archive(matrix_dir, "world", [v_world])
+        self._seed_archive(matrix_dir, "hello")
+        self._seed_archive(matrix_dir, "world")
+        agg_hello = self._matrix_agg("hello", hash_prefix="th")
+        agg_world = self._matrix_agg("world", hash_prefix="tw")
+        self._patch_derive(monkeypatch, {
+            agg_hello: self._stub_lookup_for("hello"),
+            agg_world: self._stub_lookup_for("world"),
+        })
 
-        # Per-archive --import stdout via the queue: the worker walks
-        # archives in sorted order (hello, world), so the first --import
-        # call returns hello's kept drv list and the second returns
-        # world's.
         stub = _SubprocessStub()
-        stub.import_stdout_queue = [
-            self._stub_import_stdout(("hello", [v_hello])),
-            self._stub_import_stdout(("world", [v_world])),
-        ]
         stub.tree_stdout = b"/nix/store/sum-drv.drv\n"
 
         sum_drv_calls: list[dict] = []
@@ -757,6 +853,7 @@ class TestRunDependencyGraphTask:
         def fake_build_sum_drv_multi(*, bash_path, toolchain_drvs,
                                        matrix_drvs, system):
             sum_drv_calls.append({
+                "toolchain_drvs": list(toolchain_drvs),
                 "matrix_drvs": {k: list(v) for k, v in matrix_drvs.items()},
             })
             return "/nix/store/sum-drv-multi"
@@ -776,20 +873,25 @@ class TestRunDependencyGraphTask:
         result = dgw.run_dependency_graph_task(
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/bash",
-            toolchain_drvs=["/nix/store/tc.drv"],
+            toolchain_aggregate_drv=self._TC_AGG,
+            matrix_aggregate_drvs={
+                "hello": agg_hello,
+                "world": agg_world,
+            },
             run_subprocess=stub,
         )
         assert result.binary_count == 2
         assert result.descriptor_count == 2
-        # Exactly ONE sum-drv build + ONE plan_total call, regardless
-        # of the two-binary input.
+        # Exactly ONE sum-drv build + ONE plan_total call.
         assert len(sum_drv_calls) == 1
         assert len(plan_calls) == 1
-        # Both binaries surfaced together in the multi-binary matrix_drvs.
-        assert set(sum_drv_calls[0]["matrix_drvs"]) == {
-            "matrix-hello", "matrix-world",
+        # Length-1 lists for both sides (post-Phase-A.2 invariant).
+        assert sum_drv_calls[0]["toolchain_drvs"] == [self._TC_AGG]
+        assert sum_drv_calls[0]["matrix_drvs"] == {
+            "matrix-hello": [agg_hello],
+            "matrix-world": [agg_world],
         }
-        # Both binaries handed to plan_total in sorted archive order.
+        # Both binaries handed to plan_total in sorted order.
         assert plan_calls[0]["binaries"] == ["hello", "world"]
         # Exactly ONE nix-store --query --tree call across both binaries.
         tree_calls = [
@@ -797,34 +899,40 @@ class TestRunDependencyGraphTask:
         ]
         assert len(tree_calls) == 1
 
-    def test_binary_with_no_kept_drvs_is_skipped(
+    def test_binary_with_empty_lookup_is_skipped(
         self, tmp_path: pathlib.Path, monkeypatch,
     ):
-        """An archive whose ``nix-store --import`` stdout carries no
-        ``*-elf-folder.drv`` entries → no kept variant drvs → skip
-        that binary and proceed with the rest."""
+        """A binary whose aggregate drv yields an empty variant_lookup
+        (D.1a returns ``{}``) is dropped before the sum-drv assembly —
+        the ``make_sum_drv_from_paths`` contract forbids a zero-variant
+        matrix wrapper.
+        """
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        # ``hello``'s archive yields a non-variant payload only.
-        (matrix_dir / "hello.nix-archive").write_bytes(b"x")
-        # ``world``'s archive yields a real variant drv.
-        v_world = _variant_drv("world", "x86_64", "O0", hash_prefix="ww1")
-        self._seed_archive(matrix_dir, "world", [v_world])
+        self._seed_archive(matrix_dir, "hello")
+        self._seed_archive(matrix_dir, "world")
+        agg_hello = self._matrix_agg("hello", hash_prefix="eh")
+        agg_world = self._matrix_agg("world", hash_prefix="ew")
+        # hello → empty lookup; world → real lookup.
+        self._patch_derive(monkeypatch, {
+            agg_hello: {},
+            agg_world: self._stub_lookup_for("world"),
+        })
 
         stub = _SubprocessStub()
-        stub.import_stdout_queue = [
-            # hello: no variant drvs in stdout → kept_drvs is empty,
-            # binary is skipped.
-            (
-                b"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc.drv\n"
-            ),
-            self._stub_import_stdout(("world", [v_world])),
-        ]
         stub.tree_stdout = b"/nix/store/sum.drv\n"
 
+        sum_drv_calls: list[dict] = []
+
+        def fake_build_sum_drv_multi(*, bash_path, toolchain_drvs,
+                                       matrix_drvs, system):
+            sum_drv_calls.append({
+                "matrix_drvs": {k: list(v) for k, v in matrix_drvs.items()},
+            })
+            return "/nix/store/sum.drv"
+
         monkeypatch.setattr(
-            dgw, "build_sum_drv_multi",
-            lambda **kw: "/nix/store/sum.drv",
+            dgw, "build_sum_drv_multi", fake_build_sum_drv_multi,
         )
         monkeypatch.setattr(
             dgw, "plan_total",
@@ -840,16 +948,78 @@ class TestRunDependencyGraphTask:
         result = dgw.run_dependency_graph_task(
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/bash",
-            toolchain_drvs=["/nix/store/tc.drv"],
+            toolchain_aggregate_drv=self._TC_AGG,
+            matrix_aggregate_drvs={
+                "hello": agg_hello,
+                "world": agg_world,
+            },
             run_subprocess=stub,
         )
         # Only world was planned.
         assert result.binary_count == 1
+        # The sum-drv builder never saw matrix-hello: it was dropped
+        # before assembly so a zero-variant wrapper cannot be passed
+        # to the path-form helper.
+        assert sum_drv_calls[0]["matrix_drvs"] == {
+            "matrix-world": [agg_world],
+        }
         from compiler_suit_runner.dependency_graph_planner import (
             load_phase4_descriptors,
         )
         descriptors, _summary = load_phase4_descriptors(result.output_path)
         assert {d.task_id for d in descriptors} == {"bv_world"}
+
+    def test_no_nix_instantiate_outside_make_sum_drv(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        """Regression guard: phase 3 must NOT call ``nix-instantiate``
+        outside the single invocation inside ``make_sum_drv_from_paths``.
+
+        We let the real :func:`build_sum_drv_multi` run, but stub
+        :func:`template_graph.make_sum_drv._run_nix_instantiate` with a
+        counter so we can assert it fires AT MOST ONCE across the
+        whole phase. Any drift back to per-leaf eval (e.g. resurrecting
+        ``nix-eval-jobs`` calls or a presence probe) trips this check.
+        """
+        from template_graph import make_sum_drv as _msd
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        self._seed_archive(matrix_dir, "hello")
+        agg_hello = self._matrix_agg("hello", hash_prefix="ni")
+        self._patch_derive(
+            monkeypatch, {agg_hello: self._stub_lookup_for("hello")},
+        )
+
+        nix_eval_calls: list[tuple] = []
+
+        def fake_run_nix_instantiate(expr, *args, **kwargs):
+            nix_eval_calls.append((expr,) + args)
+            return "/nix/store/fake-sum.drv"
+
+        monkeypatch.setattr(
+            _msd, "_run_nix_instantiate", fake_run_nix_instantiate,
+        )
+
+        stub = _SubprocessStub()
+        stub.tree_stdout = b"/nix/store/fake-sum.drv\n"
+
+        # plan_total is patched to a no-op so the test stays
+        # planner-independent — the regression is about
+        # nix-instantiate invocations, not descriptor shape.
+        monkeypatch.setattr(dgw, "plan_total", lambda **kw: [])
+
+        dgw.run_dependency_graph_task(
+            matrix_eval_out_dir=matrix_dir,
+            bash_path="/nix/store/bash",
+            toolchain_aggregate_drv=self._TC_AGG,
+            matrix_aggregate_drvs={"hello": agg_hello},
+            run_subprocess=stub,
+        )
+        assert len(nix_eval_calls) <= 1, (
+            f"phase 3 must invoke nix-instantiate AT MOST ONCE (the sum-drv "
+            f"assembly inside make_sum_drv_from_paths); got "
+            f"{len(nix_eval_calls)} calls — drift back to per-leaf eval"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1214,16 +1384,40 @@ class TestDependencyGraphCounters:
         planner output, and the summary log line fires."""
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        v_hello = _variant_drv("hello", "x86_64", "O0", hash_prefix="rh1")
-        v_world = _variant_drv("world", "aarch64", "O0", hash_prefix="rw1")
         (matrix_dir / "hello.nix-archive").write_bytes(b"x")
         (matrix_dir / "world.nix-archive").write_bytes(b"x")
+        agg_hello = "/nix/store/" + "rh" + "a" * 30 + "-matrix-hello.drv"
+        agg_world = "/nix/store/" + "rw" + "a" * 30 + "-matrix-world.drv"
+        tc_agg = "/nix/store/zzzz-toolchains.drv"
+
+        # Stub D.1a's derive_variant_lookup_from_aggregate so the
+        # worker sees a non-empty lookup per binary (otherwise both
+        # binaries would be skipped before planning).
+        from compiler_suit_runner.workers.dependency_graph_worker import (
+            archive as _archive_mod,
+        )
+        lookups = {
+            agg_hello: {
+                ("x86_64", "hello__x86_64__stub"): {
+                    "drv": "/nix/store/dummy-hello.drv",
+                    "arch": "x86_64", "label": "hello__x86_64__stub",
+                    "suffix": "stub",
+                },
+            },
+            agg_world: {
+                ("aarch64", "world__aarch64__stub"): {
+                    "drv": "/nix/store/dummy-world.drv",
+                    "arch": "aarch64", "label": "world__aarch64__stub",
+                    "suffix": "stub",
+                },
+            },
+        }
+        monkeypatch.setattr(
+            _archive_mod, "derive_variant_lookup_from_aggregate",
+            lambda agg: lookups.get(agg, {}), raising=False,
+        )
 
         stub = _SubprocessStub()
-        stub.import_stdout_queue = [
-            (v_hello + "\n").encode("utf-8"),
-            (v_world + "\n").encode("utf-8"),
-        ]
         stub.tree_stdout = b"/nix/store/sum.drv\n"
 
         descriptors = self._two_binary_descriptors()
@@ -1244,7 +1438,10 @@ class TestDependencyGraphCounters:
             result = dgw.run_dependency_graph_task(
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/bash",
-                toolchain_drvs=["/nix/store/tc.drv"],
+                toolchain_aggregate_drv=tc_agg,
+                matrix_aggregate_drvs={
+                    "hello": agg_hello, "world": agg_world,
+                },
                 run_subprocess=stub,
             )
 
