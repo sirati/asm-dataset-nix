@@ -77,6 +77,45 @@ def _parse_line(line: str) -> tuple[int, str, str, bool]:
     return depth, drv_hash, drv_name, is_backref
 
 
+_PREFIX = b"/nix/store/"
+_PREFIX_LEN = 11
+_BACKREF = b" [...]"
+_BACKREF_LEN = 6
+
+
+def parse_line_bytes(line: bytes) -> tuple[int, bytes, str, bool]:
+    """Decode one ``nix-store --query --tree`` line into
+    ``(depth, drv_hash, drv_name, is_backref)``.
+
+    ``drv_hash`` is the raw 32-byte base32 ASCII hash; ``drv_name``
+    is the decoded post-hash basename. Raises ``ValueError`` on
+    malformed indent (mis-aligned segments or missing connector).
+    """
+    is_backref = line.endswith(_BACKREF)
+    end = len(line) - _BACKREF_LEN if is_backref else len(line)
+    offset = line.find(_PREFIX, 0, end)
+    if offset < 0:
+        raise ValueError(f"no /nix/store/ in line: {line!r}")
+    e2_count = line.count(b"\xe2", 0, offset)
+    if (offset - 2 * e2_count) & 0b11:
+        raise ValueError(
+            f"indent bytes={offset} e2={e2_count} not divisible "
+            f"into 4-codepoint segments: {line!r}"
+        )
+    if offset > 0 and e2_count < 4:
+        raise ValueError(
+            f"indent has no connector (e2={e2_count} < 4): {line!r}"
+        )
+    depth = (offset - 2 * e2_count) >> 2
+    h = offset + _PREFIX_LEN
+    return (
+        depth,
+        line[h:h + _HASH_LEN],
+        line[h + _HASH_LEN + 1:end].decode("ascii"),
+        is_backref,
+    )
+
+
 # ─── Variant filename → (binary, arch, comp, opt) ───────────────────
 
 # Architectures from lib/architectures.nix. Longest-first so that
