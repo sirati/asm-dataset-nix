@@ -79,10 +79,15 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--system",
         "--sys-name",
+        dest="sys_name",
         type=str,
         default="x86_64-linux",
-        help="Target system attr (default x86_64-linux).",
+        help=(
+            "Target system attr (default x86_64-linux). The submitter "
+            "threads its --system flag to this worker via argv."
+        ),
     )
     return parser
 

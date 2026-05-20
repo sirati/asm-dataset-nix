@@ -123,10 +123,15 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Run identifier (default: timestamp).",
     )
     parser.add_argument(
+        "--system",
         "--sys",
         dest="sys_name",
         default="x86_64-linux",
-        help="Flake system attribute (default: x86_64-linux).",
+        help=(
+            "Flake system attribute that the run targets (default: "
+            "x86_64-linux). Threaded into the matrix-eval manifest "
+            "header and every worker dispatched from this submitter."
+        ),
     )
     parser.add_argument(
         "--packages",
@@ -588,6 +593,7 @@ _CSR_FLAGS_WITH_VALUE: frozenset[str] = frozenset({
     "--shared-fs",
     "--run-id",
     "--sys",
+    "--system",
     "--cachix-cache",
     "--cachix-auth-token-file",
     "--cache-root",
