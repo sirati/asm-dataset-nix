@@ -16,6 +16,7 @@ streaming planner — no full tree buffer, no follow-up
 from __future__ import annotations
 
 import re
+from typing import Iterator
 
 BACKREF_SUFFIX = " [...]"
 # Each indentation level is a 4-character segment: '│   ', '    ',
@@ -150,3 +151,15 @@ def parse_variant_path(
         f"no known arch matches variant rest {rest!r}; "
         f"tried {sorted(archs)}"
     )
+
+
+def drv_tree_stream(stream) -> Iterator[tuple[int, bytes, str, bool]]:
+    """Iterate parsed tuples from a byte stream of
+    ``nix-store --query --tree`` output. Stops at producer EOF.
+    Strips trailing ``\n`` cheaply.
+    """
+    _parse = parse_line_bytes
+    for raw in stream:
+        if raw[-1] == 0x0a:
+            raw = raw[:-1]
+        yield _parse(raw)
