@@ -87,6 +87,12 @@ class PreflightResult:
     hoist it to phase 2" vs "this is a common host dep we should
     pre-build". For now we expose it as a frozenset so the consumer
     can use it without reconstructing the set itself.
+
+    ``toolchain_aggregate_drv`` is the ``toolchains`` wrapper drv path
+    built by :func:`enumerate_toolchains_only` from the sorted leaf
+    toolchain drv list. It collapses N per-compiler leaves into one
+    handle the downstream phases (sum-drv assembly, dependency_graph
+    planner) consume directly. Empty string when no leaves resolved.
     """
 
     sys_name: str
@@ -94,6 +100,7 @@ class PreflightResult:
     toolchain_specs: tuple[tuple[str, str], ...]
     common_dep_drvs: tuple[tuple[str, str], ...]
     toolchain_drvs: frozenset[str]
+    toolchain_aggregate_drv: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1056,34 +1063,66 @@ def enumerate_toolchains(
 
 def enumerate_toolchains_only(
     flake_ref: str,
-    sys_name: str,
+    sys_name: str = "x86_64-linux",
     *,
     archs: Optional[list[str]] = None,
     run_subprocess: Optional[RunSubprocess] = None,
-) -> tuple[tuple[tuple[str, str], ...], dict[tuple[str, str], str]]:
+) -> tuple[
+    tuple[tuple[str, str], ...],
+    dict[tuple[str, str], str],
+    str,
+]:
     """Submitter-side toolchain-only preflight.
 
     Resolves the (arch, compiler) toolchain set and their drv paths
-    without touching any variant matrix data. This is the fast surface
-    Phase -1 bootstrap uses to seed the cluster with toolchain drvs
-    before matrix_eval tasks fire on secondaries.
+    without touching any variant matrix data, then assembles the leaf
+    drv paths into a single ``toolchains`` aggregate wrapper drv via
+    :func:`template_graph.make_sum_drv.make_wrapper_drv_from_paths`.
+    This is the fast surface Phase -1 bootstrap uses to seed the
+    cluster with toolchain drvs before matrix_eval tasks fire on
+    secondaries; downstream phases consume the aggregate as a single
+    handle instead of N leaves.
 
-    Returns ``(pairs, drv_paths)`` where ``pairs`` is the sorted
-    ``(arch, compiler)`` tuple list and ``drv_paths`` maps each pair to
-    its resolved ``.drv`` path. Entries with failed drv evaluation are
-    dropped from ``drv_paths`` but stay in ``pairs`` so the caller can
-    decide what to do with them (e.g. log a warning, fall back to
-    flake-attr resolution downstream).
+    Returns ``(pairs, drv_paths, aggregate_drv)`` where:
+
+    - ``pairs`` is the sorted ``(arch, compiler)`` tuple list.
+    - ``drv_paths`` maps each pair to its resolved ``.drv`` path.
+      Entries with failed drv evaluation are dropped from ``drv_paths``
+      but stay in ``pairs`` so the caller can decide what to do with
+      them (e.g. log a warning, fall back to flake-attr resolution
+      downstream).
+    - ``aggregate_drv`` is the ``toolchains`` wrapper drv path built
+      from ``sorted(drv_paths.values())`` — sorted for determinism so
+      the same leaf set always yields the same wrapper-drv hash. When
+      no leaves resolve, the aggregate is an empty string.
+
+    ``sys_name`` defaults to ``"x86_64-linux"`` for callers that do
+    not yet thread a system literal; the CLI passes its own
+    ``--sys-name`` value through.
     """
     pairs = enumerate_toolchains(
         flake_ref, sys_name, archs=archs, run_subprocess=run_subprocess,
     )
     if not pairs:
-        return pairs, {}
+        return pairs, {}, ""
     drv_paths = eval_toolchain_drvs(
         flake_ref, sys_name, pairs, run_subprocess=run_subprocess,
     )
-    return pairs, drv_paths
+    leaf_drvs = sorted(d for d in drv_paths.values() if d)
+    if not leaf_drvs:
+        return pairs, drv_paths, ""
+    # Imported lazily so the import cost is paid only when the
+    # submitter actually builds the aggregate (the toolchain-only
+    # composite is the sole call site).
+    from template_graph.make_sum_drv import (  # noqa: PLC0415
+        make_wrapper_drv_from_paths,
+    )
+    aggregate_drv = make_wrapper_drv_from_paths(
+        drvs=leaf_drvs,
+        name="toolchains",
+        system=sys_name,
+    )
+    return pairs, drv_paths, aggregate_drv
 
 
 # ---------------------------------------------------------------------------

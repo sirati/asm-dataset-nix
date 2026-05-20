@@ -762,10 +762,12 @@ def test_enumerate_variants_honours_filters():
 # ---------------------------------------------------------------------------
 
 
-def test_enumerate_toolchains_only_returns_pairs_and_drv_paths():
+def test_enumerate_toolchains_only_returns_pairs_drvs_and_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+):
     """``enumerate_toolchains_only`` is the submitter-side toolchain
-    bootstrap surface; it returns ``(pairs, drv_paths)`` and never
-    touches variants."""
+    bootstrap surface; it returns ``(pairs, drv_paths, aggregate_drv)``
+    and never touches variants."""
     responses = _all_responses()
     # Stub drv resolution for every toolchain pair the fixture exposes.
     for arch, comp in (("x86_64", "gcc15"), ("x86_64", "clang20"),
@@ -774,8 +776,21 @@ def test_enumerate_toolchains_only_returns_pairs_and_drv_paths():
             f"_crossToolchainMap.x86_64-linux.{arch}.{comp}.drvPath"
         ] = b"/nix/store/" + f"{arch}-{comp}.drv".encode()
 
+    captured: dict[str, object] = {}
+
+    def fake_make_wrapper(*, drvs, name, system, extra_nix_args=None):
+        captured["drvs"] = list(drvs)
+        captured["name"] = name
+        captured["system"] = system
+        return "/nix/store/aaaa-toolchains.drv"
+
+    monkeypatch.setattr(
+        "template_graph.make_sum_drv.make_wrapper_drv_from_paths",
+        fake_make_wrapper,
+    )
+
     runner, calls = _make_run_subprocess(responses)
-    pairs, drv_paths = enumerate_toolchains_only(
+    pairs, drv_paths, aggregate = enumerate_toolchains_only(
         ".",
         "x86_64-linux",
         run_subprocess=runner,
@@ -790,6 +805,13 @@ def test_enumerate_toolchains_only_returns_pairs_and_drv_paths():
         ("x86_64", "clang20"): "/nix/store/x86_64-clang20.drv",
         ("x86_64", "gcc15"): "/nix/store/x86_64-gcc15.drv",
     }
+    assert aggregate == "/nix/store/aaaa-toolchains.drv"
+    # The aggregate-builder must see a SORTED leaf list (determinism:
+    # same set of leaves → same wrapper-drv hash regardless of dict
+    # iteration order).
+    assert captured["drvs"] == sorted(drv_paths.values())
+    assert captured["name"] == "toolchains"
+    assert captured["system"] == "x86_64-linux"
     # No variant-side eval — we never look at _meta or _drvPaths.
     for argv in calls:
         for tok in argv:
@@ -799,10 +821,69 @@ def test_enumerate_toolchains_only_returns_pairs_and_drv_paths():
                 )
 
 
-def test_enumerate_toolchains_only_empty_pairs_skip_drv_eval():
-    """If no toolchain pairs survive filtering, drv eval is skipped."""
+def test_enumerate_toolchains_only_sorts_leaf_drvs_for_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The aggregate-builder must receive leaf drv paths in sorted
+    order so the wrapper-drv hash is stable across runs regardless of
+    dict iteration order from ``eval_toolchain_drvs``."""
+    responses = _all_responses()
+    # Pick fake drv paths whose lexical sort order differs from the
+    # default insertion order of the toolchain pairs fixture.
+    responses["_crossToolchainMap.x86_64-linux.aarch64.gcc15.drvPath"] = (
+        b"/nix/store/zzz-aarch64-gcc15.drv"
+    )
+    responses["_crossToolchainMap.x86_64-linux.x86_64.gcc15.drvPath"] = (
+        b"/nix/store/aaa-x86_64-gcc15.drv"
+    )
+    responses["_crossToolchainMap.x86_64-linux.x86_64.clang20.drvPath"] = (
+        b"/nix/store/mmm-x86_64-clang20.drv"
+    )
+
+    captured_drvs: list[list[str]] = []
+
+    def fake_make_wrapper(*, drvs, name, system, extra_nix_args=None):
+        captured_drvs.append(list(drvs))
+        return "/nix/store/aggregate.drv"
+
+    monkeypatch.setattr(
+        "template_graph.make_sum_drv.make_wrapper_drv_from_paths",
+        fake_make_wrapper,
+    )
+
+    runner, _calls = _make_run_subprocess(responses)
+    _pairs, _drv_paths, _agg = enumerate_toolchains_only(
+        ".", "x86_64-linux", run_subprocess=runner,
+    )
+    assert len(captured_drvs) == 1
+    assert captured_drvs[0] == sorted(captured_drvs[0])
+    # Sanity: the sorted list is what we actually expect for the
+    # responses above (lexical drv-path order, not pair order).
+    assert captured_drvs[0] == [
+        "/nix/store/aaa-x86_64-gcc15.drv",
+        "/nix/store/mmm-x86_64-clang20.drv",
+        "/nix/store/zzz-aarch64-gcc15.drv",
+    ]
+
+
+def test_enumerate_toolchains_only_empty_pairs_skip_drv_eval(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """If no toolchain pairs survive filtering, drv eval is skipped
+    and the aggregate is the empty string."""
+    wrapper_calls: list[object] = []
+
+    def fake_make_wrapper(*, drvs, name, system, extra_nix_args=None):
+        wrapper_calls.append((list(drvs), name, system))
+        return "/nix/store/should-not-be-called.drv"
+
+    monkeypatch.setattr(
+        "template_graph.make_sum_drv.make_wrapper_drv_from_paths",
+        fake_make_wrapper,
+    )
+
     runner, calls = _make_run_subprocess(_all_responses())
-    pairs, drv_paths = enumerate_toolchains_only(
+    pairs, drv_paths, aggregate = enumerate_toolchains_only(
         ".",
         "x86_64-linux",
         archs=["nonexistent"],
@@ -810,6 +891,9 @@ def test_enumerate_toolchains_only_empty_pairs_skip_drv_eval():
     )
     assert pairs == ()
     assert drv_paths == {}
+    assert aggregate == ""
+    # No leaves → no wrapper-drv construction.
+    assert wrapper_calls == []
     # Only the _crossToolchainsMeta eval ran; no per-pair drv resolve.
     for argv in calls:
         for tok in argv:

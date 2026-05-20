@@ -862,6 +862,7 @@ def _serialize_preflight_for_cache(
             [arch, compiler, drv]
             for (arch, compiler), drv in sorted(tc_pairs.items())
         ],
+        "toolchain_aggregate_drv": pre.toolchain_aggregate_drv,
         "num_workers": num_workers,
         "allow_toolchain_build": bool(allow_toolchain_build),
     }
@@ -1047,7 +1048,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # watcher (``_MatrixEvalQuiesceWatcher`` in suit_task.py).
         log.info("running pre-flight (toolchains + per-binary metadata only)")
         try:
-            tc_pairs, tc_drvs = enumerate_toolchains_only(
+            tc_pairs, tc_drvs, tc_aggregate_drv = enumerate_toolchains_only(
                 args.flake, args.sys_name, archs=args.archs,
             )
         except Exception:  # noqa: BLE001
@@ -1215,6 +1216,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             toolchain_specs=tc_pairs,
             common_dep_drvs=(),
             toolchain_drvs=frozenset(tc_drv_set),
+            toolchain_aggregate_drv=tc_aggregate_drv,
         )
 
     # Build SuitTaskConfig. ``pre`` still carries the toolchain set
