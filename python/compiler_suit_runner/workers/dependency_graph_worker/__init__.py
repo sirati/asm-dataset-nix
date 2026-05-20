@@ -15,10 +15,11 @@ Worker flow:
      variant-drv list + per-binary ``variant_lookup``.
   3. ``template_graph.make_sum_drv.make_sum_drv_from_paths`` glues
      toolchains + per-binary kept-drvs into a single sum-root drv;
-     ``nix-store --query --tree`` walks that into the line-by-line
-     tree the streaming planner consumes.
-  4. ``template_graph.streaming.plan_from_tree_streaming`` produces the
-     classified template graph.
+     :func:`stream_drv_tree` then spawns ``nix-store --query --tree``
+     and yields ``(depth, hash, name, is_backref)`` tuples directly
+     to the streaming planner.
+  4. ``template_graph.streaming.plan_from_drv_tree`` consumes that
+     tuple stream and produces the classified template graph.
   5. ``dependency_graph_planner.plan_phase4_from_graph`` adapts the
      streaming result into a flat list of
      :class:`Phase4Descriptor` records.

@@ -44,7 +44,7 @@ VIOLATION_DUMP_LIMIT = 20
 def invoke_planner(
     *,
     pkg: Any,
-    tree_text: str,
+    sum_drv: str,
     binaries: list[str],
     variant_lookups: dict[str, dict[tuple[str, str], dict]],
     tc_ids: dict[str, str],
@@ -69,7 +69,7 @@ def invoke_planner(
         and unpatched_plan_total is not None
     ):
         return _plan_module.plan_total_with_counters(
-            tree_text=tree_text,
+            sum_drv=sum_drv,
             binaries=binaries,
             variant_lookups=variant_lookups,
             toolchain_task_ids=tc_ids,
@@ -77,7 +77,7 @@ def invoke_planner(
         )
     # Patched plan_total path: caller's fake supplies descriptors only.
     descriptors = pkg.plan_total(
-        tree_text=tree_text,
+        sum_drv=sum_drv,
         binaries=binaries,
         variant_lookups=variant_lookups,
         toolchain_task_ids=tc_ids,

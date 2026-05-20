@@ -706,10 +706,10 @@ class TestRunDependencyGraphTask:
             })
             return "/nix/store/sum-drv-multi"
 
-        def fake_plan_total(*, tree_text, binaries, variant_lookups,
+        def fake_plan_total(*, sum_drv, binaries, variant_lookups,
                              toolchain_task_ids, sys_name):
             plan_calls.append({
-                "tree_text": tree_text,
+                "sum_drv": sum_drv,
                 "binaries": list(binaries),
                 "variant_lookups": {
                     b: dict(lookup)
@@ -854,12 +854,32 @@ class TestRunDependencyGraphTask:
             monkeypatch, {matrix_agg: self._stub_lookup_for("hello")},
         )
         stub = _SubprocessStub()
-        stub.tree_rc = 1
 
         monkeypatch.setattr(
             dgw, "build_sum_drv_multi",
             lambda **kw: "/nix/store/sum.drv",
         )
+
+        # Post-byte-stream refactor: ``nix-store --query --tree`` runs
+        # inside :func:`stream_drv_tree` via ``subprocess.Popen`` —
+        # the injected ``run_subprocess`` stub no longer sees it. Patch
+        # :func:`stream_drv_tree` to raise the same ``RuntimeError`` the
+        # production path raises on a non-zero exit; run.py must still
+        # re-wrap it as ``DependencyGraphWorkerError(stage="query_tree")``.
+        from compiler_suit_runner.workers.dependency_graph_worker import (
+            sum_drv as _sum_drv_mod,
+        )
+
+        def fake_stream_drv_tree(_sum_drv_path: str):
+            raise RuntimeError(
+                f"nix-store --query --tree {_sum_drv_path} failed "
+                f"(rc=1): borked"
+            )
+
+        monkeypatch.setattr(
+            _sum_drv_mod, "stream_drv_tree", fake_stream_drv_tree,
+        )
+
         with pytest.raises(dgw.DependencyGraphWorkerError) as excinfo:
             dgw.run_dependency_graph_task(
                 matrix_eval_out_dir=matrix_dir,
@@ -904,7 +924,7 @@ class TestRunDependencyGraphTask:
             })
             return "/nix/store/sum-drv-multi"
 
-        def fake_plan_total(*, tree_text, binaries, variant_lookups,
+        def fake_plan_total(*, sum_drv, binaries, variant_lookups,
                              toolchain_task_ids, sys_name):
             plan_calls.append({"binaries": list(binaries)})
             return [Phase4Descriptor(
@@ -939,11 +959,16 @@ class TestRunDependencyGraphTask:
         }
         # Both binaries handed to plan_total in sorted order.
         assert plan_calls[0]["binaries"] == ["hello", "world"]
-        # Exactly ONE nix-store --query --tree call across both binaries.
+        # The injected ``run_subprocess`` stub no longer sees the
+        # ``nix-store --query --tree`` invocation — the planner pulls
+        # that stream via :func:`stream_drv_tree` (a direct
+        # ``subprocess.Popen``) instead. With ``plan_total`` patched out
+        # here the planner never runs, so the stub records zero
+        # tree-query calls.
         tree_calls = [
             c for c in stub.calls if c[:3] == ["nix-store", "--query", "--tree"]
         ]
-        assert len(tree_calls) == 1
+        assert tree_calls == []
 
     def test_binary_with_empty_lookup_is_skipped(
         self, tmp_path: pathlib.Path, monkeypatch,
@@ -1302,6 +1327,24 @@ class TestPlanTotalLaxDefault:
             _dgp, "plan_phase4_from_graph", fake_plan_phase4_from_graph,
         )
 
+        # The planner now pulls a tuple stream via stream_drv_tree; the
+        # test injects an in-memory equivalent derived from the synthetic
+        # tree_text so we never spawn ``nix-store``.
+        import io  # noqa: PLC0415
+        from template_graph.tree_walker import (  # noqa: PLC0415
+            drv_tree_stream,
+        )
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: E501, PLC0415
+            sum_drv as _sum_drv_mod,
+        )
+
+        def fake_stream_drv_tree(_sum_drv_path: str):
+            return drv_tree_stream(io.BytesIO(tree_text.encode("utf-8")))
+
+        monkeypatch.setattr(
+            _sum_drv_mod, "stream_drv_tree", fake_stream_drv_tree,
+        )
+
         # plan_total imports the planner adapter at call time so the
         # monkeypatch above must hit the module attribute; the import
         # inside plan_total re-uses the patched module.
@@ -1311,7 +1354,7 @@ class TestPlanTotalLaxDefault:
 
         # No exception — calibration mismatch is recorded, not raised.
         result = plan_total(
-            tree_text=tree_text,
+            sum_drv="/nix/store/dummy-sum.drv",
             binaries=["hello"],
             variant_lookups={"hello": {}},
             toolchain_task_ids={},
@@ -1338,7 +1381,7 @@ class TestPlanTotalLaxDefault:
             f"got kinds={kinds}"
         )
 
-    def test_strict_mode_still_raises_when_requested(self):
+    def test_strict_mode_still_raises_when_requested(self, monkeypatch):
         """The lax default is overridable: passing ``lax=False`` to
         ``plan_total`` restores strict-mode behavior and the same
         calibration-mismatch tree raises.
@@ -1376,6 +1419,21 @@ class TestPlanTotalLaxDefault:
         )
         tree_text = render_tree(root)
 
+        import io  # noqa: PLC0415
+        from template_graph.tree_walker import (  # noqa: PLC0415
+            drv_tree_stream,
+        )
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: E501, PLC0415
+            sum_drv as _sum_drv_mod,
+        )
+
+        def fake_stream_drv_tree(_sum_drv_path: str):
+            return drv_tree_stream(io.BytesIO(tree_text.encode("utf-8")))
+
+        monkeypatch.setattr(
+            _sum_drv_mod, "stream_drv_tree", fake_stream_drv_tree,
+        )
+
         from compiler_suit_runner.workers.dependency_graph_worker.plan import (  # noqa: E501
             plan_total,
         )
@@ -1385,7 +1443,7 @@ class TestPlanTotalLaxDefault:
             match=r"calibration pair same-name child count mismatch",
         ):
             plan_total(
-                tree_text=tree_text,
+                sum_drv="/nix/store/dummy-sum.drv",
                 binaries=["hello"],
                 variant_lookups={"hello": {}},
                 toolchain_task_ids={},

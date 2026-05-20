@@ -1,4 +1,4 @@
-"""Streaming-planner driver: tree text → phase-4 descriptors.
+"""Streaming-planner driver: sum-drv path → phase-4 descriptors.
 
 Two entry points:
 
@@ -6,7 +6,7 @@ Two entry points:
     existing tests that monkey-patch it.
   * :func:`plan_total` — multi-binary path used by ``run_dependency_graph_task``
     after the per-binary loop collapse. Runs the streaming planner ONCE
-    on a multi-binary sum-drv tree and partitions the result per binary
+    on a multi-binary sum-drv and partitions the result per binary
     before feeding :func:`plan_phase4_from_graph`.
   * :func:`plan_total_with_counters` — same as :func:`plan_total` but
     also returns the per-category integer counters used in the worker's
@@ -37,14 +37,18 @@ __all__ = [
 def plan_binary(
     *,
     binary: str,
-    tree_text: str,
+    sum_drv: str,
     variant_lookup: dict[tuple[str, str], dict],
     toolchain_task_ids: dict[str, str],
     sys_name: str,
     lax: bool = True,
 ) -> list[Any]:
     """Run the streaming planner + dependency_graph_planner adapter
-    against ``tree_text`` for one binary.
+    against ``sum_drv`` for one binary.
+
+    ``sum_drv`` is the multi-binary sum-drv path; ``stream_drv_tree``
+    spawns ``nix-store --query --tree`` and feeds the planner tuples
+    as they arrive.
 
     Returns the list of :class:`Phase4Descriptor` records. Raises
     :class:`DependencyGraphCycleError` (from the adapter) on cycle
@@ -58,13 +62,16 @@ def plan_binary(
     via :class:`DependencyGraphResult` so the run log preserves
     visibility for follow-up investigation.
     """
-    from template_graph.streaming import plan_from_tree_streaming  # noqa: PLC0415
+    from template_graph.streaming import plan_from_drv_tree  # noqa: PLC0415
+    from compiler_suit_runner.workers.dependency_graph_worker.sum_drv import (  # noqa: PLC0415
+        stream_drv_tree,
+    )
     from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
         BinaryPlanInput,
         plan_phase4_from_graph,
     )
 
-    streaming_result = plan_from_tree_streaming(tree_text, lax=lax)
+    streaming_result = plan_from_drv_tree(stream_drv_tree(sum_drv), lax=lax)
     inp = BinaryPlanInput(
         binary=binary,
         streaming_result=streaming_result,
@@ -76,14 +83,14 @@ def plan_binary(
 
 def plan_total(
     *,
-    tree_text: str,
+    sum_drv: str,
     binaries: list[str],
     variant_lookups: dict[str, dict[tuple[str, str], dict]],
     toolchain_task_ids: dict[str, str],
     sys_name: str,
     lax: bool = True,
 ) -> list[Any]:
-    """Run ONE streaming pass against ``tree_text`` and emit a single
+    """Run ONE streaming pass against ``sum_drv`` and emit a single
     flat phase-4 descriptor list spanning all binaries.
 
     ``binaries`` is the deterministic ordered list of binary names that
@@ -110,7 +117,7 @@ def plan_total(
     Raises :class:`DependencyGraphCycleError` on cycle detection.
     """
     descriptors, _streaming = _plan_total_impl(
-        tree_text=tree_text,
+        sum_drv=sum_drv,
         binaries=binaries,
         variant_lookups=variant_lookups,
         toolchain_task_ids=toolchain_task_ids,
@@ -122,7 +129,7 @@ def plan_total(
 
 def plan_total_with_counters(
     *,
-    tree_text: str,
+    sum_drv: str,
     binaries: list[str],
     variant_lookups: dict[str, dict[tuple[str, str], dict]],
     toolchain_task_ids: dict[str, str],
@@ -140,7 +147,7 @@ def plan_total_with_counters(
     WARN-level dump when non-empty.
     """
     descriptors, streaming_result = _plan_total_impl(
-        tree_text=tree_text,
+        sum_drv=sum_drv,
         binaries=binaries,
         variant_lookups=variant_lookups,
         toolchain_task_ids=toolchain_task_ids,
@@ -158,7 +165,7 @@ def plan_total_with_counters(
 
 def _plan_total_impl(
     *,
-    tree_text: str,
+    sum_drv: str,
     binaries: list[str],
     variant_lookups: dict[str, dict[tuple[str, str], dict]],
     toolchain_task_ids: dict[str, str],
@@ -172,13 +179,16 @@ def _plan_total_impl(
     is consumed by :func:`compute_dependency_graph_counters` and is not
     part of the public worker contract).
     """
-    from template_graph.streaming import plan_from_tree_streaming  # noqa: PLC0415
+    from template_graph.streaming import plan_from_drv_tree  # noqa: PLC0415
+    from compiler_suit_runner.workers.dependency_graph_worker.sum_drv import (  # noqa: PLC0415
+        stream_drv_tree,
+    )
     from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
         BinaryPlanInput,
         plan_phase4_from_graph,
     )
 
-    streaming_result = plan_from_tree_streaming(tree_text, lax=lax)
+    streaming_result = plan_from_drv_tree(stream_drv_tree(sum_drv), lax=lax)
 
     # Group templates by the binary their root role encodes. Each
     # binary's BinaryPlanInput consumes a sliced streaming_result

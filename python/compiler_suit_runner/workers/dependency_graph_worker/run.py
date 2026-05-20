@@ -19,7 +19,6 @@ from typing import Any, Optional, Union
 
 from . import archive as _archive
 from . import output as _output
-from . import sum_drv as _sum_drv
 from . import summary as _summary
 from .errors import DependencyGraphResult, DependencyGraphWorkerError
 from .subproc import RunSubprocess, default_run_subprocess
@@ -61,10 +60,11 @@ def run_dependency_graph_task(
          :func:`build_sum_drv_multi`, which in turn calls
          :func:`template_graph.make_sum_drv.make_sum_drv_from_paths`
          (the sole ``nix-instantiate`` in this phase);
-      4. ``nix-store --query --tree`` ONCE on the resulting sum-drv;
-      5. ``plan_from_tree_streaming`` ONCE — cross-binary template
-         dedup fires inside the single :class:`StreamPlanner`;
-      6. one phase-4 descriptor list emitted for all binaries.
+      4. ``plan_from_drv_tree`` ONCE — the planner streams
+         ``nix-store --query --tree`` tuples directly from
+         :func:`stream_drv_tree` so cross-binary template dedup fires
+         inside the single :class:`StreamPlanner`;
+      5. one phase-4 descriptor list emitted for all binaries.
 
     ``toolchain_aggregate_drv`` and ``matrix_aggregate_drvs`` MUST both
     be non-empty — phase 3 cannot run without the producer's output.
@@ -138,7 +138,6 @@ def run_dependency_graph_task(
         sys_name=sys_name,
         variant_lookups=variant_lookups,
         tc_ids=tc_ids,
-        runner=runner,
     )
 
     _summary.emit_summary_log(
@@ -301,17 +300,19 @@ def _plan_all_binaries(
     sys_name: str,
     variant_lookups: dict[str, dict[tuple[str, str], dict]],
     tc_ids: dict[str, str],
-    runner: RunSubprocess,
 ) -> tuple[list[Any], dict[str, int], list[dict]]:
-    """Build the multi-binary sum-drv, query its tree, and produce
+    """Build the multi-binary sum-drv, stream-plan it, and produce
     ``(descriptors, counters, violation_entries)`` spanning every
     plannable binary.
 
     Stages are surfaced via :class:`DependencyGraphWorkerError` tagged
     with ``binary="<all>"`` for the sum-drv / tree-query / plan steps.
-    ``build_sum_drv_multi`` and ``plan_total`` are resolved through
-    the package namespace so test monkeypatches are honoured; see
-    :func:`summary.invoke_planner` for the planner-call shim.
+    The planner pulls its own ``nix-store --query --tree`` stream via
+    :func:`stream_drv_tree` so this helper no longer needs the
+    subprocess-runner injection. ``build_sum_drv_multi`` and
+    ``plan_total`` are resolved through the package namespace so test
+    monkeypatches are honoured; see :func:`summary.invoke_planner`
+    for the planner-call shim.
     """
     import importlib  # noqa: PLC0415
     _pkg = importlib.import_module(__package__)
@@ -331,22 +332,23 @@ def _plan_all_binaries(
         ) from exc
 
     try:
-        tree_text = _sum_drv.query_drv_tree(sum_drv, run_subprocess=runner)
-    except RuntimeError as exc:
-        raise DependencyGraphWorkerError(
-            binary="<all>", stage="query_tree",
-            message=str(exc), cause=exc,
-        ) from exc
-
-    try:
         return _summary.invoke_planner(
             pkg=_pkg,
-            tree_text=tree_text,
+            sum_drv=sum_drv,
             binaries=binaries,
             variant_lookups=variant_lookups,
             tc_ids=tc_ids,
             sys_name=sys_name,
         )
+    except RuntimeError as exc:
+        # ``stream_drv_tree`` raises ``RuntimeError`` on a non-zero
+        # ``nix-store --query --tree`` exit; keep the historical
+        # ``stage="query_tree"`` label so operator-side error
+        # introspection stays the same.
+        raise DependencyGraphWorkerError(
+            binary="<all>", stage="query_tree",
+            message=str(exc), cause=exc,
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         raise DependencyGraphWorkerError(
             binary="<all>", stage="plan",
