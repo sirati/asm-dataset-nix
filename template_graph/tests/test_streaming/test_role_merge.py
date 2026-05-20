@@ -21,7 +21,7 @@ from template_graph.cowalk._role_merge import (
     canonical_walk_order,
 )
 from template_graph.graph import Template, TemplateNode, VariantArray
-from template_graph.tests.test_streaming.fixtures import make_hash
+from template_graph.tests.test_streaming.fixtures import make_hash_bytes
 
 
 def _mk_template(
@@ -53,11 +53,11 @@ def _mk_template(
 
 def _mk_variant_array(
     template_id: int, arch: str, n_nodes: int,
-    drv_for_nid: dict[int, tuple[str, str]],
+    drv_for_nid: dict[int, tuple[bytes, str]],
 ) -> VariantArray:
     """Single-variant ``VariantArray``. ``drv_for_nid`` supplies the
     variant-0 ``(hash, name)`` tuple per node id; unmentioned node
-    ids get ``None``.
+    ids get ``None``. ``hash`` is bytes (planner-side type).
     """
     hashes: list[list] = []
     for nid in range(n_nodes):
@@ -98,8 +98,8 @@ def test_role_merge_keymap_groups_by_role_and_enforce():
         built_from="i686-v0",
     )
 
-    drv_rt_x86 = (make_hash(101), "gcc-runtime-14.0.drv")
-    drv_rt_arm = (make_hash(102), "gcc-runtime-14.0.drv")
+    drv_rt_x86 = (make_hash_bytes(101), "gcc-runtime-14.0.drv")
+    drv_rt_arm = (make_hash_bytes(102), "gcc-runtime-14.0.drv")
 
     arr_a = _mk_variant_array(0, "x86_64", 2, {1: drv_rt_x86})
     arr_b = _mk_variant_array(1, "aarch64", 2, {1: drv_rt_arm})

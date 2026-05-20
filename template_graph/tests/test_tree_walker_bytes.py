@@ -219,8 +219,10 @@ def test_corpus_parity_with_parse_line(tree_path: Path) -> None:
         assert s_depth == b_depth, ln
         assert s_name == b_name, ln
         assert s_br == b_br, ln
-        # _parse_line returns str hash, parse_line_bytes returns bytes.
-        assert s_hash == b_hash.decode("ascii"), ln
+        # Both parsers return bytes for the hash after the str→bytes
+        # migration; this parity check pins that.
+        assert isinstance(s_hash, bytes), ln
+        assert s_hash == b_hash, ln
 
 
 def test_corpus_parity_at_least_six_fixtures() -> None:

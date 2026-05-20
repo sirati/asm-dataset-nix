@@ -22,20 +22,30 @@ def _coerce_ident(raw: Any) -> Optional[tuple[str, str]]:
     """Normalise a single toolchain ident entry to ``(hash, name)``.
 
     Accepts:
-      * ``(hash, name)`` tuples (native streaming output);
-      * ``[hash, name]`` lists (JSON-roundtripped form);
+      * ``(hash, name)`` tuples (native streaming output) — ``hash`` may
+        be ``bytes`` (planner-native after the str→bytes hash migration)
+        or ``str`` (legacy / dict consumers);
+      * ``[hash, name]`` lists (JSON-roundtripped form) — same
+        ``hash`` typing rules;
       * ``"<hash>-<name>"`` strings (legacy refcount form).
+
+    The result always carries a ``str`` hash for compatibility with the
+    legacy ``"<hash>-<name>"`` task_id formatter and JSON descriptors.
 
     Returns ``None`` for anything else so the caller can decide whether
     to log + skip vs raise.
     """
     if isinstance(raw, tuple) and len(raw) == 2:
         h, n = raw
+        if isinstance(h, bytes) and isinstance(n, str):
+            return h.decode("ascii"), n
         if isinstance(h, str) and isinstance(n, str):
             return h, n
         return None
     if isinstance(raw, list) and len(raw) == 2:
         h, n = raw
+        if isinstance(h, bytes) and isinstance(n, str):
+            return h.decode("ascii"), n
         if isinstance(h, str) and isinstance(n, str):
             return h, n
         return None

@@ -19,7 +19,7 @@ def _capture_stdenv(
     label_slots: list[str], eff_arch: Optional[str],
 ) -> None:
     """Siphon each unique stdenv raw root into ``out.stdenv_subtrees``."""
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[bytes, str]] = set()
     for rn, slot in zip(raw_nodes, label_slots):
         if rn.ident in seen:
             continue

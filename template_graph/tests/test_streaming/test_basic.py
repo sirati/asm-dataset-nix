@@ -128,7 +128,7 @@ def test_two_binaries_arch_indep_deps_first_visit_only():
     # non-backref idents to arch_indep_deps. So the shared ident
     # appears in hello (visited first) but not in goodbye.
     indep = result["arch_indep_deps"]
-    shared_ident = (shared_src.hash, shared_src.name)
+    shared_ident = shared_src.ident
     assert shared_ident in indep["hello"]
     assert shared_ident not in indep["goodbye"], (
         "second visit is a backref; planner correctly skips re-adding"
@@ -226,7 +226,7 @@ def test_calibration_cowalk_then_third_variant_assertion():
     assert classes[zlib_nid] == "common_dep"
     # All three variants stored the same hash at that row.
     assert arr.hashes[zlib_nid] == [
-        (shared_src_hash, "zlib-1.3.drv")
+        (shared_src_hash.encode("ascii"), "zlib-1.3.drv")
     ] * 3
     assert planner.violations == []
 
@@ -265,10 +265,10 @@ def test_arch_indep_deps_populated_per_binary():
     result = planner.finalize()
 
     indep = result["arch_indep_deps"]
-    assert (hello_src.hash, hello_src.name) in indep["hello"]
-    assert (hello_src.hash, hello_src.name) not in indep["goodbye"]
-    assert (goodbye_src.hash, goodbye_src.name) in indep["goodbye"]
-    assert (goodbye_src.hash, goodbye_src.name) not in indep["hello"]
+    assert hello_src.ident in indep["hello"]
+    assert hello_src.ident not in indep["goodbye"]
+    assert goodbye_src.ident in indep["goodbye"]
+    assert goodbye_src.ident not in indep["hello"]
     # Both binaries appear as keys.
     assert set(indep.keys()) == {"hello", "goodbye"}
 
