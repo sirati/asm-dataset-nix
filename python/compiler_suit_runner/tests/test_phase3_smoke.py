@@ -103,7 +103,9 @@ def _canonical_toolchain_task_id_for(descriptor) -> str:
     return f"build_compilers__{SYS_NAME}__{arch_v}__{comp}"
 
 
-def _assert_descriptors_contract(descriptors, streaming_result) -> None:
+def _assert_descriptors_contract(
+    descriptors, streaming_result, variant_lookup,
+) -> None:
     """Invariants the live matrix is expected to satisfy."""
     from compiler_suit_runner.workers.dependency_graph_worker.counters import (  # noqa: PLC0415
         compute_dependency_graph_counters,
@@ -116,11 +118,38 @@ def _assert_descriptors_contract(descriptors, streaming_result) -> None:
     assert len(build_variant_descs) > 0, (
         "no build_variant descriptors — variant_lookup never matched"
     )
+    # Exactly one ``build_variant`` per lookup entry -- the planner
+    # must mint a descriptor for every variant the matrix discovered
+    # (no extras, no drops between graph generation and planning).
+    assert len(build_variant_descs) == len(variant_lookup), (
+        f"build_variant_count {len(build_variant_descs)} != "
+        f"len(variant_lookup) {len(variant_lookup)}"
+    )
 
     task_ids = [d.task_id for d in descriptors]
     assert len(task_ids) == len(set(task_ids)), (
         "duplicate task_ids in plan: "
         + repr([t for t in task_ids if task_ids.count(t) > 1][:5])
+    )
+
+    # Every non-toolchain dep task must dedup (>= 2 dependents).
+    # ``build_compilers__*`` (toolchain pull-to-node) is the
+    # documented exception -- emit on presence, not on dedup.
+    counts: dict[str, int] = {}
+    for d in descriptors:
+        for dep in (d.depends_on or ()):
+            counts[dep] = counts.get(dep, 0) + 1
+    variant_task_ids = {d.task_id for d in build_variant_descs}
+    violators = sorted(
+        d.task_id for d in descriptors
+        if d.task_id not in variant_task_ids
+        and not d.task_id.startswith("build_compilers__")
+        and counts.get(d.task_id, 0) < 2
+    )
+    assert not violators, (
+        f"non-toolchain dep tasks with < 2 dependents (planner output "
+        f"bug -- a one-consumer dep should have been inlined): "
+        f"{violators}"
     )
 
     # Canonical-form toolchain wiring (Finding 3): each build_variant's
@@ -196,4 +225,4 @@ def test_phase3_smoke_live_matrix():
         variant_lookup=variant_lookup,
         toolchain_task_ids=toolchain_task_ids,
     )
-    _assert_descriptors_contract(descriptors, streaming_result)
+    _assert_descriptors_contract(descriptors, streaming_result, variant_lookup)

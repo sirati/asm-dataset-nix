@@ -3,5 +3,6 @@
   "violations_min": 1,
   "violations_at_least_kinds": [
     "calibration-same-name-count-mismatch"
-  ]
+  ],
+  "relax_dependent_count": true
 }
