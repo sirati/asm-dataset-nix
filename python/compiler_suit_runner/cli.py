@@ -1079,6 +1079,20 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
             return 1
 
+        # Fail fast when toolchain enumeration produced no aggregate but
+        # binaries are queued for matrix_eval: emit_matrix_eval_manifests
+        # would otherwise raise ``ValueError("toolchain_aggregate_drv
+        # must be a non-empty string")`` deep inside the manifest-emit
+        # step, masking the real preflight failure.
+        if per_binary_meta_raw and not tc_aggregate_drv:
+            log.error(
+                "submit pre-flight: toolchain aggregate is empty (no toolchain "
+                "leaves resolved) but %d binaries queued for matrix_eval — "
+                "refusing to emit manifests that will fail downstream",
+                len(per_binary_meta_raw),
+            )
+            return 1
+
         # Flatten the {pkg: {"archs": [...], "suffixes_by_arch":
         # {arch: [...]}, "sample_size": ..., "sample_seed": ...}} shape
         # returned by enumerate_variants into the {binary: {"archs":

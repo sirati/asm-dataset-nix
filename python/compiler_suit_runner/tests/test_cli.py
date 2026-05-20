@@ -441,23 +441,29 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
     existing test contracts remain meaningful.
     """
 
-    state: dict[str, list] = {
+    state: dict = {
         "preflight_calls": [],
         "emit_calls": [],
+        "emit_per_binary_metadata": [],
         "single_process_calls": [],
         "cache_lookup_calls": [],
         "cache_store_calls": [],
         "restore_calls": [],
+        # Mutable so individual tests can override what the stubbed
+        # enumerate_* helpers return without rewriting the whole
+        # fixture.
+        "toolchain_return": ((), {}, ""),
+        "variants_return": {},
     }
 
     def fake_enumerate_toolchains_only(
         flake_ref, sys_name, *, archs=None, run_subprocess=None,
     ):
         state["preflight_calls"].append((flake_ref, sys_name, None, archs))
-        # Empty toolchain set keeps downstream branches simple.
-        # Third element is the aggregate drv path; empty string here
-        # mirrors the "no leaves resolved → no aggregate" return shape.
-        return (), {}, ""
+        # Third element is the aggregate drv path; empty string by
+        # default mirrors the "no leaves resolved → no aggregate"
+        # return shape.
+        return state["toolchain_return"]
 
     monkeypatch.setattr(
         cli_module, "enumerate_toolchains_only", fake_enumerate_toolchains_only,
@@ -468,8 +474,7 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
         sample_size=0, sample_seed="42", run_subprocess=None,
     ):
         del flake_ref, sys_name, packages, archs, sample_size, sample_seed
-        # Empty per-binary metadata; emit_all_manifests handles it.
-        return {}
+        return state["variants_return"]
 
     monkeypatch.setattr(
         cli_module, "enumerate_variants", fake_enumerate_variants,
@@ -483,9 +488,10 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
     ):
         del (
             variants, toolchain_specs, common_deps, toolchain_drvs,
-            allow_toolchain_build, per_binary_metadata, drv_outpaths, stages,
+            allow_toolchain_build, drv_outpaths, stages,
         )
         state["emit_calls"].append((target_dir, sys_name, num_workers))
+        state["emit_per_binary_metadata"].append(per_binary_metadata)
 
         # Simulate manifest_dir population so cache.store can pack it.
         target_dir = pathlib.Path(target_dir)
@@ -493,6 +499,20 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
         (target_dir / "stub.json").write_text("{}")
 
     monkeypatch.setattr(cli_module, "emit_all_manifests", fake_emit)
+
+    # Stub the toolchain availability + outpath helpers so tests can
+    # drive ``cmd_submit`` with a non-empty ``tc_drvs`` without needing
+    # /nix/store entries to actually exist.
+    monkeypatch.setattr(
+        cli_module, "check_toolchains_locally", lambda drvs: frozenset(),
+    )
+    monkeypatch.setattr(
+        cli_module, "build_toolchains_locally", lambda drvs: None,
+    )
+    monkeypatch.setattr(
+        cli_module, "eval_drv_outpaths",
+        lambda drvs: {d: f"{d}.out" for d in drvs},
+    )
 
     def fake_single_process(config, *, logger=None):
         state["single_process_calls"].append(config)
@@ -669,6 +689,116 @@ def test_cmd_submit_propagates_failure(
     rc = cmd_submit(args)
     assert rc == 1
     assert stub_submit_helpers["cache_store_calls"] == []
+
+
+def test_cmd_submit_fails_fast_on_empty_toolchain_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    stub_submit_helpers: dict,
+    caplog: pytest.LogCaptureFixture,
+):
+    """When preflight returns an empty toolchain aggregate but
+    ``enumerate_variants`` reports binaries queued for matrix_eval,
+    cmd_submit must abort BEFORE manifest emission — otherwise
+    ``emit_matrix_eval_manifests`` raises ``ValueError`` deep inside
+    the emit step and the user-visible failure hides the real root
+    cause (toolchain enumeration produced no aggregate)."""
+
+    class _MissCache(IncrementalCache):
+        def lookup(self, input_hash: str):  # type: ignore[override]
+            return None
+
+        def store(self, *a, **kw):  # type: ignore[override]
+            stub_submit_helpers["cache_store_calls"].append("stored")
+            return None
+
+    monkeypatch.setattr(cli_module, "IncrementalCache", _MissCache)
+
+    # Preflight returns an empty aggregate (third element of tuple).
+    stub_submit_helpers["toolchain_return"] = ((), {}, "")
+    # But variants enumeration reports binaries queued for matrix_eval.
+    stub_submit_helpers["variants_return"] = {
+        "hello": {
+            "archs": ["x86_64"],
+            "suffixes_by_arch": {"x86_64": ["baseline-default-san-off-march-default"]},
+            "sample_size": 2,
+            "sample_seed": 42,
+        },
+    }
+
+    args = _make_args(tmp_path)
+    with caplog.at_level("ERROR"):
+        rc = cmd_submit(args)
+
+    assert rc == 1
+    # The guard short-circuits BEFORE emit_all_manifests runs.
+    assert stub_submit_helpers["emit_calls"] == []
+    # And BEFORE cache.store fires.
+    assert stub_submit_helpers["cache_store_calls"] == []
+    # The error log explicitly names the empty aggregate as the cause.
+    assert any(
+        "toolchain aggregate is empty" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_cmd_submit_populates_per_binary_toolchain_aggregate_drv(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    stub_submit_helpers: dict,
+):
+    """When preflight returns a non-empty toolchain aggregate AND
+    enumerate_variants returns binary metadata, cmd_submit's
+    construction loop must thread the aggregate drv path into every
+    per-binary metadata entry — and the fail-fast guard must NOT
+    fire."""
+
+    class _MissCache(IncrementalCache):
+        def lookup(self, input_hash: str):  # type: ignore[override]
+            return None
+
+        def store(self, input_hash, partition_path, manifests_dir, meta_path):  # type: ignore[override]
+            return CacheEntry(
+                input_hash=input_hash,
+                partition_path=partition_path,
+                manifests_archive=manifests_dir.parent / "manifests.tar",
+                meta_path=meta_path,
+            )
+
+    monkeypatch.setattr(cli_module, "IncrementalCache", _MissCache)
+
+    aggregate_drv = "/nix/store/fake-toolchains.drv"
+    stub_submit_helpers["toolchain_return"] = (
+        (("x86_64", "gcc15"),),
+        {("x86_64", "gcc15"): "/nix/store/fake-gcc15.drv"},
+        aggregate_drv,
+    )
+    stub_submit_helpers["variants_return"] = {
+        "hello": {
+            "archs": ["x86_64"],
+            "suffixes_by_arch": {"x86_64": ["baseline-default-san-off-march-default"]},
+            "sample_size": 2,
+            "sample_seed": 42,
+        },
+    }
+
+    args = _make_args(tmp_path)
+    rc = cmd_submit(args)
+    assert rc == 0
+
+    # emit_all_manifests received per_binary_metadata threaded through
+    # from the construction loop.
+    assert stub_submit_helpers["emit_per_binary_metadata"]
+    pbm = stub_submit_helpers["emit_per_binary_metadata"][-1]
+    assert pbm is not None
+    assert "hello" in pbm
+    assert pbm["hello"]["toolchain_aggregate_drv"] == aggregate_drv
+    assert pbm["hello"]["archs"] == ["x86_64"]
+    assert pbm["hello"]["suffixes"] == [
+        "baseline-default-san-off-march-default"
+    ]
+    assert pbm["hello"]["variant_sample"] == 2
+    assert pbm["hello"]["variant_seed"] == 42
 
 
 def test_serialize_then_restore_preflight_roundtrip(tmp_path: pathlib.Path):
