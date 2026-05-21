@@ -1935,14 +1935,15 @@ def test_task_completed_listener_forwards_to_watcher(
     assert watcher.completed == frozenset()
 
     listener(hello, True, None)
-    # Phase-3 dispatch is now driven from on_phase_end (per
-    # dynrunner-owner 2026-05-21); the listener only records.
+    # PH-D: phase-3 dispatch no longer fires from on_phase_end. The
+    # listener still records the completion for the matrix_aggregate
+    # bookkeeping path, but the watcher's ``_fired`` flag is never
+    # flipped because ``fire_phase_3`` is not called any more (the
+    # framework drives dependency_graph as a PhaseSpec task).
     assert watcher.completed == frozenset({hello})
     assert watcher.fired is False
-    # SuitTask.on_phase_end forwards into watcher.fire_phase_3 for
-    # matrix_eval — exercise it the same way the framework would.
     task.on_phase_end("matrix_eval", completed=1, failed=0)
-    assert watcher.fired is True
+    assert watcher.fired is False
 
 
 def test_task_completed_listener_noop_without_watcher(

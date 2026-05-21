@@ -13,25 +13,33 @@ Protocol under the new phase taxonomy:
   registered so the framework's dispatch surface is uniform; the CLI
   gate (``--build-compilers``) decides whether any manifests are
   actually emitted.
-* ``dependency_graph`` (phase 3) — primary-only worker invoked by
-  :class:`_MatrixEvalQuiesceWatcher` as a subprocess once every
-  ``matrix_eval`` task has quiesced. No framework PhaseSpec — the
-  watcher runs the subprocess inline and the descriptors it produces
-  are spawned as phase-4 work via ``primary_handle.spawn_tasks``. See
-  ``_MatrixEvalQuiesceWatcher._fire`` for the full hand-off.
+* ``dependency_graph`` (phase 3) — framework task, one per binary;
+  ``task_depends_on=[matrix_eval__<binary>]`` so the CRDT activates
+  each dep_graph task atomically with the matching matrix_eval
+  TaskCompleted apply. The worker reads
+  ``<matrix_eval_out_dir>/<binary>.matrix_aggregate.json`` + the
+  imported per-binary nix-archive, runs the streaming planner, and
+  emits per-(compiler, arch) sidecar manifests at
+  ``<matrix_eval_out_dir>/_manifests/`` for the placeholder
+  build_variant tasks to consume. Pre-PH-A this step ran as an
+  in-process subprocess invoked by
+  :class:`_MatrixEvalQuiesceWatcher` from
+  :meth:`SuitTask.on_phase_end`; that path is now disabled (see PH-D
+  comment in :meth:`on_phase_end`).
 * ``build`` (phase 4) — distributed ``build_common_dep`` +
   ``build_variant`` workers; ``toolchain_validate`` shares the same
   dispatch (rarely emitted, gated by ``--debug-testbuild``).
+  ``build_variant`` tasks are declared at submit time as K-sized
+  placeholders behind ``dependency_graph__<binary>``; the worker
+  resolves each placeholder via its per-cell sidecar slot.
 
 Responsibilities:
 
 1. **Topology** (:meth:`get_phases`) declares the ``matrix_eval``,
-   ``build_compilers`` and ``build`` framework phases. The
-   ``dependency_graph`` step is primary-only; it runs from the
-   :class:`_MatrixEvalQuiesceWatcher` (which lives on the primary's
-   completion-event thread) so we keep it out of the framework
-   PhaseSpec graph entirely — primary-affined PhaseSpec support is
-   not part of the dynamic-runner contract today.
+   ``build_compilers``, ``dependency_graph`` and ``build`` framework
+   phases. All four are first-class PhaseSpecs; the dispatch graph
+   between them is encoded as ``depends_on`` tuples so the framework
+   schedules them in topological order.
 2. **Item discovery** (:meth:`discover_items`) scans the manifest
    directory written by :mod:`compiler_suit_runner.manifest_gen` and
    yields one :class:`TaskInfo` per manifest, classifying each by
@@ -631,6 +639,19 @@ def _resolve_bash_store_path() -> Optional[str]:
 
 class _MatrixEvalQuiesceWatcher:
     """Wait for every ``matrix_eval__<binary>`` task to complete, then plan.
+
+    .. note::
+       Transitional after PH-D: the framework now drives phase-3 via
+       its own ``dependency_graph`` PhaseSpec (see PH-A in
+       plan/placeholder-pattern-restructure.md), so
+       :meth:`SuitTask.on_phase_end` no longer invokes
+       :meth:`fire_phase_3`. ``_record_matrix_aggregate`` continues to
+       populate the matrix_aggregate cache for observability + the
+       gateway rsync mirror, but the ``_fire`` /
+       ``_spawn_tasks`` dispatch surface is unused on the cluster.
+       The methods are retained because some single-process tests
+       still exercise them; once those migrate to framework-task
+       dispatch the whole class can be deleted.
 
     The watcher is registered as a task-completion listener at
     :meth:`SuitTask.on_run_start`. Each call to :meth:`on_task_completed`
@@ -2904,19 +2925,18 @@ class SuitTask:
             completed,
             failed,
         )
-        # Phase-3 (dependency_graph + build_variant spawn) MUST be
-        # driven from here — TaskCompletedEvent fires off the
-        # operational loop's apply path, so calling spawn_tasks from
-        # on_task_completed races the loop's exit-condition check.
-        # See dynrunner-owner 2026-05-21 10:45 + framework's
-        # crates/dynrunner-manager-distributed/src/primary/coordinator.rs:1516-1525.
-        if phase_id == "matrix_eval" and self._matrix_eval_watcher is not None:
-            try:
-                self._matrix_eval_watcher.fire_phase_3()
-            except Exception:  # noqa: BLE001 — never propagate into framework
-                self._logger.exception(
-                    "on_phase_end: matrix_eval watcher fire_phase_3 raised"
-                )
+        # PH-D: phase-3 dispatch is no longer driven from on_phase_end.
+        # PH-A registers ``dependency_graph`` as a framework PhaseSpec
+        # with ``depends_on=("matrix_eval",)`` so the CRDT activates
+        # each dep_graph task atomically with the matching matrix_eval
+        # TaskCompleted apply. PH-B+C place K-sized build_variant
+        # placeholders behind ``dependency_graph__<binary>``. No
+        # in-process subprocess + spawn_tasks fan-out is required; the
+        # framework handles the full phase-3 → phase-4 graph itself.
+        # The matrix_eval watcher's ``_record_matrix_aggregate`` still
+        # populates the gateway rsync mirror needed for archive
+        # discovery, but its ``fire_phase_3`` entry point is no longer
+        # invoked from here.
 
     # ── Broadcast-receive placement gossip ────────────────────────────
 
