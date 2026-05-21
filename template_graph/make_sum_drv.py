@@ -193,18 +193,53 @@ def _run_nix_instantiate(
                         fh.write(f"(read failed: {exc})")
                     fh.write("\n\n--- harmonia probe (localhost:5005) ---\n")
                     try:
+                        from urllib.request import urlopen  # noqa: PLC0415
+                        with urlopen(
+                            "http://localhost:5005/nix-cache-info",
+                            timeout=5,
+                        ) as r:
+                            fh.write(
+                                f"status={r.status} headers={dict(r.headers)}\n"
+                                f"body: {r.read().decode('utf-8','replace')[:500]}"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        fh.write(f"(probe failed: {exc!r})")
+                    fh.write("\n\n--- nix store ping localhost:5005 ---\n")
+                    try:
                         probe = subprocess.run(
-                            ["curl", "-sv", "--max-time", "5",
-                             "http://localhost:5005/nix-cache-info"],
-                            capture_output=True, check=False,
+                            ["nix", "store", "ping",
+                             "--extra-experimental-features",
+                             "nix-command flakes",
+                             "--store", "http://localhost:5005"],
+                            capture_output=True, check=False, timeout=10,
                         )
                         fh.write(
                             f"rc={probe.returncode}\n"
                             f"stdout: {probe.stdout.decode('utf-8','replace')}\n"
                             f"stderr: {probe.stderr.decode('utf-8','replace')}"
                         )
-                    except OSError as exc:
-                        fh.write(f"(curl probe failed: {exc})")
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        fh.write(f"(nix store ping failed: {exc})")
+                    fh.write(
+                        "\n\n--- nix path-info on toolchains.drv via "
+                        "submitter ---\n",
+                    )
+                    try:
+                        probe = subprocess.run(
+                            ["nix", "path-info",
+                             "--extra-experimental-features",
+                             "nix-command flakes",
+                             "--store", "http://localhost:5005",
+                             "/nix/store/p1q09cznx974drnxf8jv6m7bcy9rzcqa-toolchains.drv"],
+                            capture_output=True, check=False, timeout=15,
+                        )
+                        fh.write(
+                            f"rc={probe.returncode}\n"
+                            f"stdout: {probe.stdout.decode('utf-8','replace')}\n"
+                            f"stderr: {probe.stderr.decode('utf-8','replace')}"
+                        )
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        fh.write(f"(nix path-info failed: {exc})")
             except OSError:
                 pass
         raise RuntimeError(
