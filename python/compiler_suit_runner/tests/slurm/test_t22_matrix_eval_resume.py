@@ -198,7 +198,7 @@ def _matrix_eval_out_dir(shared_fs: pathlib.Path) -> pathlib.Path:
 
 
 def _archive_path(shared_fs: pathlib.Path, binary: str) -> pathlib.Path:
-    """Archive path for ``binary`` -- the matrix-eval resume marker.
+    """Archive path for ``binary`` -- one of two matrix-eval resume markers.
 
     Mirrors :func:`eval_worker._archive_path` -- kept local so the
     test doesn't import the worker module just for one constant; a
@@ -208,33 +208,60 @@ def _archive_path(shared_fs: pathlib.Path, binary: str) -> pathlib.Path:
     return _matrix_eval_out_dir(shared_fs) / f"{binary}.nix-archive"
 
 
+def _sidecar_path(shared_fs: pathlib.Path, binary: str) -> pathlib.Path:
+    """Sidecar path -- the second resume marker.
+
+    Post-PH-A, the dependency_graph framework task reads the
+    matrix_aggregate drv from this JSON sidecar, so eval_worker now
+    requires BOTH archive and sidecar to be present for its resume
+    short-circuit to fire. The test waits for both before killing the
+    submitter to keep the second-dispatch resume path valid.
+    """
+    return _matrix_eval_out_dir(shared_fs) / f"{binary}.matrix_aggregate.json"
+
+
 def _wait_for_marker(
     archive: pathlib.Path,
     *,
     timeout_s: float = MARKER_WATCH_TIMEOUT_S,
     poll_interval_s: float = MARKER_POLL_INTERVAL_S,
+    sidecar: Optional[pathlib.Path] = None,
 ) -> bool:
-    """Poll ``archive`` until it exists and is non-empty, with a deadline.
+    """Poll until both markers exist and are non-empty, with a deadline.
 
-    Returns ``True`` on success, ``False`` on timeout. The resume
-    short-circuit in ``run_eval_task`` fires when the archive exists
-    and has non-zero size (see ``workers.eval_worker.run_eval_task``
-    Step 0), so the test must wait for that condition to hold before
-    SIGKILL'ing the submitter. The JSON sidecar that used to accompany
-    the archive was retired — the dependency_graph_worker derives
-    variant_lookup from the imported .drv paths via
-    ``parse_variant_path``.
+    Returns ``True`` on success, ``False`` on timeout. Post-PH-A, the
+    resume short-circuit in ``run_eval_task`` fires only when BOTH the
+    archive and the matrix_aggregate sidecar exist and are non-empty
+    (see ``workers.eval_worker.run_eval_task`` Step 0), so the test
+    must wait for that condition to hold before SIGKILL'ing the
+    submitter. The sidecar is written immediately after the archive
+    in the eval worker; the gap is typically sub-second but the wait
+    is bounded by the same timeout regardless.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        archive_ok = False
+        sidecar_ok = sidecar is None
         if archive.exists():
             try:
-                if archive.stat().st_size > 0:
-                    return True
+                archive_ok = archive.stat().st_size > 0
             except OSError:
                 pass
+        if sidecar is not None and sidecar.exists():
+            try:
+                sidecar_ok = sidecar.stat().st_size > 0
+            except OSError:
+                pass
+        if archive_ok and sidecar_ok:
+            return True
         time.sleep(poll_interval_s)
-    return archive.exists() and archive.stat().st_size > 0
+    # Best-effort final check.
+    archive_ok = archive.exists() and archive.stat().st_size > 0
+    sidecar_ok = (
+        sidecar is None
+        or (sidecar.exists() and sidecar.stat().st_size > 0)
+    )
+    return archive_ok and sidecar_ok
 
 
 def _spawn_submit_background(
@@ -412,11 +439,13 @@ def test_t22_matrix_eval_resume(
     started_first = time.monotonic()
     proc, _, _ = _spawn_submit_background(argv)
 
+    sidecar = _sidecar_path(invocation.shared_fs, "hello")
     try:
         marker_seen = _wait_for_marker(
             archive,
             timeout_s=MARKER_WATCH_TIMEOUT_S,
             poll_interval_s=MARKER_POLL_INTERVAL_S,
+            sidecar=sidecar,
         )
         first_wall = time.monotonic() - started_first
 
@@ -462,7 +491,7 @@ def test_t22_matrix_eval_resume(
         f"archive={archive!s}"
     )
 
-    # ---- post-kill assertions on the marker --------------------------
+    # ---- post-kill assertions on both resume markers -----------------
     assert archive.is_file(), (
         f"resume archive disappeared between watch and assertion at "
         f"{archive} ({first_detail}). stderr tail:\n"
@@ -473,6 +502,18 @@ def test_t22_matrix_eval_resume(
         f"eval worker wrote a zero-byte archive which is the "
         f"'no plannable variants' outcome — T22 needs at least "
         f"one variant for the resume short-circuit to be exercised."
+        f"\nstderr tail:\n{first_stderr[-2000:]}"
+    )
+    # Sidecar required post-PH-A. Both markers are written within the
+    # same `run_eval_task` invocation, so seeing the archive without
+    # the sidecar means the worker wrote the archive then crashed
+    # before the sidecar drop — a separate failure we surface here.
+    assert sidecar.is_file() and sidecar.stat().st_size > 0, (
+        f"matrix_aggregate sidecar {sidecar} missing or empty "
+        f"({first_detail}); eval worker wrote the archive but did "
+        f"not complete the sidecar drop. Without it, eval_worker "
+        f"won't honour the resume short-circuit on the second "
+        f"dispatch and the test loses its discriminator."
         f"\nstderr tail:\n{first_stderr[-2000:]}"
     )
 
