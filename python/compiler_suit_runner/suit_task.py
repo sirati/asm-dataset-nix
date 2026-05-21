@@ -863,11 +863,20 @@ class _MatrixEvalQuiesceWatcher:
                 self._matrix_aggregates[binary] = matrix_drv
                 return
         # Fall through to sidecar lookup (the canonical cluster path).
+        # Post-PH-D the watcher's matrix_aggregates cache is no longer
+        # the source of truth for downstream dispatch — the framework's
+        # dependency_graph PhaseSpec reads the sidecar directly inside
+        # the worker subprocess. The bookkeeping here is retained for
+        # observability + single-process tests; missing/unreadable
+        # sidecars are normal in the cluster topology (the file lives
+        # on a bind-mount the primary container can't always see). We
+        # downgrade these messages to DEBUG so production logs stay
+        # clean.
         if not binary:
-            self._logger.warning(
+            self._logger.debug(
                 "_MatrixEvalQuiesceWatcher: matrix_eval task %s has no"
                 " result dict and no binary derivable from task_id;"
-                " dgw --matrix-drv entry omitted",
+                " bookkeeping entry omitted",
                 task_id,
             )
             return
@@ -875,19 +884,20 @@ class _MatrixEvalQuiesceWatcher:
         try:
             payload = json.loads(sidecar.read_text())
         except (OSError, json.JSONDecodeError) as exc:
-            self._logger.warning(
+            self._logger.debug(
                 "_MatrixEvalQuiesceWatcher: matrix_eval task %s"
-                " (binary=%s): no result dict AND sidecar %s unreadable"
-                " (%s); dgw --matrix-drv entry omitted",
+                " (binary=%s): sidecar %s unreadable (%s); bookkeeping"
+                " entry omitted (framework dep_graph reads sidecar"
+                " directly on the worker)",
                 task_id, binary, sidecar, exc,
             )
             return
         matrix_drv = payload.get("matrix_aggregate_drv")
         if not isinstance(matrix_drv, str) or not matrix_drv:
-            self._logger.warning(
+            self._logger.debug(
                 "_MatrixEvalQuiesceWatcher: matrix_eval task %s"
                 " (binary=%s): sidecar %s has no matrix_aggregate_drv"
-                " (value=%r); dgw --matrix-drv entry omitted",
+                " (value=%r); bookkeeping entry omitted",
                 task_id, binary, sidecar, matrix_drv,
             )
             return
