@@ -127,6 +127,43 @@ def _read_list_file(path: Path | None) -> list[str]:
     return out
 
 
+_PEER_CONF_PATHS = ("/etc/nix/peer.conf",)
+
+
+def _live_peer_conf_opts() -> list[str]:
+    """Return ``--option`` argv fragments forwarding the current
+    ``extra-substituters`` + ``extra-trusted-public-keys`` from
+    ``/etc/nix/peer.conf`` (if present).
+
+    Empty list if no peer.conf exists or it has no values. Tolerates
+    malformed entries — the worker's substituter recovery is
+    best-effort, not a hard contract.
+    """
+    opts: list[str] = []
+    for path in _PEER_CONF_PATHS:
+        try:
+            with open(path) as fh:
+                body = fh.read()
+        except OSError:
+            continue
+        for line in body.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if key in (
+                "extra-substituters",
+                "extra-trusted-public-keys",
+            ) and val:
+                opts.extend(["--option", key, val])
+        break
+    return opts
+
+
 def _run_nix_instantiate(
     expr: str,
     *,
@@ -147,6 +184,16 @@ def _run_nix_instantiate(
         if with_flakes:
             argv += ["--extra-experimental-features", "flakes"]
         argv.append(expr_file)
+        # The nix-daemon reads /etc/nix/nix.conf at startup. On the
+        # secondary container `peer.conf` is populated AFTER daemon
+        # boot (PeerNixConfWatcher rewrites it once the submitter
+        # advertises its harmonia), so the daemon still operates with
+        # its boot-time substituters list. Forwarding the live peer.conf
+        # contents via --option on the client call propagates them to
+        # the daemon for THIS request, letting nix-instantiate substitute
+        # submitter-built input drvs that wouldn't otherwise be reachable.
+        for opt_arg in _live_peer_conf_opts():
+            argv.append(opt_arg)
         if extra_nix_args:
             argv.extend(extra_nix_args)
         proc = subprocess.run(argv, capture_output=True, check=False)

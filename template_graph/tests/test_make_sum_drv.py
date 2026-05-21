@@ -360,7 +360,7 @@ def test_run_nix_instantiate_failure_mirrors_stderr_and_dumps_debug_log(
     """
     monkeypatch.setenv("CSR_NIX_DEBUG_DIR", str(tmp_path))
 
-    def _fake_run(argv, capture_output=True, check=False):
+    def _fake_run(argv, capture_output=True, check=False, **_):
         return _FakeCompletedProcess(
             returncode=1,
             stdout=b"",
@@ -451,7 +451,7 @@ def test_run_nix_instantiate_failure_without_debug_dir_still_mirrors_stderr(
     """
     monkeypatch.delenv("CSR_NIX_DEBUG_DIR", raising=False)
 
-    def _fake_run(argv, capture_output=True, check=False):
+    def _fake_run(argv, capture_output=True, check=False, **_):
         return _FakeCompletedProcess(
             returncode=2,
             stdout=b"",
