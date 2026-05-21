@@ -104,7 +104,10 @@ def _make_run_subprocess(responses: dict[str, object]):
         # one of:
         #   - ``m: { "S1" = m."S1"; ... }`` — projection by suffix list
         #   - ``m: builtins.mapAttrs (_: a: builtins.attrNames a) m``
-        #     — pkg → [arch] index for the scoped-meta path
+        #     — pkg → [arch] index for the per-pkg arch query against
+        #     ``dataset.<sys>``
+        #   - ``m: builtins.attrNames m`` — top-level key list for the
+        #     package-name query against ``dataset.<sys>``
         if apply_expr and isinstance(payload, dict):
             if "mapAttrs" in apply_expr and "attrNames" in apply_expr:
                 projected = {
@@ -112,6 +115,8 @@ def _make_run_subprocess(responses: dict[str, object]):
                     for pkg, arches in payload.items()
                 }
                 return json.dumps(projected).encode("utf-8"), b"", 0
+            if "attrNames" in apply_expr:
+                return json.dumps(list(payload.keys())).encode("utf-8"), b"", 0
             suffixes = re.findall(r'"([A-Za-z0-9._-]+)"\s*=\s*m\."', apply_expr)
             if suffixes:
                 projected = {s: payload[s] for s in suffixes if s in payload}
@@ -205,6 +210,7 @@ def _all_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
     responses: dict[str, object] = {
         f"_meta.{sys_name}": meta,
         f"_drvPaths.{sys_name}": drvs,
+        f"dataset.{sys_name}": drvs,
         f"_crossToolchainsMeta.{sys_name}": _fake_toolchains(),
     }
     for pkg, arch_map in drvs.items():
@@ -276,10 +282,12 @@ def test_enumerate_variants_full_matrix():
     assert set(result.keys()) == {"hello", "busybox"}
     assert sorted(result["hello"]["archs"]) == ["aarch64", "x86_64"]
     assert result["busybox"]["archs"] == ["x86_64"]
-    assert result["hello"]["suffixes_by_arch"]["x86_64"] == [
-        "gcc15-O0-baseline-unhardened",
-        "gcc15-O2-baseline-unhardened",
-    ]
+    # New shape: no per-arch suffix lists — those are enumerated on the
+    # cluster inside matrix_eval. The submitter only surfaces the four
+    # per-pkg metadata fields below.
+    assert set(result["hello"]) == {
+        "archs", "sample_size", "sample_seed", "tier",
+    }
 
 
 def test_enumerate_variants_filter_by_packages():
@@ -301,9 +309,13 @@ def test_enumerate_variants_filter_by_archs():
         archs=["aarch64"],
         run_subprocess=runner,
     )
-    # Only hello has an aarch64 cell in the fixture; busybox is dropped.
-    assert set(result.keys()) == {"hello"}
+    # The submitter no longer probes per-(pkg, arch) cells, so every
+    # package retains the caller's arch filter verbatim — the matrix_eval
+    # worker is responsible for dropping (pkg, arch) cells the matrix
+    # doesn't actually expose.
+    assert set(result.keys()) == {"hello", "busybox"}
     assert result["hello"]["archs"] == ["aarch64"]
+    assert result["busybox"]["archs"] == ["aarch64"]
 
 
 def test_enumerate_variants_combined_filter():
@@ -466,6 +478,7 @@ def _wide_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
     responses: dict[str, object] = {
         f"_meta.{sys_name}": meta,
         f"_drvPaths.{sys_name}": drvs,
+        f"dataset.{sys_name}": drvs,
         f"_crossToolchainsMeta.{sys_name}": _fake_toolchains(),
     }
     for pkg, arch_map in drvs.items():
@@ -479,11 +492,11 @@ def _wide_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
     return responses
 
 
-def test_enumerate_variants_pre_samples_at_submit_time():
-    """Submit-time pre-sampling: the wire manifest carries the already-
-    sampled suffix subset (not the full 12) and signals to the worker
-    via ``sample_size=0`` that no re-sampling is needed. Without this,
-    a 150k-variant matrix overflows the ClusterMutation SSH tunnel."""
+def test_enumerate_variants_threads_sample_args_to_worker():
+    """The submitter no longer pre-samples — sampling is the worker's
+    job (``eval_worker._sample_per_arch``). ``enumerate_variants`` just
+    threads the caller's ``sample_size`` and ``sample_seed`` through to
+    each pkg entry so the wire manifest carries them verbatim."""
     runner, _ = _make_run_subprocess(_wide_responses())
     result = enumerate_variants(
         ".",
@@ -492,12 +505,9 @@ def test_enumerate_variants_pre_samples_at_submit_time():
         sample_seed="alpha",
         run_subprocess=runner,
     )
-    # Worker re-sampling disabled — suffixes are the final subset.
-    assert result["hello"]["sample_size"] == 0
+    # The arguments flow straight through; no rewrite to 0.
+    assert result["hello"]["sample_size"] == 2
     assert result["hello"]["sample_seed"] == "alpha"
-    # Sampling is per (compiler, opt) group: 1 compiler x 2 opts = 2
-    # groups, sample_size=2 each → 4 suffixes total.
-    assert len(result["hello"]["suffixes_by_arch"]["x86_64"]) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -700,45 +710,39 @@ def test_enumerate_variants_returns_metadata_only():
         sample_seed="alpha",
         run_subprocess=runner,
     )
-    # Return shape: dict[pkg, metadata_dict].
+    # Return shape: dict[pkg, metadata_dict] with exactly four fields
+    # per pkg — no ``suffixes`` / ``suffixes_by_arch`` (those are
+    # enumerated on the cluster).
     assert isinstance(result, dict)
     assert set(result.keys()) == {"hello", "busybox"}
 
     hello = result["hello"]
+    assert set(hello) == {"archs", "sample_size", "sample_seed", "tier"}
     assert sorted(hello["archs"]) == ["aarch64", "x86_64"]
-    # Submit-time pre-sampling already ran; sample_size=0 signals to
-    # the worker that the carried suffix list is the final subset.
-    assert hello["sample_size"] == 0
+    assert hello["sample_size"] == 3
     assert hello["sample_seed"] == "alpha"
     assert hello["tier"] == 1
-    # Only 2 candidates exist for hello/x86_64 (one per opt group);
-    # sample_size=3 keeps all of them (min(sample, len)).
-    assert hello["suffixes_by_arch"]["x86_64"] == [
-        "gcc15-O0-baseline-unhardened",
-        "gcc15-O2-baseline-unhardened",
-    ]
-    assert hello["suffixes_by_arch"]["aarch64"] == [
-        "gcc15-O2-baseline-unhardened",
-    ]
 
     busybox = result["busybox"]
+    assert set(busybox) == {"archs", "sample_size", "sample_seed", "tier"}
     assert busybox["archs"] == ["x86_64"]
-    assert busybox["suffixes_by_arch"]["x86_64"] == [
-        "gcc15-O2-baseline-unhardened",
-    ]
+    assert busybox["sample_size"] == 3
+    assert busybox["sample_seed"] == "alpha"
 
     # Regression guard: the slow drv-instantiation path is never hit.
     # No call should target ``_drvPaths.<sys>`` (the cached full-matrix
-    # eval) and no nix-eval-jobs subprocess should be spawned.
+    # eval) and no nix-eval-jobs subprocess should be spawned. Also
+    # neither ``_meta.<sys>`` nor any per-(pkg, arch) cell — those
+    # belong to the matrix_eval worker.
     for argv in calls:
         if argv and pathlib.Path(argv[0]).name == "nix-eval-jobs":
             raise AssertionError(
                 f"nix-eval-jobs spawned: {argv}"
             )
         for tok in argv:
-            if "#_drvPaths." in tok:
+            if "#_drvPaths." in tok or "#_meta." in tok:
                 raise AssertionError(
-                    f"_drvPaths eval triggered: {tok}"
+                    f"variant-side eval triggered: {tok}"
                 )
 
 
@@ -754,7 +758,6 @@ def test_enumerate_variants_honours_filters():
     )
     assert set(result.keys()) == {"hello"}
     assert result["hello"]["archs"] == ["x86_64"]
-    assert "aarch64" not in result["hello"]["suffixes_by_arch"]
 
 
 # ---------------------------------------------------------------------------
