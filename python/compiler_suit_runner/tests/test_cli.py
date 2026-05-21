@@ -720,9 +720,9 @@ def test_cmd_submit_fails_fast_on_empty_toolchain_aggregate(
     stub_submit_helpers["variants_return"] = {
         "hello": {
             "archs": ["x86_64"],
-            "suffixes_by_arch": {"x86_64": ["baseline-default-san-off-march-default"]},
             "sample_size": 2,
             "sample_seed": 42,
+            "tier": 1,
         },
     }
 
@@ -776,9 +776,9 @@ def test_cmd_submit_populates_per_binary_toolchain_aggregate_drv(
     stub_submit_helpers["variants_return"] = {
         "hello": {
             "archs": ["x86_64"],
-            "suffixes_by_arch": {"x86_64": ["baseline-default-san-off-march-default"]},
             "sample_size": 2,
             "sample_seed": 42,
+            "tier": 1,
         },
     }
 
@@ -792,13 +792,22 @@ def test_cmd_submit_populates_per_binary_toolchain_aggregate_drv(
     pbm = stub_submit_helpers["emit_per_binary_metadata"][-1]
     assert pbm is not None
     assert "hello" in pbm
+    # New flatten shape: archs, variant_sample, variant_seed, tier,
+    # toolchain_aggregate_drv. Per-arch suffix selection now lives in
+    # eval_worker, not the submit-time flatten loop.
+    assert "suffixes" not in pbm["hello"]
+    assert set(pbm["hello"].keys()) == {
+        "archs",
+        "variant_sample",
+        "variant_seed",
+        "tier",
+        "toolchain_aggregate_drv",
+    }
     assert pbm["hello"]["toolchain_aggregate_drv"] == aggregate_drv
     assert pbm["hello"]["archs"] == ["x86_64"]
-    assert pbm["hello"]["suffixes"] == [
-        "baseline-default-san-off-march-default"
-    ]
     assert pbm["hello"]["variant_sample"] == 2
     assert pbm["hello"]["variant_seed"] == 42
+    assert pbm["hello"]["tier"] == 1
 
 
 def test_serialize_then_restore_preflight_roundtrip(tmp_path: pathlib.Path):
