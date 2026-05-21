@@ -1131,12 +1131,24 @@ def test_seed_toolchain_drvs_empty_set_returns_zero_summary() -> None:
     assert result == {"sent": 0, "failed": 0, "failed_drvs": []}
 
 
+def _stub_first_secondary_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test helper: short-circuit the reachability probe so tests exercising
+    the broadcast loop don't depend on a real HTTP listener.
+    """
+    from compiler_suit_runner.peer_cache import SubmitterPeer
+    monkeypatch.setattr(
+        SubmitterPeer, "_first_secondary_reachable",
+        lambda self, url: True,
+    )
+
+
 def test_seed_toolchain_drvs_happy_path_one_call_per_drv(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Each drv triggers exactly one ``push_path_broadcast_offer`` call
     with size from disk, fresh broadcast_id, origin=submitter, hop=0."""
+    _stub_first_secondary_reachable(monkeypatch)
     drv_a = _write_drv(tmp_path / "a.drv", b"alpha" * 7)
     drv_b = _write_drv(tmp_path / "b.drv", b"beta" * 11)
     drv_c = _write_drv(tmp_path / "c.drv", b"gamma" * 13)
@@ -1185,6 +1197,7 @@ def test_seed_toolchain_drvs_partial_failure_records_failed_drvs(
 ) -> None:
     """A None response from push_path_broadcast_offer for one drv lands
     it in ``failed_drvs`` while the rest of the set still succeeds."""
+    _stub_first_secondary_reachable(monkeypatch)
     drv_ok1 = _write_drv(tmp_path / "ok1.drv", b"x" * 16)
     drv_bad = _write_drv(tmp_path / "bad.drv", b"y" * 32)
     drv_ok2 = _write_drv(tmp_path / "ok2.drv", b"z" * 48)
@@ -1212,6 +1225,7 @@ def test_seed_toolchain_drvs_all_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If every push returns None, sent=0 and failed_drvs lists all."""
+    _stub_first_secondary_reachable(monkeypatch)
     drvs = {
         _write_drv(tmp_path / f"drv{i}.drv", bytes([i]) * (8 + i))
         for i in range(4)
@@ -1237,6 +1251,7 @@ def test_seed_toolchain_drvs_missing_file_lands_in_failed_drvs(
 ) -> None:
     """A drv whose on-disk file is missing (stat raises OSError) is
     recorded as a failure WITHOUT a peer_push call for that path."""
+    _stub_first_secondary_reachable(monkeypatch)
     drv_ok = _write_drv(tmp_path / "ok.drv", b"present")
     drv_missing = str(tmp_path / "nope.drv")  # never created
 
@@ -1260,3 +1275,39 @@ def test_seed_toolchain_drvs_missing_file_lands_in_failed_drvs(
     # Only the present drv was actually broadcast.
     assert len(calls) == 1
     assert calls[0]["path"] == drv_ok
+
+
+def test_seed_toolchain_drvs_off_cluster_short_circuits(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the first-secondary URL is unreachable from the submitter
+    (e.g. off-cluster LMU dispatch), the broadcast loop short-circuits
+    before any per-drv push attempts."""
+    from compiler_suit_runner.peer_cache import SubmitterPeer
+    monkeypatch.setattr(
+        SubmitterPeer, "_first_secondary_reachable",
+        lambda self, url: False,
+    )
+
+    drvs = {
+        _write_drv(tmp_path / f"d{i}.drv", b"x" * (5 + i))
+        for i in range(3)
+    }
+    calls: list[dict] = []
+
+    def fake_push(**kwargs):
+        calls.append(kwargs)
+        return {"dedup": False, "accepted": True}
+
+    from compiler_suit_runner import peer_push
+    monkeypatch.setattr(peer_push, "push_path_broadcast_offer", fake_push)
+
+    peer = _make_submitter_for_seed()
+    result = peer.seed_toolchain_drvs(drvs, "http://offcluster:6000")
+
+    assert result == {
+        "sent": 0, "failed": 0, "failed_drvs": [],
+        "skipped_unreachable": True,
+    }
+    assert calls == []  # zero per-drv POSTs
