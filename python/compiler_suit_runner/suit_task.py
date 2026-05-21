@@ -670,6 +670,9 @@ class _MatrixEvalQuiesceWatcher:
         dependency_graph_command_override: Optional[list[str]] = None,
         bash_path: Optional[str] = None,
         toolchain_aggregate_drv: str = "",
+        gateway_url: Optional[str] = None,
+        slurm_root_folder: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> None:
         self._expected: frozenset[str] = frozenset(expected_task_ids)
         self._completed: set[str] = set()
@@ -700,6 +703,17 @@ class _MatrixEvalQuiesceWatcher:
         # When None at construction time, ``_resolve_bash_store_path``
         # is called lazily at fire time (and cached).
         self._bash_path = bash_path
+        # Gateway-mirror inputs. The dispatcher writes worker outputs
+        # to the gateway's ``<slurm_root_folder>/out/_matrix_eval/``
+        # via the per-container bind-mount; the framework does NOT
+        # sync those back to the submitter, so the watcher rsyncs them
+        # into ``self._out_dir`` itself before importing archives /
+        # reading sidecars. All three fields together gate the mirror —
+        # any missing → step is skipped (tests, local single-host
+        # runs).
+        self._gateway_url = gateway_url
+        self._slurm_root_folder = slurm_root_folder
+        self._run_id = run_id
         self._fired: bool = False
         self._lock = threading.Lock()
         self._logger = logger or logging.getLogger(__name__)
@@ -864,6 +878,13 @@ class _MatrixEvalQuiesceWatcher:
             " starting dependency_graph subprocess",
             len(self._expected),
         )
+        # Mirror gateway-side worker outputs into self._out_dir. The
+        # framework's bind-mount only flows gateway → container; the
+        # submitter side stays empty unless we rsync explicitly. Then
+        # re-walk the (now populated) out_dir for sidecars so the
+        # phase-3 aggregate map is complete before we check it.
+        self._mirror_outputs_from_gateway()
+        self._reread_matrix_aggregate_sidecars()
         # Phase 3 cannot run without (a) the toolchain aggregate drv
         # that anchors the sum-drv graph, AND (b) at least one
         # matrix_eval task contributing a per-binary aggregate. Bail
@@ -915,6 +936,113 @@ class _MatrixEvalQuiesceWatcher:
             return
         headers = headers_from_descriptors(descriptors)
         self._spawn_tasks(headers)
+
+    def _mirror_outputs_from_gateway(self) -> None:
+        """Rsync the gateway-side matrix_eval output dir into ``self._out_dir``.
+
+        The framework's `-R` bind-mount delivers worker outputs to
+        ``<slurm_root_folder>/out/`` on the gateway but does NOT sync
+        them back to the submitter's ``<shared_fs>/dataset/``. The
+        watcher runs on the submitter, so phase 3's inputs
+        (``<binary>.nix-archive`` + ``<binary>.matrix_aggregate.json``)
+        live on the wrong host until we mirror them. One ``rsync``
+        invocation pulls the entire ``out/_matrix_eval/`` tree onto
+        the submitter.
+
+        Skipped silently when gateway parameters are missing (single-
+        host tests, local-mode dispatches). Errors are logged at
+        WARNING — the caller's existing fall-through paths surface
+        the absence loudly enough.
+        """
+        if not (
+            self._gateway_url
+            and self._slurm_root_folder
+        ):
+            return
+        gateway_host = self._parse_gateway_url(self._gateway_url)
+        if gateway_host is None:
+            self._logger.warning(
+                "_MatrixEvalQuiesceWatcher: cannot parse gateway URL"
+                " %r; skipping output mirror",
+                self._gateway_url,
+            )
+            return
+        remote_dir = (
+            f"{self._slurm_root_folder.rstrip('/')}/out/"
+            f"{self._out_dir.name}/"
+        )
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        argv = [
+            "rsync",
+            "-az",
+            "--include=*.nix-archive",
+            "--include=*.matrix_aggregate.json",
+            "--exclude=*",
+            "-e", "ssh -o BatchMode=yes",
+            f"{gateway_host}:{remote_dir}",
+            str(self._out_dir) + "/",
+        ]
+        try:
+            proc = self._run_subprocess(argv)
+        except OSError as exc:
+            self._logger.warning(
+                "_MatrixEvalQuiesceWatcher: rsync failed to launch (%s);"
+                " phase-3 will see no mirrored outputs", exc,
+            )
+            return
+        if proc.returncode != 0:
+            stderr_text = (
+                proc.stderr.decode("utf-8", errors="replace")
+                if isinstance(proc.stderr, (bytes, bytearray))
+                else (proc.stderr or "")
+            )
+            self._logger.warning(
+                "_MatrixEvalQuiesceWatcher: rsync rc=%d when mirroring"
+                " %s → %s: %s", proc.returncode, remote_dir,
+                self._out_dir, stderr_text.strip(),
+            )
+
+    @staticmethod
+    def _parse_gateway_url(gateway_url: str) -> Optional[str]:
+        """Reduce ``ssh://user@host[:port]`` to ``user@host`` for rsync's
+        positional source spec. Returns None on unrecognised shapes."""
+        prefix = "ssh://"
+        if not gateway_url.startswith(prefix):
+            return None
+        body = gateway_url[len(prefix):]
+        # Strip any trailing path component (``user@host/path``).
+        body = body.split("/", 1)[0]
+        # Strip ``:port`` — rsync's ``-e`` carries the SSH config so
+        # port overrides belong there, not in the host string.
+        if ":" in body and "@" in body:
+            user_host, _, port = body.partition(":")
+            try:
+                int(port)
+                body = user_host
+            except ValueError:
+                pass
+        return body or None
+
+    def _reread_matrix_aggregate_sidecars(self) -> None:
+        """Refresh ``self._matrix_aggregates`` from on-disk sidecars.
+
+        Called after :meth:`_mirror_outputs_from_gateway` so the
+        rsynced sidecars contribute to the aggregate map even when
+        the per-task ``on_task_completed`` hook fired before the
+        mirror.
+        """
+        for task_id in sorted(self._completed):
+            binary = self._binary_from_task_id(task_id)
+            if not binary or binary in self._matrix_aggregates:
+                continue
+            sidecar = self._out_dir / f"{binary}.matrix_aggregate.json"
+            try:
+                payload = json.loads(sidecar.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            matrix_drv = payload.get("matrix_aggregate_drv")
+            if isinstance(matrix_drv, str) and matrix_drv:
+                self._matrix_aggregates[binary] = matrix_drv
 
     def _import_matrix_eval_archives(self) -> None:
         """Run ``nix-store --import`` for every ``*.nix-archive`` under
@@ -1380,6 +1508,20 @@ class SuitTaskConfig:
     # container side: ``/app/out-network/_matrix_eval`` (same
     # physical dir via the framework's --output bind mount).
     matrix_eval_out_dir: Optional[pathlib.Path] = None
+
+    # SSH gateway URL (``ssh://user@host[:port]``) used by the
+    # matrix_eval quiesce watcher to mirror per-binary outputs back
+    # from ``<slurm_root_folder>/out/`` into the submitter-local
+    # ``<dataset_dir>/_matrix_eval/`` between matrix_eval-quiesce and
+    # phase-3 spawn. ``None`` (the default) means the watcher skips
+    # the mirror step — useful for in-process tests, local single-host
+    # smokes, and the legacy submitter-side-only flow.
+    gateway_url: Optional[str] = None
+    # Gateway-side root containing ``out/``, ``image_bin/``, ``log/``
+    # subdirs. Required (together with ``gateway_url``) for the
+    # matrix_eval output-mirror step. CLI populates from
+    # ``--slurm-root-folder``; tests leave ``None``.
+    slurm_root_folder: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -2858,6 +3000,9 @@ class SuitTask:
             sys_name=self.config.sys_name,
             flake_ref=self.config.flake_ref,
             toolchain_aggregate_drv=toolchain_aggregate_drv,
+            gateway_url=self.config.gateway_url,
+            slurm_root_folder=self.config.slurm_root_folder,
+            run_id=self.config.run_id,
         )
 
     def _register_matrix_eval_watcher(

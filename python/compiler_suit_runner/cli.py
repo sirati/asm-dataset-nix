@@ -714,6 +714,12 @@ def _config_from_args(
         cachix_cache=args.cachix_cache,
         cachix_token_file=args.cachix_auth_token_file,
         matrix_eval_out_dir=matrix_eval_out_dir,
+        # SLURM-only fields; cli's local-mode / test paths omit them.
+        gateway_url=getattr(args, "gateway", None),
+        slurm_root_folder=(
+            str(args.slurm_root_folder)
+            if getattr(args, "slurm_root_folder", None) else None
+        ),
         # Defaults the user is unlikely to override from the CLI; tests
         # build SuitTaskConfig directly when they need to tweak these.
         # Harmonia ON by default — it's the whole point of cluster
