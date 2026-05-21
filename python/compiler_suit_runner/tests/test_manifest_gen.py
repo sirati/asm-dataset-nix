@@ -408,6 +408,7 @@ def test_manifest_set_by_class_includes_all_known_classes(
     grouped = result.by_class
     expected_keys = {
         "matrix_eval",
+        "dependency_graph",
         "build_compilers",
         "toolchain_validate",
         "build_common_dep",

@@ -1185,6 +1185,19 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "variant_seed": meta.get("sample_seed"),
                 "tier": meta.get("tier"),
                 "toolchain_aggregate_drv": tc_aggregate_drv,
+                # Threaded so emit_dependency_graph_manifests can
+                # include the bind-mounted matrix_eval output dir in
+                # each dep_graph payload — the worker reads
+                # <out_dir>/<binary>.{nix-archive, matrix_aggregate.json}
+                # from there. bash_path is dispatch-time resolved
+                # inside the worker (no need to thread). ``config``
+                # isn't built yet at this point — recompute the path
+                # from args + shared_fs the same way _config_from_args
+                # does at line 700.
+                "matrix_eval_out_dir": str(
+                    shared_fs / "dataset" / "_matrix_eval"
+                ),
+                "bash_path": "",
             }
         log.info(
             "submit pre-flight: %d toolchains, %d binaries queued for matrix_eval",
@@ -1263,9 +1276,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # needs a manifest_gen extension before both classes can be
         # emitted simultaneously. The flag is captured here and threaded
         # forward; the validate emission itself is a follow-up.
-        stages: list[str] = ["matrix_eval"]
+        stages: list[str] = ["matrix_eval", "dependency_graph"]
         if build_compilers_on:
-            stages = ["build_compilers", "matrix_eval"]
+            stages = ["build_compilers", "matrix_eval", "dependency_graph"]
         if debug_testbuild and "build_compilers" not in stages:
             stages.insert(0, "build_compilers")
 

@@ -57,6 +57,7 @@ from compiler_suit_runner.partition import VariantSpec
 
 ItemClass = Literal[
     "matrix_eval",
+    "dependency_graph",
     "build_compilers",
     "toolchain_validate",
     "build_common_dep",
@@ -69,6 +70,7 @@ ItemClass = Literal[
 # rather than raising ``KeyError``.
 _ALL_ITEM_CLASSES: tuple[ItemClass, ...] = (
     "matrix_eval",
+    "dependency_graph",
     "build_compilers",
     "toolchain_validate",
     "build_common_dep",
@@ -93,10 +95,13 @@ _STAGE_TO_CLASSES: dict[Stage, frozenset[ItemClass]] = {
     "build_compilers": frozenset({
         "build_compilers", "toolchain_validate",
     }),
-    # The dependency_graph stage runs primary-only and emits no
-    # dispatch manifests; it's listed so callers can request it by
-    # name without tripping the unknown-stage guard.
-    "dependency_graph": frozenset(),
+    # Dependency_graph as a framework task (per
+    # plan/placeholder-pattern-restructure.md PH-A): one task per
+    # binary, depends_on=[matrix_eval__<binary>], writes per-cell
+    # sidecar manifests for the placeholder build_variant + common_dep
+    # workers. Pre-PH-A this stage emitted nothing — the planner ran
+    # in-process from the watcher.
+    "dependency_graph": frozenset({"dependency_graph"}),
     "build": frozenset({
         "build_common_dep",
         "build_variant",
@@ -727,6 +732,47 @@ def emit_matrix_eval_manifests(
     return headers
 
 
+def emit_dependency_graph_manifests(
+    per_binary_metadata: dict[str, dict],
+    *,
+    sys_name: str,
+    matrix_eval_out_dir: str,
+    bash_path: str,
+) -> list[ManifestHeader]:
+    """Build one ``dependency_graph`` manifest header per binary.
+
+    Symmetric with :func:`emit_matrix_eval_manifests`. Each header has
+    ``task_depends_on=[matrix_eval_task_id(binary)]`` so the framework
+    CRDT activates the dep_graph task atomically with the matrix_eval
+    completion (no on_phase_end-driven spawn race; see
+    plan/placeholder-pattern-restructure.md PH-A).
+
+    Per-binary metadata is the same shape :func:`emit_matrix_eval_manifests`
+    consumes; the only required field is
+    ``toolchain_aggregate_drv`` (re-used as the planner's anchor drv).
+    """
+    headers: list[ManifestHeader] = []
+    for binary in sorted(per_binary_metadata.keys()):
+        meta = per_binary_metadata[binary]
+        toolchain_aggregate_drv = meta.get("toolchain_aggregate_drv")
+        if not toolchain_aggregate_drv:
+            raise ValueError(
+                f"emit_dependency_graph_manifests: binary {binary!r} metadata"
+                " is missing required 'toolchain_aggregate_drv' field;"
+                " re-run pre-flight to regenerate manifests."
+            )
+        headers.append(
+            make_dependency_graph_header(
+                binary=binary,
+                sys_name=sys_name,
+                toolchain_aggregate_drv=toolchain_aggregate_drv,
+                matrix_eval_out_dir=matrix_eval_out_dir,
+                bash_path=bash_path,
+            )
+        )
+    return headers
+
+
 def emit_all_manifests(
     *,
     target_dir: pathlib.Path,
@@ -833,6 +879,32 @@ def emit_all_manifests(
                 per_binary_metadata, sys_name=sys_name
             )
         )
+
+    # dependency_graph manifests piggy-back on per_binary_metadata
+    # (same shape as matrix_eval consumes). The framework activates
+    # each dep_graph task atomically with the matching matrix_eval
+    # completion via task_depends_on=[matrix_eval__<binary>] — no
+    # in-process spawn from on_phase_end. ``matrix_eval_out_dir`` and
+    # ``bash_path`` are taken from the metadata (cli.py threads them
+    # through the same SuitTaskConfig fields used by the legacy
+    # in-process planner).
+    if "dependency_graph" in active_classes and per_binary_metadata:
+        sample_meta = next(iter(per_binary_metadata.values()), {})
+        dep_graph_out_dir = sample_meta.get("matrix_eval_out_dir", "")
+        # bash_path is dispatch-time resolved by the worker (the
+        # submitter doesn't know which container's nix store the
+        # framework will pick); pass empty string so the worker's
+        # _resolve_bash_store_path equivalent fills it in.
+        dep_graph_bash_path = sample_meta.get("bash_path", "")
+        if dep_graph_out_dir:
+            headers.extend(
+                emit_dependency_graph_manifests(
+                    per_binary_metadata,
+                    sys_name=sys_name,
+                    matrix_eval_out_dir=dep_graph_out_dir,
+                    bash_path=dep_graph_bash_path,
+                )
+            )
 
     # build_compilers / toolchain_validate, then build_common_dep.
     # Toolchain manifests carry the realised drv path when available
