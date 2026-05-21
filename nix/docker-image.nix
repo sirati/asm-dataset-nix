@@ -393,7 +393,11 @@ pkgs.dockerTools.buildLayeredImage {
   config = {
     Env = [
       "LANG=C.UTF-8"
-      "PYTHONPATH=/app/python"
+      # /app/python carries compiler_suit_runner; /app/flake carries the
+      # rest of the flake source, including template_graph (which the
+      # eval / dependency-graph workers import for sum_drv assembly and
+      # tree-walker streaming).
+      "PYTHONPATH=/app/python:${flakeFiles}/app/flake"
       "PATH=/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin"
       # Direct store-path pointer to the baked flake source. Layered
       # images sometimes present /app/flake as a symlink-into-store
