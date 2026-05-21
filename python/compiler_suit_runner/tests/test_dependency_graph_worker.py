@@ -479,6 +479,93 @@ class TestWritePhase4Descriptors:
         assert recovered == []
         assert summary == {}
 
+
+class TestWritePerCellManifests:
+    """Per-(binary, compiler, arch) sidecar emit for the placeholder
+    build_variant + build_common_dep workers (PH-A in
+    ``plan/placeholder-pattern-restructure.md``).
+    """
+
+    def test_groups_by_binary_compiler_arch_and_orders_by_task_id(
+        self, tmp_path: pathlib.Path,
+    ):
+        import json
+        from compiler_suit_runner.workers.dependency_graph_worker.output import (
+            write_per_cell_manifests,
+            DEPENDENCY_GRAPH_MANIFEST_DIR,
+        )
+
+        descriptors = [
+            Phase4Descriptor(
+                kind="build_variant", task_id="bv_hello_gcc15_x86_b",
+                name="bv_hello_b",
+                payload={"binary": "hello", "compiler_id": "gcc15",
+                         "arch": "x86_64", "label": "L-b"},
+                depends_on=(),
+            ),
+            Phase4Descriptor(
+                kind="build_variant", task_id="bv_hello_gcc15_x86_a",
+                name="bv_hello_a",
+                payload={"binary": "hello", "compiler_id": "gcc15",
+                         "arch": "x86_64", "label": "L-a"},
+                depends_on=(),
+            ),
+            Phase4Descriptor(
+                kind="build_common_dep", task_id="cd_busybox_x86",
+                name="cd_busybox",
+                payload={"binary": "busybox", "arch": "x86_64",
+                         "node_name": "stdlib"},
+                depends_on=(),
+            ),
+        ]
+        written = write_per_cell_manifests(
+            descriptors=descriptors,
+            matrix_eval_out_dir=tmp_path,
+        )
+        assert len(written) == 2
+        hello_path = (tmp_path / DEPENDENCY_GRAPH_MANIFEST_DIR
+                      / "hello__gcc15__x86_64.json")
+        busybox_path = (tmp_path / DEPENDENCY_GRAPH_MANIFEST_DIR
+                        / "busybox____common____x86_64.json")
+        assert hello_path.exists()
+        assert busybox_path.exists()
+        hello_body = json.loads(hello_path.read_text())
+        # Sorted by task_id: bv_hello_gcc15_x86_a < ..._b
+        assert hello_body["binary"] == "hello"
+        assert hello_body["compiler"] == "gcc15"
+        assert hello_body["arch"] == "x86_64"
+        labels = [v["payload"]["label"] for v in hello_body["variants"]]
+        assert labels == ["L-a", "L-b"]
+        # slot_idx is the position in the sorted list.
+        assert [v["slot_idx"] for v in hello_body["variants"]] == [0, 1]
+
+    def test_skips_descriptors_missing_keys(
+        self, tmp_path: pathlib.Path,
+    ):
+        from compiler_suit_runner.workers.dependency_graph_worker.output import (
+            write_per_cell_manifests,
+        )
+
+        descriptors = [
+            Phase4Descriptor(
+                kind="build_variant", task_id="x", name="x",
+                payload={"binary": "", "compiler_id": "gcc15",
+                         "arch": "x86_64"},
+                depends_on=(),
+            ),
+            Phase4Descriptor(
+                kind="build_variant", task_id="y", name="y",
+                payload={"binary": "hello", "compiler_id": "",
+                         "arch": "x86_64"},
+                depends_on=(),
+            ),
+        ]
+        written = write_per_cell_manifests(
+            descriptors=descriptors,
+            matrix_eval_out_dir=tmp_path,
+        )
+        assert written == []
+
     def test_summary_text_companion(self, tmp_path: pathlib.Path):
         """The summary-text writer emits a ``key: value`` per line
         sorted by key for diff-friendly operator inspection."""
