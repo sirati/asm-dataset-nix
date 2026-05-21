@@ -305,6 +305,11 @@ let
       nssFiles
       nixConfDir
       hostKeys
+      # Materialise the nixpkgs source so the NIX_PATH=nixpkgs=...
+      # entry points at a path that actually exists in the container's
+      # store. Used by template_graph wrapper_drv.nix's
+      # `import <nixpkgs> {}`.
+      pkgs.path
     ]
     ++ lib.optional (rootAuthorizedKeys != null) rootAuthorizedKeys
     ++ lib.optional (harmonia != null) harmonia
@@ -398,6 +403,12 @@ pkgs.dockerTools.buildLayeredImage {
       # eval / dependency-graph workers import for sum_drv assembly and
       # tree-walker streaming).
       "PYTHONPATH=/app/python:${flakeFiles}/app/flake"
+      # Sum-drv aggregate construction (template_graph.make_sum_drv) runs
+      # nix-instantiate against wrapper_drv.nix, which evaluates
+      # `import <nixpkgs> {}` for its bash builder. Without a NIX_PATH
+      # entry the worker fails matrix_eval with `nix-instantiate failed`
+      # the first time it tries to build the matrix-<binary> aggregate.
+      "NIX_PATH=nixpkgs=${pkgs.path}"
       "PATH=/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin"
       # Direct store-path pointer to the baked flake source. Layered
       # images sometimes present /app/flake as a symlink-into-store
