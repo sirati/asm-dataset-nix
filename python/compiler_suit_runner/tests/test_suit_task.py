@@ -302,6 +302,78 @@ def test_watcher_skips_when_sidecar_missing(
     )
 
 
+def test_watcher_mirror_invokes_rsync(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When gateway+slurm_root are configured, the watcher rsyncs the
+    gateway-side ``out/_matrix_eval/`` tree into its local out_dir
+    BEFORE checking aggregates, so sidecars dropped on the gateway
+    bind-mount become visible to phase-3 dispatch."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    seen_argvs: list[list[str]] = []
+
+    def _fake_subprocess(argv: list[str], **_: object) -> subprocess.CompletedProcess:
+        seen_argvs.append(argv)
+        # Drop a sidecar so the post-mirror reread finds the aggregate.
+        if argv[0] == "rsync":
+            (out_dir / "hello.matrix_aggregate.json").write_text(
+                '{"binary": "hello", "matrix_aggregate_drv": "/nix/store/X-hello.drv"}'
+            )
+            return subprocess.CompletedProcess(
+                argv, returncode=0, stdout=b"", stderr=b"",
+            )
+        return subprocess.CompletedProcess(
+            argv, returncode=0, stdout=b"", stderr=b"",
+        )
+
+    hello = matrix_eval_task_id("hello")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+        run_subprocess=_fake_subprocess,
+        gateway_url="ssh://kruppb@remote.cip.ifi.lmu.de",
+        slurm_root_folder="/home/k/kruppb/BIG/slurm",
+        run_id="run_TEST",
+    )
+    w._mirror_outputs_from_gateway()
+    rsync_argvs = [a for a in seen_argvs if a[0] == "rsync"]
+    assert len(rsync_argvs) == 1
+    argv = rsync_argvs[0]
+    assert "kruppb@remote.cip.ifi.lmu.de:/home/k/kruppb/BIG/slurm/out/out/" in " ".join(argv)
+    assert "--include=*.nix-archive" in argv
+    assert "--include=*.matrix_aggregate.json" in argv
+    # Post-mirror reread populates aggregates from the dropped sidecar.
+    w._completed.add(hello)
+    w._reread_matrix_aggregate_sidecars()
+    assert w._matrix_aggregates == {"hello": "/nix/store/X-hello.drv"}
+
+
+def test_watcher_mirror_skipped_when_gateway_unconfigured(
+    tmp_path: pathlib.Path,
+) -> None:
+    """No gateway_url → no subprocess. Single-host / local-mode runs
+    skip the mirror entirely without WARNING noise."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    seen: list[list[str]] = []
+
+    def _stub(argv: list[str], **_: object) -> subprocess.CompletedProcess:
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, returncode=0)
+
+    hello = matrix_eval_task_id("hello")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+        run_subprocess=_stub,
+    )
+    w._mirror_outputs_from_gateway()
+    assert seen == []
+
+
 def test_watcher_is_idempotent_on_duplicate_completion(
     tmp_path: pathlib.Path,
 ) -> None:
