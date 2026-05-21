@@ -253,6 +253,7 @@ def test_watcher_fires_when_complete(
         bash_path="/nix/store/fake-bash",
     )
     w.on_task_completed(hello)
+    w.fire_phase_3()
     assert w.fired is True
 
 
@@ -397,10 +398,12 @@ def test_watcher_is_idempotent_on_duplicate_completion(
     assert w.completed == frozenset({hello})
     assert w.fired is False
     w.on_task_completed(busybox)
+    w.fire_phase_3()
     assert w.fired is True
     # Another stray completion after firing is a no-op.
     w.on_task_completed(busybox)
     w.on_task_completed(hello)
+    w.fire_phase_3()
     assert w.fired is True
 
 
@@ -631,6 +634,7 @@ def test_fire_invokes_dependency_graph_subprocess_and_spawns(
                 "matrix_aggregate_drv": "/nix/store/yyyy-matrix-hello.drv",
             },
         )
+        w.fire_phase_3()
 
     # Subprocess was invoked exactly once.
     assert runs == [["true"]]
@@ -681,6 +685,7 @@ def test_fire_logs_and_degrades_on_subprocess_failure(
                 "matrix_aggregate_drv": "/nix/store/yyyy-matrix-hello.drv",
             },
         )
+    w.fire_phase_3()
     assert w.fired is True
     handle.spawn_tasks.assert_not_called()
     assert any(
@@ -720,6 +725,7 @@ def test_fire_logs_and_degrades_when_descriptors_missing(
                 "matrix_aggregate_drv": "/nix/store/yyyy-matrix-hello.drv",
             },
         )
+        w.fire_phase_3()
     handle.spawn_tasks.assert_not_called()
     assert any(
         "cannot read" in rec.message and "_dependency_graph.pkl" in rec.message
@@ -766,6 +772,7 @@ def test_fire_argv_includes_toolchain_drv_and_task_id_mappings(
             "matrix_aggregate_drv": "/nix/store/bbbb-matrix-hello.drv",
         },
     )
+    w.fire_phase_3()
 
     assert len(runs) == 1
     argv = runs[0]
@@ -823,6 +830,7 @@ def test_watcher_emits_toolchain_and_matrix_argv_on_quiesce(
         busybox,
         result={"binary": "busybox", "matrix_aggregate_drv": mat_busybox},
     )
+    w.fire_phase_3()
 
     assert len(runs) == 1
     argv = runs[0]
@@ -878,6 +886,7 @@ def test_watcher_skips_dgw_when_no_matrix_aggregates(
             result={"binary": "hello", "matrix_aggregate_drv": None,
                     "resumed": True},
         )
+    w.fire_phase_3()
     assert w.fired is True
     # No subprocess invocation.
     assert runs == []
@@ -919,6 +928,7 @@ def test_watcher_skips_dgw_when_toolchain_aggregate_drv_empty(
                 "matrix_aggregate_drv": "/nix/store/bb-matrix-hello.drv",
             },
         )
+    w.fire_phase_3()
     assert w.fired is True
     assert runs == []
     assert any(
@@ -973,6 +983,7 @@ def test_watcher_skips_resumed_tasks(
 
     # Watcher fired; subprocess invoked because at least one aggregate
     # came through.
+    w.fire_phase_3()
     assert w.fired is True
     assert len(runs) == 1
     argv = runs[0]
@@ -1924,6 +1935,13 @@ def test_task_completed_listener_forwards_to_watcher(
     assert watcher.completed == frozenset()
 
     listener(hello, True, None)
+    # Phase-3 dispatch is now driven from on_phase_end (per
+    # dynrunner-owner 2026-05-21); the listener only records.
+    assert watcher.completed == frozenset({hello})
+    assert watcher.fired is False
+    # SuitTask.on_phase_end forwards into watcher.fire_phase_3 for
+    # matrix_eval — exercise it the same way the framework would.
+    task.on_phase_end("matrix_eval", completed=1, failed=0)
     assert watcher.fired is True
 
 

@@ -737,16 +737,16 @@ class _MatrixEvalQuiesceWatcher:
     def on_task_completed(
         self, task_id: str, result: Any = None
     ) -> None:
-        """Process one task-completion notification.
+        """Bookkeeping-only: record one matrix_eval task's completion.
 
-        ``result`` is the matrix_eval worker's per-binary return dict
-        (see :func:`workers.eval_worker.run_eval_task`). When present
-        we extract its ``matrix_aggregate_drv`` field and stash it
-        keyed by ``binary`` so :meth:`_build_dependency_graph_argv`
-        can emit ``--matrix-drv <binary>=<path>`` at fire time.
-        Resumed tasks return ``matrix_aggregate_drv: None`` (the
-        archive already carries the wrapper-drv closure); those are
-        logged at WARNING but do NOT break the watcher.
+        Dispatching phase 3 is the job of :meth:`fire_phase_3` driven
+        from :meth:`SuitTask.on_phase_end`. The framework's
+        TaskCompletedEvent is delivered off the operational loop's
+        apply path so calling ``primary_handle.spawn_tasks`` from here
+        races the loop's exit-condition check (per dynrunner-owner
+        2026-05-21 10:45 + `coordinator.rs:1516-1525`); the only safe
+        runtime-injection entry point is the synchronous
+        ``on_phase_end`` hook.
 
         No-op when:
 
@@ -767,19 +767,32 @@ class _MatrixEvalQuiesceWatcher:
                 return
             self._completed.add(task_id)
             self._record_matrix_aggregate(task_id, result)
-            if self._completed < self._expected:
-                # Still waiting on more matrix_eval tasks.
+            # Phase-3 dispatch is driven from on_phase_end now (see
+            # class docstring); on_task_completed just keeps the
+            # bookkeeping (completed set + aggregates) so on_phase_end
+            # has the data when it fires synchronously inside
+            # process_phase_lifecycle.
+            return
+
+    def fire_phase_3(self) -> None:
+        """Run phase-3 dispatch end-to-end. Invoked from
+        :meth:`SuitTask.on_phase_end` for ``phase_id == "matrix_eval"``.
+
+        Idempotent: a second call after :attr:`_fired` is a no-op so
+        downstream retries or duplicate phase-end notifications never
+        double-spawn.
+        """
+        with self._lock:
+            if self._fired:
                 return
             self._fired = True
-            should_fire = True
-        if should_fire:
-            try:
-                self._fire()
-            except Exception:  # noqa: BLE001 — never raise into framework
-                self._logger.exception(
-                    "_MatrixEvalQuiesceWatcher._fire raised; build phase"
-                    " will not be scheduled (operator-visible stall)"
-                )
+        try:
+            self._fire()
+        except Exception:  # noqa: BLE001 — never raise into framework
+            self._logger.exception(
+                "_MatrixEvalQuiesceWatcher._fire raised; build phase"
+                " will not be scheduled (operator-visible stall)"
+            )
 
     def _record_matrix_aggregate(
         self, task_id: str, result: Any,
@@ -2852,6 +2865,19 @@ class SuitTask:
             completed,
             failed,
         )
+        # Phase-3 (dependency_graph + build_variant spawn) MUST be
+        # driven from here — TaskCompletedEvent fires off the
+        # operational loop's apply path, so calling spawn_tasks from
+        # on_task_completed races the loop's exit-condition check.
+        # See dynrunner-owner 2026-05-21 10:45 + framework's
+        # crates/dynrunner-manager-distributed/src/primary/coordinator.rs:1516-1525.
+        if phase_id == "matrix_eval" and self._matrix_eval_watcher is not None:
+            try:
+                self._matrix_eval_watcher.fire_phase_3()
+            except Exception:  # noqa: BLE001 — never propagate into framework
+                self._logger.exception(
+                    "on_phase_end: matrix_eval watcher fire_phase_3 raised"
+                )
 
     # ── Broadcast-receive placement gossip ────────────────────────────
 
