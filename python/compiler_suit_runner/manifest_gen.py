@@ -206,6 +206,20 @@ def matrix_eval_task_id(binary: str) -> str:
     return f"matrix_eval__{binary}"
 
 
+def dependency_graph_task_id(binary: str) -> str:
+    """Stable id for a per-binary dependency_graph framework task.
+
+    One task per binary, mirrors :func:`matrix_eval_task_id`. The
+    dep-graph worker reads ``<out_dir>/<binary>.nix-archive`` plus the
+    matrix_aggregate sidecar that the matrix_eval worker dropped for
+    its binary, runs the streaming planner, and writes per-(compiler,
+    arch) sidecar manifests under ``<out_dir>/_manifests/``. The
+    placeholder build_variant tasks declare
+    ``task_depends_on=[dependency_graph_task_id(binary)]``.
+    """
+    return f"dependency_graph__{binary}"
+
+
 # ---------------------------------------------------------------------------
 # Header constructors
 
@@ -265,6 +279,52 @@ def make_matrix_eval_header(
         payload=payload,
         task_id=matrix_eval_task_id(binary),
         task_depends_on=(),
+    )
+
+
+def make_dependency_graph_header(
+    binary: str,
+    sys_name: str,
+    *,
+    toolchain_aggregate_drv: str,
+    matrix_eval_out_dir: str,
+    bash_path: str,
+) -> ManifestHeader:
+    """Build a dependency_graph (Phase-3 framework-task) manifest.
+
+    One task per binary. The worker reads
+    ``<matrix_eval_out_dir>/<binary>.matrix_aggregate.json`` (written
+    by the matrix_eval worker), imports
+    ``<matrix_eval_out_dir>/<binary>.nix-archive``, runs the streaming
+    planner against the toolchain aggregate + this binary's matrix
+    aggregate, and emits per-(compiler, arch) sidecar manifests at
+    ``<matrix_eval_out_dir>/_manifests/<binary>__<compiler>__<arch>.json``
+    for the placeholder build_variant tasks to consume.
+
+    ``task_depends_on=[matrix_eval_task_id(binary)]`` — the CRDT
+    activates this task atomically with matrix_eval's TaskCompleted
+    apply, avoiding the eager-spawn race that bit the on_phase_end
+    shape (see dynrunner-owner consult 2026-05-21 12:04).
+    """
+    if not isinstance(toolchain_aggregate_drv, str) or not toolchain_aggregate_drv:
+        raise ValueError(
+            "make_dependency_graph_header: 'toolchain_aggregate_drv'"
+            f" must be a non-empty string, got {toolchain_aggregate_drv!r}"
+        )
+    payload: dict = {
+        "binary": binary,
+        "sys": sys_name,
+        "toolchain_aggregate_drv": toolchain_aggregate_drv,
+        "matrix_eval_out_dir": matrix_eval_out_dir,
+        "bash_path": bash_path,
+    }
+    return ManifestHeader(
+        item_class="dependency_graph",
+        name=f"dependency_graph__{binary}",
+        size=0,
+        payload=payload,
+        task_id=dependency_graph_task_id(binary),
+        task_depends_on=(matrix_eval_task_id(binary),),
     )
 
 
