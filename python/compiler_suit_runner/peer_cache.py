@@ -1307,6 +1307,21 @@ class PeerNixConfWatcher(threading.Thread):
         self._tick = float(tick_seconds)
         self._stop = threading.Event()
         self._last_signature: tuple | None = None
+        # Quick writability probe: on the submitter side (not inside a
+        # secondary container as root), ``/etc/nix`` is read-only. The
+        # watcher's purpose is to keep the container's nix-daemon
+        # config fresh — when there's no writable target, the refresh
+        # loop is pointless. Detect once at construction and degrade
+        # to a no-op rather than burning log noise on every tick.
+        self._writable = self._probe_writable()
+        if not self._writable:
+            logger.info(
+                "PeerNixConfWatcher: %s not writable from this process;"
+                " skipping live peer.conf updates (submitter uses"
+                " --option extra-substituters per-call instead).",
+                self._target,
+            )
+            return
         # Prime peer.conf synchronously from the watcher's already-snapshotted
         # peer set so the first ``nix build`` invocation (which the framework
         # may dispatch within ~280 ms of bootstrap returning) sees the live
@@ -1315,6 +1330,23 @@ class PeerNixConfWatcher(threading.Thread):
         # tasks falls back to cache.nixos.org and rebuilds toolchains that
         # would otherwise substitute from the dev-box harmonia.
         self._refresh_once(suppress_log=True)
+
+    def _probe_writable(self) -> bool:
+        """Return True iff this process can create/modify ``self._target``.
+
+        We treat any of the following as ``not writable``:
+        * the parent directory doesn't exist AND can't be created;
+        * the parent directory exists but isn't writable.
+        Used at construction to short-circuit when the watcher would
+        otherwise emit a permission-denied traceback on every refresh.
+        """
+        parent = self._target.parent
+        try:
+            if not parent.is_dir():
+                parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        return os.access(parent, os.W_OK)
 
     def stop(self) -> None:
         self._stop.set()
@@ -1333,6 +1365,8 @@ class PeerNixConfWatcher(threading.Thread):
                 logger.exception("PeerNixConfWatcher refresh failed")
 
     def run(self) -> None:  # pragma: no cover — exercised via integration
+        if not self._writable:
+            return
         while not self._stop.is_set():
             self._refresh_once()
             self._stop.wait(self._tick)
