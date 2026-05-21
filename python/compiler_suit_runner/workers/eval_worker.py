@@ -597,15 +597,28 @@ def _resolve_flake_ref(flake_ref: str) -> str:
     ``flake.nix``). Fall back to ``/app/flake`` if the env var is
     missing (legacy images / unrelated container runtimes); honour
     non-default flake_ref values verbatim.
+
+    Absolute filesystem paths get a ``path:`` prefix so ``nix eval`` and
+    ``nix-eval-jobs`` both parse them as direct flake locations rather
+    than "search up" for the nearest ``flake.nix``. Without the prefix
+    ``nix eval /nix/store/<hash>/sub/dir#attr`` strips the trailing
+    components and tries to evaluate the bare store-path root, which
+    fails because the flake lives in the subdirectory.
     """
     if flake_ref != ".":
-        return flake_ref
+        return _as_installable(flake_ref)
     env_path = os.environ.get(_CONTAINER_FLAKE_ENV)
     if env_path and os.path.isfile(os.path.join(env_path, "flake.nix")):
-        return env_path
+        return _as_installable(env_path)
     if os.path.isdir(_CONTAINER_FLAKE_ROOT) and \
             os.path.isfile(os.path.join(_CONTAINER_FLAKE_ROOT, "flake.nix")):
-        return _CONTAINER_FLAKE_ROOT
+        return _as_installable(_CONTAINER_FLAKE_ROOT)
+    return flake_ref
+
+
+def _as_installable(flake_ref: str) -> str:
+    if flake_ref.startswith("/") and not flake_ref.startswith("path:"):
+        return f"path:{flake_ref}"
     return flake_ref
 
 
