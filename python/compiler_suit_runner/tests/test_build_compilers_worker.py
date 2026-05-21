@@ -425,6 +425,29 @@ class TestRunBuildCompilersTask:
         assert "closure export failed" in (result.error or "")
         # Realise succeeded so outpaths still populated for triage.
         assert result.outpaths == ("/nix/store/aaa",)
+        # The export-side stderr made it into the excerpt.
+        assert "export borked" in (result.nix_log_excerpt or "")
+
+    def test_requisites_failure_surfaces_stderr_in_excerpt(self, env):
+        """When ``nix-store --query --requisites`` fails (the FIRST
+        sub-call of export_closure), its stderr must still reach the
+        result excerpt — previously only the export-side stderr was
+        surfaced, hiding the actual error. Observed on LMU 2026-05-21
+        as the silent ``closure export failed`` failure mode."""
+        stub: _NixSubprocessStub = env.run_subprocess
+        stub.build_stdout = b"/nix/store/aaa\n"
+        # Requisites query fails first; no export call follows.
+        stub.req_rc = 1
+        stub.req_stderr = b"error: path '/nix/store/aaa' is not valid"
+
+        result = bcw.run_build_compilers_task(_payload(), env, name="x")
+        assert result.success is False
+        assert "closure export failed" in (result.error or "")
+        # The requisites-side stderr is preserved verbatim in the
+        # excerpt so the operator can see what nix-store complained
+        # about.
+        assert "not valid" in (result.nix_log_excerpt or ""), \
+            f"got excerpt: {result.nix_log_excerpt!r}"
 
     def test_bad_payload_shape(self, env):
         result = bcw.run_build_compilers_task(
