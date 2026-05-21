@@ -9,11 +9,11 @@ worker:
    that intersects every requested arch AND every sampled suffix
    in one pass (``builtins.intersectAttrs`` at both the arch and
    suffix levels, plus ``--force-recurse`` so the walker descends
-   through both nested levels). The worker re-applies the same
-   deterministic ``_sample_suffix_attrs`` sampling as the submitter
-   (keyed on the payload's ``variant_seed``) BEFORE the bulk eval
-   so primary and secondaries agree on the variant subset without
-   the submitter ever shipping the list.
+   through both nested levels). The worker applies the deterministic
+   :func:`sample_suffix_attrs` sampling (keyed on the payload's
+   ``variant_seed``) BEFORE the bulk eval so primary and secondaries
+   agree on the variant subset without the submitter ever shipping
+   the list.
 2. Broadcasts each produced ``.drv`` path to every peer in the
    cluster via :class:`peer_replication.BroadcastSender` (which
    posts ``/peer/path-broadcast-offer`` and lets the receiver flood
@@ -148,23 +148,20 @@ def sample_suffix_attrs(
     sample_size: int,
     seed: str,
 ) -> dict:
-    """Re-implementation of ``preflight._sample_suffix_attrs``.
+    """Deterministically down-sample ``{suffix: meta_entry}``.
 
-    Deterministically down-samples ``{suffix: meta_entry}`` to
-    ``sample_size`` per ``(compiler, optimization)`` group, seeded on
+    Picks at most ``sample_size`` entries per ``(compiler,
+    optimization)`` group, seeded on
     ``f"{seed}:{compiler}:{arch}:{opt}"`` so the same operator seed
     produces the same sample on every peer.
 
     Suffixes with non-dict meta or missing compiler/optimization
     metadata are passed through unchanged (we cannot group them).
 
-    The implementation MUST stay bit-for-bit in lock-step with the
-    submitter-side ``_sample_suffix_attrs``; any drift would let
-    Phase 0 workers and the submitter disagree on the variant
-    subset, breaking Phase 1 dedup. The two implementations are
-    intentionally kept side-by-side rather than imported so that a
-    future refactor of one cannot silently change the wire
-    contract of the other.
+    Every peer that needs the sampled subset (eval worker, phase-3
+    dot helper, smoke harness) imports this same function so all
+    sites agree on the variant subset without the submitter ever
+    shipping the list.
     """
     if sample_size <= 0:
         return suffix_attrs
