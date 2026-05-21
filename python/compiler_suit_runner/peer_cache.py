@@ -2051,6 +2051,35 @@ class SubmitterPeer:
         """Submitter's stable peer id within the cluster federation."""
         return self.SUBMITTER_PEER_ID
 
+    def _first_secondary_reachable(self, base_url: str) -> bool:
+        """Probe ``<base_url>/healthz`` (or root) with a short timeout.
+
+        Off-cluster submitters can't reach the compute-node's HTTP push
+        listener directly; the framework's `-R` reverse tunnel is the
+        only path back. Probing once before the flood-fill loop avoids
+        burning N × push-timeout on guaranteed-failing requests.
+        """
+        import socket
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        parsed = urllib.parse.urlsplit(base_url)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        probe_url = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, "/", "", "")
+        )
+        try:
+            req = urllib.request.Request(probe_url, method="GET")
+            with urllib.request.urlopen(req, timeout=2.0) as resp:  # noqa: S310
+                return resp.status < 500
+        except urllib.error.HTTPError as exc:
+            # 4xx means the listener IS up; we treat any HTTP response
+            # as proof of reachability.
+            return 400 <= exc.code < 500
+        except (urllib.error.URLError, TimeoutError, OSError, socket.timeout):
+            return False
+
     def seed_toolchain_drvs(
         self,
         drv_set: set[str],
@@ -2087,6 +2116,30 @@ class SubmitterPeer:
         from compiler_suit_runner import peer_push
 
         our_pubkey = self._public_key or ""
+
+        # Reachability probe before the loop: when the submitter is
+        # OFF the cluster network (e.g. LMU Krater dispatched from a
+        # laptop), the compute-node port 6000 is NOT reachable from
+        # the submitter — only the framework's `-R` reverse-tunnelled
+        # `localhost:5005` goes the other way. Per the operational
+        # memory and cluster_dispatch_pitfalls notes, this is structural
+        # noise: the workers pull from the submitter's harmonia, no
+        # push needed. Skipping the per-drv loop avoids 317×2s = ~10 min
+        # of submitter time burned on guaranteed-failing POSTs.
+        if not self._first_secondary_reachable(first_secondary_url):
+            self.log.info(
+                "seed_toolchain_drvs: %s unreachable from submitter; "
+                "skipping flood-fill (workers pull via -R tunnel) "
+                "[%d drv(s) not broadcast]",
+                first_secondary_url, len(drv_set),
+            )
+            return {
+                "sent": 0,
+                "failed": 0,
+                "failed_drvs": [],
+                "skipped_unreachable": True,
+            }
+
         sent = 0
         failed = 0
         failed_drvs: list[str] = []
