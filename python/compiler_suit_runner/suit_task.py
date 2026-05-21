@@ -1868,26 +1868,8 @@ class SuitTask:
             "--manifest-dir",
             str(self.config.manifest_dir),
         ]
-        if type_id == "dep_graph":
-            # dependency_graph framework task: worker reads its
-            # per-binary manifest, the matrix_eval sidecar that the
-            # eval worker wrote, and the imported nix-archive — then
-            # produces per-(compiler, arch) sidecars under
-            # _manifests/. Args mirror the existing CLI shape so the
-            # downstream package can dispatch via either path.
-            argv = common + [
-                "--flake-ref",
-                self.config.flake_ref,
-                "--system",
-                self.config.sys_name,
-            ]
-            if self.config.matrix_eval_out_dir is not None:
-                argv += [
-                    "--matrix-eval-out-dir",
-                    str(self.config.matrix_eval_out_dir),
-                ]
-            return argv
         if type_id in {
+            "dep_graph",
             "eval", "build_compilers", "toolchain_validate",
             "common_dep", "variant",
         }:
@@ -1919,11 +1901,12 @@ class SuitTask:
                     "--signing-public-key", self._signing_key.public_key,
                 ]
             # matrix_eval marker dir: bind-mount-visible path so the
-            # primary's _MatrixEvalQuiesceWatcher can read what the
-            # worker wrote. Only meaningful for type_id == "eval"; the
-            # other types ignore it.
+            # eval worker writes its archive + sidecar there and the
+            # dep_graph worker (PH-A) reads them from the same location.
+            # Other types (toolchain_validate / common_dep / variant)
+            # ignore the flag harmlessly.
             if (
-                type_id == "eval"
+                type_id in {"eval", "dep_graph"}
                 and self.config.matrix_eval_out_dir is not None
             ):
                 argv += [
