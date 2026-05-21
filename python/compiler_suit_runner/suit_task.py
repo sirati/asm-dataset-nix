@@ -21,11 +21,7 @@ Protocol under the new phase taxonomy:
   imported per-binary nix-archive, runs the streaming planner, and
   emits per-(compiler, arch) sidecar manifests at
   ``<matrix_eval_out_dir>/_manifests/`` for the placeholder
-  build_variant tasks to consume. Pre-PH-A this step ran as an
-  in-process subprocess invoked by
-  :class:`_MatrixEvalQuiesceWatcher` from
-  :meth:`SuitTask.on_phase_end`; that path is now disabled (see PH-D
-  comment in :meth:`on_phase_end`).
+  build_variant tasks to consume.
 * ``build`` (phase 4) — distributed ``build_common_dep`` +
   ``build_variant`` workers; ``toolchain_validate`` shares the same
   dispatch (rarely emitted, gated by ``--debug-testbuild``).
@@ -63,13 +59,10 @@ deployments go through the framework's worker protocol.
 from __future__ import annotations
 
 import dataclasses
-import functools
 import json
 import logging
 import os
 import pathlib
-import subprocess
-import sys
 import threading
 from argparse import ArgumentParser, Namespace
 from collections.abc import Callable, Iterable
@@ -88,11 +81,6 @@ from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
     matrix_eval_task_id,
     read_manifest,
-)
-from compiler_suit_runner.dependency_graph_planner import (
-    DependencyGraphPickleError,
-    headers_from_descriptors,
-    load_phase4_descriptors,
 )
 from compiler_suit_runner.peer_cache import (
     SUBSTITUTERS_FILENAME,
@@ -594,168 +582,31 @@ class _PeerLifecycleListener:
 # ---------------------------------------------------------------------------
 
 
-# Default subprocess runner: just ``subprocess.run`` with capture. Tests
-# substitute via the ``run_subprocess`` constructor kwarg.
-_SubprocessRunner = Callable[[list[str]], "subprocess.CompletedProcess[bytes]"]
-
-
-def _default_subprocess_runner(
-    argv: list[str],
-) -> "subprocess.CompletedProcess[bytes]":
-    return subprocess.run(  # noqa: S603 - argv constructed in-module
-        argv,
-        check=False,
-        capture_output=True,
-        shell=False,
-    )
-
-
-@functools.lru_cache(maxsize=1)
-def _resolve_bash_store_path() -> Optional[str]:
-    """Best-effort discovery of the realised ``bash`` store path.
-
-    The dependency_graph worker invocation needs a concrete bash store
-    path to thread into ``make_sum_drv_from_paths``. We resolve it once
-    per process via ``nix eval --raw nixpkgs#bash.outPath`` and cache
-    the result. Returns ``None`` on any failure — the caller logs +
-    surfaces the gap (the watcher refuses to run the dependency_graph
-    subprocess without it).
-    """
-    try:
-        proc = subprocess.run(  # noqa: S603 - argv is fixed
-            ["nix", "eval", "--raw", "nixpkgs#bash.outPath"],
-            check=False,
-            capture_output=True,
-            shell=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
-    out = proc.stdout.decode("utf-8", errors="replace").strip()
-    return out or None
-
-
 class _MatrixEvalQuiesceWatcher:
-    """Wait for every ``matrix_eval__<binary>`` task to complete, then plan.
+    """Wait for every ``matrix_eval__<binary>`` task to complete.
 
-    .. note::
-       Transitional after PH-D: the framework now drives phase-3 via
-       its own ``dependency_graph`` PhaseSpec (see PH-A in
-       plan/placeholder-pattern-restructure.md), so
-       :meth:`SuitTask.on_phase_end` no longer invokes
-       :meth:`fire_phase_3`. ``_record_matrix_aggregate`` continues to
-       populate the matrix_aggregate cache for observability + the
-       gateway rsync mirror, but the ``_fire`` /
-       ``_spawn_tasks`` dispatch surface is unused on the cluster.
-       The methods are retained because some single-process tests
-       still exercise them; once those migrate to framework-task
-       dispatch the whole class can be deleted.
+    The framework drives phase-3 via its own ``dependency_graph``
+    PhaseSpec; this watcher only records matrix_eval task completions
+    so :meth:`SuitTask.on_phase_end` can observe quiesce. The spawn
+    primitives :meth:`_spawn_tasks` / :meth:`_header_to_task_info`
+    remain for callers that still drive task injection synchronously.
 
-    The watcher is registered as a task-completion listener at
-    :meth:`SuitTask.on_run_start`. Each call to :meth:`on_task_completed`
-    either ignores a non-matrix_eval task_id or marks the matching
-    matrix_eval task as complete. Once the completed set covers the
-    expected set, ``_fire`` runs:
-
-    1. Iterates ``<matrix_eval_out_dir>/*.nix-archive`` and runs
-       ``nix-store --import < <archive>`` for each (the kept-drv
-       closure produced by the eval worker becomes resolvable in the
-       primary's local store).
-    2. Invokes ``workers.dependency_graph_worker`` as a subprocess
-       (``python -m compiler_suit_runner.workers.dependency_graph_worker``)
-       with ``--matrix-eval-out-dir`` + ``--bash-path`` +
-       per-toolchain ``--toolchain-drv`` / ``--toolchain-task-id``
-       flags. The subprocess writes
-       ``<matrix_eval_out_dir>/_dependency_graph.pkl``.
-    3. Reads that pickle via
-       :func:`dependency_graph_planner.load_phase4_descriptors`,
-       translates the :class:`Phase4Descriptor` list into
-       :class:`ManifestHeader` instances via
-       :func:`headers_from_descriptors`, and feeds the result to
-       :meth:`_spawn_tasks` which calls
-       ``primary_handle.spawn_tasks`` for the ``build`` phase.
-
-    Step 1's archive-import is skipped per-archive when ``nix path-info``
-    already finds the kept drvs locally (the dependency_graph worker
-    has the same fast-path; the watcher's import is a belt-and-braces
-    pre-population so the subprocess sees consistent state).
-
-    Step 2's subprocess invocation is opt-out via
-    ``dependency_graph_command_override`` (constructor kwarg used by
-    unit tests). When ``primary_handle`` is None (single-process
-    tests, framework-pin gap) ``_spawn_tasks`` degrades to writing
-    the dump-equivalent JSON
-    (``_dependency_graph_headers.json``, alongside the worker's
-    ``_dependency_graph.pkl`` already on disk) and logging an INFO
-    line.
-
-    The watcher is NOT a framework task — it runs entirely in-process
-    on whichever thread the framework's task-completion notification is
-    delivered on. Calls to :meth:`on_task_completed` are guarded by an
-    internal lock so concurrent completions from a worker pool are safe.
+    Calls to :meth:`on_task_completed` are guarded by an internal lock
+    so concurrent completions from a worker pool are safe.
     """
 
     def __init__(
         self,
         expected_task_ids: Iterable[str],
         out_dir: pathlib.Path,
-        toolchain_task_ids: dict[str, str],
         *,
-        primary_handle: Optional[Any] = None,
         logger: Optional[logging.Logger] = None,
-        sys_name: str = "x86_64-linux",
-        flake_ref: str = ".",
-        run_subprocess: Optional[_SubprocessRunner] = None,
-        dependency_graph_command_override: Optional[list[str]] = None,
-        bash_path: Optional[str] = None,
-        toolchain_aggregate_drv: str = "",
-        gateway_url: Optional[str] = None,
-        slurm_root_folder: Optional[str] = None,
-        run_id: Optional[str] = None,
+        primary_handle: Optional[Any] = None,
     ) -> None:
         self._expected: frozenset[str] = frozenset(expected_task_ids)
         self._completed: set[str] = set()
         self._out_dir = pathlib.Path(out_dir)
-        self._toolchain_task_ids: dict[str, str] = dict(toolchain_task_ids)
-        self._toolchain_aggregate_drv: str = toolchain_aggregate_drv or ""
-        # Collected at on_task_completed time from each matrix_eval task's
-        # result dict. Keyed by ``binary`` (the matrix_eval payload's
-        # ``binary`` field, also derivable from the ``matrix_eval__<binary>``
-        # task_id shape). Used at _fire time to emit ``--matrix-drv
-        # <binary>=<path>`` arguments to the dependency_graph_worker.
-        self._matrix_aggregates: dict[str, str] = {}
         self._primary_handle = primary_handle
-        self._sys_name = sys_name
-        self._flake_ref = flake_ref
-        self._run_subprocess: _SubprocessRunner = (
-            run_subprocess or _default_subprocess_runner
-        )
-        # Tests can swap in a fixed ``argv`` to invoke; production runs
-        # build the argv from the watcher's state.
-        self._dependency_graph_command_override = (
-            list(dependency_graph_command_override)
-            if dependency_graph_command_override is not None
-            else None
-        )
-        # ``bash_path`` is the realised ``/nix/store/...-bash-X`` path
-        # the dependency_graph worker passes to make_sum_drv_from_paths.
-        # When None at construction time, ``_resolve_bash_store_path``
-        # is called lazily at fire time (and cached).
-        self._bash_path = bash_path
-        # Gateway-mirror inputs. The dispatcher writes worker outputs
-        # to the gateway's ``<slurm_root_folder>/out/_matrix_eval/``
-        # via the per-container bind-mount; the framework does NOT
-        # sync those back to the submitter, so the watcher rsyncs them
-        # into ``self._out_dir`` itself before importing archives /
-        # reading sidecars. All three fields together gate the mirror —
-        # any missing → step is skipped (tests, local single-host
-        # runs).
-        self._gateway_url = gateway_url
-        self._slurm_root_folder = slurm_root_folder
-        self._run_id = run_id
-        self._fired: bool = False
         self._lock = threading.Lock()
         self._logger = logger or logging.getLogger(__name__)
 
@@ -769,10 +620,6 @@ class _MatrixEvalQuiesceWatcher:
     def completed(self) -> frozenset[str]:
         return frozenset(self._completed)
 
-    @property
-    def fired(self) -> bool:
-        return self._fired
-
     # ── Event entry point ──────────────────────────────────────────────
 
     def on_task_completed(
@@ -780,506 +627,21 @@ class _MatrixEvalQuiesceWatcher:
     ) -> None:
         """Bookkeeping-only: record one matrix_eval task's completion.
 
-        Dispatching phase 3 is the job of :meth:`fire_phase_3` driven
-        from :meth:`SuitTask.on_phase_end`. The framework's
-        TaskCompletedEvent is delivered off the operational loop's
-        apply path so calling ``primary_handle.spawn_tasks`` from here
-        races the loop's exit-condition check (per dynrunner-owner
-        2026-05-21 10:45 + `coordinator.rs:1516-1525`); the only safe
-        runtime-injection entry point is the synchronous
-        ``on_phase_end`` hook.
-
         No-op when:
 
-        * ``task_id`` is not a matrix_eval task_id (e.g. a toolchain
-          task completion arrives — the watcher coexists with K=3
-          listeners on the same hook).
-        * The watcher has already fired (``self._fired``).
+        * ``task_id`` is empty.
+        * ``task_id`` is not in the expected set (the watcher coexists
+          with other listeners on the same hook surface).
         * The task_id has already been marked complete (idempotent).
         """
         if not task_id:
             return
         with self._lock:
-            if self._fired:
-                return
             if task_id not in self._expected:
                 return
             if task_id in self._completed:
                 return
             self._completed.add(task_id)
-            self._record_matrix_aggregate(task_id, result)
-            # Phase-3 dispatch is driven from on_phase_end now (see
-            # class docstring); on_task_completed just keeps the
-            # bookkeeping (completed set + aggregates) so on_phase_end
-            # has the data when it fires synchronously inside
-            # process_phase_lifecycle.
-            return
-
-    def fire_phase_3(self) -> None:
-        """Run phase-3 dispatch end-to-end. Invoked from
-        :meth:`SuitTask.on_phase_end` for ``phase_id == "matrix_eval"``.
-
-        Idempotent: a second call after :attr:`_fired` is a no-op so
-        downstream retries or duplicate phase-end notifications never
-        double-spawn.
-        """
-        with self._lock:
-            if self._fired:
-                return
-            self._fired = True
-        try:
-            self._fire()
-        except Exception:  # noqa: BLE001 — never raise into framework
-            self._logger.exception(
-                "_MatrixEvalQuiesceWatcher._fire raised; build phase"
-                " will not be scheduled (operator-visible stall)"
-            )
-
-    def _record_matrix_aggregate(
-        self, task_id: str, result: Any,
-    ) -> None:
-        """Capture ``matrix_aggregate_drv`` for one matrix_eval task.
-
-        Two sources, tried in order:
-
-        1. ``result`` dict (only populated if the framework's
-           task-completion wire ever grows a payload slot — per
-           dynrunner-owner 2026-05-21 it intentionally does not, but
-           the in-process tests still hand the dict directly).
-        2. Sidecar JSON the worker writes alongside the archive at
-           ``<out_dir>/<binary>.matrix_aggregate.json``. Bind-mounted
-           ``out_dir`` is visible from every secondary, so the
-           primary-promoted secondary's watcher reads what the
-           originating worker wrote.
-
-        Caller MUST hold :attr:`_lock`.
-        """
-        binary = self._binary_from_task_id(task_id)
-        if isinstance(result, dict):
-            if isinstance(result.get("binary"), str) and result["binary"]:
-                binary = result["binary"]
-            matrix_drv = result.get("matrix_aggregate_drv")
-            if isinstance(matrix_drv, str) and matrix_drv and binary:
-                self._matrix_aggregates[binary] = matrix_drv
-                return
-        # Fall through to sidecar lookup (the canonical cluster path).
-        # Post-PH-D the watcher's matrix_aggregates cache is no longer
-        # the source of truth for downstream dispatch — the framework's
-        # dependency_graph PhaseSpec reads the sidecar directly inside
-        # the worker subprocess. The bookkeeping here is retained for
-        # observability + single-process tests; missing/unreadable
-        # sidecars are normal in the cluster topology (the file lives
-        # on a bind-mount the primary container can't always see). We
-        # downgrade these messages to DEBUG so production logs stay
-        # clean.
-        if not binary:
-            self._logger.debug(
-                "_MatrixEvalQuiesceWatcher: matrix_eval task %s has no"
-                " result dict and no binary derivable from task_id;"
-                " bookkeeping entry omitted",
-                task_id,
-            )
-            return
-        sidecar = self._out_dir / f"{binary}.matrix_aggregate.json"
-        try:
-            payload = json.loads(sidecar.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            self._logger.debug(
-                "_MatrixEvalQuiesceWatcher: matrix_eval task %s"
-                " (binary=%s): sidecar %s unreadable (%s); bookkeeping"
-                " entry omitted (framework dep_graph reads sidecar"
-                " directly on the worker)",
-                task_id, binary, sidecar, exc,
-            )
-            return
-        matrix_drv = payload.get("matrix_aggregate_drv")
-        if not isinstance(matrix_drv, str) or not matrix_drv:
-            self._logger.debug(
-                "_MatrixEvalQuiesceWatcher: matrix_eval task %s"
-                " (binary=%s): sidecar %s has no matrix_aggregate_drv"
-                " (value=%r); bookkeeping entry omitted",
-                task_id, binary, sidecar, matrix_drv,
-            )
-            return
-        self._matrix_aggregates[binary] = matrix_drv
-
-    @staticmethod
-    def _binary_from_task_id(task_id: str) -> str:
-        """Recover ``<binary>`` from a ``matrix_eval__<binary>`` task_id."""
-        prefix = "matrix_eval__"
-        if task_id.startswith(prefix):
-            return task_id[len(prefix):]
-        return ""
-
-    # ── Plan invocation ────────────────────────────────────────────────
-
-    def _fire(self) -> None:
-        """matrix_eval quiesce reached; run dependency_graph + spawn build tasks.
-
-        Three steps, with per-step failure logged + degraded:
-
-        1. Best-effort archive pre-population. Each ``*.nix-archive``
-           under :attr:`_out_dir` is fed to ``nix-store --import`` so
-           the dependency_graph subprocess sees the kept-drv closure
-           in the primary's local store. Per-archive failures log +
-           continue; the subprocess will retry the import itself if a
-           kept-drv is still missing.
-        2. ``workers.dependency_graph_worker`` invocation. The
-           subprocess writes ``_dependency_graph.pkl`` (a pickled
-           dict with a list of :class:`Phase4Descriptor` records and
-           a summary) into :attr:`_out_dir`. Exit-nonzero raises;
-           without the planner output we cannot spawn the build
-           phase.
-        3. :func:`headers_from_descriptors` translation + ``_spawn_tasks``
-           hand-off into ``primary_handle.spawn_tasks``.
-
-        See module docstring for the rationale on running the
-        dependency_graph worker as a primary-side subprocess rather
-        than dispatching it through the framework's worker pool.
-        """
-        self._logger.info(
-            "_MatrixEvalQuiesceWatcher: all %d matrix_eval tasks complete;"
-            " starting dependency_graph subprocess",
-            len(self._expected),
-        )
-        # Mirror gateway-side worker outputs into self._out_dir. The
-        # framework's bind-mount only flows gateway → container; the
-        # submitter side stays empty unless we rsync explicitly. Then
-        # re-walk the (now populated) out_dir for sidecars so the
-        # phase-3 aggregate map is complete before we check it.
-        self._mirror_outputs_from_gateway()
-        self._reread_matrix_aggregate_sidecars()
-        # Phase 3 cannot run without (a) the toolchain aggregate drv
-        # that anchors the sum-drv graph, AND (b) at least one
-        # matrix_eval task contributing a per-binary aggregate. Bail
-        # early with an explicit error so the operator-visible failure
-        # mode is "no dgw spawn", not "dgw spawned with empty inputs
-        # then crashed mid-run".
-        if not self._toolchain_aggregate_drv:
-            self._logger.error(
-                "_MatrixEvalQuiesceWatcher: toolchain_aggregate_drv is"
-                " empty; phase 3 has no anchor drv to walk and will be"
-                " skipped (operator-visible stall — restart with a"
-                " preflight that produces the toolchains aggregate)"
-            )
-            return
-        if not self._matrix_aggregates:
-            self._logger.error(
-                "_MatrixEvalQuiesceWatcher: no matrix_aggregate_drv"
-                " entries collected from %d matrix_eval task(s); phase 3"
-                " has no producers and will be skipped (every task may"
-                " have been resumed — re-run from a clean state if a"
-                " build phase is required)",
-                len(self._expected),
-            )
-            return
-        self._import_matrix_eval_archives()
-        try:
-            self._invoke_dependency_graph_worker()
-        except RuntimeError as exc:
-            self._logger.error(
-                "_MatrixEvalQuiesceWatcher: dependency_graph worker"
-                " failed; build phase will not be scheduled: %s", exc,
-            )
-            return
-        descriptors_path = self._out_dir / "_dependency_graph.pkl"
-        try:
-            descriptors, _summary = load_phase4_descriptors(descriptors_path)
-        except (OSError, DependencyGraphPickleError) as exc:
-            self._logger.error(
-                "_MatrixEvalQuiesceWatcher: cannot read %s: %s",
-                descriptors_path, exc,
-            )
-            return
-        if not descriptors:
-            self._logger.warning(
-                "_MatrixEvalQuiesceWatcher: %s produced 0 descriptors;"
-                " nothing to spawn (matrix may have no buildable variants)",
-                descriptors_path,
-            )
-            return
-        headers = headers_from_descriptors(descriptors)
-        self._spawn_tasks(headers)
-
-    def _mirror_outputs_from_gateway(self) -> None:
-        """Rsync the gateway-side matrix_eval output dir into ``self._out_dir``.
-
-        The framework's `-R` bind-mount delivers worker outputs to
-        ``<slurm_root_folder>/out/`` on the gateway but does NOT sync
-        them back to the submitter's ``<shared_fs>/dataset/``. The
-        watcher runs on the submitter, so phase 3's inputs
-        (``<binary>.nix-archive`` + ``<binary>.matrix_aggregate.json``)
-        live on the wrong host until we mirror them. One ``rsync``
-        invocation pulls the entire ``out/_matrix_eval/`` tree onto
-        the submitter.
-
-        Skipped silently when gateway parameters are missing (single-
-        host tests, local-mode dispatches). Errors are logged at
-        WARNING — the caller's existing fall-through paths surface
-        the absence loudly enough.
-        """
-        if not (
-            self._gateway_url
-            and self._slurm_root_folder
-        ):
-            return
-        gateway_host = self._parse_gateway_url(self._gateway_url)
-        if gateway_host is None:
-            self._logger.warning(
-                "_MatrixEvalQuiesceWatcher: cannot parse gateway URL"
-                " %r; skipping output mirror",
-                self._gateway_url,
-            )
-            return
-        remote_dir = (
-            f"{self._slurm_root_folder.rstrip('/')}/out/"
-            f"{self._out_dir.name}/"
-        )
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        argv = [
-            "rsync",
-            "-az",
-            "--include=*.nix-archive",
-            "--include=*.matrix_aggregate.json",
-            "--exclude=*",
-            "-e", "ssh -o BatchMode=yes",
-            f"{gateway_host}:{remote_dir}",
-            str(self._out_dir) + "/",
-        ]
-        try:
-            proc = self._run_subprocess(argv)
-        except OSError as exc:
-            self._logger.warning(
-                "_MatrixEvalQuiesceWatcher: rsync failed to launch (%s);"
-                " phase-3 will see no mirrored outputs", exc,
-            )
-            return
-        if proc.returncode != 0:
-            stderr_text = (
-                proc.stderr.decode("utf-8", errors="replace")
-                if isinstance(proc.stderr, (bytes, bytearray))
-                else (proc.stderr or "")
-            )
-            self._logger.warning(
-                "_MatrixEvalQuiesceWatcher: rsync rc=%d when mirroring"
-                " %s → %s: %s", proc.returncode, remote_dir,
-                self._out_dir, stderr_text.strip(),
-            )
-
-    @staticmethod
-    def _parse_gateway_url(gateway_url: str) -> Optional[str]:
-        """Reduce ``ssh://user@host[:port]`` to ``user@host`` for rsync's
-        positional source spec. Returns None on unrecognised shapes."""
-        prefix = "ssh://"
-        if not gateway_url.startswith(prefix):
-            return None
-        body = gateway_url[len(prefix):]
-        # Strip any trailing path component (``user@host/path``).
-        body = body.split("/", 1)[0]
-        # Strip ``:port`` — rsync's ``-e`` carries the SSH config so
-        # port overrides belong there, not in the host string.
-        if ":" in body and "@" in body:
-            user_host, _, port = body.partition(":")
-            try:
-                int(port)
-                body = user_host
-            except ValueError:
-                pass
-        return body or None
-
-    def _reread_matrix_aggregate_sidecars(self) -> None:
-        """Refresh ``self._matrix_aggregates`` from on-disk sidecars.
-
-        Called after :meth:`_mirror_outputs_from_gateway` so the
-        rsynced sidecars contribute to the aggregate map even when
-        the per-task ``on_task_completed`` hook fired before the
-        mirror.
-        """
-        for task_id in sorted(self._completed):
-            binary = self._binary_from_task_id(task_id)
-            if not binary or binary in self._matrix_aggregates:
-                continue
-            sidecar = self._out_dir / f"{binary}.matrix_aggregate.json"
-            try:
-                payload = json.loads(sidecar.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            matrix_drv = payload.get("matrix_aggregate_drv")
-            if isinstance(matrix_drv, str) and matrix_drv:
-                self._matrix_aggregates[binary] = matrix_drv
-
-    def _import_matrix_eval_archives(self) -> None:
-        """Run ``nix-store --import`` for every ``*.nix-archive`` under
-        :attr:`_out_dir` AND the sibling ``_build_compilers/`` directory.
-
-        The matrix_eval archive carries the per-binary kept-variant
-        closure; the build_compilers archive carries each toolchain's
-        drv + output closure. The primary needs BOTH to walk the full
-        sum-drv graph at phase3 (the matrix_eval closure typically does
-        NOT include the toolchain.drv outputs — those land in
-        ``<shared_fs>/out/_build_compilers/`` via the build_compilers
-        worker's own ``export_closure`` call).
-
-        Per-archive failures are logged but do NOT abort: the
-        dependency_graph subprocess does its own import-or-skip pass
-        per-binary and surfaces irrecoverable misses as a hard failure.
-        """
-        archives: list[pathlib.Path] = []
-        archives.extend(self._discover_archives_in(self._out_dir))
-        # ``<shared_fs>/out/_build_compilers/`` is a sibling of
-        # ``<shared_fs>/out/_matrix_eval/`` — both live under the same
-        # ``<shared_fs>/out/`` root.
-        build_compilers_dir = self._out_dir.parent / "_build_compilers"
-        archives.extend(self._discover_archives_in(build_compilers_dir))
-
-        if not archives:
-            self._logger.warning(
-                "_MatrixEvalQuiesceWatcher: no archives to import under"
-                " %s or %s", self._out_dir, build_compilers_dir,
-            )
-            return
-
-        for archive in archives:
-            try:
-                with open(archive, "rb") as fh:
-                    proc = subprocess.run(  # noqa: S603
-                        ["nix-store", "--import"],
-                        stdin=fh,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        check=False,
-                    )
-            except OSError as exc:
-                self._logger.warning(
-                    "_MatrixEvalQuiesceWatcher: nix-store --import"
-                    " skipped for %s (open/spawn failed: %s)",
-                    archive, exc,
-                )
-                continue
-            if proc.returncode != 0:
-                self._logger.warning(
-                    "_MatrixEvalQuiesceWatcher: nix-store --import"
-                    " failed for %s rc=%d stderr=%r",
-                    archive, proc.returncode,
-                    proc.stderr.decode("utf-8", errors="replace")[:400],
-                )
-
-    def _discover_archives_in(
-        self, directory: pathlib.Path,
-    ) -> list[pathlib.Path]:
-        """Return sorted ``*.nix-archive`` files under ``directory``.
-
-        Returns an empty list when ``directory`` does not exist; absence
-        of either matrix_eval or build_compilers is a valid configuration
-        (e.g. ``--build-compilers`` not passed → no _build_compilers/
-        dir). Empty / missing directories are logged at debug level only
-        — the caller emits a higher-severity warning when BOTH are
-        empty.
-        """
-        if not directory.is_dir():
-            self._logger.debug(
-                "_MatrixEvalQuiesceWatcher: %s is not a directory; skipping"
-                " archive walk", directory,
-            )
-            return []
-        return sorted(
-            p for p in directory.iterdir()
-            if p.is_file() and p.suffix == ".nix-archive"
-        )
-
-    def _invoke_dependency_graph_worker(self) -> None:
-        """Run the dependency_graph worker as a subprocess.
-
-        Argv is built from the watcher's state — see
-        :meth:`_build_dependency_graph_argv`. Tests can pre-empt the
-        whole call by passing ``dependency_graph_command_override``
-        at construction (the override is used verbatim).
-
-        Raises :class:`RuntimeError` on a non-zero exit so the caller
-        can log + degrade. The subprocess writes
-        ``_dependency_graph.pkl`` on success.
-        """
-        argv = (
-            self._dependency_graph_command_override
-            if self._dependency_graph_command_override is not None
-            else self._build_dependency_graph_argv()
-        )
-        if argv is None:
-            raise RuntimeError(
-                "dependency_graph_worker argv could not be assembled"
-                " (likely missing bash store path; check"
-                " `nix eval --raw nixpkgs#bash.outPath`)"
-            )
-        self._logger.info(
-            "_MatrixEvalQuiesceWatcher: invoking dependency_graph"
-            " worker argv=%r", argv,
-        )
-        completed = self._run_subprocess(argv)
-        rc = getattr(completed, "returncode", 1)
-        if rc != 0:
-            stderr_bytes = getattr(completed, "stderr", b"") or b""
-            raise RuntimeError(
-                f"dependency_graph_worker exited rc={rc}: "
-                + stderr_bytes.decode("utf-8", errors="replace").strip()
-            )
-
-    def _build_dependency_graph_argv(self) -> Optional[list[str]]:
-        """Assemble the argv for the dependency_graph_worker subprocess.
-
-        Returns ``None`` when a required input (today: the realised
-        bash store path) is unavailable. The caller treats ``None``
-        as a hard failure.
-        """
-        bash_path = self._bash_path or _resolve_bash_store_path()
-        if not bash_path:
-            return None
-        # Cache the resolved path on the instance so a retry doesn't
-        # re-shell-out (lru_cache scope is process-wide anyway).
-        self._bash_path = bash_path
-        argv: list[str] = [
-            sys.executable, "-m",
-            "compiler_suit_runner.workers.dependency_graph_worker",
-            "--matrix-eval-out-dir", str(self._out_dir),
-            "--bash-path", bash_path,
-            "--system", self._sys_name,
-            "--flake-ref", self._flake_ref,
-            # Single toolchain aggregate drv anchors the phase-3
-            # sum-drv graph. Replaces the legacy per-toolchain
-            # ``--toolchain-drv`` repetition; the dgw now walks the
-            # aggregate's input closure instead of enumerating each
-            # toolchain leaf at argv-construction time.
-            "--toolchain-drv", self._toolchain_aggregate_drv,
-        ]
-        # Per-binary matrix aggregate drv paths collected at
-        # ``on_task_completed`` time. The dgw consumes
-        # ``--matrix-drv <binary>=<path>`` repeats and pairs each with
-        # the binary's archive on disk. Sorted iteration keeps the
-        # argv deterministic across runs.
-        for binary, matrix_agg in sorted(self._matrix_aggregates.items()):
-            argv += ["--matrix-drv", f"{binary}={matrix_agg}"]
-        # Per-toolchain phase-1 task-id mappings still pass through
-        # so the planner can wire build_compilers → build_variant
-        # depends_on. The subprocess expects
-        # ``--toolchain-task-id <ident>=<task_id>``; ``<ident>`` is
-        # the ``<hash>-<name>`` shape derived from the drv basename.
-        for drv, task_id in sorted(self._toolchain_task_ids.items()):
-            ident = self._drv_to_ident(drv)
-            if ident and task_id:
-                argv += ["--toolchain-task-id", f"{ident}={task_id}"]
-        return argv
-
-    @staticmethod
-    def _drv_to_ident(drv_path: str) -> str:
-        """Translate ``/nix/store/<hash>-<name>.drv`` → ``<hash>-<name>``.
-
-        Matches :func:`dependency_graph_planner._ident_to_str`'s
-        canonical shape so the subprocess's parsed mapping keys line
-        up with what the streaming planner emits.
-        """
-        base = pathlib.Path(drv_path).name
-        if base.endswith(".drv"):
-            base = base[:-4]
-        return base
 
     # ── spawn_tasks dispatch ──────────────────────────────────────────
 
@@ -2918,18 +2280,6 @@ class SuitTask:
             completed,
             failed,
         )
-        # PH-D: phase-3 dispatch is no longer driven from on_phase_end.
-        # PH-A registers ``dependency_graph`` as a framework PhaseSpec
-        # with ``depends_on=("matrix_eval",)`` so the CRDT activates
-        # each dep_graph task atomically with the matching matrix_eval
-        # TaskCompleted apply. PH-B+C place K-sized build_variant
-        # placeholders behind ``dependency_graph__<binary>``. No
-        # in-process subprocess + spawn_tasks fan-out is required; the
-        # framework handles the full phase-3 → phase-4 graph itself.
-        # The matrix_eval watcher's ``_record_matrix_aggregate`` still
-        # populates the gateway rsync mirror needed for archive
-        # discovery, but its ``fire_phase_3`` entry point is no longer
-        # invoked from here.
 
     # ── Broadcast-receive placement gossip ────────────────────────────
 
@@ -3072,15 +2422,8 @@ class SuitTask:
         return _MatrixEvalQuiesceWatcher(
             expected_task_ids=expected_ids,
             out_dir=resolved_out_dir,
-            toolchain_task_ids=toolchain_task_ids,
             primary_handle=self._primary_handle,
             logger=self._logger,
-            sys_name=self.config.sys_name,
-            flake_ref=self.config.flake_ref,
-            toolchain_aggregate_drv=toolchain_aggregate_drv,
-            gateway_url=self.config.gateway_url,
-            slurm_root_folder=self.config.slurm_root_folder,
-            run_id=self.config.run_id,
         )
 
     def _register_matrix_eval_watcher(
