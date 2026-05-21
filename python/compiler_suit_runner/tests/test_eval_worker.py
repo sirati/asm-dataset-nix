@@ -584,11 +584,13 @@ def test_run_eval_task_happy_path(
     # Legacy per-binary manifest.json marker is NOT emitted (hard cutover).
     assert not (tmp_path / "hello" / "manifest.json").exists()
     assert not (tmp_path / "hello").exists()
-    # No companion JSON file is emitted alongside the archive — the
-    # archive itself is the resume marker, and the dependency_graph
-    # worker derives variant_lookup from the imported .drv paths.
+    # Worker drops a sidecar JSON alongside the archive so the
+    # dependency_graph watcher can read matrix_aggregate_drv without
+    # relying on the framework's payload-less TaskCompletedEvent wire.
     siblings = sorted(p.name for p in tmp_path.iterdir())
-    assert siblings == ["hello.nix-archive"], siblings
+    assert siblings == [
+        "hello.matrix_aggregate.json", "hello.nix-archive",
+    ], siblings
 
 
 # ---------------------------------------------------------------------------
