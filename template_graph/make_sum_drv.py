@@ -179,6 +179,32 @@ def _run_nix_instantiate(
                     fh.write(stderr_text)
                     fh.write("\n\n--- expression ---\n")
                     fh.write(expr)
+                    fh.write("\n\n--- /etc/nix/nix.conf ---\n")
+                    try:
+                        with open("/etc/nix/nix.conf") as nc:
+                            fh.write(nc.read())
+                    except OSError as exc:
+                        fh.write(f"(read failed: {exc})")
+                    fh.write("\n\n--- /etc/nix/peer.conf ---\n")
+                    try:
+                        with open("/etc/nix/peer.conf") as pc:
+                            fh.write(pc.read())
+                    except OSError as exc:
+                        fh.write(f"(read failed: {exc})")
+                    fh.write("\n\n--- harmonia probe (localhost:5005) ---\n")
+                    try:
+                        probe = subprocess.run(
+                            ["curl", "-sv", "--max-time", "5",
+                             "http://localhost:5005/nix-cache-info"],
+                            capture_output=True, check=False,
+                        )
+                        fh.write(
+                            f"rc={probe.returncode}\n"
+                            f"stdout: {probe.stdout.decode('utf-8','replace')}\n"
+                            f"stderr: {probe.stderr.decode('utf-8','replace')}"
+                        )
+                    except OSError as exc:
+                        fh.write(f"(curl probe failed: {exc})")
             except OSError:
                 pass
         raise RuntimeError(
