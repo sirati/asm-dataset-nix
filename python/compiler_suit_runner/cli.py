@@ -45,11 +45,7 @@ from compiler_suit_runner.incremental_cache import (
     collect_input_hash_inputs,
     compute_input_hash,
 )
-from compiler_suit_runner.manifest_gen import emit_all_manifests, write_manifest
-from compiler_suit_runner.placeholder_enumerator import (
-    enumerate_build_variant_placeholders,
-)
-from compiler_suit_runner.support_table import load_support_table
+from compiler_suit_runner.manifest_gen import emit_all_manifests
 from compiler_suit_runner.nix_drv_show import eval_drv_outpaths
 from compiler_suit_runner.preflight import (
     PreflightError,
@@ -1303,37 +1299,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
         except Exception:  # noqa: BLE001
             log.exception("submit pre-flight: manifest emission failed")
             return 1
-
-        # Placeholder build_variant tasks (PH-B). One header per
-        # (binary, compiler, arch, slot_idx) for every supported cell.
-        # The framework will dispatch them once each per-binary
-        # dependency_graph task completes; the worker reads the per-cell
-        # sidecar and either executes the resolved variant or returns
-        # a no-op for out-of-range slots.
-        if per_binary_metadata and tc_pairs:
-            try:
-                support_table = load_support_table()
-                placeholder_count = 0
-                for placeholder in enumerate_build_variant_placeholders(
-                    per_binary_metadata,
-                    sys_name=args.sys_name,
-                    tc_pairs=tc_pairs,
-                    support_table=support_table,
-                    matrix_eval_out_dir=str(
-                        shared_fs / "dataset" / "_matrix_eval"
-                    ),
-                ):
-                    write_manifest(manifest_dir, placeholder)
-                    placeholder_count += 1
-                log.info(
-                    "submit pre-flight: emitted %d build_variant placeholders",
-                    placeholder_count,
-                )
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "submit pre-flight: build_variant placeholder emission failed"
-                )
-                return 1
 
         # Expose the toolchain outpaths to the submitter-peer placement
         # block below. Without this, ``partition_drv_outpaths`` stays
