@@ -1458,6 +1458,28 @@ def main() -> int:
                 bc_payload, bc_env, name=bc_name,
             )
             if not result.success:
+                # Persist the nix_log_excerpt to the gateway-visible
+                # build-failures dir so operators can attribute failures
+                # to a specific toolchain. Mirrors the build_worker
+                # standard path; worker subprocess stderr is silenced by
+                # the framework so this is the only off-process surface.
+                if result.nix_log_excerpt:
+                    try:
+                        log_dir = pathlib.Path(
+                            "/app/log-network/build-failures"
+                        )
+                        log_dir.mkdir(parents=True, exist_ok=True)
+                        (log_dir / f"{bc_name}.log").write_text(
+                            f"item_class: build_compilers\n"
+                            f"name: {bc_name}\n"
+                            f"error: {result.error or 'unknown'}\n"
+                            f"--- nix log excerpt ---\n"
+                            f"{result.nix_log_excerpt}\n"
+                            f"--- end ---\n",
+                            encoding="utf-8",
+                        )
+                    except Exception:  # noqa: BLE001 — best-effort
+                        pass
                 raise NonRecoverableError(
                     f"build_compilers failed: {result.error or 'unknown'}"
                 )

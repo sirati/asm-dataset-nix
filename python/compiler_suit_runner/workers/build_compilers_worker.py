@@ -566,7 +566,7 @@ def run_build_compilers_task(
         seed.append(drv)
 
     try:
-        exported, _req_err, exp_err = export_closure(
+        exported, req_err, exp_err = export_closure(
             archive_path, seed,
             run_subprocess=env.run_subprocess,
         )
@@ -580,13 +580,25 @@ def run_build_compilers_task(
             error=f"nix-store --export crashed: {exc}",
         )
     if not exported:
+        # Surface BOTH stderr streams: ``nix-store --query --requisites``
+        # writes to req_err and ``nix-store --export`` writes to exp_err.
+        # When the requisites query is the failing step, exp_err is empty
+        # (set to b"" by export_closure on the early-return path), so an
+        # excerpt of exp_err alone would be useless. Concatenating both
+        # gives the operator the actual error class.
+        combined = exp_err or req_err or b""
+        if exp_err and req_err and req_err != exp_err:
+            combined = (
+                b"--- requisites stderr ---\n" + req_err
+                + b"\n--- export stderr ---\n" + exp_err
+            )
         return BuildCompilersResult(
             name=name,
             success=False,
             duration_seconds=max(0.0, clock() - start),
             drv=drv,
             outpaths=tuple(outpaths),
-            nix_log_excerpt=_excerpt_log(exp_err, env.log_excerpt_lines),
+            nix_log_excerpt=_excerpt_log(combined, env.log_excerpt_lines),
             error="closure export failed",
         )
 
