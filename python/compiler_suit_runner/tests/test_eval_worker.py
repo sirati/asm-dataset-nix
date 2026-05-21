@@ -88,7 +88,13 @@ class _EvalJobsStub:
       itself emits with ``--force-recurse``). ``arch``/``suffix`` drvs
       come from ``drv_map[arch]``.
     * ``nix``: emits the JSON dict from ``meta_map[arch]`` for
-      ``_meta.<sys>.<binary>.<arch>`` lookups.
+      ``_meta.<sys>.<binary>.<arch>`` lookups. When ``meta_map`` is
+      omitted (``None``) the stub auto-synthesises a passing meta dict
+      from ``drv_map[arch]`` keys (every suffix gets
+      ``{"compiler": "gcc15", "optimization": "O0"}`` — gcc15 is OK
+      across every arch in ``table.md`` and the entry sails through
+      ``is_known_bad_combo``). Pass ``meta_map={}`` to suppress the
+      auto-derivation (an empty mapping is honoured as-is).
     * ``nix-store --query --requisites``: synthesises the closure as
       ``[<drv>, <drv>-input] for drv in argv[3:]`` so the export step
       has paths to act on. Override the synthesis by setting
@@ -103,23 +109,43 @@ class _EvalJobsStub:
     error propagation.
     """
 
+    _META_AUTO = object()  # sentinel: derive meta from drv_map
+
     def __init__(
         self,
         *,
         drv_map: Optional[dict[str, dict[str, str]]] = None,
-        meta_map: Optional[dict[str, dict[str, dict]]] = None,
+        meta_map: Any = _META_AUTO,
         bulk_eval_fail: Optional[str] = None,
         requisites_for: Optional[dict[str, list[str]]] = None,
         export_fail: bool = False,
         requisites_fail: bool = False,
     ) -> None:
         self.drv_map = drv_map or {}
-        self.meta_map = meta_map or {}
+        self._auto_meta = meta_map is _EvalJobsStub._META_AUTO
+        self.meta_map = {} if self._auto_meta else (meta_map or {})
         self.bulk_eval_fail = bulk_eval_fail
         self.requisites_for = requisites_for or {}
         self.export_fail = export_fail
         self.requisites_fail = requisites_fail
         self.calls: list[list[str]] = []
+
+    def _meta_for(self, arch: str) -> dict[str, dict]:
+        """Return meta for ``arch``: explicit map if set, else auto-synth.
+
+        Auto-synth: every suffix in ``drv_map[arch]`` gets a stub meta
+        entry that ``is_supported`` accepts (gcc15 + every cross arch
+        is ``OK`` per table.md, native x86_64 is unconditionally OK)
+        and ``is_known_bad_combo`` returns ``None`` for (gcc15 isn't
+        legacy so the broken-flag branches never fire, and the
+        ``-O0`` optimisation alone is not a flag-vs-flag conflict).
+        """
+        if not self._auto_meta:
+            return self.meta_map.get(arch, {})
+        return {
+            suffix: {"compiler": "gcc15", "optimization": "O0"}
+            for suffix in self.drv_map.get(arch, {})
+        }
 
     def __call__(self, argv: list[str]) -> tuple[bytes, bytes, int]:
         self.calls.append(list(argv))
@@ -178,7 +204,7 @@ class _EvalJobsStub:
             for piece in argv:
                 if "#_meta." in piece:
                     arch = piece.rsplit(".", 1)[-1]
-                    meta = self.meta_map.get(arch, {})
+                    meta = self._meta_for(arch)
                     return json.dumps(meta).encode(), b"", 0
             return b"{}", b"", 0
         return b"", f"unexpected argv: {argv!r}\n".encode(), 1
@@ -772,7 +798,11 @@ def test_run_eval_task_subprocess_failure_raises(
     attr) for operator triage.
     """
     payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
+    # drv_map seeds the auto-derived _meta entry for x86_64.O0 so the
+    # in-worker filter keeps at least one cell — otherwise nix-eval-jobs
+    # is never dispatched and the bulk_eval_fail arm never fires.
     runner = _EvalJobsStub(
+        drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
         bulk_eval_fail="eval-time OOM: out of memory",
     )
     sender = _make_broadcast_sender()
@@ -995,29 +1025,44 @@ def test_run_eval_task_invokes_meta_eval_when_sampling(
     assert sender.enqueue_broadcast.call_count == 4
 
 
-def test_run_eval_task_skips_meta_when_no_sampling(
+def test_run_eval_task_calls_meta_even_when_no_sampling(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No ``variant_sample`` → no _meta call; we use the full
-    ``suffixes`` list straight from the payload and run exactly one
-    bulk nix-eval-jobs invocation.
+    """No ``variant_sample`` STILL triggers one ``_meta`` lookup per arch.
+
+    Filter relocation (``is_supported`` + ``is_known_bad_combo`` moved
+    from the submitter into ``_sample_per_arch``) means every run
+    needs the meta dict to drive the filter, sample or not. With
+    ``variant_sample`` unset the worker bypasses the rng sampler and
+    forwards the FULL filtered set to the bulk eval — but ``_meta``
+    has already been read once per arch by then.
     """
     _install_wrapper_stub(monkeypatch)
-    payload = _make_payload(archs=["x86_64"], suffixes=["O0", "O2"])
+    payload = _make_payload(
+        archs=["x86_64", "aarch64"], suffixes=["O0", "O2"],
+    )
     runner = _EvalJobsStub(
         drv_map={
-            "x86_64": {"O0": "/nix/store/a.drv", "O2": "/nix/store/b.drv"}
+            "x86_64": {"O0": "/nix/store/a.drv", "O2": "/nix/store/b.drv"},
+            "aarch64": {"O0": "/nix/store/c.drv", "O2": "/nix/store/d.drv"},
         }
     )
     sender = _make_broadcast_sender()
-    run_eval_task(
+    result = run_eval_task(
         payload, tmp_path, sender, run_subprocess=runner, now=lambda: 1.0,
     )
-    # Zero _meta lookups — we never invoked `nix eval`.
+    # One _meta lookup per arch — variant_sample unset does NOT skip
+    # them anymore, because the filter chain still needs the meta dict.
     meta_calls = [
-        c for c in runner.calls if c and c[0] == "nix"
+        c for c in runner.calls
+        if c and c[0] == "nix" and any("#_meta." in p for p in c)
     ]
-    assert meta_calls == []
+    assert len(meta_calls) == 2
+    arches_queried = sorted(c[-1].rsplit(".", 1)[-1] for c in meta_calls)
+    assert arches_queried == ["aarch64", "x86_64"]
+    # The full filtered set is forwarded to the bulk eval (no rng
+    # down-sampling): 2 archs × 2 surviving suffixes = 4 variants.
+    assert len(result["variants"]) == 4
     # Exactly one bulk nix-eval-jobs invocation.
     eval_calls = [c for c in runner.calls if c and c[0] == "nix-eval-jobs"]
     assert len(eval_calls) == 1
@@ -1406,3 +1451,238 @@ def test_module_exports_drop_main() -> None:
         "sample_suffix_attrs",
     ):
         assert name in eval_worker.__all__, name
+
+
+# ---------------------------------------------------------------------------
+# _sample_per_arch — support_table + known-bad filter chain
+# ---------------------------------------------------------------------------
+
+
+_FILTER_TEST_TABLE = """\
+| Compiler   | i686      | aarch64   | mips64el  |
+|------------|-----------|-----------|-----------|
+| gcc15      | OK        | OK        | OK        |
+| clang19    | OK        | OK        | OK        |
+| gcc4_6     | OK        | n/a       | OK        |
+"""
+
+
+@pytest.fixture
+def _filter_table(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+    """Install a deterministic support_table on disk for the filter tests.
+
+    The real ``table.md`` lives at the flake root and is not visible
+    from pytest's cwd (``python/``). We write a synthetic table to
+    ``tmp_path``, repoint :func:`default_table_path` at it, and clear
+    the lru_cache so ``_sample_per_arch``'s lazy ``load_support_table()``
+    call picks up the synthetic table.
+    """
+    from compiler_suit_runner import support_table as _support_table
+    table_path = tmp_path / "table.md"
+    table_path.write_text(_FILTER_TEST_TABLE, encoding="utf-8")
+    monkeypatch.setattr(
+        _support_table, "default_table_path", lambda *a, **kw: table_path,
+    )
+    _support_table.load_support_table.cache_clear()
+    yield
+    _support_table.load_support_table.cache_clear()
+
+
+class TestSamplePerArchFilters:
+    """Coverage for the filter logic relocated into ``_sample_per_arch``.
+
+    Each test stubs :func:`eval_worker._eval_meta_for_arch` via
+    monkeypatch so we feed the filter chain a fully-controlled meta
+    dict; the underlying nix-eval subprocess is never invoked. The
+    ``_filter_table`` fixture pins a deterministic support_table on
+    disk so ``is_supported`` returns the expected verdict regardless
+    of pytest's cwd.
+    """
+
+    @staticmethod
+    def _patch_meta(
+        monkeypatch: pytest.MonkeyPatch,
+        meta_by_arch: dict[str, dict[str, dict]],
+    ) -> list[str]:
+        """Install a stub for ``_eval_meta_for_arch``; record archs asked.
+
+        Returns the (mutable) list the stub appends to on each call —
+        tests can assert order / multiplicity if they care.
+        """
+        seen: list[str] = []
+
+        def _stub(sys_name, binary, arch, *, flake_ref, run_subprocess):
+            seen.append(arch)
+            return meta_by_arch.get(arch, {})
+
+        monkeypatch.setattr(eval_worker, "_eval_meta_for_arch", _stub)
+        return seen
+
+    @staticmethod
+    def _call(
+        archs: list[str],
+        suffixes: list[str],
+        variant_sample: Optional[int],
+        variant_seed: Optional[str],
+    ) -> dict[str, list[str]]:
+        return eval_worker._sample_per_arch(
+            archs,
+            suffixes,
+            variant_sample,
+            variant_seed,
+            sys_name="x86_64-linux",
+            binary="hello",
+            flake_ref=".",
+            run_subprocess=lambda argv: (b"", b"", 0),
+        )
+
+    def test_drops_suffix_with_unsupported_compiler(
+        self, monkeypatch: pytest.MonkeyPatch, _filter_table,
+    ) -> None:
+        """``gcc4_6 + aarch64`` is ``n/a`` per table.md → dropped.
+
+        ``gcc15 + aarch64`` is ``OK`` so the second suffix survives.
+        """
+        self._patch_meta(monkeypatch, {
+            "aarch64": {
+                "good": {"compiler": "gcc15", "optimization": "O0"},
+                "bad": {"compiler": "gcc4_6", "optimization": "O0"},
+            },
+        })
+        out = self._call(["aarch64"], [], None, None)
+        assert out == {"aarch64": ["good"]}
+
+    def test_drops_suffix_with_known_bad_combo(
+        self, monkeypatch: pytest.MonkeyPatch, _filter_table,
+    ) -> None:
+        """``sanitizer + O0`` is a known flag-vs-flag conflict; the
+        suffix is dropped even though its (compiler, arch) pair is
+        supported. The benign sibling survives.
+        """
+        self._patch_meta(monkeypatch, {
+            "x86_64": {
+                "good": {"compiler": "gcc15", "optimization": "O2"},
+                "bad": {
+                    "compiler": "gcc15",
+                    "optimization": "O0",
+                    "sanitizer": "san-address",
+                },
+            },
+        })
+        out = self._call(["x86_64"], [], None, None)
+        assert out == {"x86_64": ["good"]}
+
+    def test_variant_sample_zero_returns_filtered_full_set(
+        self, monkeypatch: pytest.MonkeyPatch, _filter_table,
+    ) -> None:
+        """``variant_sample=0`` short-circuits the rng sampler — the
+        worker still runs the support / known-bad filter and returns
+        the FULL filtered set (every suffix the filter kept).
+        """
+        self._patch_meta(monkeypatch, {
+            "x86_64": {
+                f"S{i:03d}": {"compiler": "gcc15", "optimization": "O0"}
+                for i in range(5)
+            },
+        })
+        out = self._call(["x86_64"], [], 0, "seed-x")
+        assert out == {"x86_64": [f"S{i:03d}" for i in range(5)]}
+
+    def test_variant_sample_positive_samples_from_filtered_set(
+        self, monkeypatch: pytest.MonkeyPatch, _filter_table,
+    ) -> None:
+        """``variant_sample=K`` (K < N filter-survivors) returns exactly
+        K suffixes AND each picked suffix was in the filtered set
+        (i.e. the drop happens BEFORE the rng — a future swap of the
+        two would let a known-bad suffix sneak through).
+        """
+        # 6 entries split 4 survivors / 2 filtered-out (sanitiser+O0).
+        meta = {
+            "G1": {"compiler": "gcc15", "optimization": "O0"},
+            "G2": {"compiler": "gcc15", "optimization": "O2"},
+            "C1": {"compiler": "clang19", "optimization": "O0"},
+            "C2": {"compiler": "clang19", "optimization": "O2"},
+            # Known-bad: sanitiser + O0.
+            "X1": {
+                "compiler": "gcc15", "optimization": "O0",
+                "sanitizer": "san-address",
+            },
+            # Unsupported: gcc4_6 on aarch64 below.
+            "X2": {"compiler": "gcc4_6", "optimization": "O0"},
+        }
+        self._patch_meta(monkeypatch, {"aarch64": meta})
+        out = self._call(["aarch64"], [], 2, "seed-y")
+        kept = out["aarch64"]
+        # rng down-samples each (compiler, opt) group to at most 2 —
+        # but the four survivor groups have one suffix each, so all
+        # four survive when sample_size >= 1.
+        assert set(kept) == {"G1", "G2", "C1", "C2"}
+        # Critically: the rejected entries are NOT in the result.
+        assert "X1" not in kept
+        assert "X2" not in kept
+
+    def test_legacy_ceiling_honoured(
+        self, monkeypatch: pytest.MonkeyPatch, _filter_table,
+    ) -> None:
+        """Non-empty ``suffixes`` (legacy payload shape) caps the
+        result to that set: a meta-only suffix (``z``) is dropped even
+        though it passes the filter. The ceiling is NOT a bypass — a
+        ceiling-listed suffix that fails the filter is still dropped.
+        """
+        self._patch_meta(monkeypatch, {
+            "x86_64": {
+                "x": {"compiler": "gcc15", "optimization": "O0"},
+                # 'y' is in the ceiling but fails the filter
+                # (sanitiser + O0).
+                "y": {
+                    "compiler": "gcc15", "optimization": "O0",
+                    "sanitizer": "san-address",
+                },
+                # 'z' would pass the filter but is NOT in the ceiling.
+                "z": {"compiler": "gcc15", "optimization": "O2"},
+            },
+        })
+        out = self._call(["x86_64"], ["x", "y"], None, None)
+        # 'z' dropped by the ceiling; 'y' dropped by is_known_bad_combo;
+        # only 'x' survives.
+        assert out == {"x86_64": ["x"]}
+
+
+# ---------------------------------------------------------------------------
+# parse_payload — suffix-tolerance
+# ---------------------------------------------------------------------------
+
+
+class TestParsePayloadSuffixesTolerance:
+    """parse_payload now treats absent / None / empty-list ``suffixes``
+    as the same canonical empty-list payload shape.
+
+    Older submitters wrote a full suffix list; the modern submitter
+    leaves the field unset and the worker derives the list from
+    ``_meta`` per arch. The parser must accept both shapes — and it
+    must still reject obvious type errors so a typo in a future header
+    refactor surfaces at parse time, not deep inside the eval pipeline.
+    """
+
+    def test_parse_payload_accepts_suffixes_absent(self) -> None:
+        payload = _make_payload()
+        payload.pop("suffixes")
+        parsed = parse_payload(payload)
+        assert parsed["suffixes"] == []
+
+    def test_parse_payload_accepts_suffixes_none(self) -> None:
+        payload = _make_payload()
+        payload["suffixes"] = None
+        parsed = parse_payload(payload)
+        assert parsed["suffixes"] == []
+
+    def test_parse_payload_accepts_suffixes_empty_list(self) -> None:
+        payload = _make_payload(suffixes=[])
+        parsed = parse_payload(payload)
+        assert parsed["suffixes"] == []
+
+    def test_parse_payload_rejects_suffixes_non_list_non_none(self) -> None:
+        payload = _make_payload()
+        payload["suffixes"] = "not_a_list"
+        with pytest.raises(ValueError, match="suffixes"):
+            parse_payload(payload)
