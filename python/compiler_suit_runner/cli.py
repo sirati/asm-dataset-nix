@@ -744,6 +744,60 @@ def _config_from_args(
     )
 
 
+def _backfill_toolchain_validate_outpath(
+    manifest_dir: pathlib.Path,
+    drv_to_outpath: dict[str, str],
+    log: logging.Logger,
+) -> None:
+    """Rewrite ``toolchain_validate__*.json`` manifests in
+    ``manifest_dir`` with the current ``payload.outpath`` value.
+
+    Used on the cache-hit path: cached manifests pre-date the
+    submitter's outpath-resolution step, so the validate worker
+    refuses them with "manifest missing 'payload.outpath'". Reads the
+    drv from each manifest, looks up the resolved outpath, and
+    atomically rewrites the file when the lookup succeeds. Tolerates
+    parse / IO errors silently — the caller's downstream warning is
+    loud enough.
+    """
+    if not drv_to_outpath:
+        return
+    patched = 0
+    for path in sorted(manifest_dir.glob("toolchain_validate__*.json")):
+        try:
+            body = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        payload = body.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if isinstance(payload.get("outpath"), str) and payload["outpath"]:
+            continue
+        drv = payload.get("drv")
+        if not isinstance(drv, str):
+            continue
+        outpath = drv_to_outpath.get(drv)
+        if not outpath:
+            continue
+        payload["outpath"] = outpath
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(json.dumps(body, indent=2, sort_keys=True))
+            tmp.replace(path)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            continue
+        patched += 1
+    if patched:
+        log.info(
+            "cache-hit: backfilled payload.outpath into %d"
+            " toolchain_validate manifests", patched,
+        )
+
+
 def _restore_manifests_from_archive(
     archive: pathlib.Path, target_dir: pathlib.Path
 ) -> dict[tuple[str, str], str]:
@@ -1040,6 +1094,17 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     )
                     if tc_outpaths:
                         partition_drv_outpaths = dict(tc_outpaths)
+                        # Cached toolchain_validate manifests pre-date
+                        # the cli.py change that started emitting
+                        # ``payload.outpath`` — restore-from-cache can't
+                        # back-fill in place because the archive is
+                        # immutable. Rewrite the on-disk files now so
+                        # the framework's validate worker (which
+                        # rejects ``payload.outpath`` missing) sees the
+                        # current shape.
+                        _backfill_toolchain_validate_outpath(
+                            manifest_dir, tc_outpaths, log,
+                        )
                 except Exception:  # noqa: BLE001
                     log.exception(
                         "cache-hit toolchain outpath eval failed;"
