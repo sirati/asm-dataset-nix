@@ -409,6 +409,11 @@ pkgs.dockerTools.buildLayeredImage {
       # entry the worker fails matrix_eval with `nix-instantiate failed`
       # the first time it tries to build the matrix-<binary> aggregate.
       "NIX_PATH=nixpkgs=${pkgs.path}"
+      # Diagnostic dump location for nix-instantiate failures inside the
+      # secondary; the worker mirrors stderr here so the gateway-side
+      # log archive captures it (the dispatcher wire format truncates
+      # the raised RuntimeError message).
+      "CSR_NIX_DEBUG_DIR=/app/out-network/.csr-nix-debug"
       "PATH=/usr/local/bin:/usr/bin:/bin:/run/current-system/sw/bin"
       # Direct store-path pointer to the baked flake source. Layered
       # images sometimes present /app/flake as a symlink-into-store

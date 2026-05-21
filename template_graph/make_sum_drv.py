@@ -156,9 +156,34 @@ def _run_nix_instantiate(
         except OSError:
             pass
     if proc.returncode != 0:
+        stderr_text = proc.stderr.decode("utf-8", errors="replace")
+        # Frameworks that wrap the worker in a thin RPC truncate the
+        # raised exception's message; mirror it to stderr (always
+        # captured into the worker / container log) so the full nix
+        # diagnostic survives.
+        print(
+            "nix-instantiate failed; stderr follows:\n" + stderr_text,
+            file=sys.stderr,
+            flush=True,
+        )
+        debug_path = os.environ.get("CSR_NIX_DEBUG_DIR")
+        if debug_path:
+            try:
+                os.makedirs(debug_path, exist_ok=True)
+                stamp = f"{os.getpid()}-{abs(hash(expr)) & 0xffff:04x}"
+                with open(
+                    os.path.join(debug_path, f"nix-instantiate-{stamp}.log"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh:
+                    fh.write(stderr_text)
+                    fh.write("\n\n--- expression ---\n")
+                    fh.write(expr)
+            except OSError:
+                pass
         raise RuntimeError(
             "nix-instantiate failed:\n"
-            + proc.stderr.decode("utf-8", errors="replace")
+            + stderr_text
             + "\n\nExpression was (truncated to 2000 chars):\n"
             + expr[:2000]
             + ("\n...[truncated]" if len(expr) > 2000 else "")
