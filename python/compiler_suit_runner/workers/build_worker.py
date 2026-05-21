@@ -243,6 +243,30 @@ def _default_run_subprocess(argv: list[str]) -> tuple[bytes, bytes, int]:
     return proc.stdout, proc.stderr, proc.returncode
 
 
+def _resolve_bash_store_path_default() -> Optional[str]:
+    """Local fallback for ``nix eval --raw nixpkgs#bash.outPath``.
+
+    Mirrors :func:`suit_task._resolve_bash_store_path`; lives here so
+    the dependency_graph dispatch branch inside :func:`main` can resolve
+    bash without importing ``suit_task`` (which already imports this
+    module — would create a cycle).
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 - argv is fixed
+            ["nix", "eval", "--raw", "nixpkgs#bash.outPath"],
+            check=False,
+            capture_output=True,
+            shell=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.decode("utf-8", errors="replace").strip()
+    return out or None
+
+
 def _read_substituters_file(path: pathlib.Path) -> list[str]:
     """Return the ``nix build`` argv fragment encoded in ``path``.
 
@@ -1223,6 +1247,9 @@ def main() -> int:
         build_compilers_worker as _build_compilers_worker,
         eval_worker as _eval_worker,
     )
+    from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+        run as _dependency_graph_run,
+    )
 
     BroadcastSender = _peer_replication.BroadcastSender
 
@@ -1372,6 +1399,74 @@ def main() -> int:
                 )
                 raise NonRecoverableError(
                     f"matrix_eval crashed: {type(exc).__name__}: {exc}"
+                ) from exc
+            return WorkerOutput()
+
+        # dependency_graph branch — primary-affined planning task. The
+        # worker reads the matrix_aggregate sidecar the eval worker
+        # left next to the archive, resolves bash on the fly, then
+        # invokes :func:`run_dependency_graph_task` against this single
+        # binary. The run function emits both ``_dependency_graph.pkl``
+        # and the per-(compiler, arch) sidecar manifests that PH-B's
+        # placeholder build_variant tasks will consume.
+        dg_payload = _extract_class_payload(payload, "dependency_graph")
+        if dg_payload is not None:
+            binary = dg_payload.get("binary")
+            sys_name = dg_payload.get("sys") or "x86_64-linux"
+            tc_drv = dg_payload.get("toolchain_aggregate_drv")
+            out_dir_raw = dg_payload.get("matrix_eval_out_dir")
+            payload_bash = dg_payload.get("bash_path") or ""
+            if not isinstance(binary, str) or not binary:
+                raise NonRecoverableError(
+                    "dependency_graph payload missing 'binary'"
+                )
+            if not isinstance(tc_drv, str) or not tc_drv:
+                raise NonRecoverableError(
+                    "dependency_graph payload missing 'toolchain_aggregate_drv'"
+                )
+            if not isinstance(out_dir_raw, str) or not out_dir_raw:
+                raise NonRecoverableError(
+                    "dependency_graph payload missing 'matrix_eval_out_dir'"
+                )
+            out_dir = pathlib.Path(out_dir_raw)
+            sidecar = out_dir / f"{binary}.matrix_aggregate.json"
+            try:
+                sidecar_payload = json.loads(sidecar.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise NonRecoverableError(
+                    f"dependency_graph: sidecar {sidecar} unreadable: {exc}"
+                ) from exc
+            matrix_drv = sidecar_payload.get("matrix_aggregate_drv")
+            if not isinstance(matrix_drv, str) or not matrix_drv:
+                raise NonRecoverableError(
+                    f"dependency_graph: sidecar {sidecar} missing"
+                    f" 'matrix_aggregate_drv' (got {matrix_drv!r})"
+                )
+            bash_path = payload_bash or _resolve_bash_store_path_default() or ""
+            if not bash_path:
+                raise NonRecoverableError(
+                    "dependency_graph: bash store path unresolved; payload"
+                    " bash_path empty and `nix eval --raw nixpkgs#bash.outPath`"
+                    " failed"
+                )
+            _handle_log.info(
+                "handle: dispatching dependency_graph task binary=%r",
+                binary,
+            )
+            try:
+                _dependency_graph_run.run_dependency_graph_task(
+                    matrix_eval_out_dir=out_dir,
+                    bash_path=bash_path,
+                    toolchain_aggregate_drv=tc_drv,
+                    matrix_aggregate_drvs={binary: matrix_drv},
+                    sys_name=sys_name,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                _handle_log.exception(
+                    "handle: run_dependency_graph_task raised unexpectedly"
+                )
+                raise NonRecoverableError(
+                    f"dependency_graph failed: {type(exc).__name__}: {exc}"
                 ) from exc
             return WorkerOutput()
 

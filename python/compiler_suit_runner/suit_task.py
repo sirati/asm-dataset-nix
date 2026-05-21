@@ -387,8 +387,18 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
             ),
         ),
         PhaseSpec(
-            phase_id="build",
+            phase_id="dependency_graph",
             depends_on=("matrix_eval",),
+            types=(
+                TaskTypeSpec(
+                    type_id="dep_graph",
+                    worker_module="compiler_suit_runner.workers.build_worker",
+                ),
+            ),
+        ),
+        PhaseSpec(
+            phase_id="build",
+            depends_on=("dependency_graph",),
             types=(
                 TaskTypeSpec(
                     type_id="toolchain_validate",
