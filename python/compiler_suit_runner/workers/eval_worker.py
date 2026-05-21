@@ -429,6 +429,11 @@ def _eval_meta_for_arch(
         "eval",
         "--extra-experimental-features",
         "nix-command flakes",
+        # Multiple workers inside one secondary container share
+        # /root/.cache/nix and would otherwise race on the eval-cache
+        # SQLite write lock; disabling the cache trades a little CPU
+        # for forward progress.
+        "--no-eval-cache",
         "--json",
         f"{flake_ref}#_meta.{sys_name}.{binary}.{arch}",
     ]
