@@ -476,6 +476,38 @@ def _drv_size(drv_path: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _matrix_aggregate_sidecar_path(
+    out_dir: pathlib.Path, binary: str,
+) -> pathlib.Path:
+    """Per-binary sidecar location for the matrix_aggregate handoff."""
+    return out_dir / f"{binary}.matrix_aggregate.json"
+
+
+def _write_matrix_aggregate_sidecar(
+    out_dir: pathlib.Path, binary: str, matrix_aggregate_drv: str,
+) -> None:
+    """Atomic-write ``<binary>.matrix_aggregate.json`` for the watcher.
+
+    Tolerates IO errors silently — the result dict is still returned to
+    the framework and a future framework change that does carry payloads
+    will work without this fallback.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = _matrix_aggregate_sidecar_path(out_dir, binary)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps({
+            "binary": binary,
+            "matrix_aggregate_drv": matrix_aggregate_drv,
+        }, sort_keys=True))
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _archive_path(out_dir: pathlib.Path, binary: str) -> pathlib.Path:
     """Per-binary archive path under the matrix-eval output dir.
 
@@ -880,6 +912,15 @@ def run_eval_task(
     _export_matrix_archive(
         matrix_aggregate_drv, archive, run_subprocess=runner,
     )
+    # Step 6b: sidecar drop. The framework's TaskCompletedEvent wire
+    # format only carries (task_id, task_hash, success, error_kind) —
+    # no result payload — so the dependency_graph watcher running on
+    # the primary-promoted secondary needs an out-of-band channel to
+    # learn each binary's matrix_aggregate_drv. The bind-mounted
+    # out_dir is shared across every secondary (and the primary), so
+    # a content-addressed JSON file is the canonical handoff (per
+    # dynrunner-owner 2026-05-21).
+    _write_matrix_aggregate_sidecar(out_dir, binary, matrix_aggregate_drv)
     # Step 7: in-process summary. ``variant_drvs`` is kept for
     # backwards compatibility with legacy consumers (retired by D.1b).
     return {

@@ -770,46 +770,57 @@ class _MatrixEvalQuiesceWatcher:
     def _record_matrix_aggregate(
         self, task_id: str, result: Any,
     ) -> None:
-        """Extract ``matrix_aggregate_drv`` from a matrix_eval result dict.
+        """Capture ``matrix_aggregate_drv`` for one matrix_eval task.
 
-        Resolves the binary key by preferring ``result["binary"]`` and
-        falling back to parsing the ``matrix_eval__<binary>`` task_id
-        shape. Stores ``{binary: drv_path}`` in
-        :attr:`_matrix_aggregates`; missing or ``None`` payloads are
-        logged at WARNING and skipped (resumed tasks legitimately
-        return ``matrix_aggregate_drv=None``).
+        Two sources, tried in order:
+
+        1. ``result`` dict (only populated if the framework's
+           task-completion wire ever grows a payload slot — per
+           dynrunner-owner 2026-05-21 it intentionally does not, but
+           the in-process tests still hand the dict directly).
+        2. Sidecar JSON the worker writes alongside the archive at
+           ``<out_dir>/<binary>.matrix_aggregate.json``. Bind-mounted
+           ``out_dir`` is visible from every secondary, so the
+           primary-promoted secondary's watcher reads what the
+           originating worker wrote.
 
         Caller MUST hold :attr:`_lock`.
         """
         binary = self._binary_from_task_id(task_id)
-        if not isinstance(result, dict):
-            # Framework hook may forward ``None`` while the
-            # task-result API is still in flight (today only the
-            # task_id is delivered). Logging at debug level keeps
-            # operator output quiet for the common path.
-            self._logger.debug(
-                "_MatrixEvalQuiesceWatcher: no result dict for task_id=%s"
-                " (binary=%s); skipping matrix_aggregate_drv capture",
-                task_id, binary,
+        if isinstance(result, dict):
+            if isinstance(result.get("binary"), str) and result["binary"]:
+                binary = result["binary"]
+            matrix_drv = result.get("matrix_aggregate_drv")
+            if isinstance(matrix_drv, str) and matrix_drv and binary:
+                self._matrix_aggregates[binary] = matrix_drv
+                return
+        # Fall through to sidecar lookup (the canonical cluster path).
+        if not binary:
+            self._logger.warning(
+                "_MatrixEvalQuiesceWatcher: matrix_eval task %s has no"
+                " result dict and no binary derivable from task_id;"
+                " dgw --matrix-drv entry omitted",
+                task_id,
             )
             return
-        if isinstance(result.get("binary"), str) and result["binary"]:
-            binary = result["binary"]
-        matrix_drv = result.get("matrix_aggregate_drv")
+        sidecar = self._out_dir / f"{binary}.matrix_aggregate.json"
+        try:
+            payload = json.loads(sidecar.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            self._logger.warning(
+                "_MatrixEvalQuiesceWatcher: matrix_eval task %s"
+                " (binary=%s): no result dict AND sidecar %s unreadable"
+                " (%s); dgw --matrix-drv entry omitted",
+                task_id, binary, sidecar, exc,
+            )
+            return
+        matrix_drv = payload.get("matrix_aggregate_drv")
         if not isinstance(matrix_drv, str) or not matrix_drv:
             self._logger.warning(
                 "_MatrixEvalQuiesceWatcher: matrix_eval task %s"
-                " (binary=%s) returned no matrix_aggregate_drv"
-                " (resumed? value=%r); dgw --matrix-drv entry omitted",
-                task_id, binary, matrix_drv,
-            )
-            return
-        if not binary:
-            self._logger.warning(
-                "_MatrixEvalQuiesceWatcher: matrix_eval task %s"
-                " returned matrix_aggregate_drv but no binary key"
-                " (result keys=%r); dgw --matrix-drv entry omitted",
-                task_id, sorted(result.keys()),
+                " (binary=%s): sidecar %s has no matrix_aggregate_drv"
+                " (value=%r); dgw --matrix-drv entry omitted",
+                task_id, binary, sidecar, matrix_drv,
             )
             return
         self._matrix_aggregates[binary] = matrix_drv

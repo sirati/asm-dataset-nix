@@ -256,6 +256,52 @@ def test_watcher_fires_when_complete(
     assert w.fired is True
 
 
+def test_watcher_reads_matrix_aggregate_sidecar(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When the framework's task-completion hook delivers no result dict
+    (the production wire format), the watcher reads
+    ``<out_dir>/<binary>.matrix_aggregate.json`` written by the worker.
+    """
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sidecar = out_dir / "hello.matrix_aggregate.json"
+    sidecar.write_text(
+        '{"binary": "hello", "matrix_aggregate_drv": "/nix/store/X-mhello.drv"}'
+    )
+    hello = matrix_eval_task_id("hello")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+    )
+    w.on_task_completed(hello, result=None)
+    assert w._matrix_aggregates == {"hello": "/nix/store/X-mhello.drv"}
+
+
+def test_watcher_skips_when_sidecar_missing(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Sidecar absent AND no result dict → warning, no aggregate
+    recorded, ``fired`` does not advance phase 3 prerequisites."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    hello = matrix_eval_task_id("hello")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+        toolchain_task_ids={},
+    )
+    caplog.set_level(logging.WARNING, logger="test_watcher_sidecar_miss")
+    w._logger = logging.getLogger("test_watcher_sidecar_miss")
+    w.on_task_completed(hello, result=None)
+    assert w._matrix_aggregates == {}
+    assert any(
+        "sidecar" in rec.message and "unreadable" in rec.message
+        for rec in caplog.records
+    )
+
+
 def test_watcher_is_idempotent_on_duplicate_completion(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -862,9 +908,12 @@ def test_watcher_skips_resumed_tasks(
         argv[i + 1] for i, tok in enumerate(argv) if tok == "--matrix-drv"
     ]
     assert matrix_pairs == [f"busybox={mat_busybox}"]
-    # Warning about the resumed task was emitted.
+    # Warning about the resumed task was emitted (the resumed worker
+    # returns ``matrix_aggregate_drv=None`` and the watcher falls
+    # through to its sidecar lookup, which for a fresh-tmp resume test
+    # has no file to read).
     assert any(
-        "no matrix_aggregate_drv" in rec.message
+        "dgw --matrix-drv entry omitted" in rec.message
         and "hello" in rec.message
         and rec.levelno == logging.WARNING
         for rec in caplog.records
