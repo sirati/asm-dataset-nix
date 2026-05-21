@@ -8,7 +8,12 @@ and subprocess argv shape. Runs in CI without nix on PATH.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from template_graph import make_sum_drv as mod
 
@@ -320,3 +325,147 @@ def test_make_sum_drv_from_paths_accepts_canonical_markers():
             toolchain_drvs=[_TOOLCHAINS_AGG],
             matrix_drvs={"matrix-hello": [_MATRIX_HELLO_AGG]},
         )
+
+
+# ---------------------------------------------------------------------------
+# _run_nix_instantiate — stderr mirror + CSR_NIX_DEBUG_DIR dump
+# ---------------------------------------------------------------------------
+
+
+class _FakeCompletedProcess:
+    """Minimal stand-in for ``subprocess.CompletedProcess``.
+
+    ``_run_nix_instantiate`` only reads ``returncode``, ``stdout``
+    (bytes), and ``stderr`` (bytes) — keeping the stub lean lets us
+    avoid mocking the constructor signature.
+    """
+
+    def __init__(self, *, returncode: int, stdout: bytes, stderr: bytes) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_run_nix_instantiate_failure_mirrors_stderr_and_dumps_debug_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression: failure path must mirror nix stderr to both
+    ``sys.stderr`` and ``$CSR_NIX_DEBUG_DIR/nix-instantiate-*.log``.
+
+    The dynamic_runner wire format truncates the raised RuntimeError
+    message; the mirror ensures the full nix diagnostic survives in
+    the worker / container log AND on the shared-fs debug dir.
+    """
+    monkeypatch.setenv("CSR_NIX_DEBUG_DIR", str(tmp_path))
+
+    def _fake_run(argv, capture_output=True, check=False):
+        return _FakeCompletedProcess(
+            returncode=1,
+            stdout=b"",
+            stderr=b"sample nix error",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="sample nix error"):
+        mod._run_nix_instantiate(
+            "let x = 1; in x",
+            extra_nix_args=None,
+            with_flakes=False,
+        )
+
+    # Mirror 1: a debug-log file landed under CSR_NIX_DEBUG_DIR with
+    # the verbatim stderr captured.
+    logs = list(tmp_path.glob("nix-instantiate-*.log"))
+    assert len(logs) == 1, (
+        f"expected exactly one nix-instantiate-*.log under {tmp_path}, "
+        f"got {[p.name for p in logs]}"
+    )
+    log_text = logs[0].read_text(encoding="utf-8")
+    assert "sample nix error" in log_text
+    # The dump also captures the expression so operators can reproduce.
+    assert "--- expression ---" in log_text
+    assert "let x = 1; in x" in log_text
+
+    # Mirror 2: stderr is echoed via print(..., file=sys.stderr).
+    captured = capsys.readouterr()
+    assert "sample nix error" in captured.err
+
+
+def test_template_graph_importable_with_project_rooted_pythonpath(
+    tmp_path: Path,
+) -> None:
+    """Smoke check mirroring ``PYTHONPATH=/app/python:/app/flake`` in the
+    docker image: spawning a fresh Python with PYTHONPATH set to the
+    project's ``python/`` dir AND the flake-root dir must let
+    ``template_graph`` resolve.
+
+    The container env baked in ``nix/docker-image.nix`` is what makes
+    the dependency_graph / eval workers able to ``import template_graph``
+    at runtime; if the entry ever drops the flake-root component, the
+    workers fail at the first sum-drv assembly. This subprocess test
+    pins the layout independently of the harness's own sys.path
+    additions.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    python_root = repo_root / "python"
+    if not (repo_root / "template_graph" / "__init__.py").is_file():
+        pytest.skip("template_graph not on disk in expected layout")
+    if not python_root.is_dir():
+        pytest.skip("python/ package root not on disk in expected layout")
+
+    # Mirror the image PYTHONPATH: compiler_suit_runner root + flake root.
+    env_pythonpath = f"{python_root}:{repo_root}"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import template_graph; print(template_graph.__name__)",
+        ],
+        env={
+            "PYTHONPATH": env_pythonpath,
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+        },
+        cwd=str(tmp_path),
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        f"importing template_graph with PYTHONPATH={env_pythonpath!r} "
+        f"failed:\nstdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+    )
+    assert proc.stdout.strip() == "template_graph"
+
+
+def test_run_nix_instantiate_failure_without_debug_dir_still_mirrors_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``CSR_NIX_DEBUG_DIR`` unset: the on-disk dump is skipped but the
+    stderr mirror still fires (so the framework-log capture survives
+    the wire-format truncation).
+    """
+    monkeypatch.delenv("CSR_NIX_DEBUG_DIR", raising=False)
+
+    def _fake_run(argv, capture_output=True, check=False):
+        return _FakeCompletedProcess(
+            returncode=2,
+            stdout=b"",
+            stderr=b"another nix diagnostic",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="another nix diagnostic"):
+        mod._run_nix_instantiate(
+            "let y = 2; in y",
+            extra_nix_args=None,
+            with_flakes=False,
+        )
+
+    captured = capsys.readouterr()
+    assert "another nix diagnostic" in captured.err

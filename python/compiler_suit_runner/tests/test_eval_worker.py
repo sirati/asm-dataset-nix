@@ -1688,3 +1688,150 @@ class TestParsePayloadSuffixesTolerance:
         payload["suffixes"] = "not_a_list"
         with pytest.raises(ValueError, match="suffixes"):
             parse_payload(payload)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_flake_ref / _as_installable — path: prefix for store subdirs
+# ---------------------------------------------------------------------------
+
+
+class TestResolveFlakeRef:
+    """Regression coverage for the ``path:`` flake-ref prefix.
+
+    ``nix eval /nix/store/<hash>/sub/dir#attr`` without the prefix
+    strips the trailing components ("searching up" for the nearest
+    ``flake.nix``) and fails on the bare store root. Prefixing the
+    absolute path with ``path:`` makes both ``nix eval`` and
+    ``nix-eval-jobs`` accept the subdirectory as the flake location.
+    """
+
+    def test_non_absolute_flake_ref_unchanged(self) -> None:
+        """``github:foo/bar`` and other non-absolute refs pass through."""
+        assert eval_worker._resolve_flake_ref("github:foo/bar") == (
+            "github:foo/bar"
+        )
+
+    def test_already_prefixed_flake_ref_unchanged(self) -> None:
+        """A pre-prefixed ``path:`` ref must not be double-prefixed."""
+        assert eval_worker._resolve_flake_ref("path:/foo/bar") == (
+            "path:/foo/bar"
+        )
+        # _as_installable directly is idempotent on the prefixed form.
+        assert eval_worker._as_installable("path:/foo/bar") == (
+            "path:/foo/bar"
+        )
+
+    def test_absolute_path_gets_path_prefix(self) -> None:
+        """Bare absolute paths gain the ``path:`` prefix so nix tools
+        treat them as direct flake locations rather than searching up.
+        """
+        assert eval_worker._resolve_flake_ref("/some/absolute/path") == (
+            "path:/some/absolute/path"
+        )
+        assert eval_worker._as_installable("/foo/bar") == "path:/foo/bar"
+
+    def test_dot_with_env_var_pointing_at_tmp_flake(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``.`` + ``CSR_FLAKE_DIR`` pointing at a dir with ``flake.nix``
+        resolves to ``path:<that-dir>`` — the in-container short-circuit
+        that avoids nix-eval-jobs re-copying the flake into its sandbox.
+        """
+        (tmp_path / "flake.nix").write_text("{ outputs = _: {}; }\n")
+        monkeypatch.setenv("CSR_FLAKE_DIR", str(tmp_path))
+        assert eval_worker._resolve_flake_ref(".") == f"path:{tmp_path}"
+
+    def test_dot_without_env_and_no_container_flake_returns_dot(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No env var + no ``/app/flake`` available → return ``.`` verbatim.
+
+        This is the developer-host default (pytest run from the repo
+        root): the eval call inherits cwd and nix resolves ``.`` itself.
+        """
+        monkeypatch.delenv("CSR_FLAKE_DIR", raising=False)
+        # Point the container-fallback at a path guaranteed not to exist
+        # so the second branch in _resolve_flake_ref also misses.
+        monkeypatch.setattr(
+            eval_worker, "_CONTAINER_FLAKE_ROOT", "/nonexistent-app-flake",
+        )
+        assert eval_worker._resolve_flake_ref(".") == "."
+
+
+# ---------------------------------------------------------------------------
+# _eval_meta_for_arch — --no-eval-cache to avoid SQLite contention
+# ---------------------------------------------------------------------------
+
+
+class TestEvalMetaForArch:
+    """Regression coverage for the ``--no-eval-cache`` flag.
+
+    Multiple workers inside one secondary container share
+    ``/root/.cache/nix/eval-cache-v6/*.sqlite``. Without
+    ``--no-eval-cache`` two concurrent ``nix eval`` invocations serialise
+    on the SQLite write lock and one fails with "database is busy".
+    """
+
+    def test_argv_contains_no_eval_cache_flag(self) -> None:
+        captured: list[list[str]] = []
+
+        def _run(argv: list[str]) -> tuple[bytes, bytes, int]:
+            captured.append(list(argv))
+            return b'{"O0": {"compiler": "gcc15", "optimization": "O0"}}', b"", 0
+
+        result = eval_worker._eval_meta_for_arch(
+            "x86_64-linux", "hello", "x86_64",
+            flake_ref="path:/some/flake",
+            run_subprocess=_run,
+        )
+        assert result == {"O0": {"compiler": "gcc15", "optimization": "O0"}}
+        assert len(captured) == 1
+        argv = captured[0]
+        assert "--no-eval-cache" in argv
+
+    def test_argv_order_matches_spec(self) -> None:
+        """The exact argv prefix is the wire contract with ``nix eval``:
+        ``nix eval --extra-experimental-features 'nix-command flakes'
+        --no-eval-cache --json <flake>#_meta....``. Any reorder or
+        accidental drop would surface here.
+        """
+        captured: list[list[str]] = []
+
+        def _run(argv: list[str]) -> tuple[bytes, bytes, int]:
+            captured.append(list(argv))
+            return b"{}", b"", 0
+
+        eval_worker._eval_meta_for_arch(
+            "x86_64-linux", "hello", "aarch64",
+            flake_ref="path:/some/flake",
+            run_subprocess=_run,
+        )
+        argv = captured[0]
+        # The fixed prefix; the trailing positional is the installable.
+        assert argv[:6] == [
+            "nix",
+            "eval",
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "--no-eval-cache",
+            "--json",
+        ]
+        # And the installable lands as the last token, identifying the
+        # arch slot we asked for.
+        assert argv[-1] == "path:/some/flake#_meta.x86_64-linux.hello.aarch64"
+
+    def test_nonzero_exit_raises_runtime_error(self) -> None:
+        """Subprocess failures map to RuntimeError (retry-pass eligible)."""
+
+        def _run(argv: list[str]) -> tuple[bytes, bytes, int]:
+            return b"", b"boom", 1
+
+        with pytest.raises(RuntimeError, match="boom"):
+            eval_worker._eval_meta_for_arch(
+                "x86_64-linux", "hello", "x86_64",
+                flake_ref=".",
+                run_subprocess=_run,
+            )
