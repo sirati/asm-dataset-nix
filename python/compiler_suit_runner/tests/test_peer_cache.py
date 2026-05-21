@@ -1311,3 +1311,66 @@ def test_seed_toolchain_drvs_off_cluster_short_circuits(
         "skipped_unreachable": True,
     }
     assert calls == []  # zero per-drv POSTs
+
+
+# ---------------------------------------------------------------------------
+# PeerNixConfWatcher writability degradation
+# ---------------------------------------------------------------------------
+
+
+class _FakePeerWatcher:
+    """Minimal stand-in for PeerListWatcher; exposes only ``peers``."""
+    peers: list = []
+
+
+def test_peer_nix_conf_watcher_degrades_when_target_not_writable(
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the target conf dir isn't writable, the watcher logs once at
+    INFO level and turns into a no-op rather than burning ERRORs on each
+    refresh tick. Reproduces the submitter-side noise the cluster log
+    surfaced during the 2026-05-21 PH-E smoke dispatch."""
+    from compiler_suit_runner.peer_cache import PeerNixConfWatcher
+
+    read_only_dir = tmp_path / "readonly"
+    read_only_dir.mkdir()
+    # Strip write bits — `os.access` returns False for the parent.
+    read_only_dir.chmod(0o555)
+    target = read_only_dir / "peer.conf"
+
+    try:
+        with caplog.at_level("INFO", logger="compiler_suit_runner.peer_cache"):
+            w = PeerNixConfWatcher(
+                _FakePeerWatcher(), target_conf=str(target),
+            )
+        # The watcher was constructed but flagged not writable; no file
+        # written, no traceback raised.
+        assert not target.exists()
+        assert w._writable is False  # noqa: SLF001 — intentional probe
+        # INFO log mentions the path + "not writable".
+        joined = "\n".join(rec.message for rec in caplog.records)
+        assert "not writable" in joined
+        # Running the thread body should not raise either; we drive run()
+        # explicitly so we don't have to wait on the daemon thread.
+        w.run()  # exits immediately because _writable is False
+    finally:
+        # Restore perms so pytest cleanup can remove the tree.
+        read_only_dir.chmod(0o755)
+
+
+def test_peer_nix_conf_watcher_writes_when_target_writable(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Sanity check: when the target dir IS writable, the watcher primes
+    peer.conf synchronously on construction (no thread needed)."""
+    from compiler_suit_runner.peer_cache import PeerNixConfWatcher
+
+    target = tmp_path / "etc" / "peer.conf"  # parent doesn't exist yet
+    w = PeerNixConfWatcher(
+        _FakePeerWatcher(), target_conf=str(target),
+    )
+    assert w._writable is True  # noqa: SLF001 — intentional probe
+    # Empty peers → empty body, but the file IS created.
+    assert target.exists()
+    assert target.read_text() == ""
