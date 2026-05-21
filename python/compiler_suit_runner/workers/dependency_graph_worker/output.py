@@ -10,6 +10,7 @@ sorted by key for diff-friendliness).
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import pickle
@@ -39,6 +40,13 @@ __all__ = [
 # Output filenames written under ``<matrix_eval_out_dir>``.
 DEPENDENCY_GRAPH_PICKLE = "_dependency_graph.pkl"
 DEPENDENCY_GRAPH_SUMMARY = "_dependency_graph_summary.txt"
+# Per-(binary, compiler, arch) sidecar directory under
+# ``<matrix_eval_out_dir>``. Each placeholder build_variant /
+# build_common_dep task reads its cell's manifest at dispatch time;
+# the file is keyed deterministically so the manifest path is
+# enumerable at submit-time (PH-B). See plan/placeholder-pattern-
+# restructure.md.
+DEPENDENCY_GRAPH_MANIFEST_DIR = "_manifests"
 
 
 # ``PHASE4_PICKLE_MAGIC`` / ``PHASE4_PICKLE_FORMAT_VERSION`` are sourced
@@ -131,3 +139,71 @@ def write_phase4_summary_text(
         raise
     os.replace(tmp, out_path)
     return out_path
+
+
+def write_per_cell_manifests(
+    *,
+    descriptors: Sequence[Phase4Descriptor],
+    matrix_eval_out_dir: pathlib.Path,
+) -> list[pathlib.Path]:
+    """Write one per-(binary, compiler, arch) sidecar manifest under
+    ``<matrix_eval_out_dir>/_manifests/``.
+
+    Each sidecar carries the list of build_variant / build_common_dep
+    descriptor payloads for that cell, ordered by ``slot_idx``. The
+    PH-B placeholder enumerator writes its task_id scheme to match
+    ``<binary>__<compiler>__<arch>__slot<N>`` where N is the position
+    in this list; the PH-C build_variant worker looks up its payload
+    by reading ``payload.manifest_path`` + ``payload.slot_idx``.
+
+    Returns the list of written sidecar paths (one per non-empty cell)
+    for observability / testability.
+    """
+    sidecar_dir = matrix_eval_out_dir / DEPENDENCY_GRAPH_MANIFEST_DIR
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    # Group descriptors by (binary, compiler, arch). build_common_dep
+    # entries live under their (binary, arch) cell with an empty
+    # compiler — the placeholder enumerator emits them under a
+    # synthetic ``__common__`` compiler tag to keep the filename
+    # convention single-shaped.
+    grouped: dict[tuple[str, str, str], list[Phase4Descriptor]] = {}
+    for d in descriptors:
+        binary = d.payload.get("binary", "")
+        arch = d.payload.get("arch", "")
+        if d.kind == "build_variant":
+            compiler = d.payload.get("compiler_id", "")
+        else:
+            compiler = "__common__"
+        if not binary or not arch or not compiler:
+            continue
+        key = (binary, compiler, arch)
+        grouped.setdefault(key, []).append(d)
+    written: list[pathlib.Path] = []
+    for (binary, compiler, arch), cell_descriptors in sorted(grouped.items()):
+        cell_descriptors = sorted(cell_descriptors, key=lambda d: d.task_id)
+        variants = [
+            {
+                "slot_idx": idx,
+                "kind": d.kind,
+                "task_id": d.task_id,
+                "name": d.name,
+                "payload": dict(d.payload),
+                "depends_on": list(d.depends_on),
+            }
+            for idx, d in enumerate(cell_descriptors)
+        ]
+        body = {
+            "binary": binary,
+            "compiler": compiler,
+            "arch": arch,
+            "variants": variants,
+        }
+        target = sidecar_dir / f"{binary}__{compiler}__{arch}.json"
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(body, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+        written.append(target)
+    return written
