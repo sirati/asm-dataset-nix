@@ -107,12 +107,6 @@ class BuildWorkerResult:
     error: Optional[str] = None
     output_path: Optional[pathlib.Path] = None
     staged_outputs: tuple[pathlib.Path, ...] = ()
-    # PH-C: True when a placeholder build_variant was resolved to an
-    # out-of-range slot (more slots emitted than the planner had
-    # variants for that cell). The framework still sees a successful
-    # task; observability + tests can branch on this flag to confirm
-    # the slot was intentionally unused.
-    no_op: bool = False
     # Cluster-wide placement-map fields. Populated when the worker
     # realises (or fetches) a store path; consumed by the post-build
     # hook in :func:`build_worker` to register the path with the
@@ -769,85 +763,6 @@ def _validate_toolchain(
     )
 
 
-def _resolve_placeholder_payload(payload: dict) -> Optional[dict]:
-    """Resolve a placeholder build_variant payload via its sidecar.
-
-    PH-C: at submit time, build_variant tasks are declared as K-sized
-    placeholders carrying ``{placeholder: True, slot_idx, manifest_path,
-    binary, compiler, arch, sys}``. The dependency_graph worker (PH-A)
-    later writes a per-cell sidecar at ``manifest_path`` containing a
-    ``variants`` list ordered by ``slot_idx``. This helper looks up the
-    placeholder's slot and returns the resolved payload (drv,
-    variant_dir, metadata, …) so :func:`build_worker` can dispatch the
-    nix build with the same shape it used pre-placeholder.
-
-    Returns:
-      * the resolved payload dict on a successful lookup;
-      * ``None`` when the slot is out of range, the manifest is missing,
-        or the resolved descriptor isn't of kind ``build_variant`` — the
-        caller treats every ``None`` as "this slot is intentionally
-        unused" and emits a no-op success.
-
-    Hard failures (manifest exists but unreadable / malformed) raise
-    ``ValueError`` so the worker surfaces the real bug instead of
-    silently no-op-ing.
-    """
-    manifest_path_raw = payload.get("manifest_path")
-    if not isinstance(manifest_path_raw, str) or not manifest_path_raw:
-        raise ValueError(
-            "placeholder build_variant missing 'manifest_path'"
-        )
-    slot_idx_raw = payload.get("slot_idx")
-    if not isinstance(slot_idx_raw, int) or slot_idx_raw < 0:
-        raise ValueError(
-            f"placeholder build_variant has invalid 'slot_idx': "
-            f"{slot_idx_raw!r}"
-        )
-    sidecar_path = pathlib.Path(manifest_path_raw)
-    if not sidecar_path.exists():
-        # No sidecar: dep_graph didn't reach this cell — treat the
-        # entire K-sized placeholder batch for this cell as no-op.
-        return None
-    try:
-        body = json.loads(sidecar_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"placeholder build_variant sidecar {sidecar_path} unreadable: {exc}"
-        ) from exc
-    variants = body.get("variants")
-    if not isinstance(variants, list):
-        raise ValueError(
-            f"placeholder build_variant sidecar {sidecar_path} missing "
-            f"'variants' list (got {type(variants).__name__})"
-        )
-    if slot_idx_raw >= len(variants):
-        # Placeholder slot beyond the planner's actual variant count
-        # for this cell. The framework still sees a successful task;
-        # the worker returns a no-op result.
-        return None
-    entry = variants[slot_idx_raw]
-    if not isinstance(entry, dict):
-        raise ValueError(
-            f"placeholder build_variant sidecar {sidecar_path} slot "
-            f"{slot_idx_raw} is not a dict (got {type(entry).__name__})"
-        )
-    kind = entry.get("kind")
-    if kind != "build_variant":
-        # The placeholder enumerator only emits build_variant slots;
-        # a non-build_variant entry indicates a configuration bug.
-        raise ValueError(
-            f"placeholder build_variant sidecar {sidecar_path} slot "
-            f"{slot_idx_raw} has kind={kind!r}, expected 'build_variant'"
-        )
-    resolved = entry.get("payload")
-    if not isinstance(resolved, dict):
-        raise ValueError(
-            f"placeholder build_variant sidecar {sidecar_path} slot "
-            f"{slot_idx_raw} missing 'payload' dict"
-        )
-    return resolved
-
-
 def _prefetch_variant_inputs(
     payload: dict,
     env: BuildWorkerEnv,
@@ -973,36 +888,6 @@ def build_worker(
             duration_seconds=max(0.0, clock() - start),
             error="manifest missing 'payload' object",
         )
-
-    # Placeholder resolution (PH-C). build_variant items declared at
-    # submit time as K-sized placeholders carry
-    # ``payload.placeholder == True`` + ``slot_idx`` + ``manifest_path``.
-    # Replace the placeholder payload with the resolved descriptor read
-    # from the per-cell sidecar so the rest of the dispatch keeps its
-    # existing shape. An out-of-range slot returns a no-op success.
-    if (
-        item_class == ITEM_CLASS_BUILD_VARIANT
-        and payload.get("placeholder") is True
-    ):
-        try:
-            resolved_payload = _resolve_placeholder_payload(payload)
-        except ValueError as exc:
-            return BuildWorkerResult(
-                item_class=item_class,
-                name=name,
-                success=False,
-                duration_seconds=max(0.0, clock() - start),
-                error=str(exc),
-            )
-        if resolved_payload is None:
-            return BuildWorkerResult(
-                item_class=item_class,
-                name=name,
-                success=True,
-                duration_seconds=max(0.0, clock() - start),
-                no_op=True,
-            )
-        payload = resolved_payload
 
     # Validate-only items have a different shape: no ``nix build``,
     # just a path-info probe + targeted ``nix copy`` against the
@@ -1543,9 +1428,7 @@ def main() -> int:
         # worker reads the matrix_aggregate sidecar the eval worker
         # left next to the archive, resolves bash on the fly, then
         # invokes :func:`run_dependency_graph_task` against this single
-        # binary. The run function emits both ``_dependency_graph.pkl``
-        # and the per-(compiler, arch) sidecar manifests that PH-B's
-        # placeholder build_variant tasks will consume.
+        # binary.
         dg_payload = _extract_class_payload(payload, "dependency_graph")
         if dg_payload is not None:
             binary = dg_payload.get("binary")

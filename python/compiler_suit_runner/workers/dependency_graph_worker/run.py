@@ -412,13 +412,4 @@ def _write_outputs(
     _output.write_phase4_summary_text(
         summary=summary, out_path=summary_path,
     )
-    # Per-(binary, compiler, arch) sidecar manifests for the
-    # placeholder build_variant + build_common_dep workers (PH-A in
-    # plan/placeholder-pattern-restructure.md). Same descriptor set,
-    # just sliced and re-serialised so each cell's worker reads only
-    # its own bytes at dispatch.
-    _output.write_per_cell_manifests(
-        descriptors=descriptors,
-        matrix_eval_out_dir=matrix_eval_out_dir,
-    )
     return pickle_path
