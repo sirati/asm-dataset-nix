@@ -283,8 +283,14 @@ def test_watcher_reads_matrix_aggregate_sidecar(
 def test_watcher_skips_when_sidecar_missing(
     tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Sidecar absent AND no result dict → warning, no aggregate
-    recorded, ``fired`` does not advance phase 3 prerequisites."""
+    """Sidecar absent AND no result dict → debug log, no aggregate
+    recorded, ``fired`` does not advance phase 3 prerequisites.
+
+    Post-PH-D the watcher's matrix_aggregates cache is bookkeeping-only
+    (the framework dep_graph task reads the sidecar directly inside
+    the worker subprocess), so missing sidecars are NOT operational
+    errors and the message level was downgraded from WARNING to DEBUG.
+    """
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     hello = matrix_eval_task_id("hello")
@@ -293,7 +299,7 @@ def test_watcher_skips_when_sidecar_missing(
         out_dir=out_dir,
         toolchain_task_ids={},
     )
-    caplog.set_level(logging.WARNING, logger="test_watcher_sidecar_miss")
+    caplog.set_level(logging.DEBUG, logger="test_watcher_sidecar_miss")
     w._logger = logging.getLogger("test_watcher_sidecar_miss")
     w.on_task_completed(hello, result=None)
     assert w._matrix_aggregates == {}
@@ -969,7 +975,7 @@ def test_watcher_skips_resumed_tasks(
         run_subprocess=fake_run,
         logger=logger,
     )
-    with caplog.at_level(logging.WARNING, logger="test_skips_resumed"):
+    with caplog.at_level(logging.DEBUG, logger="test_skips_resumed"):
         w.on_task_completed(
             hello,
             result={"binary": "hello", "matrix_aggregate_drv": None,
@@ -991,14 +997,13 @@ def test_watcher_skips_resumed_tasks(
         argv[i + 1] for i, tok in enumerate(argv) if tok == "--matrix-drv"
     ]
     assert matrix_pairs == [f"busybox={mat_busybox}"]
-    # Warning about the resumed task was emitted (the resumed worker
-    # returns ``matrix_aggregate_drv=None`` and the watcher falls
-    # through to its sidecar lookup, which for a fresh-tmp resume test
-    # has no file to read).
+    # Post-PH-D the missing-sidecar branch logs at DEBUG (bookkeeping
+    # is non-critical now that the framework dep_graph reads the
+    # sidecar directly inside the worker subprocess).
     assert any(
-        "dgw --matrix-drv entry omitted" in rec.message
+        "bookkeeping entry omitted" in rec.message
         and "hello" in rec.message
-        and rec.levelno == logging.WARNING
+        and rec.levelno == logging.DEBUG
         for rec in caplog.records
     )
     # Internal aggregates dict only carries the non-resumed binary.
