@@ -599,15 +599,19 @@ def test_run_eval_task_happy_path(
 
 
 def test_run_eval_task_resume_short_circuits(tmp_path: pathlib.Path) -> None:
-    """If the archive exists and is non-empty, short-circuit eval +
-    broadcast + export and return a minimal ``{"resumed": True}``
-    dict. The archive presence is the matrix_eval-done signal; the
-    dependency_graph_worker derives variant_lookup from the imported
-    .drv paths so no in-memory variant list is needed.
-    """
+    """If BOTH the archive and the matrix_aggregate sidecar from a
+    prior run are present, short-circuit eval + broadcast + export and
+    return a minimal ``{"resumed": True}`` dict. The archive carries the
+    closure import for dep_graph; the sidecar carries the aggregate drv
+    path. Without the sidecar, PH-A's dependency_graph framework task
+    has no handoff, so the resume MUST require both (see
+    :func:`test_run_eval_task_resume_requires_sidecar`)."""
     payload = _make_payload()
     archive = tmp_path / "hello.nix-archive"
     archive.write_bytes(b"NIX_EXPORT:previous-run")
+    # Sidecar from the prior run must also be present for resume to fire.
+    sidecar = tmp_path / "hello.matrix_aggregate.json"
+    sidecar.write_text('{"binary":"hello","matrix_aggregate_drv":"/nix/store/prev.drv"}')
 
     runner = _EvalJobsStub()
     sender = _make_broadcast_sender()
@@ -662,12 +666,42 @@ def test_run_eval_task_empty_archive_re_runs(
     assert result["matrix_aggregate_drv"] == "/nix/store/wrap-matrix-hello.drv"
 
 
-# (test_run_eval_task_corrupt_sidecar_falls_through was deleted — the
-# eval_worker no longer writes the JSON sidecar, so a corrupt-sidecar
-# fall-through case is structurally obsolete. The archive itself is
-# now the sole resume marker; coverage for a non-empty archive is in
-# test_run_eval_task_resume_short_circuits and for an empty/missing
-# archive in test_run_eval_task_empty_archive_re_runs.)
+# Resume coverage:
+#   * archive AND sidecar present  →  short-circuit (test_run_eval_task_resume_short_circuits)
+#   * empty archive                 →  re-run (test_run_eval_task_empty_archive_re_runs)
+#   * archive but NO sidecar       →  re-run + write sidecar (test_run_eval_task_resume_requires_sidecar)
+
+
+def test_run_eval_task_resume_requires_sidecar(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An archive from a prior run is NOT sufficient for resume — the
+    matrix_aggregate sidecar must also be present. PH-A's
+    dependency_graph framework task reads the sidecar to learn the
+    aggregate drv path; without it, dep_graph hangs (observed on the
+    2026-05-21 cluster smoke).
+    """
+    _install_wrapper_stub(monkeypatch)
+    payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
+    archive = tmp_path / "hello.nix-archive"
+    archive.write_bytes(b"NIX_EXPORT:previous-run")
+    # No sidecar — should trigger full re-evaluation despite archive.
+    assert not (tmp_path / "hello.matrix_aggregate.json").exists()
+
+    runner = _EvalJobsStub(
+        drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
+    )
+    sender = _make_broadcast_sender()
+    result = run_eval_task(
+        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 7.0,
+    )
+    # nix-eval-jobs ran — resume short-circuit didn't fire.
+    assert any(c and c[0] == "nix-eval-jobs" for c in runner.calls)
+    assert result.get("resumed") is not True
+    assert result["matrix_aggregate_drv"] == "/nix/store/wrap-matrix-hello.drv"
+    # Sidecar was written this time.
+    sidecar = tmp_path / "hello.matrix_aggregate.json"
+    assert sidecar.exists() and sidecar.stat().st_size > 0
 
 
 # ---------------------------------------------------------------------------

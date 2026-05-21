@@ -870,12 +870,20 @@ def run_eval_task(
     sys_name = parsed["sys"]
     archive = _archive_path(out_dir, binary)
 
-    # Step 0: resume short-circuit — archive presence is the watcher's
-    # matrix_eval-quiesce signal; a prior run already broadcast every
-    # drv AND exported the closure, so re-running would only duplicate
-    # work. We omit matrix_aggregate_drv on resume so callers don't
-    # misread a non-empty value as "freshly built".
-    if archive.exists() and archive.stat().st_size > 0:
+    # Step 0: resume short-circuit — when BOTH the archive AND the
+    # matrix_aggregate sidecar from a prior run are present, the
+    # downstream dependency_graph framework task has everything it
+    # needs (the archive's closure import + the sidecar's drv path);
+    # re-running would only duplicate work. We omit matrix_aggregate_drv
+    # on resume so callers don't misread a non-empty value as "freshly
+    # built". Archive-without-sidecar means a stale half-run (or pre-PH-A
+    # archive from before sidecars were written); fall through and
+    # re-evaluate so PH-A's dep_graph task can find its handoff.
+    sidecar = _matrix_aggregate_sidecar_path(out_dir, binary)
+    if (
+        archive.exists() and archive.stat().st_size > 0
+        and sidecar.exists() and sidecar.stat().st_size > 0
+    ):
         return {
             "binary": binary, "sys": sys_name,
             "produced_at": float(clock()),
