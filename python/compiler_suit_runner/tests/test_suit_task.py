@@ -2022,16 +2022,17 @@ def test_task_completed_listener_attribute_signature(
 # ---------------------------------------------------------------------------
 
 
-def test_phase_specs_returns_three_phases() -> None:
-    """``_phase_specs`` declares build_compilers, matrix_eval, build —
-    the dependency_graph step is primary-only and not a framework
-    phase."""
+def test_phase_specs_returns_four_phases() -> None:
+    """``_phase_specs`` declares build_compilers, matrix_eval,
+    dependency_graph, build (PH-A landed dep_graph as a first-class
+    framework phase). The CRDT activates dep_graph atomically with the
+    matching matrix_eval TaskCompleted via task_depends_on."""
     pytest.importorskip("dynamic_runner.task_protocol")
     from compiler_suit_runner.suit_task import _phase_specs
     specs = _phase_specs(build_max_concurrent=None)
     by_id = {s.phase_id: s for s in specs}
     assert set(by_id.keys()) == {
-        "build_compilers", "matrix_eval", "build",
+        "build_compilers", "matrix_eval", "dependency_graph", "build",
     }
 
 
@@ -2071,12 +2072,31 @@ def test_phase_specs_matrix_eval_depends_on_build_compilers() -> None:
     assert matrix_eval.depends_on == ("build_compilers",)
 
 
-def test_phase_specs_build_depends_on_matrix_eval() -> None:
+def test_phase_specs_build_depends_on_dependency_graph() -> None:
+    """PH-A inserted dependency_graph between matrix_eval and build."""
     pytest.importorskip("dynamic_runner.task_protocol")
     from compiler_suit_runner.suit_task import _phase_specs
     specs = _phase_specs(build_max_concurrent=None)
     build = next(s for s in specs if s.phase_id == "build")
-    assert build.depends_on == ("matrix_eval",)
+    assert build.depends_on == ("dependency_graph",)
+
+
+def test_phase_specs_dependency_graph_depends_on_matrix_eval() -> None:
+    pytest.importorskip("dynamic_runner.task_protocol")
+    from compiler_suit_runner.suit_task import _phase_specs
+    specs = _phase_specs(build_max_concurrent=None)
+    dep_graph = next(
+        s for s in specs if s.phase_id == "dependency_graph"
+    )
+    assert dep_graph.depends_on == ("matrix_eval",)
+    # Single type_id dep_graph routed to build_worker (handle closure
+    # sniffs item_class).
+    assert len(dep_graph.types) == 1
+    assert dep_graph.types[0].type_id == "dep_graph"
+    assert (
+        dep_graph.types[0].worker_module
+        == "compiler_suit_runner.workers.build_worker"
+    )
 
 
 def test_phase_specs_build_carries_validate_common_dep_variant() -> None:
