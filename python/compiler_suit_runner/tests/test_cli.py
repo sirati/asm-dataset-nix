@@ -802,12 +802,19 @@ def test_cmd_submit_populates_per_binary_toolchain_aggregate_drv(
         "variant_seed",
         "tier",
         "toolchain_aggregate_drv",
+        # PH-A: dep_graph framework task carries the matrix_eval
+        # out_dir + bash_path in its payload (worker resolves bash
+        # at dispatch, so submit-time bash_path is empty string).
+        "matrix_eval_out_dir",
+        "bash_path",
     }
     assert pbm["hello"]["toolchain_aggregate_drv"] == aggregate_drv
     assert pbm["hello"]["archs"] == ["x86_64"]
     assert pbm["hello"]["variant_sample"] == 2
     assert pbm["hello"]["variant_seed"] == 42
     assert pbm["hello"]["tier"] == 1
+    assert pbm["hello"]["matrix_eval_out_dir"].endswith("_matrix_eval")
+    assert pbm["hello"]["bash_path"] == ""
 
 
 def test_serialize_then_restore_preflight_roundtrip(tmp_path: pathlib.Path):
