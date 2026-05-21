@@ -190,6 +190,16 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
         # grepping; framework just treats it as a tag).
         binary = header.payload.get("binary", "?")
         return ("matrix_eval", "eval", binary)
+    if item_class == "dependency_graph":
+        # One task per binary; depends on matrix_eval__<binary>. The
+        # worker imports that binary's nix-archive + reads the matrix
+        # aggregate sidecar, runs the streaming planner, and writes
+        # per-(compiler, arch) sidecar manifests for the placeholder
+        # build_variant tasks (see plan: placeholder-pattern-restructure
+        # PH-A). Affinity = binary so the framework keeps the import
+        # closure warm on the worker that just finished matrix_eval.
+        binary = header.payload.get("binary", "?")
+        return ("dependency_graph", "dep_graph", binary)
     if item_class == "build_compilers":
         compiler = header.payload.get("compiler_label", "?")
         arch = header.payload.get("arch", "?")
@@ -1817,6 +1827,25 @@ class SuitTask:
             "--manifest-dir",
             str(self.config.manifest_dir),
         ]
+        if type_id == "dep_graph":
+            # dependency_graph framework task: worker reads its
+            # per-binary manifest, the matrix_eval sidecar that the
+            # eval worker wrote, and the imported nix-archive — then
+            # produces per-(compiler, arch) sidecars under
+            # _manifests/. Args mirror the existing CLI shape so the
+            # downstream package can dispatch via either path.
+            argv = common + [
+                "--flake-ref",
+                self.config.flake_ref,
+                "--system",
+                self.config.sys_name,
+            ]
+            if self.config.matrix_eval_out_dir is not None:
+                argv += [
+                    "--matrix-eval-out-dir",
+                    str(self.config.matrix_eval_out_dir),
+                ]
+            return argv
         if type_id in {
             "eval", "build_compilers", "toolchain_validate",
             "common_dep", "variant",
