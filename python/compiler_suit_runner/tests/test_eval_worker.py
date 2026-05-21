@@ -1591,10 +1591,12 @@ class TestSamplePerArchFilters:
     def test_variant_sample_positive_samples_from_filtered_set(
         self, monkeypatch: pytest.MonkeyPatch, _filter_table,
     ) -> None:
-        """``variant_sample=K`` (K < N filter-survivors) returns exactly
-        K suffixes AND each picked suffix was in the filtered set
-        (i.e. the drop happens BEFORE the rng — a future swap of the
-        two would let a known-bad suffix sneak through).
+        """``variant_sample > 0`` path: rejected entries from the raw
+        ``_meta`` set MUST NOT appear in the sampled output. Sampling
+        itself happens per-``(compiler, opt)`` group, so this test
+        guards the filter-before-sample invariant rather than the
+        absolute output cardinality (a future swap of the two would
+        let a known-bad suffix sneak through).
         """
         # 6 entries split 4 survivors / 2 filtered-out (sanitiser+O0).
         meta = {
