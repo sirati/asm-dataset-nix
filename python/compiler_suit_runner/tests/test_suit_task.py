@@ -28,6 +28,13 @@ from compiler_suit_runner.suit_task import (
     SuitTaskConfig,
     _MatrixEvalQuiesceWatcher,
 )
+from compiler_suit_runner.dependency_graph_planner import (
+    Phase4Descriptor,
+)
+from compiler_suit_runner.workers.dependency_graph_worker.output import (
+    DEPENDENCY_GRAPH_PICKLE,
+    write_phase4_descriptors,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1142,16 +1149,8 @@ def test_task_completed_listener_attribute_signature(
 
 
 def test_on_phase_end_dependency_graph_reads_pickle_and_spawns(
-    tmp_path, monkeypatch,
+    tmp_path,
 ) -> None:
-    from unittest import mock
-    from compiler_suit_runner.dependency_graph_planner import (
-        Phase4Descriptor,
-    )
-    from compiler_suit_runner.workers.dependency_graph_worker.output import (
-        DEPENDENCY_GRAPH_PICKLE,
-        write_phase4_descriptors,
-    )
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     descriptors = [
@@ -1177,8 +1176,8 @@ def test_on_phase_end_dependency_graph_reads_pickle_and_spawns(
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={hello},
         out_dir=out_dir,
+        primary_handle=primary_handle,
     )
-    w._primary_handle = primary_handle
     task._matrix_eval_watcher = w
     task.on_phase_end("dependency_graph", completed=1, failed=0)
     primary_handle.spawn_tasks.assert_called_once()
@@ -1193,15 +1192,14 @@ def test_on_phase_end_dependency_graph_reads_pickle_and_spawns(
 def test_on_phase_end_other_phases_noop(
     tmp_path, phase_id,
 ) -> None:
-    from unittest import mock
     config = _make_config(tmp_path)
     task = SuitTask(config)
     primary_handle = mock.Mock()
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=tmp_path / "out",
+        primary_handle=primary_handle,
     )
-    w._primary_handle = primary_handle
     task._matrix_eval_watcher = w
     task.on_phase_end(phase_id, completed=1, failed=0)
     primary_handle.spawn_tasks.assert_not_called()

@@ -1464,9 +1464,10 @@ def main() -> int:
             bash_path = _resolve_bash_store_path_default() or ""
             if not bash_path:
                 raise NonRecoverableError(
-                    "dependency_graph: bash store path unresolved; payload"
-                    " bash_path empty and `nix eval --raw nixpkgs#bash.outPath`"
-                    " failed"
+                    "dependency_graph: bash store path unresolved"
+                    " (`_resolve_bash_store_path_default()` returned"
+                    " empty); check the worker environment for `nix`"
+                    " on PATH and a usable nixpkgs channel"
                 )
             _handle_log.info(
                 "handle: dispatching dependency_graph task binary=%r",

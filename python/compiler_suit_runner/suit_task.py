@@ -588,7 +588,8 @@ class _MatrixEvalQuiesceWatcher:
     PhaseSpec; this watcher only records matrix_eval task completions
     so :meth:`SuitTask.on_phase_end` can observe quiesce. The spawn
     primitives :meth:`_spawn_tasks` / :meth:`_header_to_task_info`
-    remain for callers that still drive task injection synchronously.
+    are invoked from :meth:`SuitTask.on_phase_end` after the framework
+    reports phase-3 quiesce.
 
     Calls to :meth:`on_task_completed` are guarded by an internal lock
     so concurrent completions from a worker pool are safe.
@@ -2383,13 +2384,6 @@ class SuitTask:
             return None
 
         expected_ids: set[str] = set()
-        toolchain_task_ids: dict[str, str] = {}
-        # Every matrix_eval manifest header carries the same
-        # ``toolchain_aggregate_drv`` (stamped by preflight before
-        # manifest emit). Capture the first one we see and surface
-        # an inconsistency at WARNING so a hand-edited manifest dir
-        # doesn't silently use the wrong anchor.
-        toolchain_aggregate_drv: str = ""
 
         for entry in entries:
             if not entry.is_file():
@@ -2408,37 +2402,6 @@ class SuitTask:
                     expected_ids.add(
                         header.task_id or matrix_eval_task_id(binary)
                     )
-                drv_agg = header.payload.get("toolchain_aggregate_drv")
-                if isinstance(drv_agg, str) and drv_agg:
-                    if (toolchain_aggregate_drv
-                            and toolchain_aggregate_drv != drv_agg):
-                        self._logger.warning(
-                            "_build_matrix_eval_watcher: matrix_eval"
-                            " manifests disagree on"
-                            " toolchain_aggregate_drv (%s vs %s);"
-                            " keeping the first observed value",
-                            toolchain_aggregate_drv, drv_agg,
-                        )
-                    elif not toolchain_aggregate_drv:
-                        toolchain_aggregate_drv = drv_agg
-                continue
-            if header.item_class in (
-                "build_compilers",
-                "toolchain_validate",
-            ):
-                if not header.task_id:
-                    continue
-                # The planner keys toolchain_task_ids by drv path —
-                # the same identifier a variant's ``inputDrvs`` set
-                # will reference. Preflight stamps that drv on the
-                # toolchain header's payload under ``drv``; fall back
-                # to the legacy ``outpath`` only when ``drv`` is
-                # missing (older manifests).
-                drv = header.payload.get("drv") or header.payload.get(
-                    "drv_path"
-                )
-                if isinstance(drv, str) and drv:
-                    toolchain_task_ids[drv] = header.task_id
 
         if not expected_ids:
             return None
