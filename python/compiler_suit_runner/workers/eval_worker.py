@@ -100,6 +100,7 @@ import pathlib
 import random
 import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable
 from typing import Any, Optional
@@ -113,8 +114,9 @@ from compiler_suit_runner.peer_replication import BroadcastSender
 # ``run_subprocess`` accepts argv (list[str]) plus an optional
 # ``input`` kwarg of bytes piped to stdin, and returns a tuple of
 # (stdout_bytes, stderr_bytes, returncode). Mirrors the
-# ``RunSubprocess`` callable shape in ``preflight.py`` so the same
-# fakes can be reused. ``Callable[..., ...]`` keeps the alias
+# ``RunSubprocess`` callable shape in ``preflight.py`` (its
+# ``_default_run_subprocess`` likewise accepts ``input=None``) so the
+# same fakes can be reused. ``Callable[..., ...]`` keeps the alias
 # permissive for callers that don't pass ``input=``.
 RunSubprocess = Callable[..., tuple[bytes, bytes, int]]
 
@@ -307,11 +309,20 @@ def _eval_jobs_for_binary(
 
     ``sampled_by_arch`` is the per-arch sampled-suffix map: archs with
     an empty suffix list are dropped from the select expression entirely
-    (a missing key matches no cells). The filter is shipped to
-    nix-eval-jobs as a JSON ``{arch: [suffix, ...]}`` map via stdin
-    (``--arg-from-stdin``); the ``--select`` lambda decodes it with
-    ``builtins.fromJSON`` so argv stays bounded regardless of variant
-    count.
+    (a missing key matches no cells). The filter is materialised to a
+    JSON tmpfile under :func:`tempfile.gettempdir` and the ``--select``
+    lambda reads it via ``builtins.fromJSON (builtins.readFile
+    "<absolute path>")`` so argv stays bounded regardless of variant
+    count. ``--impure`` is passed because absolute-path reads are
+    forbidden in pure-eval mode (flake context defaults to pure); the
+    rest of the dataset eval is unaffected by impure mode.
+
+    The earlier ``arg-from-stdin`` shape was reverted because
+    nix-eval-jobs binds ``--arg`` names at the top-level expression
+    scope, NOT inside the ``--select`` lambda — referencing the
+    arg-name from inside the lambda raises ``undefined variable``.
+    The tmpfile lives only for the duration of the subprocess and is
+    unlinked in a ``finally`` block so we never leak.
 
     The ``--select`` lambda walks the nested ``{ arch: { suffix: drv } }``
     layout and filters BOTH levels in one go:
@@ -363,26 +374,44 @@ def _eval_jobs_for_binary(
                     " to splice into nix-eval-jobs --select"
                 )
 
-    # Ship the per-arch suffix filter as JSON via stdin so argv stays
-    # well under MAX_ARG_STRLEN even at full-LMU variant counts (where
-    # the inline-attrset form pushed argv past 128 KB and exec failed
-    # with ``Argument list too long``).
+    # Materialise the per-arch suffix filter to a JSON tmpfile so argv
+    # stays well under MAX_ARG_STRLEN even at full-LMU variant counts
+    # (where the inline-attrset form pushed argv past 128 KB and exec
+    # failed with ``Argument list too long``). The path is embedded
+    # inline in the --select expression as a Nix string literal; the
+    # lambda reads it via builtins.readFile. ``--impure`` is required
+    # because absolute-path reads are restricted in pure-eval mode
+    # (which flake context enters by default).
     payload_bytes = json.dumps(effective, sort_keys=True).encode("utf-8")
+    tmp = tempfile.NamedTemporaryFile(
+        mode="wb",
+        suffix=".json",
+        prefix="csr-eval-filter-",
+        delete=False,
+    )
+    try:
+        tmp.write(payload_bytes)
+        tmp.flush()
+    finally:
+        tmp.close()
+    filter_path = tmp.name
 
-    # The select lambda: decode the JSON filter map, then filter outer
-    # archs first and per surviving arch intersectAttrs against THAT
-    # arch's sampled suffixes. The ``filter.${a}`` lookup is safe
+    # The select lambda: read+decode the JSON filter map, then filter
+    # outer archs first and per surviving arch intersectAttrs against
+    # THAT arch's sampled suffixes. The ``filter.${a}`` lookup is safe
     # because the outer intersectAttrs guarantees ``a`` is one of our
-    # keys.
-    select_expr = """\
+    # keys. Quoting the path with a JSON-encoded string literal escapes
+    # any backslash / double-quote (NamedTemporaryFile names normally
+    # don't contain those, but defence in depth is cheap here).
+    select_expr = f"""\
 m: let
-  archMap = builtins.fromJSON __filterJson;
+  archMap = builtins.fromJSON (builtins.readFile {json.dumps(filter_path)});
   toSet  = lst: builtins.listToAttrs
-    (builtins.map (s: { name = s; value = null; }) lst);
+    (builtins.map (s: {{ name = s; value = null; }}) lst);
   filter = builtins.mapAttrs (_: toSet) archMap;
 in
   builtins.mapAttrs
-    (a: v: builtins.intersectAttrs filter.${a} v)
+    (a: v: builtins.intersectAttrs filter.${{a}} v)
     (builtins.intersectAttrs filter m)\
 """
 
@@ -390,15 +419,22 @@ in
         "nix-eval-jobs",
         "--flake",
         f"{flake_ref}#{attr}",
-        "--arg-from-stdin",
-        "__filterJson",
+        "--impure",
         "--select",
         select_expr,
         "--force-recurse",
         "--max-jobs",
         "1",
     ]
-    stdout, stderr, rc = run_subprocess(argv, input=payload_bytes)
+    try:
+        stdout, stderr, rc = run_subprocess(argv)
+    finally:
+        try:
+            os.unlink(filter_path)
+        except OSError:
+            # Best-effort cleanup; a leftover tmpfile in /tmp is not
+            # worth raising over (and would mask the real eval error).
+            pass
     if rc != 0:
         decoded_err = stderr.decode("utf-8", errors="replace").strip()
         # RuntimeError → framework harness maps to ErrorType::Errored
