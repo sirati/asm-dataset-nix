@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 from typing import Any, Optional
 from unittest.mock import MagicMock
 
@@ -80,14 +81,19 @@ class _EvalJobsStub:
 
     * ``nix-eval-jobs``: ONE bulk invocation per binary. The ``--flake``
       argument is ``<flake_ref>#<attr>`` (no per-arch suffix); the
-      per-arch suffix filter is shipped as a JSON ``{arch: [suffix, ...]}``
-      map on stdin (``--arg-from-stdin __filterJson``) and the
-      ``--select`` lambda decodes it with ``builtins.fromJSON``. The
-      stub decodes the ``input`` kwarg and emits one JSONL line per
-      surviving (arch, suffix) → drvPath, using ``attrPath = [arch,
+      per-arch suffix filter is materialised to a JSON tmpfile and the
+      ``--select`` lambda reads it via
+      ``builtins.fromJSON (builtins.readFile "<absolute path>")`` —
+      the path is embedded inline as a Nix string literal so it remains
+      visible inside the lambda scope (``--arg-from-stdin`` binds at
+      top-level only). The stub extracts the path from the ``--select``
+      argv with a regex, loads the JSON file, and emits one JSONL line
+      per surviving (arch, suffix) → drvPath, using ``attrPath = [arch,
       suffix]`` (matching what nix-eval-jobs itself emits with
       ``--force-recurse``). ``arch``/``suffix`` drvs come from
-      ``drv_map[arch]``.
+      ``drv_map[arch]``. ``--impure`` is asserted to be present so the
+      eval-jobs ``readFile`` on an absolute path works (pure-eval
+      forbids absolute-path reads).
     * ``nix``: emits the JSON dict from ``meta_map[arch]`` for
       ``_meta.<sys>.<binary>.<arch>`` lookups. When ``meta_map`` is
       omitted (``None``) the stub auto-synthesises a passing meta dict
@@ -139,6 +145,13 @@ class _EvalJobsStub:
         # (argv, input) tuples — tests that want to introspect the
         # stdin payload assert against this list.
         self.invocations: list[tuple[list[str], Optional[bytes]]] = []
+        # Captures the parsed JSON filter payload for each
+        # ``nix-eval-jobs`` arm invocation. The worker writes the
+        # filter to a tmpfile, embeds its absolute path inline in the
+        # --select lambda, and unlinks the file after the subprocess
+        # returns — so the stub snapshots the JSON contents at call
+        # time so tests can introspect what the worker shipped.
+        self.eval_filter_payloads: list[dict[str, list[str]]] = []
 
     def _meta_for(self, arch: str) -> dict[str, dict]:
         """Return meta for ``arch``: explicit map if set, else auto-synth.
@@ -168,9 +181,33 @@ class _EvalJobsStub:
         if argv and argv[0] == "nix-eval-jobs":
             if self.bulk_eval_fail is not None:
                 return b"", self.bulk_eval_fail.encode(), 1
-            # The per-arch suffix filter arrives as JSON on stdin via
-            # --arg-from-stdin __filterJson.
-            payload = json.loads(input.decode("utf-8")) if input else {}
+            # The per-arch suffix filter arrives via a tmpfile path
+            # embedded inline in the --select argv as
+            # ``builtins.readFile "<absolute path>"``. We regex-extract
+            # the path (JSON-encoded so json.loads handles any quoting)
+            # and load the JSON tmpfile.
+            try:
+                select_idx = argv.index("--select")
+                select_expr = argv[select_idx + 1]
+            except (ValueError, IndexError):
+                return b"", b"stub: missing --select arg\n", 1
+            m = re.search(
+                r'builtins\.readFile\s+("(?:[^"\\]|\\.)*")',
+                select_expr,
+            )
+            if m is None:
+                return (
+                    b"",
+                    b"stub: could not extract filter tmpfile path "
+                    b"from --select expression\n",
+                    1,
+                )
+            filter_path = json.loads(m.group(1))
+            with open(filter_path, "rb") as fh:
+                payload = json.loads(fh.read().decode("utf-8"))
+            # Snapshot so tests can introspect after the worker's
+            # finally-block unlinks the tmpfile.
+            self.eval_filter_payloads.append(payload)
             requested: dict[str, set[str]] = {
                 arch: set(suffixes) for arch, suffixes in payload.items()
             }
@@ -512,25 +549,47 @@ def test_run_eval_task_happy_path(
     assert len(eval_calls) == 1
     # --flake points at the binary attr (no per-arch tail).
     assert eval_calls[0][2] == ".#dataset.x86_64-linux.hello"
-    # The per-arch filter map is fed via --arg-from-stdin __filterJson;
-    # the --select lambda decodes it with builtins.fromJSON. argv stays
-    # bounded regardless of variant count.
+    # The per-arch filter map is materialised to a tmpfile; the
+    # --select lambda reads it via builtins.readFile so argv stays
+    # bounded regardless of variant count and the filter binding lives
+    # inside the lambda scope (top-level --arg-from-stdin would not).
+    # --impure is required because absolute-path readFile is forbidden
+    # in pure-eval (flakes default to pure).
     eval_argv = eval_calls[0]
-    arg_idx = eval_argv.index("--arg-from-stdin")
-    assert eval_argv[arg_idx + 1] == "__filterJson"
+    assert "--impure" in eval_argv
+    assert "--arg-from-stdin" not in eval_argv
     select_idx = eval_argv.index("--select")
     select_expr = eval_argv[select_idx + 1]
-    assert "builtins.fromJSON __filterJson" in select_expr
+    assert "builtins.readFile" in select_expr
+    assert "builtins.fromJSON" in select_expr
     assert "listToAttrs" in select_expr
     assert "intersectAttrs" in select_expr
-    # The stdin payload is the JSON-encoded per-arch suffix map.
+    # The select expression must carry the absolute tmpfile path the
+    # worker wrote — extract it and verify the JSON content round-trips
+    # back to the per-arch suffix map the worker assembled.
+    m = re.search(
+        r'builtins\.readFile\s+("(?:[^"\\]|\\.)*")',
+        select_expr,
+    )
+    assert m is not None, "--select expression must embed a readFile path"
+    filter_path = json.loads(m.group(1))
+    # Path was unlinked in the worker's finally block after the
+    # subprocess returned; the stub already read its contents while
+    # standing in for nix-eval-jobs. We only need to assert the shape
+    # of the path here (absolute, JSON suffix, lives somewhere temp).
+    assert filter_path.startswith("/")
+    assert filter_path.endswith(".json")
     eval_invocations = [
         inv for inv in runner.invocations if inv[0] and inv[0][0] == "nix-eval-jobs"
     ]
     assert len(eval_invocations) == 1
     _, eval_input = eval_invocations[0]
-    assert eval_input is not None
-    decoded = json.loads(eval_input.decode("utf-8"))
+    # The eval-jobs arm now reads its filter from disk, NOT stdin.
+    assert eval_input is None
+    # The stub snapshot of the JSON tmpfile contents must match the
+    # per-arch filter the worker assembled from the sample chain.
+    assert len(runner.eval_filter_payloads) == 1
+    decoded = runner.eval_filter_payloads[0]
     assert set(decoded.keys()) == {"x86_64", "aarch64"}
     for arch in ("x86_64", "aarch64"):
         assert set(decoded[arch]) == {"O0", "O2"}
@@ -1212,24 +1271,25 @@ def test_bulk_eval_drops_archs_with_no_sampled_suffixes(
     # The JSON filter payload must not name aarch64 at all (empty
     # entry would still leak the arch key into the outer
     # intersectAttrs and confuse downstream readers).
-    eval_invocations = [
-        inv for inv in runner.invocations
-        if inv[0] and inv[0][0] == "nix-eval-jobs"
-    ]
-    assert len(eval_invocations) == 1
-    _, eval_input = eval_invocations[0]
-    decoded = json.loads(eval_input.decode("utf-8"))
+    assert len(runner.eval_filter_payloads) == 1
+    decoded = runner.eval_filter_payloads[0]
     assert "x86_64" in decoded
     assert "aarch64" not in decoded
 
 
-def test_bulk_eval_filter_payload_round_trips_via_stdin(
+def test_bulk_eval_filter_payload_round_trips_via_tmpfile(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The per-arch suffix filter is JSON-encoded with ``sort_keys=True``
-    and shipped via ``input=`` (not stuffed inline into ``--select``).
+    and materialised to a tmpfile whose absolute path is embedded inline
+    in the ``--select`` expression as a ``builtins.readFile`` argument.
     The decoded payload must round-trip to the per-arch suffix map the
     worker assembled from the sample / filter chain.
+
+    The ``--arg-from-stdin __filterJson`` shape from the previous
+    refactor is gone — it bound at top-level expression scope and was
+    not visible inside the ``--select`` lambda (``undefined variable``
+    against real nix-eval-jobs).
     """
     _install_wrapper_stub(monkeypatch)
     payload = _make_payload(
@@ -1251,14 +1311,36 @@ def test_bulk_eval_filter_payload_round_trips_via_stdin(
         if inv[0] and inv[0][0] == "nix-eval-jobs"
     ]
     assert len(eval_invocations) == 1
-    _, eval_input = eval_invocations[0]
-    decoded = json.loads(eval_input.decode("utf-8"))
+    eval_argv, eval_input = eval_invocations[0]
+    # Filter no longer travels via stdin and the legacy --arg-from-stdin
+    # flag is gone.
+    assert eval_input is None
+    assert "--arg-from-stdin" not in eval_argv
+    # The select expression carries the tmpfile path inline and the
+    # stub snapshot captured the JSON contents the worker wrote.
+    select_idx = eval_argv.index("--select")
+    select_expr = eval_argv[select_idx + 1]
+    assert "builtins.readFile" in select_expr
+    assert "builtins.fromJSON" in select_expr
+    assert len(runner.eval_filter_payloads) == 1
+    decoded = runner.eval_filter_payloads[0]
     assert decoded == {
         "aarch64": ["O0", "O2"],
         "x86_64": ["O0", "O2"],
     }
-    # sort_keys=True: arch keys appear in sorted order in the raw bytes.
-    assert eval_input == json.dumps(decoded, sort_keys=True).encode("utf-8")
+    # The worker must unlink the tmpfile in its finally block — the
+    # readFile path the select_expr cites no longer exists after the
+    # subprocess returns.
+    m = re.search(
+        r'builtins\.readFile\s+("(?:[^"\\]|\\.)*")',
+        select_expr,
+    )
+    assert m is not None
+    filter_path = json.loads(m.group(1))
+    assert not pathlib.Path(filter_path).exists(), (
+        f"tmpfile {filter_path!r} should have been unlinked by the "
+        f"worker's finally block"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1522,6 +1604,104 @@ def test_matrix_archive_round_trips_leaves(tmp_path: pathlib.Path) -> None:
             f"nix-store --export dropped a transitively-referenced "
             f"inputDrv from the aggregate's closure"
         )
+
+
+@pytest.mark.nix
+def test_bulk_eval_against_real_nix_eval_jobs(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Run :func:`_eval_jobs_for_binary` against a real ``nix-eval-jobs``
+    process targeting a tiny synthetic flake with a known 2 × 2 matrix.
+    Asserts the returned ``{(arch, suffix): drvPath}`` map covers
+    exactly the filter cells the worker requested.
+
+    This guards against the previous BLOCKER where the
+    ``--arg-from-stdin __filterJson`` binding worked against the unit
+    stub (which regex-greps argv) but failed against the real
+    nix-eval-jobs binary because the ``--arg`` namespace is the
+    top-level scope, NOT the ``--select`` lambda's scope — referencing
+    ``__filterJson`` from inside the lambda raised
+    ``undefined variable``. The unit stub gave false confidence and
+    only an end-to-end test against the real binary could have caught
+    it. The fix materialises the filter to a tmpfile and reads it via
+    ``builtins.readFile`` inline; this test exercises that path.
+    """
+    import shutil
+    import subprocess
+
+    for tool in ("nix-eval-jobs",):
+        if shutil.which(tool) is None:
+            pytest.skip(f"{tool} not in PATH")
+
+    # Build a 2 (arch) × 2 (suffix) dataset attrset over distinct
+    # synthetic leaf derivations. The shape mirrors what
+    # ``dataset.<sys>.<binary>`` produces in the production flake; we
+    # only need enough structure for ``--force-recurse`` to walk two
+    # levels and emit ``attrPath = [arch, suffix]`` entries.
+    flake_dir = tmp_path / "flake"
+    flake_dir.mkdir()
+    (flake_dir / "flake.nix").write_text(
+        """{
+  outputs = { self }: {
+    dataset.x86_64-linux.hello = {
+      x86_64 = {
+        O0 = derivation { name = "leaf-x86-O0"; system = "x86_64-linux"; builder = "/bin/sh"; };
+        O2 = derivation { name = "leaf-x86-O2"; system = "x86_64-linux"; builder = "/bin/sh"; };
+      };
+      aarch64 = {
+        O0 = derivation { name = "leaf-arm-O0"; system = "x86_64-linux"; builder = "/bin/sh"; };
+        O2 = derivation { name = "leaf-arm-O2"; system = "x86_64-linux"; builder = "/bin/sh"; };
+      };
+    };
+  };
+}
+""",
+        encoding="utf-8",
+    )
+    # nix-eval-jobs against a path flake requires the path be a git
+    # repo (or use the ``path:`` URL prefix which we already do via
+    # _as_installable). Initialise one and stage the flake.
+    subprocess.run(
+        ["git", "init", "-q"], cwd=flake_dir, check=True,
+    )
+    subprocess.run(
+        ["git", "add", "flake.nix"], cwd=flake_dir, check=True,
+    )
+
+    # Real subprocess wrapper that matches the RunSubprocess shape and
+    # propagates --extra-experimental-features through the env so this
+    # test runs against any host nix config.
+    def _runner(argv, *, input=None):
+        import subprocess as _sp
+        # nix-eval-jobs needs nix-command + flakes experimental
+        # features. Pass them on argv (works on every version).
+        full_argv = [argv[0],
+                     "--extra-experimental-features",
+                     "nix-command flakes"] + argv[1:]
+        proc = _sp.run(
+            full_argv, capture_output=True, check=False, input=input,
+        )
+        return proc.stdout, proc.stderr, proc.returncode
+
+    drvs = eval_worker._eval_jobs_for_binary(
+        attr="dataset.x86_64-linux.hello",
+        sampled_by_arch={
+            "x86_64": ["O0", "O2"],
+            "aarch64": ["O0"],
+        },
+        flake_ref=f"path:{flake_dir}",
+        run_subprocess=_runner,
+    )
+
+    # Three cells in the filter → three leaves in the result.
+    assert set(drvs.keys()) == {
+        ("x86_64", "O0"),
+        ("x86_64", "O2"),
+        ("aarch64", "O0"),
+    }
+    for key, drv in drvs.items():
+        assert drv.startswith("/nix/store/"), (key, drv)
+        assert drv.endswith(".drv"), (key, drv)
 
 
 # ---------------------------------------------------------------------------

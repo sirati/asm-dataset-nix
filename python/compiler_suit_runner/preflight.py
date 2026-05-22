@@ -105,18 +105,27 @@ class PreflightResult:
 # ---------------------------------------------------------------------------
 
 
-# ``run_subprocess`` accepts argv (list[str]) and returns a tuple of
-# (stdout_bytes, stderr_bytes, returncode).
-RunSubprocess = Callable[[list[str]], tuple[bytes, bytes, int]]
+# ``run_subprocess`` accepts argv (list[str]) plus an optional
+# ``input`` kwarg of bytes piped to stdin, and returns a tuple of
+# (stdout_bytes, stderr_bytes, returncode). The ``input`` kwarg
+# mirrors the signature in :mod:`workers.eval_worker` so the same
+# fakes can be reused; preflight callers never pass ``input=`` and
+# the kwarg is ignored when ``None``.
+RunSubprocess = Callable[..., tuple[bytes, bytes, int]]
 
 
-def _default_run_subprocess(argv: list[str]) -> tuple[bytes, bytes, int]:
+def _default_run_subprocess(
+    argv: list[str],
+    *,
+    input: Optional[bytes] = None,
+) -> tuple[bytes, bytes, int]:
     """Real ``subprocess.run`` invocation; never goes through a shell."""
     proc = subprocess.run(  # noqa: S603 - argv is constructed in-module
         argv,
         check=False,
         capture_output=True,
         shell=False,
+        input=input,
     )
     return proc.stdout, proc.stderr, proc.returncode
 
