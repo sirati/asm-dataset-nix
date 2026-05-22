@@ -47,7 +47,21 @@ __all__ = [
     "copy_elf_folder",
     "write_sidecar_metadata",
     "build_worker",
+    "ensure_binary_archive_imported",
 ]
+
+
+# Module-level cache of binaries whose matrix-aggregate archive has
+# already been imported on this worker process. Workers live across
+# many ``build_variant`` tasks; importing the same binary's archive
+# more than once is wasted I/O (and CPU on the nix-store side). The
+# set is keyed by ``payload["pkg"]`` — :func:`ensure_binary_archive_imported`
+# treats the first task for binary X as "import then build" and every
+# subsequent task on the same worker process as "build only". Resets
+# only on process exit; the cache is intentionally per-worker because
+# the archive content is per-binary-per-run and the local nix store is
+# also per-worker (containers don't share /nix/store).
+_imported_binaries: set[str] = set()
 
 # Item-class string tokens (matched against the manifest header). Kept as
 # module-level constants so callers (manifest_gen, suit_task) reference
@@ -161,6 +175,14 @@ class BuildWorkerEnv:
     placement_watcher: Optional["object"] = None
     peer_watcher: Optional["object"] = None
     signing_public_key: str = ""
+    # Per-binary matrix-eval archive root. When set, the first
+    # ``build_variant`` task targeting binary ``X`` on this worker
+    # process imports ``matrix-X.drv.archive`` from this dir before
+    # running ``nix build`` (see :func:`ensure_binary_archive_imported`).
+    # Unit tests typically leave this ``None`` and the import is a
+    # no-op; production invocations via :func:`main` always set it
+    # from ``--matrix-eval-out-dir``.
+    matrix_eval_out_dir: Optional[pathlib.Path] = None
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +785,69 @@ def _validate_toolchain(
     )
 
 
+def ensure_binary_archive_imported(
+    binary: str,
+    matrix_eval_out_dir: Optional[pathlib.Path],
+    *,
+    run_subprocess: Optional[Callable[..., tuple[bytes, bytes, int]]] = None,
+) -> None:
+    """Import ``matrix-<binary>.drv.archive`` into the local nix store once.
+
+    Phase 2 (matrix_eval) writes a self-contained
+    ``matrix-<binary>.drv.archive`` under ``matrix_eval_out_dir`` whose
+    closure carries every variant leaf the cluster sampled for this
+    binary plus the toolchain aggregate. Phase 4 (build_variant) on each
+    secondary now imports that archive ONCE at the start of the first
+    ``build_variant`` task targeting this binary so the subsequent
+    ``nix build <drv>^*`` can resolve every leaf drv locally without
+    fanning out to a peer harmonia. Subsequent ``build_variant`` tasks
+    for the same binary on the same worker process short-circuit via
+    :data:`_imported_binaries`.
+
+    Failure to import is escalated to :class:`RuntimeError`; the framework
+    wraps that into ``ErrorType::Errored`` (retry-pass eligible). The
+    archive is the single point of truth for the matrix-eval drv graph
+    on this secondary — without it the build_variant will fail with a
+    "missing drv" error a few seconds later, so failing fast here is
+    strictly the better surface.
+
+    The ``matrix_eval_out_dir`` argument may be ``None`` (e.g. legacy
+    unit tests that don't supply it); in that case the import is a
+    no-op so existing fixtures keep working. Production invocations
+    via :func:`main` always supply it.
+    """
+    if not binary:
+        return
+    if matrix_eval_out_dir is None:
+        return
+    if binary in _imported_binaries:
+        return
+    # Late import to keep the module-load graph lean for tests that
+    # never touch dependency_graph_worker.
+    from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+        archive as _archive,
+    )
+
+    archive_path = matrix_eval_out_dir / f"matrix-{binary}.drv.archive"
+    ok, err, imported = _archive.import_archive(
+        archive_path, run_subprocess=run_subprocess,
+    )
+    if not ok:
+        raise RuntimeError(
+            f"build_worker: failed to import matrix-{binary}.drv.archive "
+            f"from {archive_path}: "
+            + err.decode("utf-8", errors="replace").strip()
+        )
+    _imported_binaries.add(binary)
+    import logging  # noqa: PLC0415 — local import; cheap
+    logging.getLogger(
+        "compiler_suit_runner.build_worker.archive_import"
+    ).info(
+        "imported matrix-%s.drv.archive (%d paths)",
+        binary, len(imported),
+    )
+
+
 def _prefetch_variant_inputs(
     payload: dict,
     env: BuildWorkerEnv,
@@ -920,11 +1005,28 @@ def build_worker(
     if item_class == ITEM_CLASS_BUILD_COMMON_DEP:
         extra_args.append("--skip-existing")
 
-    # Variant pre-fetch: pull every input dep the placement map
-    # knows about from a single targeted peer (no fanout). Runs
-    # before nix build so the deps are already in the local store
-    # when nix walks the closure. Best-effort — silent on failure.
+    # Variant prelude: import the per-binary matrix-eval archive (once
+    # per binary per worker process) so the matrix-aggregate drv graph
+    # is local; then pre-fetch any input deps the placement map knows
+    # about from a single targeted peer. Pre-fetch is best-effort;
+    # archive import is fatal (the drv must exist locally before the
+    # nix build below).
     if item_class == ITEM_CLASS_BUILD_VARIANT:
+        binary = payload.get("pkg") if isinstance(payload.get("pkg"), str) else ""
+        try:
+            ensure_binary_archive_imported(
+                binary or "",
+                env.matrix_eval_out_dir,
+                run_subprocess=env.run_subprocess,
+            )
+        except RuntimeError as exc:
+            return BuildWorkerResult(
+                item_class=item_class,
+                name=name,
+                success=False,
+                duration_seconds=max(0.0, clock() - start),
+                error=str(exc),
+            )
         _prefetch_variant_inputs(payload, env)
 
     try:
@@ -1214,6 +1316,11 @@ def main() -> int:
         ),
         secondary_id=args.secondary_id or "",
         signing_public_key=args.signing_public_key or "",
+        matrix_eval_out_dir=(
+            pathlib.Path(args.matrix_eval_out_dir)
+            if args.matrix_eval_out_dir
+            else None
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -1228,21 +1335,12 @@ def main() -> int:
     #
     #   * matrix_eval payloads carry a ``binary`` + ``attr`` top-level
     #     pair (matches ``manifest_gen.make_matrix_eval_header``);
-    #     dispatched to :func:`eval_worker.run_eval_task`.
+    #     dispatched to :func:`eval_worker.run_eval_task`. The eval
+    #     worker writes the per-binary ``matrix-<binary>.drv.archive``
+    #     to ``--matrix-eval-out-dir`` which the build_variant branch
+    #     (below) imports lazily.
     #   * everything else is a build manifest;
     #     dispatched to :func:`build_worker` (this module).
-    #
-    # The BroadcastSender is constructed up-front so the eval branch can
-    # use it without paying init cost per-task. It is daemon-thread
-    # backed and idle if never used — cheap to leave running for the
-    # lifetime of the worker subprocess.
-    # ``BroadcastSender`` is fetched via attribute access (not a
-    # ``from … import``) so unit tests that monkeypatch
-    # ``compiler_suit_runner.peer_replication.BroadcastSender`` see
-    # the override; the late import keeps the module load cheap.
-    from compiler_suit_runner import (  # noqa: PLC0415
-        peer_replication as _peer_replication,
-    )
     from compiler_suit_runner.manifest_gen import (  # noqa: PLC0415
         matrix_eval_task_id,
     )
@@ -1253,25 +1351,6 @@ def main() -> int:
     from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
         run as _dependency_graph_run,
     )
-
-    BroadcastSender = _peer_replication.BroadcastSender
-
-    broadcast_sender: Optional[BroadcastSender] = None
-    if args.shared_fs:
-        shared_fs_path = pathlib.Path(args.shared_fs)
-        self_sid = args.secondary_id or ""
-
-        def _peer_url_provider() -> list[str]:
-            # Re-fetch through the module each call so the
-            # gossip-dir reader picks up tests' monkeypatched override
-            # and so peers that joined after process start are seen.
-            return _eval_worker.read_peer_push_urls(shared_fs_path, self_sid)
-
-        broadcast_sender = BroadcastSender(
-            self_peer_id=self_sid,
-            peer_url_provider=_peer_url_provider,
-            our_pubkey=args.signing_public_key or "",
-        )
 
     _handle_log = logging.getLogger("compiler_suit_runner.build_worker.handle")
 
@@ -1379,18 +1458,12 @@ def main() -> int:
         # the build path.
         eval_payload = _extract_matrix_eval_payload(payload)
         if eval_payload is not None:
-            if broadcast_sender is None:
-                # matrix_eval requires shared_fs for the peer-gossip
-                # directory (BroadcastSender peer URL lookups). Without
-                # it we can't honour the broadcast contract.
-                raise NonRecoverableError(
-                    "matrix_eval requires --shared-fs for peer gossip;"
-                    " refusing to proceed without it"
-                )
             if not args.matrix_eval_out_dir:
                 # matrix_eval marker dir must be passed explicitly —
                 # it's the bind-mounted shared output, distinct from
-                # the per-secondary scratch ``--shared-fs``.
+                # the per-secondary scratch ``--shared-fs``. The eval
+                # worker writes the per-binary drv archive here for
+                # phase 3 + phase 4 consumption.
                 raise NonRecoverableError(
                     "matrix_eval requires --matrix-eval-out-dir (shared"
                     " bind-mounted marker dir); refusing to proceed"
@@ -1408,7 +1481,6 @@ def main() -> int:
                 _eval_worker.run_eval_task(
                     eval_payload,
                     out_dir=out_dir,
-                    broadcast_sender=broadcast_sender,
                     task=task,
                 )
             except RuntimeError as exc:
@@ -1542,16 +1614,7 @@ def main() -> int:
                 ) from exc
         return WorkerOutput()
 
-    try:
-        run(handle, args=args)
-    finally:
-        # Daemon thread, but a clean stop drains in-flight broadcasts
-        # before the subprocess exits.
-        if broadcast_sender is not None:
-            try:
-                broadcast_sender.stop()
-            except Exception:  # noqa: BLE001
-                pass
+    run(handle, args=args)
     return 0
 
 

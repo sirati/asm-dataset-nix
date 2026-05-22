@@ -954,8 +954,8 @@ def _run_build_worker_main_with_capture(
     """Invoke ``build_worker.main()`` with framework dependencies
     monkey-patched so the test never opens a real socket or thread.
 
-    Returns ``(handle, run_mock, sender_class_mock)`` where ``handle``
-    is the closure the worker registered with the framework.
+    Returns ``(handle, run_mock)`` where ``handle`` is the closure
+    the worker registered with the framework.
     """
     import sys as _sys
     import types as _types
@@ -1001,23 +1001,13 @@ def _run_build_worker_main_with_capture(
         _sys.modules["dynamic_runner"] = _types.ModuleType("dynamic_runner")
     monkeypatch.setitem(_sys.modules, "dynamic_runner.worker", fake_worker)
 
-    # Patch BroadcastSender on the build_worker module (where the
-    # late-import binds the symbol) so we don't spin up a daemon thread.
-    sender_class_mock = MagicMock()
-    sender_instance = MagicMock()
-    sender_class_mock.return_value = sender_instance
-    monkeypatch.setattr(
-        "compiler_suit_runner.peer_replication.BroadcastSender",
-        sender_class_mock,
-    )
-
     monkeypatch.setattr(_sys, "argv", ["build_worker", *argv])
 
     rc = bw.main()
     assert rc == 0
     run_mock.assert_called_once()
     captured_handle = run_mock.call_args.args[0]
-    return captured_handle, run_mock, sender_class_mock
+    return captured_handle, run_mock
 
 
 def _matrix_eval_wrapper_payload(
@@ -1045,9 +1035,10 @@ def test_main_handle_dispatches_matrix_eval_to_run_eval_task(
     monkeypatch, tmp_path
 ):
     """A task whose ``item_class == 'matrix_eval'`` is routed to
-    :func:`eval_worker.run_eval_task` with the inner payload, the
-    shared-fs-derived out_dir, and the constructed BroadcastSender."""
-    handle, _, sender_cls = _run_build_worker_main_with_capture(
+    :func:`eval_worker.run_eval_task` with the inner payload and the
+    matrix-eval-out-dir; the per-drv broadcast sender has been
+    retired so no third argument is threaded through."""
+    handle, _ = _run_build_worker_main_with_capture(
         monkeypatch,
         [
             "--socket-path", str(tmp_path / "sock"),
@@ -1059,14 +1050,12 @@ def test_main_handle_dispatches_matrix_eval_to_run_eval_task(
             "--signing-public-key", "k:abc",
         ],
     )
-    sender_instance = sender_cls.return_value
 
     captured: dict = {}
 
-    def _fake_run_eval(payload, *, out_dir, broadcast_sender, task):
+    def _fake_run_eval(payload, *, out_dir, task):
         captured["payload"] = payload
         captured["out_dir"] = out_dir
-        captured["broadcast_sender"] = broadcast_sender
         captured["task"] = task
         return {"ok": True}
 
@@ -1086,7 +1075,7 @@ def test_main_handle_dispatches_matrix_eval_to_run_eval_task(
     assert isinstance(output, fake_output_cls)
     # The inner payload was unwrapped before dispatch.
     assert captured["payload"] == wrapper["payload"]
-    assert captured["broadcast_sender"] is sender_instance
+    assert "broadcast_sender" not in captured
     assert captured["out_dir"] == tmp_path / "phase0"
 
 
@@ -1096,7 +1085,7 @@ def test_main_handle_dispatches_build_manifest_to_build_worker(
     """A task whose payload is NOT a matrix_eval wrapper (e.g. a
     toolchain manifest) is routed to the existing build_worker path,
     NOT to run_eval_task."""
-    handle, _, _ = _run_build_worker_main_with_capture(
+    handle, _ = _run_build_worker_main_with_capture(
         monkeypatch,
         [
             "--socket-path", str(tmp_path / "sock"),
@@ -1156,7 +1145,7 @@ def test_main_handle_matrix_eval_runtime_error_becomes_non_recoverable(
     """When run_eval_task raises RuntimeError the handle re-raises as
     NonRecoverableError so the framework surfaces it as
     ``error:non_recoverable:``."""
-    handle, _, _ = _run_build_worker_main_with_capture(
+    handle, _ = _run_build_worker_main_with_capture(
         monkeypatch,
         [
             "--socket-path", str(tmp_path / "sock"),
@@ -1169,7 +1158,7 @@ def test_main_handle_matrix_eval_runtime_error_becomes_non_recoverable(
 
     from compiler_suit_runner.workers import eval_worker as ew
 
-    def _boom(payload, *, out_dir, broadcast_sender, task):
+    def _boom(payload, *, out_dir, task):
         raise RuntimeError("nix-eval-jobs fell over")
 
     monkeypatch.setattr(ew, "run_eval_task", _boom)
@@ -1187,10 +1176,9 @@ def test_main_handle_matrix_eval_without_matrix_eval_out_dir_is_non_recoverable(
     monkeypatch, tmp_path
 ):
     """matrix_eval requires --matrix-eval-out-dir (shared bind-mounted
-    marker dir). Receiving the task without that flag — even with
-    --shared-fs — is a structural misconfiguration ->
-    NonRecoverableError."""
-    handle, _, _ = _run_build_worker_main_with_capture(
+    marker dir). Receiving the task without that flag is a structural
+    misconfiguration -> NonRecoverableError."""
+    handle, _ = _run_build_worker_main_with_capture(
         monkeypatch,
         [
             "--socket-path", str(tmp_path / "sock"),
@@ -1210,47 +1198,300 @@ def test_main_handle_matrix_eval_without_matrix_eval_out_dir_is_non_recoverable(
     assert "matrix-eval-out-dir" in str(exc_info.value)
 
 
-def test_main_handle_matrix_eval_without_shared_fs_is_non_recoverable(
-    monkeypatch, tmp_path
+
+# ---------------------------------------------------------------------------
+# Per-binary matrix-eval archive import (build_variant prelude)
+#
+# Phase 4 (build_variant) on each secondary imports the per-binary
+# ``matrix-<binary>.drv.archive`` exactly once per worker process. The
+# first ``build_variant`` task for binary X triggers the import; every
+# subsequent ``build_variant`` task for the SAME binary on the SAME
+# process skips the import (idempotent via ``_imported_binaries``).
+# Switching to binary Y triggers a fresh import for ``matrix-Y.drv.archive``.
+#
+# The archive itself is opaque bytes here — we patch ``import_archive``
+# so the test never shells out to ``nix-store``; we assert only on the
+# call multiplicity + the archive path argv.
+# ---------------------------------------------------------------------------
+
+
+def _reset_imported_binaries() -> None:
+    """Clear the module-level cache so tests stay hermetic."""
+    bw._imported_binaries.clear()
+
+
+def _make_variant_manifest(
+    tmp_path: pathlib.Path, *, pkg: str, variant_dir: str,
+) -> pathlib.Path:
+    """Write a build_variant manifest with the given pkg / variant_dir."""
+    return _write_manifest(
+        tmp_path / f"{variant_dir}.json",
+        item_class=ITEM_CLASS_BUILD_VARIANT,
+        name=variant_dir,
+        payload={
+            "attr": f"dataset.x86_64-linux.{pkg}.x86_64.gcc15.O2",
+            "variant_dir": variant_dir,
+            "pkg": pkg,
+        },
+    )
+
+
+def test_ensure_binary_archive_imported_calls_import_once_per_binary(
+    monkeypatch, tmp_path,
 ):
-    """matrix_eval requires --shared-fs (resume marker + peer gossip
-    both live under it). Receiving the task without that flag is a
-    structural misconfiguration -> NonRecoverableError."""
-    handle, _, sender_cls = _run_build_worker_main_with_capture(
-        monkeypatch,
-        [
-            "--socket-path", str(tmp_path / "sock"),
-            "--flake-ref", ".",
-            "--dataset-output-dir", str(tmp_path / "dataset"),
-            # --shared-fs OMITTED
-        ],
+    """First call for binary ``hello`` triggers ``import_archive``; the
+    second call for the same binary is a no-op (cache hit). Switching
+    to ``world`` triggers a fresh import against matrix-world.drv.archive.
+    """
+    _reset_imported_binaries()
+    calls: list[pathlib.Path] = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        calls.append(archive)
+        return True, b"", ["/nix/store/x"]
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.dependency_graph_worker"
+        ".archive.import_archive",
+        _fake_import,
     )
-    # No shared-fs -> no BroadcastSender should be constructed.
-    sender_cls.assert_not_called()
 
-    import sys as _sys
-    fake_mod = _sys.modules["dynamic_runner.worker"]
-    Task = fake_mod.Task
-    NonRecoverable = fake_mod.NonRecoverableError
-    with pytest.raises(NonRecoverable) as exc_info:
-        handle(Task(payload=_matrix_eval_wrapper_payload()))
-    assert "shared-fs" in str(exc_info.value)
+    out_dir = tmp_path / "phase0"
+    out_dir.mkdir()
+
+    # First call: import fires.
+    bw.ensure_binary_archive_imported("hello", out_dir)
+    assert calls == [out_dir / "matrix-hello.drv.archive"]
+    assert "hello" in bw._imported_binaries
+
+    # Second call for the SAME binary: no new import.
+    bw.ensure_binary_archive_imported("hello", out_dir)
+    assert calls == [out_dir / "matrix-hello.drv.archive"]
+
+    # Switching binary: fresh import against matrix-world.drv.archive.
+    bw.ensure_binary_archive_imported("world", out_dir)
+    assert calls == [
+        out_dir / "matrix-hello.drv.archive",
+        out_dir / "matrix-world.drv.archive",
+    ]
+
+    _reset_imported_binaries()
 
 
-def test_main_stops_broadcast_sender_on_exit(monkeypatch, tmp_path):
-    """``BroadcastSender.stop`` is called after ``run`` returns so the
-    daemon thread drains in-flight broadcasts before the subprocess
-    exits."""
-    _, _, sender_cls = _run_build_worker_main_with_capture(
-        monkeypatch,
-        [
-            "--socket-path", str(tmp_path / "sock"),
-            "--flake-ref", ".",
-            "--dataset-output-dir", str(tmp_path / "dataset"),
-            "--shared-fs", str(tmp_path),
-            "--matrix-eval-out-dir", str(tmp_path / "phase0"),
-            "--secondary-id", "sec1",
-        ],
+def test_ensure_binary_archive_imported_noop_when_out_dir_is_none(
+    monkeypatch, tmp_path,
+):
+    """A ``None`` ``matrix_eval_out_dir`` (unit-test default + legacy
+    callers) makes the import a no-op so existing fixtures keep working
+    without needing to thread an archive root through every test.
+    """
+    _reset_imported_binaries()
+
+    def _fake_import(archive, *, run_subprocess=None):
+        raise AssertionError(f"import should not run; got {archive!r}")
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.dependency_graph_worker"
+        ".archive.import_archive",
+        _fake_import,
     )
-    sender_cls.return_value.stop.assert_called_once()
 
+    # Must NOT raise; must NOT mark the binary imported.
+    bw.ensure_binary_archive_imported("hello", None)
+    assert "hello" not in bw._imported_binaries
+    _reset_imported_binaries()
+
+
+def test_ensure_binary_archive_imported_raises_on_import_failure(
+    monkeypatch, tmp_path,
+):
+    """When ``import_archive`` returns ``(False, ...)`` we propagate
+    :class:`RuntimeError`; the framework wraps that into
+    ``ErrorType::Errored`` (retry-pass) at the worker harness."""
+    _reset_imported_binaries()
+
+    def _fake_import(archive, *, run_subprocess=None):
+        return False, b"archive corrupt", []
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.dependency_graph_worker"
+        ".archive.import_archive",
+        _fake_import,
+    )
+
+    out_dir = tmp_path / "phase0"
+    out_dir.mkdir()
+    with pytest.raises(RuntimeError) as exc_info:
+        bw.ensure_binary_archive_imported("hello", out_dir)
+    msg = str(exc_info.value)
+    assert "matrix-hello.drv.archive" in msg
+    assert "archive corrupt" in msg
+    # On failure the binary is NOT marked imported — a retry can try again.
+    assert "hello" not in bw._imported_binaries
+    _reset_imported_binaries()
+
+
+def test_build_worker_build_variant_imports_archive_first_time(
+    monkeypatch, tmp_path,
+):
+    """A first ``build_variant`` task for binary X invokes
+    ``ensure_binary_archive_imported`` with the BuildWorkerEnv's
+    matrix-eval-out-dir + the binary from the payload."""
+    _reset_imported_binaries()
+    captured: list[tuple[str, pathlib.Path]] = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        captured.append(("import", archive))
+        return True, b"", []
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.dependency_graph_worker"
+        ".archive.import_archive",
+        _fake_import,
+    )
+
+    out_dir = tmp_path / "phase0"
+    out_dir.mkdir()
+    nix_out = tmp_path / "nix-out"
+    _make_elf_folder(nix_out, {"hello": b"v"})
+    manifest = _make_variant_manifest(
+        tmp_path, pkg="hello", variant_dir="hello__x86_64__gcc15__O2",
+    )
+    runner = RecordingRunner(stdout=f"{nix_out}\n".encode("utf-8"))
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "dataset",
+        run_subprocess=runner,
+        matrix_eval_out_dir=out_dir,
+    )
+    result = build_worker(manifest, env)
+    assert result.success is True
+    assert captured == [("import", out_dir / "matrix-hello.drv.archive")]
+    _reset_imported_binaries()
+
+
+def test_build_worker_build_variant_does_not_re_import_same_binary(
+    monkeypatch, tmp_path,
+):
+    """The second ``build_variant`` task for the SAME binary on the
+    SAME process MUST NOT re-trigger ``import_archive`` — the cache
+    short-circuit lives in :data:`_imported_binaries`."""
+    _reset_imported_binaries()
+    captured: list[pathlib.Path] = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        captured.append(archive)
+        return True, b"", []
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.dependency_graph_worker"
+        ".archive.import_archive",
+        _fake_import,
+    )
+
+    out_dir = tmp_path / "phase0"
+    out_dir.mkdir()
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "dataset",
+        matrix_eval_out_dir=out_dir,
+    )
+
+    # Two variant tasks back-to-back for the same binary.
+    for variant_dir in (
+        "hello__x86_64__gcc15__O2", "hello__x86_64__gcc15__O0",
+    ):
+        nix_out = tmp_path / f"nix-out-{variant_dir}"
+        _make_elf_folder(nix_out, {"hello": b"v"})
+        manifest = _make_variant_manifest(
+            tmp_path, pkg="hello", variant_dir=variant_dir,
+        )
+        env.run_subprocess = RecordingRunner(
+            stdout=f"{nix_out}\n".encode("utf-8"),
+        )
+        result = build_worker(manifest, env)
+        assert result.success is True
+
+    # Exactly ONE import — even though two variant tasks ran.
+    assert captured == [out_dir / "matrix-hello.drv.archive"]
+    _reset_imported_binaries()
+
+
+def test_build_worker_build_variant_imports_new_binary_after_switch(
+    monkeypatch, tmp_path,
+):
+    """After a build_variant task for binary X imports its archive,
+    a build_variant task for binary Y on the same worker process
+    triggers a fresh import for ``matrix-Y.drv.archive`` (one per
+    binary cache key, not one per process)."""
+    _reset_imported_binaries()
+    captured: list[pathlib.Path] = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        captured.append(archive)
+        return True, b"", []
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.dependency_graph_worker"
+        ".archive.import_archive",
+        _fake_import,
+    )
+
+    out_dir = tmp_path / "phase0"
+    out_dir.mkdir()
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "dataset",
+        matrix_eval_out_dir=out_dir,
+    )
+
+    for pkg in ("hello", "world"):
+        nix_out = tmp_path / f"nix-out-{pkg}"
+        _make_elf_folder(nix_out, {pkg: b"v"})
+        manifest = _make_variant_manifest(
+            tmp_path, pkg=pkg, variant_dir=f"{pkg}__x86_64__gcc15__O2",
+        )
+        env.run_subprocess = RecordingRunner(
+            stdout=f"{nix_out}\n".encode("utf-8"),
+        )
+        result = build_worker(manifest, env)
+        assert result.success is True
+
+    assert captured == [
+        out_dir / "matrix-hello.drv.archive",
+        out_dir / "matrix-world.drv.archive",
+    ]
+    _reset_imported_binaries()
+
+
+def test_build_worker_build_variant_archive_import_failure_is_failure_result(
+    monkeypatch, tmp_path,
+):
+    """Archive import failure surfaces as ``result.success=False``;
+    the framework worker-handle wraps that into NonRecoverableError
+    (Bug A's exit-1 contract) further upstream."""
+    _reset_imported_binaries()
+
+    def _fake_import(archive, *, run_subprocess=None):
+        return False, b"missing archive", []
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.dependency_graph_worker"
+        ".archive.import_archive",
+        _fake_import,
+    )
+
+    out_dir = tmp_path / "phase0"
+    out_dir.mkdir()
+    manifest = _make_variant_manifest(
+        tmp_path, pkg="hello", variant_dir="hello__x86_64__gcc15__O2",
+    )
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "dataset",
+        matrix_eval_out_dir=out_dir,
+    )
+    result = build_worker(manifest, env)
+    assert result.success is False
+    assert "matrix-hello.drv.archive" in (result.error or "")
+    _reset_imported_binaries()

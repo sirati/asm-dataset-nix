@@ -1,8 +1,10 @@
 """Unit tests for ``compiler_suit_runner.workers.eval_worker``.
 
-The nix subprocess and the BroadcastSender are always stubbed; tests
-run in milliseconds and never touch the network or the local
-/nix/store.
+The nix subprocess is always stubbed; tests run in milliseconds and
+never touch the network or the local /nix/store. The per-drv
+broadcast loop the worker used to drive is gone — phase 4
+(build_worker) imports the per-binary archive directly — so these
+tests no longer thread a ``BroadcastSender`` through ``run_eval_task``.
 
 Note: ``eval_worker`` is a pure library module. The subprocess
 entry point lives in :func:`workers.build_worker.main`, which
@@ -21,7 +23,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from compiler_suit_runner.peer_replication import BroadcastResult
 from compiler_suit_runner.workers import eval_worker
 from compiler_suit_runner.workers.eval_worker import (
     MATRIX_EVAL_ITEM_CLASS,
@@ -319,38 +320,6 @@ def _make_task_mock() -> MagicMock:
     return MagicMock()
 
 
-def _make_broadcast_sender(
-    *,
-    success_count: int = 2,
-    fail_count: int = 0,
-    failed_peers: tuple[str, ...] = (),
-) -> MagicMock:
-    """Return a MagicMock typed as BroadcastSender.
-
-    enqueue_broadcast returns a deterministic counter-based id and
-    records the call args; wait_for_completion returns a synthetic
-    BroadcastResult unless the id is in ``timeout_ids``.
-    """
-    sender = MagicMock()
-    counter = {"n": 0}
-
-    def _enqueue(path: str, size: int, item_class=None) -> str:
-        counter["n"] += 1
-        return f"bid-{counter['n']:04d}"
-
-    def _wait(broadcast_id: str, timeout=None):
-        return BroadcastResult(
-            broadcast_id=broadcast_id,
-            success_count=success_count,
-            fail_count=fail_count,
-            failed_peers=failed_peers,
-        )
-
-    sender.enqueue_broadcast.side_effect = _enqueue
-    sender.wait_for_completion.side_effect = _wait
-    return sender
-
-
 # ---------------------------------------------------------------------------
 # parse_payload
 # ---------------------------------------------------------------------------
@@ -502,18 +471,19 @@ def test_sample_suffix_attrs_passthrough_unstructured_entries() -> None:
 def test_run_eval_task_happy_path(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Mock subprocess + BroadcastSender; verify the full flow.
+    """Mock subprocess; verify the full flow.
 
     Asserts: (1) nix-eval-jobs is called EXACTLY ONCE for the whole
     binary (bulk intersect over every arch + suffix); (2)
-    BroadcastSender.enqueue_broadcast is called once per (arch ×
-    suffix); (3) make_wrapper_drv_from_paths is invoked with the
-    toolchain aggregate first + sorted leaves; (4) the per-binary
-    ``matrix-<binary>.drv.archive`` is written; (5) the return value carries
-    the variants + variant_drvs + broadcast results + the new
-    ``matrix_aggregate_drv`` field; (6) the legacy
-    ``<binary>/manifest.json`` marker is NOT emitted; (7)
-    ``task.publish_string`` is called once with key
+    make_wrapper_drv_from_paths is invoked with the toolchain
+    aggregate first + sorted leaves; (3) the per-binary
+    ``matrix-<binary>.drv.archive`` is written; (4) the return value
+    carries the variants + variant_drvs + the
+    ``matrix_aggregate_drv`` field and no longer carries a
+    ``broadcasts`` field (the per-drv broadcast loop was retired in
+    favour of per-binary archive import on the build_worker side);
+    (5) the legacy ``<binary>/manifest.json`` marker is NOT emitted;
+    (6) ``task.publish_string`` is called once with key
     ``"matrix_aggregate_drv"`` and the wrapper drv path (replaces the
     legacy JSON-sidecar drop with the framework's keyed-outputs API).
     """
@@ -536,10 +506,9 @@ def test_run_eval_task_happy_path(
             },
         },
     )
-    sender = _make_broadcast_sender()
 
     result = run_eval_task(
-        payload, tmp_path, sender, task=task,
+        payload, tmp_path, task=task,
         run_subprocess=runner, now=lambda: 123.5,
     )
 
@@ -596,24 +565,6 @@ def test_run_eval_task_happy_path(
     # --force-recurse must be passed so nix-eval-jobs walks both
     # nested levels (arch → suffix) and emits leaves.
     assert "--force-recurse" in eval_argv
-
-    # BroadcastSender.enqueue_broadcast: one call per (arch × suffix) = 4.
-    assert sender.enqueue_broadcast.call_count == 4
-    broadcast_drvs = [
-        call.args[0] for call in sender.enqueue_broadcast.call_args_list
-    ]
-    assert set(broadcast_drvs) == {
-        "/nix/store/aaa-hello-x86_64-O0.drv",
-        "/nix/store/bbb-hello-x86_64-O2.drv",
-        "/nix/store/ccc-hello-aarch64-O0.drv",
-        "/nix/store/ddd-hello-aarch64-O2.drv",
-    }
-    # item_class kwarg is the broadcast namespace marker.
-    for call in sender.enqueue_broadcast.call_args_list:
-        assert call.kwargs["item_class"] == "matrix_eval_drv"
-
-    # wait_for_completion: one call per broadcast id.
-    assert sender.wait_for_completion.call_count == 4
 
     # make_wrapper_drv_from_paths invoked once for the matrix
     # aggregate: toolchain aggregate first, then sorted leaves.
@@ -689,12 +640,9 @@ def test_run_eval_task_happy_path(
         "hello__x86_64__O2",
     ]
     assert all(v["drv"].startswith("/nix/store/") for v in result["variants"])
-    # Broadcast results recorded.
-    assert len(result["broadcasts"]) == 4
-    for b in result["broadcasts"]:
-        assert b["status"] == "ok"
-        assert b["success_count"] == 2
-        assert b["fail_count"] == 0
+    # The per-drv broadcast loop was retired; the result dict no longer
+    # carries a ``broadcasts`` key.
+    assert "broadcasts" not in result
 
     # Legacy per-binary manifest.json marker is NOT emitted (hard cutover).
     assert not (tmp_path / "hello" / "manifest.json").exists()
@@ -740,10 +688,9 @@ def test_run_eval_task_overwrites_existing_archive(
     runner = _EvalJobsStub(
         drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
     )
-    sender = _make_broadcast_sender()
     task = _make_task_mock()
     result = run_eval_task(
-        payload, tmp_path, sender, task=task,
+        payload, tmp_path, task=task,
         run_subprocess=runner, now=lambda: 42.0,
     )
     # nix-eval-jobs ran (no short-circuit on an existing archive).
@@ -805,9 +752,8 @@ def test_run_eval_task_determinism_same_seed(
             drv_map={"x86_64": drv_table},
             meta_map={"x86_64": meta},
         )
-        sender = _make_broadcast_sender()
         return run_eval_task(
-            payload, out, sender, task=_make_task_mock(),
+            payload, out, task=_make_task_mock(),
             run_subprocess=runner, now=lambda: 1.0,
         )
 
@@ -866,9 +812,8 @@ def test_run_eval_task_determinism_different_seed(
             drv_map={"x86_64": drv_table},
             meta_map={"x86_64": meta},
         )
-        sender = _make_broadcast_sender()
         return run_eval_task(
-            payload, out, sender, task=_make_task_mock(),
+            payload, out, task=_make_task_mock(),
             run_subprocess=runner, now=lambda: 1.0,
         )
 
@@ -901,11 +846,10 @@ def test_run_eval_task_subprocess_failure_raises(
         drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
         bulk_eval_fail="eval-time OOM: out of memory",
     )
-    sender = _make_broadcast_sender()
 
     with pytest.raises(RuntimeError) as exc_info:
         run_eval_task(
-            payload, tmp_path, sender, task=_make_task_mock(),
+            payload, tmp_path, task=_make_task_mock(),
             run_subprocess=runner,
         )
 
@@ -917,8 +861,6 @@ def test_run_eval_task_subprocess_failure_raises(
     assert "eval-time OOM" in msg
     # No archive on failure — re-execution must re-eval.
     assert not (tmp_path / "matrix-hello.drv.archive").exists()
-    # No broadcasts fired (we failed before any leaves were extracted).
-    sender.enqueue_broadcast.assert_not_called()
 
 
 def test_run_eval_task_bad_payload_raises_valueerror(
@@ -929,39 +871,12 @@ def test_run_eval_task_bad_payload_raises_valueerror(
     """
     payload = _make_payload()
     payload["archs"] = "not-a-list"
-    sender = _make_broadcast_sender()
     runner = _EvalJobsStub()
     with pytest.raises(ValueError):
         run_eval_task(
-            payload, tmp_path, sender, task=_make_task_mock(),
+            payload, tmp_path, task=_make_task_mock(),
             run_subprocess=runner,
         )
-
-
-def test_run_eval_task_broadcast_timeout_recorded(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A broadcast timeout is non-fatal: we record ``status=timeout``
-    on the returned summary and continue. The flood-fill protocol is
-    best-effort.
-    """
-    _install_wrapper_stub(monkeypatch)
-    payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
-    runner = _EvalJobsStub(
-        drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}}
-    )
-    sender = MagicMock()
-    sender.enqueue_broadcast.return_value = "bid-1"
-    sender.wait_for_completion.return_value = None  # timeout
-
-    result = run_eval_task(
-        payload, tmp_path, sender, task=_make_task_mock(),
-        run_subprocess=runner, now=lambda: 1.0,
-    )
-    assert len(result["broadcasts"]) == 1
-    assert result["broadcasts"][0]["status"] == "timeout"
-    # Archive still persisted.
-    assert (tmp_path / "matrix-hello.drv.archive").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -981,10 +896,9 @@ def test_run_eval_task_requisites_failure_raises(
         drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
         requisites_fail=True,
     )
-    sender = _make_broadcast_sender()
     with pytest.raises(RuntimeError, match="nix-store --query --requisites"):
         run_eval_task(
-            payload, tmp_path, sender, task=_make_task_mock(),
+            payload, tmp_path, task=_make_task_mock(),
             run_subprocess=runner,
         )
     assert not (tmp_path / "matrix-hello.drv.archive").exists()
@@ -1003,10 +917,9 @@ def test_run_eval_task_export_failure_raises_and_cleans_up(
         drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
         export_fail=True,
     )
-    sender = _make_broadcast_sender()
     with pytest.raises(RuntimeError, match="nix-store --export"):
         run_eval_task(
-            payload, tmp_path, sender, task=_make_task_mock(),
+            payload, tmp_path, task=_make_task_mock(),
             run_subprocess=runner,
         )
     # No archive (export failed). No stale .tmp lingering either.
@@ -1037,11 +950,10 @@ def test_run_eval_task_wrapper_failure_leaves_no_archive(
     runner = _EvalJobsStub(
         drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
     )
-    sender = _make_broadcast_sender()
 
     with pytest.raises(RuntimeError, match="synthetic nix-instantiate failure"):
         run_eval_task(
-            payload, tmp_path, sender, task=_make_task_mock(),
+            payload, tmp_path, task=_make_task_mock(),
             run_subprocess=runner,
         )
 
@@ -1064,9 +976,8 @@ def test_run_eval_task_empty_kept_drvs_writes_empty_archive(
     payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
     # Empty drv map for the requested arch → bulk_drvs ends up empty.
     runner = _EvalJobsStub(drv_map={"x86_64": {}})
-    sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, task=_make_task_mock(),
+        payload, tmp_path, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
     assert result["variant_drvs"] == []
@@ -1120,9 +1031,8 @@ def test_run_eval_task_invokes_meta_eval_when_sampling(
     runner = _EvalJobsStub(
         drv_map={"x86_64": drv_table}, meta_map={"x86_64": meta},
     )
-    sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, task=_make_task_mock(),
+        payload, tmp_path, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
 
@@ -1137,8 +1047,6 @@ def test_run_eval_task_invokes_meta_eval_when_sampling(
     assert len(eval_calls) == 1
     # 4 groups × sample_size=1 → 4 variants kept.
     assert len(result["variants"]) == 4
-    # Each broadcast enqueued once.
-    assert sender.enqueue_broadcast.call_count == 4
 
 
 def test_run_eval_task_calls_meta_even_when_no_sampling(
@@ -1163,9 +1071,8 @@ def test_run_eval_task_calls_meta_even_when_no_sampling(
             "aarch64": {"O0": "/nix/store/c.drv", "O2": "/nix/store/d.drv"},
         }
     )
-    sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, task=_make_task_mock(),
+        payload, tmp_path, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
     # One _meta lookup per arch — variant_sample unset does NOT skip
@@ -1222,15 +1129,14 @@ def test_bulk_eval_per_arch_suffix_filter_is_distinct_per_arch(
         },
         meta_map={"x86_64": meta_x86, "aarch64": meta_aarch},
     )
-    sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, task=_make_task_mock(),
+        payload, tmp_path, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
     # We expect one variant per (arch, group) = 4 total (2 archs ×
     # 2 groups × sample=1).
     assert len(result["variants"]) == 4
-    # Both archs are represented in the broadcast set.
+    # Both archs are represented in the variant set.
     arches = {v["arch"] for v in result["variants"]}
     assert arches == {"x86_64", "aarch64"}
     # Single bulk eval call.
@@ -1260,9 +1166,8 @@ def test_bulk_eval_drops_archs_with_no_sampled_suffixes(
             "aarch64": {},
         },
     )
-    sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, task=_make_task_mock(),
+        payload, tmp_path, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
     # Only x86_64 produced a variant.
@@ -1301,9 +1206,8 @@ def test_bulk_eval_filter_payload_round_trips_via_tmpfile(
             "aarch64": {"O0": "/nix/store/c.drv", "O2": "/nix/store/d.drv"},
         },
     )
-    sender = _make_broadcast_sender()
     run_eval_task(
-        payload, tmp_path, sender, task=_make_task_mock(),
+        payload, tmp_path, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
     eval_invocations = [
@@ -1378,9 +1282,8 @@ def test_matrix_aggregate_carries_toolchain_and_sorted_leaves(
             "aarch64": {"O0": drv_a},
         },
     )
-    sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, task=_make_task_mock(),
+        payload, tmp_path, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
 
@@ -1421,9 +1324,8 @@ def test_matrix_aggregate_is_export_seed_for_archive(
             "O2": "/nix/store/o2.drv",
         }},
     )
-    sender = _make_broadcast_sender()
     run_eval_task(
-        payload, tmp_path, sender, task=_make_task_mock(),
+        payload, tmp_path, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
     req_invocations = [
@@ -1456,9 +1358,8 @@ def test_export_closure_pipes_paths_via_stdin(
             "O2": "/nix/store/o2.drv",
         }},
     )
-    sender = _make_broadcast_sender()
     run_eval_task(
-        payload, tmp_path, sender, task=_make_task_mock(),
+        payload, tmp_path, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
     # --requisites: argv ends with --stdin; the kept-drv list (just the
