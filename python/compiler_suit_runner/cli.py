@@ -1547,10 +1547,17 @@ def cmd_submit(args: argparse.Namespace) -> int:
             # caching with redundancy but that's a major design
             # effort.
             _nix_max_jobs = os.environ.get("ASM_NIX_MAX_JOBS", "2")
+            # connect-timeout / download-attempts are bumped from the
+            # original 1/1 (tuned for many-secondary dead-peer-harmonia
+            # fast-fail) to 5/3: cache.nixos.org legitimately needs >1s
+            # for source-narinfo round-trips on cold flake inputs, and
+            # the per-drv broadcast loop has been removed so dead-peer
+            # cost is now minimal (workers consume the matrix .drv.archive
+            # rather than peer-substituting individual drvs).
             _nix_config = (
                 f"max-jobs = {_nix_max_jobs}\n"
-                "connect-timeout = 1\n"
-                "download-attempts = 1"
+                "connect-timeout = 5\n"
+                "download-attempts = 3"
             )
             run_args += ["-e", f"NIX_CONFIG={_nix_config}"]
             deployment = TaskDeploymentSpec(
