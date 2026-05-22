@@ -6,7 +6,7 @@ types as :class:`TaskTypeSpec`. :class:`SuitTask` implements that
 Protocol under the new phase taxonomy:
 
 * ``matrix_eval`` (phase 2 in the plan) — distributed eval workers, one
-  task per binary; produces ``<binary>.nix-archive`` per-binary
+  task per binary; produces ``matrix-<binary>.drv.archive`` per-binary
   closures plus the kept-drv set the dependency_graph worker walks.
 * ``build_compilers`` (phase 1, optional) — distributed cross-toolchain
   build workers; one task per (arch, compiler). PhaseSpec is always
@@ -20,7 +20,7 @@ Protocol under the new phase taxonomy:
   path from ``task.predecessor_outputs[matrix_eval__<binary>]
   ["matrix_aggregate_drv"]["value"]`` (published by the upstream
   matrix_eval task via ``Task.publish_string``), imports the
-  per-binary nix-archive, runs the streaming planner, and emits
+  per-binary matrix-aggregate drv archive, runs the streaming planner, and emits
   per-(compiler, arch) sidecar manifests at
   ``<matrix_eval_out_dir>/_manifests/`` for the placeholder
   build_variant tasks to consume.
@@ -190,7 +190,7 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
         return ("matrix_eval", "eval", binary)
     if item_class == "dependency_graph":
         # One task per binary; depends on matrix_eval__<binary>. The
-        # worker imports that binary's nix-archive + reads the matrix
+        # worker imports that binary's matrix-aggregate drv archive + reads the matrix
         # aggregate drv from ``task.predecessor_outputs[
         # matrix_eval__<binary>]["matrix_aggregate_drv"]["value"]``
         # (published via ``Task.publish_string``), runs the streaming
@@ -934,10 +934,13 @@ class SuitTaskConfig:
     # retry budget); see ``feedback_state_machine_semantics.md``.
     unfulfillable_reinject_max_per_task: Optional[int] = None
     # Shared bind-mounted path where matrix_eval workers write their
-    # per-binary ``<binary>.nix-archive`` closures + resume markers.
-    # Submitter side: ``<shared_fs>/dataset/_matrix_eval``; secondary
-    # container side: ``/app/out-network/_matrix_eval`` (same
-    # physical dir via the framework's --output bind mount).
+    # per-binary ``matrix-<binary>.drv.archive`` closures. The archive
+    # is the watcher's quiesce signal; there is no resume short-
+    # circuit (in-run second attempts are failure restarts where the
+    # cached on-disk archive cannot be trusted, so the worker always
+    # re-runs). Submitter side: ``<shared_fs>/dataset/_matrix_eval``;
+    # secondary container side: ``/app/out-network/_matrix_eval``
+    # (same physical dir via the framework's --output bind mount).
     matrix_eval_out_dir: Optional[pathlib.Path] = None
 
     # SSH gateway URL (``ssh://user@host[:port]``) used by the
@@ -1268,7 +1271,7 @@ class SuitTask:
                     "--signing-public-key", self._signing_key.public_key,
                 ]
             # matrix_eval marker dir: bind-mount-visible path so the
-            # eval worker writes its <binary>.nix-archive there and the
+            # eval worker writes its matrix-<binary>.drv.archive there and the
             # dep_graph worker (PH-A) imports it from the same location.
             # The matrix_aggregate drv is threaded out-of-band via
             # ``Task.publish_string`` / predecessor_outputs, not on

@@ -28,25 +28,27 @@ worker:
    ``nix-store --query --tree`` refcount-sort floats the toolchain
    layer to a sensible position relative to the matrix layer.
 4. Exports the aggregate closure to
-   ``<matrix_eval_out_dir>/<binary>.nix-archive`` via
+   ``<matrix_eval_out_dir>/matrix-<binary>.drv.archive`` via
    ``nix-store --query --requisites`` + ``nix-store --export`` so the
    primary's ``_MatrixEvalQuiesceWatcher`` + ``dependency_graph_worker``
    can re-import the full drv graph (toolchain aggregate + matrix
    aggregate + every leaf) into the primary's local store without
-   re-evaluating the flake. The ``dependency_graph_worker`` discovers
-   the ROOT (kept) drvs by parsing the variant path of each imported
-   .drv directly (``parse_variant_path``) — no JSON sidecar is
-   emitted.
+   re-evaluating the flake. The archive filename mirrors the
+   ``matrix-<binary>.drv`` storename so the on-disk artefact is self-
+   identifying — readers recognise it without out-of-band metadata.
+   The ``dependency_graph_worker`` discovers the ROOT (kept) drvs by
+   parsing the variant path of each imported .drv directly
+   (``parse_variant_path``) — no JSON sidecar is emitted.
 
-Resume marker
--------------
+Re-execution
+------------
 
-The archive itself IS the resume marker. A short-circuit fires when
-the archive exists and is non-empty: re-execution skips eval +
-broadcast + export. The hard-cutover design uses archive presence as
-the single source of truth; the dependency_graph_worker derives
-variant_lookup from the imported .drv paths via ``parse_variant_path``,
-so no JSON sidecar is emitted.
+The worker always re-runs Steps 1-7 on every invocation; there is no
+resume fast-path. In-run "second attempts" are failure restarts
+where any cached on-disk archive cannot be trusted (the writer never
+fully completed). The atomic ``.tmp`` + ``os.replace`` archive writer
+guarantees readers never see a half-written file, so a fresh run
+simply overwrites the prior archive in place.
 
 Error-type contract (framework integration)
 -------------------------------------------
@@ -83,8 +85,8 @@ invocation, all inside one task. Two reasons:
   cache across archs. The matrix-aggregate refactor collapsed the
   earlier per-arch loop into one bulk eval per binary so that
   sharing is realised.
-* Phase 1 task spawn waits for the per-binary marker file; a
-  binary's resume marker is single-writer so we never race on it.
+* Phase 1 task spawn waits for the per-binary archive file; a
+  binary's archive is single-writer so we never race on it.
 
 See ``~/.claude/plans/lively-beaming-summit.md`` Part B for the
 full rationale and the Phase 1 planner that consumes the marker.
@@ -474,7 +476,7 @@ def _drv_size(drv_path: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Archive (resume marker for post-A3 hard-cutover format)
+# Archive (matrix-aggregate drv export — quiesce signal for the watcher)
 # ---------------------------------------------------------------------------
 
 
@@ -483,9 +485,13 @@ def _archive_path(out_dir: pathlib.Path, binary: str) -> pathlib.Path:
 
     ``out_dir`` is the matrix-eval-specific dir (e.g. ``_matrix_eval``
     on the host, ``/app/out-network/_matrix_eval`` in the container);
-    each binary's kept-variant closure lands at ``<out_dir>/<binary>.nix-archive``.
+    each binary's kept-variant closure lands at
+    ``<out_dir>/matrix-<binary>.drv.archive``. The filename mirrors the
+    ``matrix-<binary>.drv`` storename pattern so the archive is self-
+    identifying — readers recognise it as the matrix-aggregate drv
+    export without out-of-band metadata.
     """
-    return out_dir / f"{binary}.nix-archive"
+    return out_dir / f"matrix-{binary}.drv.archive"
 
 
 def _export_kept_closure(
@@ -516,9 +522,9 @@ def _export_kept_closure(
     """
     if not kept_drvs:
         # No kept drvs ⇒ no archive. Still produce an empty file so the
-        # primary's archive presence-check resume marker stays consistent
-        # (zero variants is a valid outcome for a binary with all archs
-        # gated out by the support table).
+        # primary's quiesce-watcher (archive-presence based) stays
+        # consistent — zero variants is a valid outcome for a binary
+        # with all archs gated out by the support table.
         archive.parent.mkdir(parents=True, exist_ok=True)
         tmp = archive.with_suffix(archive.suffix + ".tmp")
         with open(tmp, "wb") as fh:
@@ -807,7 +813,7 @@ def _export_matrix_archive(
     the archive on the primary and walk the full graph without
     re-evaluating the flake. When ``matrix_aggregate_drv`` is ``None``
     (a binary with all archs gated out) we still write an empty archive
-    so the primary's presence-based resume marker stays consistent.
+    so the primary's archive-presence quiesce signal stays consistent.
     """
     export_seeds = [matrix_aggregate_drv] if matrix_aggregate_drv else []
     _export_kept_closure(archive, export_seeds, run_subprocess=run_subprocess)
@@ -828,10 +834,15 @@ def run_eval_task(
 
     See the module docstring for the protocol and the Step-1..7 layout
     each helper handles. The only on-disk artefact is the binary
-    archive at ``out_dir/<binary>.nix-archive``; the returned dict is
-    an in-process summary. Failure modes raise :class:`RuntimeError`
-    so the harness surfaces ``ErrorType::Errored`` (retry-pass) —
-    never ``Unfulfillable`` (that belongs to toolchain-validate).
+    archive at ``out_dir/matrix-<binary>.drv.archive``; the returned
+    dict is an in-process summary. Every invocation re-runs Steps 1-7
+    — there is no resume fast-path. An in-run second attempt is
+    always a failure restart (the cached on-disk archive cannot be
+    trusted), and the archive writer's atomic ``.tmp`` +
+    ``os.replace`` overwrites any prior file in place. Failure modes
+    raise :class:`RuntimeError` so the harness surfaces
+    ``ErrorType::Errored`` (retry-pass) — never ``Unfulfillable``
+    (that belongs to toolchain-validate).
     """
     clock = now or time.time
     runner = run_subprocess or _default_run_subprocess
@@ -840,20 +851,6 @@ def run_eval_task(
     binary = parsed["binary"]
     sys_name = parsed["sys"]
     archive = _archive_path(out_dir, binary)
-
-    # Step 0: resume short-circuit — archive presence IS the resume
-    # marker. The downstream dependency_graph task imports the archive
-    # closure and derives variant_lookup by parsing the imported .drv
-    # paths via parse_variant_path; no out-of-band sidecar is consulted.
-    # We omit matrix_aggregate_drv on resume so callers don't misread a
-    # non-empty value as "freshly built".
-    if archive.exists() and archive.stat().st_size > 0:
-        return {
-            "binary": binary, "sys": sys_name,
-            "produced_at": float(clock()),
-            "variant_drvs": [], "variants": [], "broadcasts": [],
-            "matrix_aggregate_drv": None, "resumed": True,
-        }
 
     # Step 1: sample per arch.
     sampled_by_arch = _sample_per_arch(

@@ -98,19 +98,25 @@ class TestDiscoverArchives:
         assert dgw.discover_archives(tmp_path / "no-such-dir") == []
 
     def test_only_archive_suffix(self, tmp_path: pathlib.Path):
-        (tmp_path / "hello.nix-archive").write_bytes(b"x")
+        (tmp_path / "matrix-hello.drv.archive").write_bytes(b"x")
+        # Non-matching files: wrong prefix, wrong suffix, legacy name,
+        # bare metadata file, and a directory.
         (tmp_path / "hello.txt").write_bytes(b"x")
+        (tmp_path / "hello.nix-archive").write_bytes(b"x")
+        (tmp_path / "matrix-hello.drv").write_bytes(b"x")
         (tmp_path / "_meta.json").write_bytes(b"x")
         (tmp_path / "subdir").mkdir()
         out = dgw.discover_archives(tmp_path)
-        assert [p.name for p in out] == ["hello.nix-archive"]
+        assert [p.name for p in out] == ["matrix-hello.drv.archive"]
 
     def test_sorted_by_name(self, tmp_path: pathlib.Path):
-        (tmp_path / "zebra.nix-archive").write_bytes(b"x")
-        (tmp_path / "hello.nix-archive").write_bytes(b"x")
-        (tmp_path / "alpha.nix-archive").write_bytes(b"x")
+        (tmp_path / "matrix-zebra.drv.archive").write_bytes(b"x")
+        (tmp_path / "matrix-hello.drv.archive").write_bytes(b"x")
+        (tmp_path / "matrix-alpha.drv.archive").write_bytes(b"x")
         out = dgw.discover_archives(tmp_path)
-        assert [p.stem for p in out] == ["alpha", "hello", "zebra"]
+        assert [
+            dgw.binary_from_archive_name(p) for p in out
+        ] == ["alpha", "hello", "zebra"]
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +339,7 @@ class TestIsPathLocallyPresent:
 class TestImportArchive:
 
     def test_missing_archive(self, tmp_path: pathlib.Path):
-        archive = tmp_path / "missing.nix-archive"
+        archive = tmp_path / "matrix-missing.drv.archive"
         stub = _SubprocessStub()
         ok, err, imported = dgw.import_archive(
             archive, run_subprocess=stub,
@@ -345,7 +351,7 @@ class TestImportArchive:
         assert stub.calls == []
 
     def test_present_archive_success(self, tmp_path: pathlib.Path):
-        archive = tmp_path / "x.nix-archive"
+        archive = tmp_path / "matrix-x.drv.archive"
         archive.write_bytes(b"fake-archive-bytes")
         stub = _SubprocessStub()
         stub.import_rc = 0
@@ -367,7 +373,7 @@ class TestImportArchive:
         ]
 
     def test_subprocess_failure(self, tmp_path: pathlib.Path):
-        archive = tmp_path / "x.nix-archive"
+        archive = tmp_path / "matrix-x.drv.archive"
         archive.write_bytes(b"junk")
         stub = _SubprocessStub()
         stub.import_rc = 1
@@ -385,7 +391,7 @@ class TestImportArchive:
     def test_empty_stdout_yields_empty_paths(
         self, tmp_path: pathlib.Path,
     ):
-        archive = tmp_path / "x.nix-archive"
+        archive = tmp_path / "matrix-x.drv.archive"
         archive.write_bytes(b"x")
         stub = _SubprocessStub()
         stub.import_stdout = b""
@@ -398,7 +404,7 @@ class TestImportArchive:
     def test_blank_lines_in_stdout_skipped(
         self, tmp_path: pathlib.Path,
     ):
-        archive = tmp_path / "x.nix-archive"
+        archive = tmp_path / "matrix-x.drv.archive"
         archive.write_bytes(b"x")
         stub = _SubprocessStub()
         stub.import_stdout = (
@@ -533,14 +539,14 @@ class TestRunDependencyGraphTask:
         matrix_dir: pathlib.Path,
         binary: str,
     ) -> pathlib.Path:
-        """Drop a placeholder ``<binary>.nix-archive`` in ``matrix_dir``.
+        """Drop a placeholder ``matrix-<binary>.drv.archive`` in ``matrix_dir``.
 
         Phase 3 still imports the archive (so the leaf closure
         materialises in the local store for the tree walk), but the
         kept-drv list no longer comes from the import stdout — D.1a's
         ``derive_variant_lookup_from_aggregate`` owns it now.
         """
-        archive = matrix_dir / f"{binary}.nix-archive"
+        archive = matrix_dir / f"matrix-{binary}.drv.archive"
         archive.write_bytes(b"fake")
         return archive
 
@@ -1534,7 +1540,7 @@ class TestDependencyGraphCounters:
         this worker run only plans one binary."""
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
-        (matrix_dir / "hello.nix-archive").write_bytes(b"x")
+        (matrix_dir / "matrix-hello.drv.archive").write_bytes(b"x")
         agg_hello = "/nix/store/" + "rh" + "a" * 30 + "-matrix-hello.drv"
         tc_agg = "/nix/store/zzzz-toolchains.drv"
 

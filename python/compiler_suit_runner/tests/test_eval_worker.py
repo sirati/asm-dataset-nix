@@ -459,7 +459,7 @@ def test_run_eval_task_happy_path(
     BroadcastSender.enqueue_broadcast is called once per (arch ×
     suffix); (3) make_wrapper_drv_from_paths is invoked with the
     toolchain aggregate first + sorted leaves; (4) the per-binary
-    ``<binary>.nix-archive`` is written; (5) the return value carries
+    ``matrix-<binary>.drv.archive`` is written; (5) the return value carries
     the variants + variant_drvs + broadcast results + the new
     ``matrix_aggregate_drv`` field; (6) the legacy
     ``<binary>/manifest.json`` marker is NOT emitted; (7)
@@ -563,7 +563,7 @@ def test_run_eval_task_happy_path(
     assert "/nix/store/wrap-matrix-hello.drv-input" in export_calls[0]
 
     # Archive written with the stub's synthetic export payload.
-    archive = tmp_path / "hello.nix-archive"
+    archive = tmp_path / "matrix-hello.drv.archive"
     assert archive.exists()
     assert archive.stat().st_size > 0
     assert archive.read_bytes().startswith(b"NIX_EXPORT:")
@@ -607,7 +607,7 @@ def test_run_eval_task_happy_path(
     # keyed-outputs API (``Task.publish_string``). Only the archive
     # remains as the per-binary artefact on the shared fs.
     siblings = sorted(p.name for p in tmp_path.iterdir())
-    assert siblings == ["hello.nix-archive"], siblings
+    assert siblings == ["matrix-hello.drv.archive"], siblings
     # Step 6b: publish_string was called exactly once with the wrapper
     # drv keyed under ``matrix_aggregate_drv``. This is the wire the
     # downstream dependency_graph task reads via predecessor_outputs.
@@ -617,60 +617,28 @@ def test_run_eval_task_happy_path(
 
 
 # ---------------------------------------------------------------------------
-# run_eval_task — resume short-circuit
+# run_eval_task — always re-runs (no resume short-circuit)
 # ---------------------------------------------------------------------------
 
 
-def test_run_eval_task_resume_short_circuits(tmp_path: pathlib.Path) -> None:
-    """If the non-empty per-binary archive from a prior run is present,
-    short-circuit eval + broadcast + export and return a minimal
-    ``{"resumed": True}`` dict. The archive carries the closure import
-    for dep_graph; the matrix_aggregate drv handoff comes from the
-    framework's keyed-outputs replay (the prior run's
-    ``Task.publish_string`` write), not an on-disk sidecar — so the
-    archive alone is the resume marker."""
-    payload = _make_payload()
-    archive = tmp_path / "hello.nix-archive"
-    archive.write_bytes(b"NIX_EXPORT:previous-run")
-
-    runner = _EvalJobsStub()
-    sender = _make_broadcast_sender()
-    task = _make_task_mock()
-    result = run_eval_task(
-        payload, tmp_path, sender, task=task, run_subprocess=runner,
-    )
-
-    # Returned dict carries the resumed marker and the per-binary
-    # identity fields; no variants enumerated; matrix_aggregate_drv is
-    # None because the archive already carries the (previously-built)
-    # aggregate — we deliberately don't re-derive it from scratch.
-    assert result.get("resumed") is True
-    assert result["binary"] == "hello"
-    assert result["sys"] == "x86_64-linux"
-    assert result["variant_drvs"] == []
-    assert result["variants"] == []
-    assert result["broadcasts"] == []
-    assert result["matrix_aggregate_drv"] is None
-    # No subprocess calls — no eval, no requisites query, no export.
-    assert runner.calls == []
-    # No broadcasts.
-    sender.enqueue_broadcast.assert_not_called()
-    sender.wait_for_completion.assert_not_called()
-    # Resume omits the publish_string write — the framework replays the
-    # prior run's keyed output, so re-publishing would be redundant.
-    task.publish_string.assert_not_called()
-
-
-def test_run_eval_task_empty_archive_re_runs(
+def test_run_eval_task_overwrites_existing_archive(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An empty archive file (zero bytes) doesn't satisfy the resume
-    check — we re-run rather than wedge on a half-written export.
+    """A pre-existing archive does NOT short-circuit run_eval_task —
+    the worker always re-runs Steps 1-7 and overwrites the prior file
+    in place via the export writer's atomic ``.tmp`` + ``os.replace``.
+
+    In-run "second attempts" are failure restarts where the cached
+    on-disk archive cannot be trusted; the resume short-circuit was
+    deleted in this commit. We seed a non-empty archive with sentinel
+    bytes and assert (a) nix-eval-jobs DID run, (b) the archive was
+    overwritten with fresh export payload, and (c) the returned dict
+    carries the freshly-built matrix_aggregate_drv (not ``None``).
     """
     _install_wrapper_stub(monkeypatch)
     payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
-    archive = tmp_path / "hello.nix-archive"
-    archive.write_bytes(b"")  # empty
+    archive = tmp_path / "matrix-hello.drv.archive"
+    archive.write_bytes(b"NIX_EXPORT:previous-run-stale")
 
     runner = _EvalJobsStub(
         drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
@@ -681,20 +649,20 @@ def test_run_eval_task_empty_archive_re_runs(
         payload, tmp_path, sender, task=task,
         run_subprocess=runner, now=lambda: 42.0,
     )
-    # nix-eval-jobs ran (resume short-circuit did not fire).
+    # nix-eval-jobs ran (no short-circuit on an existing archive).
     assert any(c and c[0] == "nix-eval-jobs" for c in runner.calls)
-    # Archive rewritten via the export path.
+    # Archive overwritten via the export path — the stale sentinel is gone.
     assert archive.stat().st_size > 0
+    assert not archive.read_bytes().startswith(b"NIX_EXPORT:previous-run-stale")
     assert result["produced_at"] == 42.0
-    assert result.get("resumed") is not True
+    assert "resumed" not in result
     assert result["variant_drvs"] == ["/nix/store/aaa.drv"]
     # The freshly-built matrix aggregate path is reported.
     assert result["matrix_aggregate_drv"] == "/nix/store/wrap-matrix-hello.drv"
-
-
-# Resume coverage:
-#   * archive present (non-empty)  →  short-circuit (test_run_eval_task_resume_short_circuits)
-#   * empty archive                 →  re-run (test_run_eval_task_empty_archive_re_runs)
+    # publish_string fires every run; no replay-via-keyed-outputs path.
+    task.publish_string.assert_called_once_with(
+        "matrix_aggregate_drv", "/nix/store/wrap-matrix-hello.drv",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +676,7 @@ def test_run_eval_task_determinism_same_seed(
     """Two runs with the same ``variant_seed`` produce identical
     variants[] lists AND identical ``drvs=`` arguments to
     ``make_wrapper_drv_from_paths``. Each run uses a fresh out_dir so
-    no resume short-circuit hides drift between runs.
+    no cached on-disk state hides drift between runs.
 
     Asserting wrapper-call equality (rather than just the synthetic
     ``matrix_aggregate_drv`` path) is what makes this test
@@ -851,7 +819,7 @@ def test_run_eval_task_subprocess_failure_raises(
     assert "rc=1" in msg
     assert "eval-time OOM" in msg
     # No archive on failure — re-execution must re-eval.
-    assert not (tmp_path / "hello.nix-archive").exists()
+    assert not (tmp_path / "matrix-hello.drv.archive").exists()
     # No broadcasts fired (we failed before any leaves were extracted).
     sender.enqueue_broadcast.assert_not_called()
 
@@ -896,7 +864,7 @@ def test_run_eval_task_broadcast_timeout_recorded(
     assert len(result["broadcasts"]) == 1
     assert result["broadcasts"][0]["status"] == "timeout"
     # Archive still persisted.
-    assert (tmp_path / "hello.nix-archive").exists()
+    assert (tmp_path / "matrix-hello.drv.archive").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -922,7 +890,7 @@ def test_run_eval_task_requisites_failure_raises(
             payload, tmp_path, sender, task=_make_task_mock(),
             run_subprocess=runner,
         )
-    assert not (tmp_path / "hello.nix-archive").exists()
+    assert not (tmp_path / "matrix-hello.drv.archive").exists()
 
 
 def test_run_eval_task_export_failure_raises_and_cleans_up(
@@ -945,8 +913,8 @@ def test_run_eval_task_export_failure_raises_and_cleans_up(
             run_subprocess=runner,
         )
     # No archive (export failed). No stale .tmp lingering either.
-    assert not (tmp_path / "hello.nix-archive").exists()
-    assert not (tmp_path / "hello.nix-archive.tmp").exists()
+    assert not (tmp_path / "matrix-hello.drv.archive").exists()
+    assert not (tmp_path / "matrix-hello.drv.archive.tmp").exists()
 
 
 def test_run_eval_task_wrapper_failure_leaves_no_archive(
@@ -980,9 +948,9 @@ def test_run_eval_task_wrapper_failure_leaves_no_archive(
             run_subprocess=runner,
         )
 
-    archive = tmp_path / "hello.nix-archive"
+    archive = tmp_path / "matrix-hello.drv.archive"
     assert not archive.exists()
-    assert not archive.with_suffix(".nix-archive.tmp").exists()
+    assert not archive.with_suffix(archive.suffix + ".tmp").exists()
 
 
 def test_run_eval_task_empty_kept_drvs_writes_empty_archive(
@@ -1011,7 +979,7 @@ def test_run_eval_task_empty_kept_drvs_writes_empty_archive(
     # raised ValueError on an empty drv list.
     assert wrapper.calls == []
     # Archive exists (zero bytes).
-    archive = tmp_path / "hello.nix-archive"
+    archive = tmp_path / "matrix-hello.drv.archive"
     assert archive.exists()
     assert archive.stat().st_size == 0
     # No requisites / export subprocesses fired (no kept drvs).
@@ -1392,7 +1360,7 @@ def test_matrix_archive_round_trips_leaves(tmp_path: pathlib.Path) -> None:
         "aggregate must appear in its own --requisites output"
     )
 
-    archive_path = tmp_path / "synthetic.nix-archive"
+    archive_path = tmp_path / "matrix-synthetic.drv.archive"
     with archive_path.open("wb") as fp:
         subprocess.run(
             ["nix-store", "--export", *requisites],

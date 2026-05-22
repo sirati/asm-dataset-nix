@@ -51,7 +51,7 @@ def run_dependency_graph_task(
     planner runs once per binary; cross-binary template dedup is no
     longer this worker's concern.
 
-      1. import the ``<binary>.nix-archive`` so the closure (and
+      1. import the ``matrix-<binary>.drv.archive`` so the closure (and
          therefore the leaves the aggregate drv references) is
          materialised in the local store — required for the
          ``nix-store --query --tree`` walk further down;
@@ -221,7 +221,8 @@ def _import_all_archives(
     """
     for archive in archives:
         _import_archive_or_raise(
-            archive=archive, runner=runner, binary=archive.stem,
+            archive=archive, runner=runner,
+            binary=_archive.binary_from_archive_name(archive),
         )
 
 

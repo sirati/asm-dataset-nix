@@ -180,7 +180,7 @@ def eval_all_binaries(
             binary = futures[future]
             eval_result = future.result()
             matrix_aggregates[binary] = eval_result["matrix_aggregate_drv"]
-            archive = archive_dir / f"{binary}.nix-archive"
+            archive = archive_dir / f"matrix-{binary}.drv.archive"
             if not archive.is_file() or archive.stat().st_size == 0:
                 raise RuntimeError(
                     f"phase3-dot-demo: missing/empty archive for "

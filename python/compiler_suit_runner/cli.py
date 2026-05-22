@@ -1188,7 +1188,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 # Threaded so emit_dependency_graph_manifests can
                 # include the bind-mounted matrix_eval output dir in
                 # each dep_graph payload — the worker imports
-                # <out_dir>/<binary>.nix-archive from there. The
+                # <out_dir>/matrix-<binary>.drv.archive from there. The
                 # matrix_aggregate drv path arrives via the framework's
                 # keyed-outputs wire (task.predecessor_outputs[
                 # matrix_eval_id]["matrix_aggregate_drv"]["value"]),
