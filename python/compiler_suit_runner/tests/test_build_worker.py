@@ -1063,10 +1063,11 @@ def test_main_handle_dispatches_matrix_eval_to_run_eval_task(
 
     captured: dict = {}
 
-    def _fake_run_eval(payload, *, out_dir, broadcast_sender):
+    def _fake_run_eval(payload, *, out_dir, broadcast_sender, task):
         captured["payload"] = payload
         captured["out_dir"] = out_dir
         captured["broadcast_sender"] = broadcast_sender
+        captured["task"] = task
         return {"ok": True}
 
     # Patch on the eval_worker module (build_worker.main late-imports
@@ -1168,7 +1169,7 @@ def test_main_handle_matrix_eval_runtime_error_becomes_non_recoverable(
 
     from compiler_suit_runner.workers import eval_worker as ew
 
-    def _boom(payload, *, out_dir, broadcast_sender):
+    def _boom(payload, *, out_dir, broadcast_sender, task):
         raise RuntimeError("nix-eval-jobs fell over")
 
     monkeypatch.setattr(ew, "run_eval_task", _boom)
