@@ -1243,6 +1243,9 @@ def main() -> int:
     from compiler_suit_runner import (  # noqa: PLC0415
         peer_replication as _peer_replication,
     )
+    from compiler_suit_runner.manifest_gen import (  # noqa: PLC0415
+        matrix_eval_task_id,
+    )
     from compiler_suit_runner.workers import (  # noqa: PLC0415
         build_compilers_worker as _build_compilers_worker,
         eval_worker as _eval_worker,
@@ -1425,10 +1428,11 @@ def main() -> int:
             return WorkerOutput()
 
         # dependency_graph branch — primary-affined planning task. The
-        # worker reads the matrix_aggregate sidecar the eval worker
-        # left next to the archive, resolves bash on the fly, then
-        # invokes :func:`run_dependency_graph_task` against this single
-        # binary.
+        # worker pulls the matrix_aggregate drv from the predecessor
+        # matrix_eval task's keyed outputs (framework-routed via
+        # ``task.predecessor_outputs`` since dynamic-runner 58931e4),
+        # resolves bash on the fly, then invokes
+        # :func:`run_dependency_graph_task` against this single binary.
         dg_payload = _extract_class_payload(payload, "dependency_graph")
         if dg_payload is not None:
             binary = dg_payload.get("binary")
@@ -1448,18 +1452,14 @@ def main() -> int:
                     "dependency_graph payload missing 'matrix_eval_out_dir'"
                 )
             out_dir = pathlib.Path(out_dir_raw)
-            sidecar = out_dir / f"{binary}.matrix_aggregate.json"
-            try:
-                sidecar_payload = json.loads(sidecar.read_text())
-            except (OSError, json.JSONDecodeError) as exc:
+            matrix_eval_id = matrix_eval_task_id(binary)
+            preds = task.predecessor_outputs.get(matrix_eval_id, {})
+            entry = preds.get("matrix_aggregate_drv", {})
+            matrix_drv = entry.get("value")
+            if not matrix_drv:
                 raise NonRecoverableError(
-                    f"dependency_graph: sidecar {sidecar} unreadable: {exc}"
-                ) from exc
-            matrix_drv = sidecar_payload.get("matrix_aggregate_drv")
-            if not isinstance(matrix_drv, str) or not matrix_drv:
-                raise NonRecoverableError(
-                    f"dependency_graph: sidecar {sidecar} missing"
-                    f" 'matrix_aggregate_drv' (got {matrix_drv!r})"
+                    f"build_worker dep_graph: no matrix_aggregate_drv from {matrix_eval_id}; "
+                    f"available keys: {sorted(preds.keys())}"
                 )
             bash_path = _resolve_bash_store_path_default() or ""
             if not bash_path:
@@ -1478,7 +1478,8 @@ def main() -> int:
                     matrix_eval_out_dir=out_dir,
                     bash_path=bash_path,
                     toolchain_aggregate_drv=tc_drv,
-                    matrix_aggregate_drvs={binary: matrix_drv},
+                    binary=binary,
+                    matrix_drv=matrix_drv,
                     sys_name=sys_name,
                 )
             except BaseException as exc:  # noqa: BLE001

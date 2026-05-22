@@ -16,7 +16,6 @@ from typing import Optional
 __all__ = [
     "build_cli_parser",
     "parse_task_id_mappings",
-    "parse_matrix_drv_mappings",
     "main",
 ]
 
@@ -73,17 +72,24 @@ def build_cli_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--matrix-drv",
-        dest="matrix_drv_raw",
-        action="append",
-        default=[],
-        metavar="BINARY=DRV_PATH",
+        "--binary",
+        type=str,
+        required=True,
         help=(
-            "Per-binary matrix aggregate .drv path in the form"
-            " '<binary>=<drv_path>'. Repeat once per binary; at least"
-            " one occurrence is required. The watcher pre-builds these"
-            " aggregates (one wrapper drv per binary collecting that"
-            " binary's variant kept-drvs) before invoking the worker."
+            "Binary name this dependency_graph run plans (single-binary"
+            " dispatch; matches the matrix_eval predecessor task)."
+        ),
+    )
+    parser.add_argument(
+        "--matrix-aggregate",
+        dest="matrix_drv",
+        type=str,
+        required=True,
+        help=(
+            "Matrix aggregate .drv path for ``--binary``. The framework"
+            " supplies this via predecessor task outputs in the"
+            " production dispatch path; the CLI accepts it directly for"
+            " ad-hoc invocation."
         ),
     )
     parser.add_argument(
@@ -130,43 +136,6 @@ def parse_task_id_mappings(raw: list[str]) -> dict[str, str]:
     return out
 
 
-def parse_matrix_drv_mappings(
-    raw: list[str],
-    *,
-    on_error,  # callable: takes a single message str, never returns
-) -> dict[str, str]:
-    """Turn ``["hello=/nix/store/x.drv", ...]`` into ``{binary: drv}``.
-
-    Hard-fail (via ``on_error`` — typically :meth:`ArgumentParser.error`)
-    on:
-
-      * malformed entries (missing ``=`` or empty binary / empty path);
-      * the same ``<binary>`` appearing more than once.
-
-    ``on_error`` is expected to terminate the process (argparse's
-    ``parser.error`` exits via ``SystemExit``) — the function still
-    returns the partial mapping for tests that inject a non-fatal
-    callback.
-    """
-    out: dict[str, str] = {}
-    for entry in raw:
-        binary, sep, path = entry.partition("=")
-        binary = binary.strip()
-        path = path.strip()
-        if not sep or not binary or not path:
-            on_error(
-                f"--matrix-drv expects binary=path, got {entry!r}"
-            )
-            continue
-        if binary in out:
-            on_error(
-                f"--matrix-drv binary {binary!r} given twice"
-            )
-            continue
-        out[binary] = path
-    return out
-
-
 def main(argv: Optional[list[str]] = None) -> int:
     """CLI entry point.
 
@@ -187,22 +156,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     matrix_eval_out_dir = pathlib.Path(args.matrix_eval_out_dir)
     toolchain_task_ids = parse_task_id_mappings(args.toolchain_task_id)
 
-    raw_matrix = args.matrix_drv_raw or []
-    if not raw_matrix:
-        parser.error(
-            "--matrix-drv is required (at least one"
-            " '<binary>=<drv_path>' entry)"
-        )
-    matrix_aggregate_drvs = parse_matrix_drv_mappings(
-        raw_matrix, on_error=parser.error,
-    )
-
     try:
         result = run_dependency_graph_task(
             matrix_eval_out_dir=matrix_eval_out_dir,
             bash_path=args.bash_path,
             toolchain_aggregate_drv=args.toolchain_aggregate_drv,
-            matrix_aggregate_drvs=matrix_aggregate_drvs,
+            binary=args.binary,
+            matrix_drv=args.matrix_drv,
             toolchain_task_ids=toolchain_task_ids,
             sys_name=args.sys_name,
         )

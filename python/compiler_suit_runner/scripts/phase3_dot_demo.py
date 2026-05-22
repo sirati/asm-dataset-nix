@@ -109,14 +109,21 @@ def run_demo(
         )
 
         # Phase 3: production code path (import archives, build sum-drv,
-        # stream-plan, write descriptors).
-        dep_result = run_dependency_graph_task(
-            matrix_eval_out_dir=archive_dir,
-            bash_path=bash_path,
-            toolchain_aggregate_drv=toolchain_aggregate_drv,
-            matrix_aggregate_drvs=matrix_aggregates,
-            sys_name=sys_name,
-        )
+        # stream-plan, write descriptors) — per-binary dispatch mirrors
+        # the framework's dependency_graph task fan-out.
+        total_descriptors = 0
+        total_binaries = 0
+        for binary, matrix_agg in matrix_aggregates.items():
+            dep_result = run_dependency_graph_task(
+                matrix_eval_out_dir=archive_dir,
+                bash_path=bash_path,
+                toolchain_aggregate_drv=toolchain_aggregate_drv,
+                binary=binary,
+                matrix_drv=matrix_agg,
+                sys_name=sys_name,
+            )
+            total_descriptors += dep_result.descriptor_count
+            total_binaries += dep_result.binary_count
 
         dot_sizes: dict[str, int] = {}
         for binary, matrix_agg in matrix_aggregates.items():
@@ -133,8 +140,8 @@ def run_demo(
         "wall_seconds": wall,
         "dot_sizes": dot_sizes,
         "binaries": list(binaries),
-        "descriptor_count": dep_result.descriptor_count,
-        "binary_count": dep_result.binary_count,
+        "descriptor_count": total_descriptors,
+        "binary_count": total_binaries,
     }
 
 

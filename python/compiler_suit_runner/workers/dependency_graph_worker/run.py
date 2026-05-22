@@ -34,42 +34,42 @@ def run_dependency_graph_task(
     matrix_eval_out_dir: pathlib.Path,
     bash_path: str,
     toolchain_aggregate_drv: str,
-    matrix_aggregate_drvs: dict[str, str],
+    binary: str,
+    matrix_drv: str,
     toolchain_task_ids: Optional[dict[str, str]] = None,
     sys_name: str = "x86_64-linux",
     run_subprocess: Optional[RunSubprocess] = None,
     clock: Optional[Callable[[], float]] = None,
 ) -> DependencyGraphResult:
-    """Assemble the multi-binary sum-drv from pre-built aggregate drvs
-    and produce ``_dependency_graph.pkl`` (plus the
+    """Assemble the sum-drv for a single binary's pre-built aggregate
+    drv and produce ``_dependency_graph.pkl`` (plus the
     ``_dependency_graph_summary.txt`` companion).
 
-    Post-refactor (D.1b): phase 3 no longer rediscovers variant leaves
-    from the archive import stream. The cluster has already evaluated
-    every binary's matrix and the watcher hands us ONE aggregate drv
-    per binary plus ONE toolchain aggregate drv via argv. We:
+    Per-binary dispatch: the framework runs one dependency_graph task
+    per binary, each fed the corresponding ``matrix_aggregate_drv`` via
+    its predecessor matrix_eval task's keyed outputs. The streaming
+    planner runs once per binary; cross-binary template dedup is no
+    longer this worker's concern.
 
-      1. import every ``<binary>.nix-archive`` so the closure (and
+      1. import the ``<binary>.nix-archive`` so the closure (and
          therefore the leaves the aggregate drv references) is
          materialised in the local store — required for the
          ``nix-store --query --tree`` walk further down;
-      2. derive the per-binary ``variant_lookup`` from each matrix
-         aggregate via :func:`archive.derive_variant_lookup_from_aggregate`
-         (D.1a) — NO post-import leaf walk;
-      3. wrap the aggregate drvs in length-1 lists and call
+      2. derive the ``variant_lookup`` from the matrix aggregate via
+         :func:`archive.derive_variant_lookup_from_aggregate` (D.1a);
+      3. wrap the aggregate drv in a length-1 list and call
          :func:`build_sum_drv_multi`, which in turn calls
          :func:`template_graph.make_sum_drv.make_sum_drv_from_paths`
          (the sole ``nix-instantiate`` in this phase);
       4. ``plan_from_drv_tree`` ONCE — the planner streams
          ``nix-store --query --tree`` tuples directly from
-         :func:`stream_drv_tree` so cross-binary template dedup fires
-         inside the single :class:`StreamPlanner`;
-      5. one phase-4 descriptor list emitted for all binaries.
+         :func:`stream_drv_tree`;
+      5. one phase-4 descriptor list emitted for this binary.
 
-    ``toolchain_aggregate_drv`` and ``matrix_aggregate_drvs`` MUST both
-    be non-empty — phase 3 cannot run without the producer's output.
+    ``toolchain_aggregate_drv`` and ``matrix_drv`` MUST both be
+    non-empty — phase 3 cannot run without the producer's output.
 
-    Any per-binary failure raises :class:`DependencyGraphWorkerError`
+    Per-binary failures raise :class:`DependencyGraphWorkerError`
     tagged with the binary + stage; the caller's main loop translates
     that into a non-zero exit code.
     """
@@ -79,11 +79,16 @@ def run_dependency_graph_task(
             "empty; phase 3 requires the producer's toolchain wrapper "
             "drv path (see preflight._build_toolchains_aggregate_drv)."
         )
-    if not matrix_aggregate_drvs:
+    if not binary:
         raise ValueError(
-            "run_dependency_graph_task: matrix_aggregate_drvs is "
-            "empty; phase 3 requires one matrix-<binary> aggregate "
-            "drv per binary (see workers/build_worker bulk-eval)."
+            "run_dependency_graph_task: binary is empty; phase 3 "
+            "requires the binary name this run plans."
+        )
+    if not matrix_drv:
+        raise ValueError(
+            "run_dependency_graph_task: matrix_drv is empty; phase 3 "
+            "requires the matrix-<binary> aggregate drv (see "
+            "workers/build_worker dep_graph dispatch)."
         )
 
     clock_fn = clock or time.monotonic
@@ -109,11 +114,10 @@ def run_dependency_graph_task(
     # cannot walk them until the closure exists in /nix/store.
     _import_all_archives(archives=archives, runner=runner)
 
-    # Step 2: derive the per-binary variant lookup from the matrix
-    # aggregate drvs (D.1a's helper). Iterate in sorted binary order so
-    # the plannable-binaries list stays deterministic across runs.
+    # Step 2: derive the variant lookup from the matrix aggregate drv
+    # (D.1a's helper). Per-binary dispatch: one binary per run.
     variant_lookups, plannable_binaries = (
-        _derive_variant_lookups_from_aggregates(matrix_aggregate_drvs)
+        _derive_variant_lookup_for_binary(binary=binary, matrix_drv=matrix_drv)
     )
 
     if not plannable_binaries:
@@ -122,12 +126,12 @@ def run_dependency_graph_task(
             duration=max(0.0, clock_fn() - start),
         )
 
-    # Step 3: wrap the aggregate drvs in length-1 lists for the
+    # Step 3: wrap the aggregate drv in a length-1 list for the
     # path-form sum-drv helper (post-Phase-A.2 invariant).
     toolchain_drvs: list[str] = [toolchain_aggregate_drv]
     matrix_drvs: dict[str, list[str]] = {
-        f"matrix-{binary}": [matrix_aggregate_drvs[binary]]
-        for binary in plannable_binaries
+        f"matrix-{b}": [matrix_drv]
+        for b in plannable_binaries
     }
 
     descriptors, counters, violation_entries = _plan_all_binaries(
@@ -221,47 +225,42 @@ def _import_all_archives(
         )
 
 
-def _derive_variant_lookups_from_aggregates(
-    matrix_aggregate_drvs: dict[str, str],
+def _derive_variant_lookup_for_binary(
+    *,
+    binary: str,
+    matrix_drv: str,
 ) -> tuple[dict[str, dict[tuple[str, str], dict]], list[str]]:
-    """Build the per-binary ``variant_lookup`` map + plannable-binary
-    list from the matrix aggregate drv paths.
+    """Build the ``variant_lookup`` map + plannable-binary list from a
+    single binary's matrix aggregate drv path.
 
     Calls :func:`archive.derive_variant_lookup_from_aggregate` (D.1a)
-    once per binary. Binaries whose aggregate yields an empty lookup
-    are silently skipped — the ``make_sum_drv_from_paths`` contract
+    on the binary's aggregate. If the helper yields an empty lookup
+    the binary is silently skipped — ``make_sum_drv_from_paths``
     forbids zero-variant matrices, and an empty lookup means the
-    cluster produced no plannable variants for that binary in this
-    run. The remaining binaries land in the returned
-    ``plannable_binaries`` list in sorted order so downstream output
-    (and operator log lines) stay deterministic.
+    cluster produced no plannable variants for this binary in this
+    run. On success the returned ``plannable_binaries`` list is
+    ``[binary]``; on the empty-lookup path it is ``[]``.
 
     Raises :class:`DependencyGraphWorkerError` tagged with the binary
     + stage ``"variant_lookup"`` if the helper itself raises (e.g.
     malformed aggregate, missing closure entries).
     """
-    variant_lookups: dict[str, dict[tuple[str, str], dict]] = {}
-    plannable_binaries: list[str] = []
-    for binary in sorted(matrix_aggregate_drvs):
-        matrix_agg = matrix_aggregate_drvs[binary]
-        try:
-            lookup = _archive.derive_variant_lookup_from_aggregate(
-                matrix_agg,
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise DependencyGraphWorkerError(
-                binary=binary, stage="variant_lookup",
-                message=(
-                    "derive_variant_lookup_from_aggregate failed for "
-                    f"{matrix_agg!r}: {exc}"
-                ),
-                cause=exc,
-            ) from exc
-        if not lookup:
-            continue
-        variant_lookups[binary] = lookup
-        plannable_binaries.append(binary)
-    return variant_lookups, plannable_binaries
+    try:
+        lookup = _archive.derive_variant_lookup_from_aggregate(
+            matrix_drv,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise DependencyGraphWorkerError(
+            binary=binary, stage="variant_lookup",
+            message=(
+                "derive_variant_lookup_from_aggregate failed for "
+                f"{matrix_drv!r}: {exc}"
+            ),
+            cause=exc,
+        ) from exc
+    if not lookup:
+        return {}, []
+    return {binary: lookup}, [binary]
 
 
 def _import_archive_or_raise(
