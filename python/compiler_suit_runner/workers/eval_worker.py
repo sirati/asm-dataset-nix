@@ -14,36 +14,38 @@ worker:
    ``variant_seed``) BEFORE the bulk eval so primary and secondaries
    agree on the variant subset without the submitter ever shipping
    the list.
-2. Broadcasts each produced ``.drv`` path to every peer in the
-   cluster via :class:`peer_replication.BroadcastSender` (which
-   posts ``/peer/path-broadcast-offer`` and lets the receiver flood
-   onward). Each receiver substitutes the drv into its local store
-   so Phase 1+ tasks scheduled anywhere in the cluster can read the
-   graph immediately.
-3. Builds the per-binary ``matrix-<binary>`` aggregate drv via
+2. Builds the per-binary ``matrix-<binary>`` aggregate drv via
    :func:`template_graph.make_sum_drv.make_wrapper_drv_from_paths`,
    passing the phase-1 toolchain aggregate AND every sampled leaf
    as inputDrvs. The aggregate is a trivial ``bash -c true`` wrapper
    whose only purpose is to carry the input set so phase 3's
    ``nix-store --query --tree`` refcount-sort floats the toolchain
    layer to a sensible position relative to the matrix layer.
-4. Exports the aggregate closure to
+3. Exports the aggregate closure to
    ``<matrix_eval_out_dir>/matrix-<binary>.drv.archive`` via
    ``nix-store --query --requisites`` + ``nix-store --export`` so the
    primary's ``_MatrixEvalQuiesceWatcher`` + ``dependency_graph_worker``
-   can re-import the full drv graph (toolchain aggregate + matrix
-   aggregate + every leaf) into the primary's local store without
-   re-evaluating the flake. The archive filename mirrors the
+   (phase 3) AND every secondary's ``build_worker`` (phase 4) can
+   re-import the full drv graph (toolchain aggregate + matrix
+   aggregate + every leaf) into their local store without re-
+   evaluating the flake. The archive filename mirrors the
    ``matrix-<binary>.drv`` storename so the on-disk artefact is self-
    identifying — readers recognise it without out-of-band metadata.
    The ``dependency_graph_worker`` discovers the ROOT (kept) drvs by
    parsing the variant path of each imported .drv directly
    (``parse_variant_path``) — no JSON sidecar is emitted.
 
+The archive on shared-fs is the ONLY route by which other phases get
+the matrix-eval drv graph: the previous per-drv broadcast loop
+(``peer_replication`` → ``/peer/path-broadcast-offer``) was removed
+because phase 4 (build_worker) now imports the per-binary archive
+once and the broadcasts were duplicating work the archive already
+covered (~30-60 min per binary saved on the LMU smoke matrix).
+
 Re-execution
 ------------
 
-The worker always re-runs Steps 1-7 on every invocation; there is no
+The worker always re-runs every step on every invocation; there is no
 resume fast-path. In-run "second attempts" are failure restarts
 where any cached on-disk archive cannot be trusted (the writer never
 fully completed). The atomic ``.tmp`` + ``os.replace`` archive writer
@@ -57,8 +59,8 @@ The dynamic_runner framework distinguishes two failure types:
 
 * ``ErrorType::Errored`` — transient / recoverable. The task is
   retry-eligible against the **retry-pass budget**. Use this for
-  nix-eval-jobs subprocess failures, network failures during the
-  broadcast fan-out, and similar.
+  nix-eval-jobs subprocess failures, archive-write failures, and
+  similar.
 
 * ``ErrorType::Unfulfillable`` — permanent / structurally impossible
   on this peer. The task is NOT retried; it transitions back to
@@ -106,9 +108,6 @@ from collections.abc import Callable
 from typing import Any, Optional
 
 from dynamic_runner.worker import Task
-
-from compiler_suit_runner.peer_paths import ITEM_CLASS_MATRIX_EVAL_DRV
-from compiler_suit_runner.peer_replication import BroadcastSender
 
 
 # ``run_subprocess`` accepts argv (list[str]) plus an optional
@@ -521,19 +520,6 @@ def _eval_meta_for_arch(
     return parsed
 
 
-def _drv_size(drv_path: str) -> int:
-    """Best-effort byte size for the broadcast offer.
-
-    The receiver uses this for an opportunistic disk-budget check
-    only; an inaccurate value is non-fatal. Missing files give 0 so
-    we still broadcast (the receiver will resolve via substitution).
-    """
-    try:
-        return os.path.getsize(drv_path)
-    except OSError:
-        return 0
-
-
 # ---------------------------------------------------------------------------
 # Archive (matrix-aggregate drv export — quiesce signal for the watcher)
 # ---------------------------------------------------------------------------
@@ -763,66 +749,26 @@ def _sample_per_arch(
     return sampled_by_arch
 
 
-def _enqueue_broadcasts(
+def _variants_from_bulk(
     bulk_drvs: dict[tuple[str, str], str],
-    broadcast_sender: BroadcastSender,
     binary: str,
-) -> tuple[list[dict[str, str]], list[tuple[str, str]]]:
-    """Step 3: enqueue a broadcast for each (arch, suffix → drv).
+) -> list[dict[str, str]]:
+    """Materialise the per-leaf summary list from the bulk-eval result.
 
-    Returns ``(variants, broadcast_ids)``: ``variants`` is the
-    per-leaf summary list surfaced on the result dict; ``broadcast_ids``
-    pairs each label with the BroadcastSender-assigned id so Step 4
-    can collect completion results in the same order.
-
-    The broadcast is non-blocking; the worker thread inside
-    BroadcastSender fans the offer out to every peer.
+    Returns the ``variants`` summary the result dict surfaces, sorted
+    by ``(arch, suffix)`` so consumers see a deterministic ordering
+    across runs. The previous companion ``_enqueue_broadcasts`` /
+    ``_wait_for_broadcasts`` pair fanned each leaf out to every peer
+    via :mod:`peer_replication`; that loop was retired once phase 4
+    (build_worker) gained per-binary archive import. The archive
+    carries the closure to every secondary in one shot.
     """
     variants: list[dict[str, str]] = []
-    broadcast_ids: list[tuple[str, str]] = []
     for (arch, suffix), drv in sorted(bulk_drvs.items()):
         label = f"{binary}__{arch}__{suffix}"
         variants.append({"label": label, "drv": drv, "arch": arch,
                          "suffix": suffix})
-        bid = broadcast_sender.enqueue_broadcast(
-            drv,
-            _drv_size(drv),
-            item_class=ITEM_CLASS_MATRIX_EVAL_DRV,
-        )
-        broadcast_ids.append((label, bid))
-    return variants, broadcast_ids
-
-
-def _wait_for_broadcasts(
-    broadcast_ids: list[tuple[str, str]],
-    broadcast_sender: BroadcastSender,
-    *,
-    broadcast_timeout: float,
-) -> list[dict[str, Any]]:
-    """Step 4: wait for each broadcast to complete (or time out).
-
-    Timeout is non-fatal: the flood-fill protocol is best-effort and
-    a slow peer will eventually pull via substitution when the Phase
-    1 task lands on it. We still record the result so operators can
-    diagnose churn — this function never raises on timeout, the only
-    failure mode here is the BroadcastSender itself raising (which
-    propagates).
-    """
-    broadcast_results: list[dict[str, Any]] = []
-    for label, bid in broadcast_ids:
-        result = broadcast_sender.wait_for_completion(
-            bid, timeout=broadcast_timeout
-        )
-        entry: dict[str, Any] = {"label": label, "broadcast_id": bid}
-        if result is None:
-            entry["status"] = "timeout"
-        else:
-            entry["status"] = "ok"
-            entry["success_count"] = result.success_count
-            entry["fail_count"] = result.fail_count
-            entry["failed_peers"] = list(result.failed_peers)
-        broadcast_results.append(entry)
-    return broadcast_results
+    return variants
 
 
 def _build_matrix_aggregate(
@@ -885,27 +831,24 @@ def _export_matrix_archive(
 def run_eval_task(
     payload: dict,
     out_dir: pathlib.Path,
-    broadcast_sender: BroadcastSender,
     task: Task,
     run_subprocess: Optional[RunSubprocess] = None,
     *,
     flake_ref: str = ".",
-    broadcast_timeout: float = 10.0,
     now: Optional[Callable[[], float]] = None,
 ) -> dict:
     """Matrix-eval per-binary eval dispatch entry point.
 
-    See the module docstring for the protocol and the Step-1..7 layout
-    each helper handles. The only on-disk artefact is the binary
-    archive at ``out_dir/matrix-<binary>.drv.archive``; the returned
-    dict is an in-process summary. Every invocation re-runs Steps 1-7
-    — there is no resume fast-path. An in-run second attempt is
-    always a failure restart (the cached on-disk archive cannot be
-    trusted), and the archive writer's atomic ``.tmp`` +
-    ``os.replace`` overwrites any prior file in place. Failure modes
-    raise :class:`RuntimeError` so the harness surfaces
-    ``ErrorType::Errored`` (retry-pass) — never ``Unfulfillable``
-    (that belongs to toolchain-validate).
+    See the module docstring for the protocol layout. The only on-disk
+    artefact is the binary archive at
+    ``out_dir/matrix-<binary>.drv.archive``; the returned dict is an
+    in-process summary. Every invocation re-runs the full pipeline —
+    there is no resume fast-path. An in-run second attempt is always a
+    failure restart (the cached on-disk archive cannot be trusted),
+    and the archive writer's atomic ``.tmp`` + ``os.replace`` overwrites
+    any prior file in place. Failure modes raise :class:`RuntimeError`
+    so the harness surfaces ``ErrorType::Errored`` (retry-pass) — never
+    ``Unfulfillable`` (that belongs to toolchain-validate).
     """
     clock = now or time.time
     runner = run_subprocess or _default_run_subprocess
@@ -927,31 +870,27 @@ def run_eval_task(
         parsed["attr"], sampled_by_arch,
         flake_ref=flake_ref, run_subprocess=runner,
     )
-    # Step 3 + Step 4: broadcast enqueue then wait.
-    variants, broadcast_ids = _enqueue_broadcasts(
-        bulk_drvs, broadcast_sender, binary,
-    )
-    broadcast_results = _wait_for_broadcasts(
-        broadcast_ids, broadcast_sender,
-        broadcast_timeout=broadcast_timeout,
-    )
-    # Step 5: build the per-binary matrix-aggregate drv.
+    # Step 3: materialise the per-leaf summary list (sorted for stable
+    # consumer ordering). The previous broadcast loop is gone — phase 4
+    # imports the per-binary archive directly.
+    variants = _variants_from_bulk(bulk_drvs, binary)
+    # Step 4: build the per-binary matrix-aggregate drv.
     kept_drvs: list[str] = sorted({v["drv"] for v in variants})
     matrix_aggregate_drv = _build_matrix_aggregate(
         parsed["toolchain_aggregate_drv"], kept_drvs, binary, sys_name,
     )
-    # Step 6: export the matrix-aggregate closure into the archive.
+    # Step 5: export the matrix-aggregate closure into the archive.
     _export_matrix_archive(
         matrix_aggregate_drv, archive, run_subprocess=runner,
     )
-    # Step 6b: publish the matrix_aggregate drv path as a keyed task
+    # Step 5b: publish the matrix_aggregate drv path as a keyed task
     # output. The framework's keyed-outputs API (Task.publish_string,
     # added in dynamic-runner 58931e4) threads the value through the
     # DoneResponse wire frame and surfaces it to the dependency_graph
     # task via predecessor_outputs[task_id]["matrix_aggregate_drv"],
     # replacing the prior per-binary JSON sidecar drop.
     task.publish_string("matrix_aggregate_drv", matrix_aggregate_drv)
-    # Step 7: in-process summary. ``variant_drvs`` is kept for
+    # Step 6: in-process summary. ``variant_drvs`` is kept for
     # backwards compatibility with legacy consumers (retired by D.1b).
     return {
         "binary": binary,
@@ -959,7 +898,6 @@ def run_eval_task(
         "produced_at": float(clock()),
         "variant_drvs": kept_drvs,
         "variants": variants,
-        "broadcasts": broadcast_results,
         "matrix_aggregate_drv": matrix_aggregate_drv,
     }
 
@@ -977,11 +915,11 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Peer push URL enumeration (public helper)
 #
-# Exported so :func:`workers.build_worker.main` can construct a
-# :class:`BroadcastSender` configured to fan matrix_eval drv broadcasts
-# out to the cluster. The unified build_worker entry point owns the
-# subprocess CLI shape now; ``eval_worker`` is a pure library module
-# (``run_eval_task`` + this helper).
+# Historically used by :func:`workers.build_worker.main` to construct
+# the per-drv broadcast sender in :mod:`peer_replication`. That loop
+# was retired in favour of per-binary archive import (see module
+# docstring); the helper is retained because consumers outside this
+# module still reference it as a peer-URL lookup.
 
 
 def read_peer_push_urls(
@@ -998,10 +936,10 @@ def read_peer_push_urls(
     Returns an empty list when ``shared_fs`` is unset or the
     ``peers/`` directory does not exist yet — this gracefully covers
     the submitter-peer timing race (workers hit toolchain_validate
-    before the submitter gossip lands) so the BroadcastSender no-ops
-    instead of raising. TODO(#submitter-gossip-race): once the
-    submitter publishes its peer file BEFORE any toolchain_validate
-    task is queued, this empty-list path becomes purely a single-peer
+    before the submitter gossip lands) so callers degrade rather
+    than raising. TODO(#submitter-gossip-race): once the submitter
+    publishes its peer file BEFORE any toolchain_validate task is
+    queued, this empty-list path becomes purely a single-peer
     cluster fallback.
     """
     if shared_fs is None:
