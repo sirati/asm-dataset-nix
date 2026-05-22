@@ -215,12 +215,14 @@ def dependency_graph_task_id(binary: str) -> str:
     """Stable id for a per-binary dependency_graph framework task.
 
     One task per binary, mirrors :func:`matrix_eval_task_id`. The
-    dep-graph worker reads ``<out_dir>/<binary>.nix-archive`` plus the
-    matrix_aggregate sidecar that the matrix_eval worker dropped for
-    its binary, runs the streaming planner, and writes per-(compiler,
-    arch) sidecar manifests under ``<out_dir>/_manifests/``. The
-    placeholder build_variant tasks declare
-    ``task_depends_on=[dependency_graph_task_id(binary)]``.
+    dep-graph worker imports ``<out_dir>/<binary>.nix-archive`` and
+    pulls the matrix_aggregate drv path from the upstream
+    matrix_eval task's keyed outputs (``task.predecessor_outputs[
+    matrix_eval_task_id(binary)]["matrix_aggregate_drv"]["value"]``,
+    published via ``Task.publish_string``), runs the streaming
+    planner, and writes per-(compiler, arch) sidecar manifests under
+    ``<out_dir>/_manifests/``. The placeholder build_variant tasks
+    declare ``task_depends_on=[dependency_graph_task_id(binary)]``.
     """
     return f"dependency_graph__{binary}"
 
@@ -296,9 +298,10 @@ def make_dependency_graph_header(
 ) -> ManifestHeader:
     """Build a dependency_graph (Phase-3 framework-task) manifest.
 
-    One task per binary. The worker reads
-    ``<matrix_eval_out_dir>/<binary>.matrix_aggregate.json`` (written
-    by the matrix_eval worker), imports
+    One task per binary. The worker reads the matrix_aggregate drv
+    path from ``task.predecessor_outputs[matrix_eval_task_id(binary)
+    ]["matrix_aggregate_drv"]["value"]`` (published by the upstream
+    matrix_eval task via ``Task.publish_string``), imports
     ``<matrix_eval_out_dir>/<binary>.nix-archive``, runs the streaming
     planner against the toolchain aggregate + this binary's matrix
     aggregate, and emits per-(compiler, arch) sidecar manifests at
