@@ -293,7 +293,6 @@ def make_dependency_graph_header(
     *,
     toolchain_aggregate_drv: str,
     matrix_eval_out_dir: str,
-    bash_path: str,
 ) -> ManifestHeader:
     """Build a dependency_graph (Phase-3 framework-task) manifest.
 
@@ -321,7 +320,6 @@ def make_dependency_graph_header(
         "sys": sys_name,
         "toolchain_aggregate_drv": toolchain_aggregate_drv,
         "matrix_eval_out_dir": matrix_eval_out_dir,
-        "bash_path": bash_path,
     }
     return ManifestHeader(
         item_class="dependency_graph",
@@ -737,7 +735,6 @@ def emit_dependency_graph_manifests(
     *,
     sys_name: str,
     matrix_eval_out_dir: str,
-    bash_path: str,
 ) -> list[ManifestHeader]:
     """Build one ``dependency_graph`` manifest header per binary.
 
@@ -767,7 +764,6 @@ def emit_dependency_graph_manifests(
                 sys_name=sys_name,
                 toolchain_aggregate_drv=toolchain_aggregate_drv,
                 matrix_eval_out_dir=matrix_eval_out_dir,
-                bash_path=bash_path,
             )
         )
     return headers
@@ -884,25 +880,20 @@ def emit_all_manifests(
     # (same shape as matrix_eval consumes). The framework activates
     # each dep_graph task atomically with the matching matrix_eval
     # completion via task_depends_on=[matrix_eval__<binary>] — no
-    # in-process spawn from on_phase_end. ``matrix_eval_out_dir`` and
-    # ``bash_path`` are taken from the metadata (cli.py threads them
-    # through the same SuitTaskConfig fields used by the legacy
-    # in-process planner).
+    # in-process spawn from on_phase_end. ``matrix_eval_out_dir`` is
+    # taken from the metadata (cli.py threads it through the same
+    # SuitTaskConfig field used by the legacy in-process planner);
+    # bash is resolved by the worker via
+    # _resolve_bash_store_path_default().
     if "dependency_graph" in active_classes and per_binary_metadata:
         sample_meta = next(iter(per_binary_metadata.values()), {})
         dep_graph_out_dir = sample_meta.get("matrix_eval_out_dir", "")
-        # bash_path is dispatch-time resolved by the worker (the
-        # submitter doesn't know which container's nix store the
-        # framework will pick); pass empty string so the worker's
-        # _resolve_bash_store_path equivalent fills it in.
-        dep_graph_bash_path = sample_meta.get("bash_path", "")
         if dep_graph_out_dir:
             headers.extend(
                 emit_dependency_graph_manifests(
                     per_binary_metadata,
                     sys_name=sys_name,
                     matrix_eval_out_dir=dep_graph_out_dir,
-                    bash_path=dep_graph_bash_path,
                 )
             )
 

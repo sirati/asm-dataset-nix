@@ -1189,15 +1189,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 # include the bind-mounted matrix_eval output dir in
                 # each dep_graph payload — the worker reads
                 # <out_dir>/<binary>.{nix-archive, matrix_aggregate.json}
-                # from there. bash_path is dispatch-time resolved
-                # inside the worker (no need to thread). ``config``
-                # isn't built yet at this point — recompute the path
-                # from args + shared_fs the same way _config_from_args
-                # does at line 700.
+                # from there. bash is dispatch-time resolved inside
+                # the worker via _resolve_bash_store_path_default()
+                # (no need to thread). ``config`` isn't built yet at
+                # this point — recompute the path from args + shared_fs
+                # the same way _config_from_args does at line 700.
                 "matrix_eval_out_dir": str(
                     shared_fs / "dataset" / "_matrix_eval"
                 ),
-                "bash_path": "",
             }
         log.info(
             "submit pre-flight: %d toolchains, %d binaries queued for matrix_eval",

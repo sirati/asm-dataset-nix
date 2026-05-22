@@ -1435,7 +1435,6 @@ def main() -> int:
             sys_name = dg_payload.get("sys") or "x86_64-linux"
             tc_drv = dg_payload.get("toolchain_aggregate_drv")
             out_dir_raw = dg_payload.get("matrix_eval_out_dir")
-            payload_bash = dg_payload.get("bash_path") or ""
             if not isinstance(binary, str) or not binary:
                 raise NonRecoverableError(
                     "dependency_graph payload missing 'binary'"
@@ -1462,7 +1461,7 @@ def main() -> int:
                     f"dependency_graph: sidecar {sidecar} missing"
                     f" 'matrix_aggregate_drv' (got {matrix_drv!r})"
                 )
-            bash_path = payload_bash or _resolve_bash_store_path_default() or ""
+            bash_path = _resolve_bash_store_path_default() or ""
             if not bash_path:
                 raise NonRecoverableError(
                     "dependency_graph: bash store path unresolved; payload"
