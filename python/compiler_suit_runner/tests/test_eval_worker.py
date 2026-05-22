@@ -256,6 +256,19 @@ def _install_wrapper_stub(monkeypatch: pytest.MonkeyPatch) -> _WrapperStub:
     return stub
 
 
+def _make_task_mock() -> MagicMock:
+    """Return a MagicMock standing in for the dynamic_runner ``Task``.
+
+    ``run_eval_task`` calls ``task.publish_string("matrix_aggregate_drv",
+    drv_path)`` in Step 6b to surface the matrix-aggregate drv to
+    successor tasks via the framework's keyed-outputs API (the
+    JSON sidecar this previously dropped is gone). A bare MagicMock
+    is enough — every attribute access yields a callable that records
+    its arguments.
+    """
+    return MagicMock()
+
+
 def _make_broadcast_sender(
     *,
     success_count: int = 2,
@@ -449,9 +462,13 @@ def test_run_eval_task_happy_path(
     ``<binary>.nix-archive`` is written; (5) the return value carries
     the variants + variant_drvs + broadcast results + the new
     ``matrix_aggregate_drv`` field; (6) the legacy
-    ``<binary>/manifest.json`` marker is NOT emitted.
+    ``<binary>/manifest.json`` marker is NOT emitted; (7)
+    ``task.publish_string`` is called once with key
+    ``"matrix_aggregate_drv"`` and the wrapper drv path (replaces the
+    legacy JSON-sidecar drop with the framework's keyed-outputs API).
     """
     wrapper = _install_wrapper_stub(monkeypatch)
+    task = _make_task_mock()
     payload = _make_payload(
         archs=["x86_64", "aarch64"],
         suffixes=["O0", "O2"],
@@ -472,7 +489,8 @@ def test_run_eval_task_happy_path(
     sender = _make_broadcast_sender()
 
     result = run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 123.5,
+        payload, tmp_path, sender, task=task,
+        run_subprocess=runner, now=lambda: 123.5,
     )
 
     # nix-eval-jobs invoked EXACTLY ONCE — one bulk eval per binary
@@ -584,13 +602,18 @@ def test_run_eval_task_happy_path(
     # Legacy per-binary manifest.json marker is NOT emitted (hard cutover).
     assert not (tmp_path / "hello" / "manifest.json").exists()
     assert not (tmp_path / "hello").exists()
-    # Worker drops a sidecar JSON alongside the archive so the
-    # dependency_graph watcher can read matrix_aggregate_drv without
-    # relying on the framework's payload-less TaskCompletedEvent wire.
+    # The on-disk JSON sidecar is gone: the matrix_aggregate drv is now
+    # threaded to the dependency_graph successor via the framework's
+    # keyed-outputs API (``Task.publish_string``). Only the archive
+    # remains as the per-binary artefact on the shared fs.
     siblings = sorted(p.name for p in tmp_path.iterdir())
-    assert siblings == [
-        "hello.matrix_aggregate.json", "hello.nix-archive",
-    ], siblings
+    assert siblings == ["hello.nix-archive"], siblings
+    # Step 6b: publish_string was called exactly once with the wrapper
+    # drv keyed under ``matrix_aggregate_drv``. This is the wire the
+    # downstream dependency_graph task reads via predecessor_outputs.
+    task.publish_string.assert_called_once_with(
+        "matrix_aggregate_drv", "/nix/store/wrap-matrix-hello.drv",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -599,24 +622,22 @@ def test_run_eval_task_happy_path(
 
 
 def test_run_eval_task_resume_short_circuits(tmp_path: pathlib.Path) -> None:
-    """If BOTH the archive and the matrix_aggregate sidecar from a
-    prior run are present, short-circuit eval + broadcast + export and
-    return a minimal ``{"resumed": True}`` dict. The archive carries the
-    closure import for dep_graph; the sidecar carries the aggregate drv
-    path. Without the sidecar, PH-A's dependency_graph framework task
-    has no handoff, so the resume MUST require both (see
-    :func:`test_run_eval_task_resume_requires_sidecar`)."""
+    """If the non-empty per-binary archive from a prior run is present,
+    short-circuit eval + broadcast + export and return a minimal
+    ``{"resumed": True}`` dict. The archive carries the closure import
+    for dep_graph; the matrix_aggregate drv handoff comes from the
+    framework's keyed-outputs replay (the prior run's
+    ``Task.publish_string`` write), not an on-disk sidecar — so the
+    archive alone is the resume marker."""
     payload = _make_payload()
     archive = tmp_path / "hello.nix-archive"
     archive.write_bytes(b"NIX_EXPORT:previous-run")
-    # Sidecar from the prior run must also be present for resume to fire.
-    sidecar = tmp_path / "hello.matrix_aggregate.json"
-    sidecar.write_text('{"binary":"hello","matrix_aggregate_drv":"/nix/store/prev.drv"}')
 
     runner = _EvalJobsStub()
     sender = _make_broadcast_sender()
+    task = _make_task_mock()
     result = run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner,
+        payload, tmp_path, sender, task=task, run_subprocess=runner,
     )
 
     # Returned dict carries the resumed marker and the per-binary
@@ -635,6 +656,9 @@ def test_run_eval_task_resume_short_circuits(tmp_path: pathlib.Path) -> None:
     # No broadcasts.
     sender.enqueue_broadcast.assert_not_called()
     sender.wait_for_completion.assert_not_called()
+    # Resume omits the publish_string write — the framework replays the
+    # prior run's keyed output, so re-publishing would be redundant.
+    task.publish_string.assert_not_called()
 
 
 def test_run_eval_task_empty_archive_re_runs(
@@ -652,8 +676,10 @@ def test_run_eval_task_empty_archive_re_runs(
         drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
     )
     sender = _make_broadcast_sender()
+    task = _make_task_mock()
     result = run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 42.0,
+        payload, tmp_path, sender, task=task,
+        run_subprocess=runner, now=lambda: 42.0,
     )
     # nix-eval-jobs ran (resume short-circuit did not fire).
     assert any(c and c[0] == "nix-eval-jobs" for c in runner.calls)
@@ -667,41 +693,8 @@ def test_run_eval_task_empty_archive_re_runs(
 
 
 # Resume coverage:
-#   * archive AND sidecar present  →  short-circuit (test_run_eval_task_resume_short_circuits)
+#   * archive present (non-empty)  →  short-circuit (test_run_eval_task_resume_short_circuits)
 #   * empty archive                 →  re-run (test_run_eval_task_empty_archive_re_runs)
-#   * archive but NO sidecar       →  re-run + write sidecar (test_run_eval_task_resume_requires_sidecar)
-
-
-def test_run_eval_task_resume_requires_sidecar(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An archive from a prior run is NOT sufficient for resume — the
-    matrix_aggregate sidecar must also be present. PH-A's
-    dependency_graph framework task reads the sidecar to learn the
-    aggregate drv path; without it, dep_graph hangs (observed on the
-    2026-05-21 cluster smoke).
-    """
-    _install_wrapper_stub(monkeypatch)
-    payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
-    archive = tmp_path / "hello.nix-archive"
-    archive.write_bytes(b"NIX_EXPORT:previous-run")
-    # No sidecar — should trigger full re-evaluation despite archive.
-    assert not (tmp_path / "hello.matrix_aggregate.json").exists()
-
-    runner = _EvalJobsStub(
-        drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
-    )
-    sender = _make_broadcast_sender()
-    result = run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 7.0,
-    )
-    # nix-eval-jobs ran — resume short-circuit didn't fire.
-    assert any(c and c[0] == "nix-eval-jobs" for c in runner.calls)
-    assert result.get("resumed") is not True
-    assert result["matrix_aggregate_drv"] == "/nix/store/wrap-matrix-hello.drv"
-    # Sidecar was written this time.
-    sidecar = tmp_path / "hello.matrix_aggregate.json"
-    assert sidecar.exists() and sidecar.stat().st_size > 0
 
 
 # ---------------------------------------------------------------------------
@@ -749,7 +742,8 @@ def test_run_eval_task_determinism_same_seed(
         )
         sender = _make_broadcast_sender()
         return run_eval_task(
-            payload, out, sender, run_subprocess=runner, now=lambda: 1.0,
+            payload, out, sender, task=_make_task_mock(),
+            run_subprocess=runner, now=lambda: 1.0,
         )
 
     out_a = tmp_path / "a"
@@ -809,7 +803,8 @@ def test_run_eval_task_determinism_different_seed(
         )
         sender = _make_broadcast_sender()
         return run_eval_task(
-            payload, out, sender, run_subprocess=runner, now=lambda: 1.0,
+            payload, out, sender, task=_make_task_mock(),
+            run_subprocess=runner, now=lambda: 1.0,
         )
 
     a = _run(tmp_path / "a", "seed-1")
@@ -844,7 +839,10 @@ def test_run_eval_task_subprocess_failure_raises(
     sender = _make_broadcast_sender()
 
     with pytest.raises(RuntimeError) as exc_info:
-        run_eval_task(payload, tmp_path, sender, run_subprocess=runner)
+        run_eval_task(
+            payload, tmp_path, sender, task=_make_task_mock(),
+            run_subprocess=runner,
+        )
 
     msg = str(exc_info.value)
     assert "nix-eval-jobs" in msg
@@ -869,7 +867,10 @@ def test_run_eval_task_bad_payload_raises_valueerror(
     sender = _make_broadcast_sender()
     runner = _EvalJobsStub()
     with pytest.raises(ValueError):
-        run_eval_task(payload, tmp_path, sender, run_subprocess=runner)
+        run_eval_task(
+            payload, tmp_path, sender, task=_make_task_mock(),
+            run_subprocess=runner,
+        )
 
 
 def test_run_eval_task_broadcast_timeout_recorded(
@@ -889,7 +890,8 @@ def test_run_eval_task_broadcast_timeout_recorded(
     sender.wait_for_completion.return_value = None  # timeout
 
     result = run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 1.0,
+        payload, tmp_path, sender, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
     )
     assert len(result["broadcasts"]) == 1
     assert result["broadcasts"][0]["status"] == "timeout"
@@ -916,7 +918,10 @@ def test_run_eval_task_requisites_failure_raises(
     )
     sender = _make_broadcast_sender()
     with pytest.raises(RuntimeError, match="nix-store --query --requisites"):
-        run_eval_task(payload, tmp_path, sender, run_subprocess=runner)
+        run_eval_task(
+            payload, tmp_path, sender, task=_make_task_mock(),
+            run_subprocess=runner,
+        )
     assert not (tmp_path / "hello.nix-archive").exists()
 
 
@@ -935,7 +940,10 @@ def test_run_eval_task_export_failure_raises_and_cleans_up(
     )
     sender = _make_broadcast_sender()
     with pytest.raises(RuntimeError, match="nix-store --export"):
-        run_eval_task(payload, tmp_path, sender, run_subprocess=runner)
+        run_eval_task(
+            payload, tmp_path, sender, task=_make_task_mock(),
+            run_subprocess=runner,
+        )
     # No archive (export failed). No stale .tmp lingering either.
     assert not (tmp_path / "hello.nix-archive").exists()
     assert not (tmp_path / "hello.nix-archive.tmp").exists()
@@ -967,7 +975,10 @@ def test_run_eval_task_wrapper_failure_leaves_no_archive(
     sender = _make_broadcast_sender()
 
     with pytest.raises(RuntimeError, match="synthetic nix-instantiate failure"):
-        run_eval_task(payload, tmp_path, sender, run_subprocess=runner)
+        run_eval_task(
+            payload, tmp_path, sender, task=_make_task_mock(),
+            run_subprocess=runner,
+        )
 
     archive = tmp_path / "hello.nix-archive"
     assert not archive.exists()
@@ -990,7 +1001,8 @@ def test_run_eval_task_empty_kept_drvs_writes_empty_archive(
     runner = _EvalJobsStub(drv_map={"x86_64": {}})
     sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 1.0,
+        payload, tmp_path, sender, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
     )
     assert result["variant_drvs"] == []
     assert result["variants"] == []
@@ -1043,7 +1055,8 @@ def test_run_eval_task_invokes_meta_eval_when_sampling(
     )
     sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 1.0,
+        payload, tmp_path, sender, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
     )
 
     # _meta lookup happened (one per arch).
@@ -1085,7 +1098,8 @@ def test_run_eval_task_calls_meta_even_when_no_sampling(
     )
     sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 1.0,
+        payload, tmp_path, sender, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
     )
     # One _meta lookup per arch — variant_sample unset does NOT skip
     # them anymore, because the filter chain still needs the meta dict.
@@ -1143,7 +1157,8 @@ def test_bulk_eval_per_arch_suffix_filter_is_distinct_per_arch(
     )
     sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 1.0,
+        payload, tmp_path, sender, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
     )
     # We expect one variant per (arch, group) = 4 total (2 archs ×
     # 2 groups × sample=1).
@@ -1180,7 +1195,8 @@ def test_bulk_eval_drops_archs_with_no_sampled_suffixes(
     )
     sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 1.0,
+        payload, tmp_path, sender, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
     )
     # Only x86_64 produced a variant.
     assert len(result["variants"]) == 1
@@ -1232,7 +1248,8 @@ def test_matrix_aggregate_carries_toolchain_and_sorted_leaves(
     )
     sender = _make_broadcast_sender()
     result = run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 1.0,
+        payload, tmp_path, sender, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
     )
 
     assert len(wrapper.calls) == 1
@@ -1274,7 +1291,8 @@ def test_matrix_aggregate_is_export_seed_for_archive(
     )
     sender = _make_broadcast_sender()
     run_eval_task(
-        payload, tmp_path, sender, run_subprocess=runner, now=lambda: 1.0,
+        payload, tmp_path, sender, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
     )
     req_calls = [
         c for c in runner.calls
