@@ -37,7 +37,7 @@ class DependencyGraphPickleError(RuntimeError):
 
 def load_phase4_descriptors(
     pkl_path: pathlib.Path,
-) -> tuple[list[Phase4Descriptor], dict[str, Union[int, float]]]:
+) -> tuple[list[Phase4Descriptor], dict[str, Union[int, float, str]]]:
     """Load and validate ``_dependency_graph.pkl``.
 
     Returns a ``(descriptors, summary)`` pair. Hard-fails with

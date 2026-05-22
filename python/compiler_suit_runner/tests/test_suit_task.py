@@ -1,19 +1,10 @@
 """Unit tests for :mod:`compiler_suit_runner.suit_task`.
 
-Today's tests cover the matrix_eval → build quiesce watcher
-(``_MatrixEvalQuiesceWatcher``) and its wiring into ``on_run_start``,
-plus the peer-lifecycle listener and the PrimaryHandle wrappers.
-
-The watcher's ``_fire`` runs the dependency_graph_worker as a
-subprocess and feeds its output into ``primary_handle.spawn_tasks``;
-the tests below substitute the subprocess + (optionally) the spawn
-handle so the bookkeeping side is testable hermetically.
-
-Post-pickle-migration the worker writes ``_dependency_graph.pkl``
-(typed dataclass list) and the watcher's operator-debug helper writes
-``_dependency_graph_headers.json`` (ManifestHeader view). The two
-files have disjoint names so tests can seed the read-path without
-clashing with assertions on the write-path.
+Tests for ``SuitTask`` wiring and the matrix_eval quiesce watcher's
+spawn bridge. Phase 3 (``dependency_graph``) is dispatched by the
+framework as a task; this module covers ``on_task_completed``
+bookkeeping, ``_spawn_tasks`` translation, and the
+``on_phase_end("dependency_graph")`` pickle-read + spawn path.
 """
 
 from __future__ import annotations
@@ -22,14 +13,10 @@ import dataclasses as _dataclasses
 import json
 import logging
 import pathlib
-import subprocess
 from unittest import mock
 
 import pytest
 
-from compiler_suit_runner.dependency_graph_planner import (
-    Phase4Descriptor,
-)
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
     matrix_eval_task_id,
@@ -41,23 +28,6 @@ from compiler_suit_runner.suit_task import (
     SuitTaskConfig,
     _MatrixEvalQuiesceWatcher,
 )
-from compiler_suit_runner.workers.dependency_graph_worker.output import (
-    DEPENDENCY_GRAPH_PICKLE,
-    write_phase4_descriptors,
-)
-
-
-def _seed_empty_dependency_graph_pickle(out_dir: pathlib.Path) -> None:
-    """Seed an empty ``_dependency_graph.pkl`` under ``out_dir``.
-
-    Mirrors what the worker subprocess would have produced on a no-op
-    matrix; the watcher's read step finds the file and proceeds with
-    an empty descriptor list.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_phase4_descriptors(
-        descriptors=[], summary={}, out_path=out_dir / DEPENDENCY_GRAPH_PICKLE,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -164,14 +134,6 @@ def _variant_header(binary: str, label: str, compiler_id: str = "gcc15"):
     )
 
 
-# A minimal subprocess.CompletedProcess stand-in for the watcher's
-# ``run_subprocess`` injection point.
-def _fake_completed(rc: int, stderr: bytes = b"") -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(
-        args=[], returncode=rc, stdout=b"", stderr=stderr,
-    )
-
-
 # ---------------------------------------------------------------------------
 # _MatrixEvalQuiesceWatcher bookkeeping
 # ---------------------------------------------------------------------------
@@ -185,11 +147,9 @@ def test_watcher_initialises_with_expected_set(
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids=expected,
         out_dir=tmp_path / "out",
-        toolchain_task_ids={},
     )
     assert w.expected == frozenset(expected)
     assert w.completed == frozenset()
-    assert w.fired is False
 
 
 def test_watcher_noops_for_non_matrix_eval_task(
@@ -201,66 +161,29 @@ def test_watcher_noops_for_non_matrix_eval_task(
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=tmp_path / "out",
-        toolchain_task_ids={},
     )
     w.on_task_completed("toolchain__gcc15__x86_64")
     w.on_task_completed("")  # empty id — defensive guard
     w.on_task_completed("merge__singleton")
     assert w.completed == frozenset()
-    assert w.fired is False
 
 
 def test_watcher_records_matrix_eval_completion(
     tmp_path: pathlib.Path,
 ) -> None:
-    """A matching matrix_eval task moves into ``completed`` but doesn't
-    fire until the set is full."""
+    """A matching matrix_eval task moves into ``completed``."""
     hello = matrix_eval_task_id("hello")
     busybox = matrix_eval_task_id("busybox")
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={hello, busybox},
         out_dir=tmp_path / "out",
-        toolchain_task_ids={},
     )
     w.on_task_completed(hello)
     assert w.completed == frozenset({hello})
-    assert w.fired is False
-
-
-def test_watcher_is_idempotent_on_duplicate_completion(
-    tmp_path: pathlib.Path,
-) -> None:
-    """The same task_id arriving twice does not flip ``fired`` twice
-    and does not double-count toward expected."""
-    hello = matrix_eval_task_id("hello")
-    busybox = matrix_eval_task_id("busybox")
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    _seed_empty_dependency_graph_pickle(out_dir)
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={hello, busybox},
-        out_dir=out_dir,
-        toolchain_task_ids={},
-        run_subprocess=lambda _argv: _fake_completed(0),
-        dependency_graph_command_override=["true"],
-        bash_path="/nix/store/fake-bash",
-    )
-    w.on_task_completed(hello)
-    w.on_task_completed(hello)  # duplicate
-    assert w.completed == frozenset({hello})
-    assert w.fired is False
-    w.on_task_completed(busybox)
-    w.fire_phase_3()
-    assert w.fired is True
-    # Another stray completion after firing is a no-op.
-    w.on_task_completed(busybox)
-    w.on_task_completed(hello)
-    w.fire_phase_3()
-    assert w.fired is True
 
 
 # ---------------------------------------------------------------------------
-# _spawn_tasks dispatch path (used by tests + _fire's translation step)
+# _spawn_tasks dispatch path (used by tests + on_phase_end translation)
 # ---------------------------------------------------------------------------
 
 
@@ -276,7 +199,6 @@ def test_spawn_tasks_no_handle_writes_dependency_graph_and_logs_count(
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=out_dir,
-        toolchain_task_ids={},
         primary_handle=None,
         logger=logger,
     )
@@ -311,7 +233,6 @@ def test_spawn_tasks_no_handle_creates_missing_out_dir(
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=out_dir,
-        toolchain_task_ids={},
         primary_handle=None,
     )
     w._spawn_tasks([])
@@ -330,7 +251,6 @@ def test_spawn_tasks_with_handle_calls_primary_handle(
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=out_dir,
-        toolchain_task_ids={},
         primary_handle=handle,
         logger=logger,
     )
@@ -368,7 +288,6 @@ def test_spawn_tasks_duplicate_task_hash_logs_warning(
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=tmp_path / "out",
-        toolchain_task_ids={},
         primary_handle=handle,
         logger=logger,
     )
@@ -404,7 +323,6 @@ def test_spawn_tasks_unknown_dependency_logs_warning(
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=tmp_path / "out",
-        toolchain_task_ids={},
         primary_handle=handle,
         logger=logger,
     )
@@ -431,7 +349,6 @@ def test_spawn_tasks_swallows_handle_exception(
     w = _MatrixEvalQuiesceWatcher(
         expected_task_ids={matrix_eval_task_id("hello")},
         out_dir=tmp_path / "out",
-        toolchain_task_ids={},
         primary_handle=handle,
         logger=logger,
     )
@@ -482,40 +399,6 @@ def test_build_matrix_eval_watcher_returns_none_when_manifest_dir_missing(
     assert task._build_matrix_eval_watcher(
         output_dir=tmp_path / "out",
     ) is None
-
-
-def test_build_matrix_eval_watcher_collects_expected_and_toolchains(
-    tmp_path: pathlib.Path,
-) -> None:
-    """With both matrix_eval and toolchain manifests on disk, the
-    watcher's expected set covers all matrix_eval task_ids and the
-    toolchain_task_ids map is keyed by drv path → task_id."""
-    config = _make_config(tmp_path)
-    gcc_drv = "/nix/store/cccccccccccccccccccccccccccccccc-gcc15.drv"
-    clang_drv = "/nix/store/dddddddddddddddddddddddddddddddd-clang20.drv"
-    _seed_manifest_dir(config, [
-        _matrix_eval_header("hello"),
-        _matrix_eval_header("busybox"),
-        _toolchain_header("x86_64", "gcc15", gcc_drv),
-        _toolchain_header("x86_64", "clang20", clang_drv),
-    ])
-    task = SuitTask(config)
-    w = task._build_matrix_eval_watcher(output_dir=tmp_path / "out")
-    assert w is not None
-    assert w.expected == frozenset({
-        matrix_eval_task_id("hello"),
-        matrix_eval_task_id("busybox"),
-    })
-    assert w._toolchain_task_ids == {
-        gcc_drv: build_compilers_task_id(_SYS, "x86_64", "gcc15"),
-        clang_drv: build_compilers_task_id(_SYS, "x86_64", "clang20"),
-    }
-    # out_dir falls through directly from the caller.
-    assert w._out_dir == tmp_path / "out"
-    # toolchain_aggregate_drv is read from the matrix_eval manifest
-    # payload (preflight stamps the same value on every matrix_eval
-    # header in a single dispatch).
-    assert w._toolchain_aggregate_drv == _TC_AGG_DRV_FIXTURE
 
 
 def test_build_matrix_eval_watcher_falls_back_to_shared_fs(
@@ -1169,14 +1052,9 @@ def test_task_completed_listener_forwards_to_watcher(
     hello = matrix_eval_task_id("hello")
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    _seed_empty_dependency_graph_pickle(out_dir)
     watcher = _MatrixEvalQuiesceWatcher(
         expected_task_ids={hello},
         out_dir=out_dir,
-        toolchain_task_ids={},
-        run_subprocess=lambda _argv: _fake_completed(0),
-        dependency_graph_command_override=["true"],
-        bash_path="/nix/store/fake-bash",
     )
     task._matrix_eval_watcher = watcher
     listener = task.task_completed_listener
@@ -1189,15 +1067,7 @@ def test_task_completed_listener_forwards_to_watcher(
     assert watcher.completed == frozenset()
 
     listener(hello, True, None)
-    # PH-D: phase-3 dispatch no longer fires from on_phase_end. The
-    # listener still records the completion for the matrix_aggregate
-    # bookkeeping path, but the watcher's ``_fired`` flag is never
-    # flipped because ``fire_phase_3`` is not called any more (the
-    # framework drives dependency_graph as a PhaseSpec task).
     assert watcher.completed == frozenset({hello})
-    assert watcher.fired is False
-    task.on_phase_end("matrix_eval", completed=1, failed=0)
-    assert watcher.fired is False
 
 
 def test_task_completed_listener_noop_without_watcher(
@@ -1264,6 +1134,77 @@ def test_task_completed_listener_attribute_signature(
     listener("some-task", False, "recoverable")
     listener("other-task", True, None)
     listener(None, True, None)
+
+
+# ---------------------------------------------------------------------------
+# on_phase_end("dependency_graph") pickle-read + spawn bridge
+# ---------------------------------------------------------------------------
+
+
+def test_on_phase_end_dependency_graph_reads_pickle_and_spawns(
+    tmp_path, monkeypatch,
+) -> None:
+    from unittest import mock
+    from compiler_suit_runner.dependency_graph_planner import (
+        Phase4Descriptor,
+    )
+    from compiler_suit_runner.workers.dependency_graph_worker.output import (
+        DEPENDENCY_GRAPH_PICKLE,
+        write_phase4_descriptors,
+    )
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    descriptors = [
+        Phase4Descriptor(
+            kind="build_common_dep",
+            task_id="build_common_dep__abc.drv",
+            name="abc",
+            payload={"drv": "/nix/store/abc.drv", "label": "abc"},
+            depends_on=(),
+            priority_hint=0,
+        ),
+    ]
+    write_phase4_descriptors(
+        descriptors=descriptors,
+        summary={},
+        out_path=out_dir / DEPENDENCY_GRAPH_PICKLE,
+    )
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    primary_handle = mock.Mock()
+    primary_handle.spawn_tasks.return_value = []
+    hello = matrix_eval_task_id("hello")
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={hello},
+        out_dir=out_dir,
+    )
+    w._primary_handle = primary_handle
+    task._matrix_eval_watcher = w
+    task.on_phase_end("dependency_graph", completed=1, failed=0)
+    primary_handle.spawn_tasks.assert_called_once()
+    task_infos = primary_handle.spawn_tasks.call_args[0][0]
+    assert len(task_infos) == 1
+    assert task_infos[0].task_id == "build_common_dep__abc.drv"
+
+
+@pytest.mark.parametrize(
+    "phase_id", ["matrix_eval", "build_compilers", "build"],
+)
+def test_on_phase_end_other_phases_noop(
+    tmp_path, phase_id,
+) -> None:
+    from unittest import mock
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    primary_handle = mock.Mock()
+    w = _MatrixEvalQuiesceWatcher(
+        expected_task_ids={matrix_eval_task_id("hello")},
+        out_dir=tmp_path / "out",
+    )
+    w._primary_handle = primary_handle
+    task._matrix_eval_watcher = w
+    task.on_phase_end(phase_id, completed=1, failed=0)
+    primary_handle.spawn_tasks.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

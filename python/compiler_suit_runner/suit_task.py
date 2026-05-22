@@ -318,19 +318,18 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
       ``matrix_eval`` because the kept-drv set + dependency_graph plan
       come out of that phase.
 
-    The ``dependency_graph`` step (phase 3 in the plan) is NOT
-    declared as a framework PhaseSpec: it is primary-only and runs
-    inline from :class:`_MatrixEvalQuiesceWatcher._fire` as a
-    subprocess invocation of ``workers.dependency_graph_worker``,
-    feeding its descriptor list straight into
-    ``primary_handle.spawn_tasks`` for the ``build`` phase. The
-    rationale: dynamic_runner's PhaseSpec contract today doesn't
-    expose a "primary-affined" type marker, and dispatching the
-    template-graph walk through the secondary pool would force the
-    whole closure across the wire. Running it as a primary-side
-    subprocess keeps the artefact paths local and lets the watcher
-    own the spawn-tasks fan-out where the constraint "task creation
-    can only be done by the manager (primary)" already holds.
+    The ``dependency_graph`` step (phase 3 in the plan) runs as a
+    first-class framework PhaseSpec task dispatched by the runner;
+    the worker writes ``_dependency_graph.pkl`` under the matrix_eval
+    output directory. :meth:`SuitTask.on_phase_end` then reads that
+    pickle when ``phase_id == "dependency_graph"``, translates the
+    descriptor list to :class:`ManifestHeader` instances via
+    :func:`dependency_graph_planner.headers_from_descriptors`, and
+    hands them to :meth:`_MatrixEvalQuiesceWatcher._spawn_tasks`
+    which in turn drives ``primary_handle.spawn_tasks`` for the
+    ``build`` phase. The spawn fan-out stays primary-affined because
+    "task creation can only be done by the manager (primary)" is
+    still a framework invariant.
     """
     from dynamic_runner.task_protocol import (  # type: ignore[import-not-found]
         PhaseSpec,
@@ -1776,10 +1775,13 @@ class SuitTask:
             # Scan the manifest dir for matrix_eval items. If any
             # exist, spin up a _MatrixEvalQuiesceWatcher whose
             # on_task_completed method is the framework's
-            # task-completion hook target. The watcher runs the
-            # dependency_graph subprocess + spawns the resulting build
-            # phase tasks once all matrix_eval tasks have completed
-            # (see _MatrixEvalQuiesceWatcher._fire).
+            # task-completion hook target. The watcher's
+            # ``_spawn_tasks`` is invoked from
+            # :meth:`SuitTask.on_phase_end` when the framework signals
+            # the ``dependency_graph`` phase has ended; that handler
+            # reads the worker-written pickle and fans out the
+            # resulting headers into ``primary_handle.spawn_tasks``
+            # for the ``build`` phase.
             #
             # We register the watcher best-effort against whatever
             # task-completion surface the framework currently exposes
@@ -2280,6 +2282,38 @@ class SuitTask:
             completed,
             failed,
         )
+        if (
+            phase_id == "dependency_graph"
+            and self._matrix_eval_watcher is not None
+        ):
+            # Late imports keep planner machinery off the import path
+            # in single-process tests that never reach phase 3.
+            from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
+                headers_from_descriptors,
+                load_phase4_descriptors,
+            )
+            from compiler_suit_runner.workers.dependency_graph_worker.output import (  # noqa: PLC0415
+                DEPENDENCY_GRAPH_PICKLE,
+            )
+
+            out_dir = self._matrix_eval_watcher._out_dir
+            pickle_path = out_dir / DEPENDENCY_GRAPH_PICKLE
+            try:
+                descriptors, _summary = load_phase4_descriptors(
+                    pickle_path
+                )
+                headers = headers_from_descriptors(descriptors)
+                self._logger.info(
+                    "on_phase_end(\"dependency_graph\"): loaded %d "
+                    "phase-4 descriptors; spawning %d tasks",
+                    len(descriptors), len(headers),
+                )
+                self._matrix_eval_watcher._spawn_tasks(headers)
+            except Exception:  # noqa: BLE001 — log + degrade
+                self._logger.exception(
+                    "on_phase_end: dependency_graph spawn failed at %s",
+                    pickle_path,
+                )
 
     # ── Broadcast-receive placement gossip ────────────────────────────
 
