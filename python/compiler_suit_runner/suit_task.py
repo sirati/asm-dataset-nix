@@ -16,10 +16,12 @@ Protocol under the new phase taxonomy:
 * ``dependency_graph`` (phase 3) — framework task, one per binary;
   ``task_depends_on=[matrix_eval__<binary>]`` so the CRDT activates
   each dep_graph task atomically with the matching matrix_eval
-  TaskCompleted apply. The worker reads
-  ``<matrix_eval_out_dir>/<binary>.matrix_aggregate.json`` + the
-  imported per-binary nix-archive, runs the streaming planner, and
-  emits per-(compiler, arch) sidecar manifests at
+  TaskCompleted apply. The worker reads the matrix_aggregate drv
+  path from ``task.predecessor_outputs[matrix_eval__<binary>]
+  ["matrix_aggregate_drv"]["value"]`` (published by the upstream
+  matrix_eval task via ``Task.publish_string``), imports the
+  per-binary nix-archive, runs the streaming planner, and emits
+  per-(compiler, arch) sidecar manifests at
   ``<matrix_eval_out_dir>/_manifests/`` for the placeholder
   build_variant tasks to consume.
 * ``build`` (phase 4) — distributed ``build_common_dep`` +
@@ -189,11 +191,14 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
     if item_class == "dependency_graph":
         # One task per binary; depends on matrix_eval__<binary>. The
         # worker imports that binary's nix-archive + reads the matrix
-        # aggregate sidecar, runs the streaming planner, and writes
-        # per-(compiler, arch) sidecar manifests for the placeholder
-        # build_variant tasks (see plan: placeholder-pattern-restructure
-        # PH-A). Affinity = binary so the framework keeps the import
-        # closure warm on the worker that just finished matrix_eval.
+        # aggregate drv from ``task.predecessor_outputs[
+        # matrix_eval__<binary>]["matrix_aggregate_drv"]["value"]``
+        # (published via ``Task.publish_string``), runs the streaming
+        # planner, and writes per-(compiler, arch) sidecar manifests
+        # for the placeholder build_variant tasks (see plan:
+        # placeholder-pattern-restructure PH-A). Affinity = binary so
+        # the framework keeps the import closure warm on the worker
+        # that just finished matrix_eval.
         binary = header.payload.get("binary", "?")
         return ("dependency_graph", "dep_graph", binary)
     if item_class == "build_compilers":
@@ -1263,10 +1268,12 @@ class SuitTask:
                     "--signing-public-key", self._signing_key.public_key,
                 ]
             # matrix_eval marker dir: bind-mount-visible path so the
-            # eval worker writes its archive + sidecar there and the
-            # dep_graph worker (PH-A) reads them from the same location.
-            # Other types (toolchain_validate / common_dep / variant)
-            # ignore the flag harmlessly.
+            # eval worker writes its <binary>.nix-archive there and the
+            # dep_graph worker (PH-A) imports it from the same location.
+            # The matrix_aggregate drv is threaded out-of-band via
+            # ``Task.publish_string`` / predecessor_outputs, not on
+            # disk. Other types (toolchain_validate / common_dep /
+            # variant) ignore the flag harmlessly.
             if (
                 type_id in {"eval", "dep_graph"}
                 and self.config.matrix_eval_out_dir is not None

@@ -1187,9 +1187,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "toolchain_aggregate_drv": tc_aggregate_drv,
                 # Threaded so emit_dependency_graph_manifests can
                 # include the bind-mounted matrix_eval output dir in
-                # each dep_graph payload — the worker reads
-                # <out_dir>/<binary>.{nix-archive, matrix_aggregate.json}
-                # from there. bash is dispatch-time resolved inside
+                # each dep_graph payload — the worker imports
+                # <out_dir>/<binary>.nix-archive from there. The
+                # matrix_aggregate drv path arrives via the framework's
+                # keyed-outputs wire (task.predecessor_outputs[
+                # matrix_eval_id]["matrix_aggregate_drv"]["value"]),
+                # not from disk. bash is dispatch-time resolved inside
                 # the worker via _resolve_bash_store_path_default()
                 # (no need to thread). ``config`` isn't built yet at
                 # this point — recompute the path from args + shared_fs

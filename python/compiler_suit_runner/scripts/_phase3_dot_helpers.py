@@ -31,6 +31,22 @@ SUFFIX_MATCH_PATTERN = (
 )
 
 
+class _NullTask:
+    """Stand-in for ``dynamic_runner.worker.Task`` in the dot-demo driver.
+
+    ``run_eval_task`` calls ``task.publish_string("matrix_aggregate_drv",
+    drv)`` to thread the per-binary aggregate drv into the framework's
+    keyed-outputs wire (consumed by dependency_graph via
+    ``predecessor_outputs``). The demo runs out-of-band with no
+    framework around it and no successor task to consume the value, so
+    the publish is a documented no-op here. We avoid duck-typing on a
+    bare ``Mock`` to keep the call site grep-friendly.
+    """
+
+    def publish_string(self, key: str, value: str) -> None:
+        del key, value
+
+
 def resolve_bash_path() -> str:
     """Production probe: ``nix eval --raw nixpkgs#bash.outPath``.
 
@@ -118,6 +134,7 @@ def run_eval_for_binary(
             payload=dict(header.payload),
             out_dir=archive_dir,
             broadcast_sender=sender,
+            task=_NullTask(),
             flake_ref=flake_ref,
             broadcast_timeout=2.0,
         )
