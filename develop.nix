@@ -6,9 +6,15 @@ let
   # `pythonPackagesExtensions`, which changes the python package set's
   # fixed point and invalidates every cached python derivation
   # downstream — including unrelated dev tooling like fastmcp / mcp.
+  # `shutdownManagerBin` is the musl-static helper the wheel's
+  # postInstall drops into `dynamic_runner/_shutdown_manager/`; the
+  # framework's own flake builds it via the same shutdown-manager-bin
+  # derivation we callPackage here.
+  shutdownManagerBin = pkgs.callPackage
+    "${dynamicRunnerSrc}/nix/shutdown-manager-bin.nix" { };
   dynamicRunner = pkgs.python313Packages.callPackage
     "${dynamicRunnerSrc}/nix/wheel.nix"
-    { };
+    { inherit shutdownManagerBin; };
 
   devPythonPackages = python-pkgs: with python-pkgs; [
     pip
