@@ -1406,6 +1406,7 @@ def main() -> int:
                     eval_payload,
                     out_dir=out_dir,
                     broadcast_sender=broadcast_sender,
+                    task=task,
                 )
             except RuntimeError as exc:
                 _handle_log.exception(

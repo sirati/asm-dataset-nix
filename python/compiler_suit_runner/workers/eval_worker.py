@@ -102,6 +102,8 @@ import time
 from collections.abc import Callable
 from typing import Any, Optional
 
+from dynamic_runner.worker import Task
+
 from compiler_suit_runner.peer_paths import ITEM_CLASS_MATRIX_EVAL_DRV
 from compiler_suit_runner.peer_replication import BroadcastSender
 
@@ -476,38 +478,6 @@ def _drv_size(drv_path: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _matrix_aggregate_sidecar_path(
-    out_dir: pathlib.Path, binary: str,
-) -> pathlib.Path:
-    """Per-binary sidecar location for the matrix_aggregate handoff."""
-    return out_dir / f"{binary}.matrix_aggregate.json"
-
-
-def _write_matrix_aggregate_sidecar(
-    out_dir: pathlib.Path, binary: str, matrix_aggregate_drv: str,
-) -> None:
-    """Atomic-write ``<binary>.matrix_aggregate.json`` for the watcher.
-
-    Tolerates IO errors silently — the result dict is still returned to
-    the framework and a future framework change that does carry payloads
-    will work without this fallback.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    target = _matrix_aggregate_sidecar_path(out_dir, binary)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    try:
-        tmp.write_text(json.dumps({
-            "binary": binary,
-            "matrix_aggregate_drv": matrix_aggregate_drv,
-        }, sort_keys=True))
-        os.replace(tmp, target)
-    except OSError:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-
-
 def _archive_path(out_dir: pathlib.Path, binary: str) -> pathlib.Path:
     """Per-binary archive path under the matrix-eval output dir.
 
@@ -847,6 +817,7 @@ def run_eval_task(
     payload: dict,
     out_dir: pathlib.Path,
     broadcast_sender: BroadcastSender,
+    task: Task,
     run_subprocess: Optional[RunSubprocess] = None,
     *,
     flake_ref: str = ".",
@@ -870,20 +841,13 @@ def run_eval_task(
     sys_name = parsed["sys"]
     archive = _archive_path(out_dir, binary)
 
-    # Step 0: resume short-circuit — when BOTH the archive AND the
-    # matrix_aggregate sidecar from a prior run are present, the
-    # downstream dependency_graph framework task has everything it
-    # needs (the archive's closure import + the sidecar's drv path);
-    # re-running would only duplicate work. We omit matrix_aggregate_drv
-    # on resume so callers don't misread a non-empty value as "freshly
-    # built". Archive-without-sidecar means a stale half-run (or pre-PH-A
-    # archive from before sidecars were written); fall through and
-    # re-evaluate so PH-A's dep_graph task can find its handoff.
-    sidecar = _matrix_aggregate_sidecar_path(out_dir, binary)
-    if (
-        archive.exists() and archive.stat().st_size > 0
-        and sidecar.exists() and sidecar.stat().st_size > 0
-    ):
+    # Step 0: resume short-circuit — archive presence IS the resume
+    # marker. The downstream dependency_graph task imports the archive
+    # closure and derives variant_lookup by parsing the imported .drv
+    # paths via parse_variant_path; no out-of-band sidecar is consulted.
+    # We omit matrix_aggregate_drv on resume so callers don't misread a
+    # non-empty value as "freshly built".
+    if archive.exists() and archive.stat().st_size > 0:
         return {
             "binary": binary, "sys": sys_name,
             "produced_at": float(clock()),
@@ -920,15 +884,13 @@ def run_eval_task(
     _export_matrix_archive(
         matrix_aggregate_drv, archive, run_subprocess=runner,
     )
-    # Step 6b: sidecar drop. The framework's TaskCompletedEvent wire
-    # format only carries (task_id, task_hash, success, error_kind) —
-    # no result payload — so the dependency_graph watcher running on
-    # the primary-promoted secondary needs an out-of-band channel to
-    # learn each binary's matrix_aggregate_drv. The bind-mounted
-    # out_dir is shared across every secondary (and the primary), so
-    # a content-addressed JSON file is the canonical handoff (per
-    # dynrunner-owner 2026-05-21).
-    _write_matrix_aggregate_sidecar(out_dir, binary, matrix_aggregate_drv)
+    # Step 6b: publish the matrix_aggregate drv path as a keyed task
+    # output. The framework's keyed-outputs API (Task.publish_string,
+    # added in dynamic-runner 58931e4) threads the value through the
+    # DoneResponse wire frame and surfaces it to the dependency_graph
+    # task via predecessor_outputs[task_id]["matrix_aggregate_drv"],
+    # replacing the prior per-binary JSON sidecar drop.
+    task.publish_string("matrix_aggregate_drv", matrix_aggregate_drv)
     # Step 7: in-process summary. ``variant_drvs`` is kept for
     # backwards compatibility with legacy consumers (retired by D.1b).
     return {
