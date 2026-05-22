@@ -38,7 +38,6 @@ whole run fits inside the 5-min budget the plan asks for. Per-row
 specifics belonging to other tests:
 
 * K=3 holder cascade — T11.
-* matrix_eval drv-broadcast latency — T21.
 * dependency_graph common-dep dedup — T23.
 
 The cluster construction follows T07 / T11: a dedicated

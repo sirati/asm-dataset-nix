@@ -16,7 +16,6 @@ from compiler_suit_runner._nix_eval_utils import (
     resolve_bash_drv_path,
 )
 from compiler_suit_runner.manifest_gen import make_matrix_eval_header
-from compiler_suit_runner.peer_replication import BroadcastSender
 from compiler_suit_runner.workers.eval_worker import (
     run_eval_task,
     sample_suffix_attrs,
@@ -105,10 +104,13 @@ def run_eval_for_binary(
     flake_ref: str,
     root: pathlib.Path,
 ) -> dict:
-    """Drive ``run_eval_task`` for one binary. BroadcastSender uses an
-    empty peer-url provider so each broadcast ack's 0/0 success
-    without network I/O while the sender thread + enqueue/wait cycle
-    still run."""
+    """Drive ``run_eval_task`` for one binary in the dot-demo driver.
+
+    The per-drv broadcast loop the eval worker used to drive is gone;
+    phase 4 (build_worker) imports the per-binary archive directly.
+    Demo invocations therefore no longer thread a ``BroadcastSender``
+    through here.
+    """
     suffixes = sampled_suffixes_for_binary(
         binary=binary, archs=archs,
         sample_size=sample_size, sample_seed=sample_seed,
@@ -125,21 +127,12 @@ def run_eval_for_binary(
         toolchain_aggregate_drv=toolchain_aggregate_drv,
         variant_sample=0, variant_seed=sample_seed,
     )
-    sender = BroadcastSender(
-        self_peer_id="phase3-dot-demo",
-        peer_url_provider=lambda: [],
+    result = run_eval_task(
+        payload=dict(header.payload),
+        out_dir=archive_dir,
+        task=_NullTask(),
+        flake_ref=flake_ref,
     )
-    try:
-        result = run_eval_task(
-            payload=dict(header.payload),
-            out_dir=archive_dir,
-            broadcast_sender=sender,
-            task=_NullTask(),
-            flake_ref=flake_ref,
-            broadcast_timeout=2.0,
-        )
-    finally:
-        sender.stop()
     if not result.get("matrix_aggregate_drv"):
         raise RuntimeError(
             f"phase3-dot-demo: run_eval_task produced no "
