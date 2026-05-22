@@ -4,15 +4,17 @@ Per-binary variant-lookup derivation
 ------------------------------------
 
 The phase-2 ``matrix_eval`` worker writes a self-contained
-``<binary>.nix-archive`` whose root is the ``matrix-<binary>``
-aggregate drv. Phase 3 imports the archive into the local store and
-then enumerates the variant leaves by walking ONE local
+``matrix-<binary>.drv.archive`` whose root is the ``matrix-<binary>``
+aggregate drv. The filename mirrors the ``matrix-<binary>.drv``
+storename pattern so the archive is self-identifying as a matrix-
+aggregate drv export. Phase 3 imports the archive into the local
+store and then enumerates the variant leaves by walking ONE local
 ``nix-store --query --references <matrix-<binary>.drv>`` —
 cheap, local-store-only, no flake re-evaluation. Filtering the
 references to ``*-elf-folder.drv`` recovers the variant roots; every
 other reference (toolchain aggregate, bash, ...) is dropped.
 
-The earlier ``<binary>.nix-archive.json`` sidecar and the
+The earlier per-archive JSON sidecar and the
 ``matrix_eval__<binary>.json`` defensive secondary discovery have
 been retired, along with the legacy stdout-walking
 ``discover_kept_drvs_from_imported_store`` helper; callers MUST use
@@ -36,24 +38,48 @@ __all__ = [
     "discover_archives",
     "import_archive",
     "is_path_locally_present",
+    "binary_from_archive_name",
 ]
+
+
+_ARCHIVE_PREFIX = "matrix-"
+_ARCHIVE_SUFFIX = ".drv.archive"
+
+
+def binary_from_archive_name(archive: pathlib.Path) -> str:
+    """Recover ``<binary>`` from a ``matrix-<binary>.drv.archive`` path.
+
+    Returns the substring between the ``matrix-`` prefix and the
+    ``.drv.archive`` suffix. If the filename does not match the
+    expected shape the full ``archive.name`` is returned unchanged —
+    callers use the result for log / error context only, never for
+    correctness-critical routing.
+    """
+    name = archive.name
+    if name.startswith(_ARCHIVE_PREFIX) and name.endswith(_ARCHIVE_SUFFIX):
+        return name[len(_ARCHIVE_PREFIX):-len(_ARCHIVE_SUFFIX)]
+    return name
 
 
 logger = logging.getLogger("compiler_suit_runner.dependency_graph_worker")
 
 
 def discover_archives(matrix_eval_out_dir: pathlib.Path) -> list[pathlib.Path]:
-    """Return every ``<binary>.nix-archive`` under ``matrix_eval_out_dir``.
+    """Return every ``matrix-<binary>.drv.archive`` under ``matrix_eval_out_dir``.
 
-    Sorted by binary name (== file stem) for deterministic processing
-    order so the resulting ``_dependency_graph.pkl`` and any operator
-    log line is stable across runs.
+    Sorted by filename for deterministic processing order so the
+    resulting ``_dependency_graph.pkl`` and any operator log line is
+    stable across runs. The ``matrix-<binary>.drv.archive`` filename
+    mirrors the matrix-aggregate drv's storename so the archive is
+    self-identifying without out-of-band metadata.
     """
     if not matrix_eval_out_dir.is_dir():
         return []
     return sorted(
         p for p in matrix_eval_out_dir.iterdir()
-        if p.is_file() and p.suffix == ".nix-archive"
+        if p.is_file()
+        and p.name.startswith("matrix-")
+        and p.name.endswith(".drv.archive")
     )
 
 

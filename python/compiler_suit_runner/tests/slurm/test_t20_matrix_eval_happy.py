@@ -12,10 +12,11 @@ cleanly:
   binary (exactly three), each task lands on a secondary, runs
   :func:`compiler_suit_runner.workers.eval_worker.run_eval_task`, and
   publishes the kept-variant closure at
-  ``<matrix_eval_out_dir>/<binary>.nix-archive`` (the matrix-eval
-  resume marker — archive presence alone is the quiesce signal; no
-  JSON sidecar is written, the dependency_graph_worker derives
-  variant_lookup from the imported .drv paths).
+  ``<matrix_eval_out_dir>/matrix-<binary>.drv.archive`` (the
+  matrix-eval quiesce signal — archive presence alone tells the
+  watcher this binary's eval is done; no JSON sidecar is written, the
+  dependency_graph_worker derives variant_lookup from the imported
+  .drv paths).
 * After matrix_eval quiesces, the
   :class:`compiler_suit_runner.suit_task._MatrixEvalQuiesceWatcher`
   shells out to ``workers.dependency_graph_worker`` and translates
@@ -38,7 +39,6 @@ specifics belonging to other tests:
 
 * K=3 holder cascade — T11.
 * matrix_eval drv-broadcast latency — T21.
-* matrix_eval resume after a partial-failure — T22.
 * dependency_graph common-dep dedup — T23.
 
 The cluster construction follows T07 / T11: a dedicated
@@ -194,14 +194,14 @@ def _assert_matrix_eval_archive(
     """Assert the per-binary matrix-eval archive exists and is non-empty.
 
     Returns the archive path. The archive's presence IS the matrix-eval
-    resume marker (see ``workers.eval_worker.run_eval_task`` Step 0
-    short-circuit), so a missing or empty archive means the eval worker
-    either never ran or crashed before writing. The JSON sidecar has
-    been retired — the dependency_graph_worker derives variant_lookup
-    from the imported .drv paths via ``parse_variant_path``.
+    quiesce signal (the ``_MatrixEvalQuiesceWatcher`` keys off it), so
+    a missing or empty archive means the eval worker either never ran
+    or crashed before writing. The JSON sidecar has been retired —
+    the dependency_graph_worker derives variant_lookup from the
+    imported .drv paths via ``parse_variant_path``.
     """
     out_dir = _matrix_eval_out_dir(shared_fs)
-    archive = out_dir / f"{binary}.nix-archive"
+    archive = out_dir / f"matrix-{binary}.drv.archive"
     assert archive.is_file(), (
         f"matrix-eval archive missing for {binary!r}: "
         f"expected {archive} to exist (presence of the archive is "
@@ -298,10 +298,10 @@ def test_t20_matrix_eval_happy(
     2. Exactly one ``matrix_eval__<binary>.json`` manifest per
        binary in :attr:`RunArtifacts.manifests_dir`.
     3. The matrix-eval archive
-       (``<matrix_eval_out_dir>/<binary>.nix-archive``) exists and is
-       non-empty for every binary. Archive presence alone is the
-       quiesce signal now; variant enumeration is verified downstream
-       via the build_variant manifest count in assertion (4).
+       (``<matrix_eval_out_dir>/matrix-<binary>.drv.archive``) exists
+       and is non-empty for every binary. Archive presence alone is
+       the quiesce signal now; variant enumeration is verified
+       downstream via the build_variant manifest count in assertion (4).
     4. dependency_graph fired: at least one ``build_variant``
        manifest exists in :attr:`RunArtifacts.manifests_dir`, and
        every such manifest's ``task_depends_on`` references a

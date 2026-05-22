@@ -1,12 +1,13 @@
 """Phase 3 ``dependency_graph`` worker — primary-only template-graph adapter.
 
 After all phase-2 ``matrix_eval`` tasks quiesce, the watcher on the
-primary calls this worker to translate the per-binary ``.nix-archive``
-artefacts into a phase-4 task plan (build_common_dep + build_variant).
+primary calls this worker to translate the per-binary
+``matrix-<binary>.drv.archive`` artefacts into a phase-4 task plan
+(build_common_dep + build_variant).
 
 Worker flow:
 
-  1. ``nix-store --import < <matrix_eval_out_dir>/<binary>.nix-archive``
+  1. ``nix-store --import < <matrix_eval_out_dir>/matrix-<binary>.drv.archive``
      loads the kept variant drvs + their transitive input closure into
      the primary's local store. The store paths printed on stdout by
      ``nix-store --import`` ARE the kept-drv source — no sidecar JSON,
@@ -55,6 +56,7 @@ from __future__ import annotations
 import sys
 
 from .archive import (
+    binary_from_archive_name,
     derive_variant_lookup_from_aggregate,
     discover_archives,
     import_archive,
@@ -94,6 +96,7 @@ __all__ = [
     "DEPENDENCY_GRAPH_SUMMARY",
     "PHASE4_PICKLE_FORMAT_VERSION",
     "PHASE4_PICKLE_MAGIC",
+    "binary_from_archive_name",
     "build_sum_drv",
     "build_sum_drv_multi",
     "compute_dependency_graph_counters",

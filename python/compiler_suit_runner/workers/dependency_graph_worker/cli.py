@@ -39,8 +39,9 @@ def build_cli_parser() -> argparse.ArgumentParser:
         type=str,
         required=True,
         help=(
-            "Directory containing the per-binary <binary>.nix-archive"
-            " files (typically <shared_fs>/out/_matrix_eval/)."
+            "Directory containing the per-binary"
+            " matrix-<binary>.drv.archive files (typically"
+            " <shared_fs>/out/_matrix_eval/)."
         ),
     )
     parser.add_argument(
