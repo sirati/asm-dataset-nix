@@ -110,11 +110,13 @@ from compiler_suit_runner.peer_paths import ITEM_CLASS_MATRIX_EVAL_DRV
 from compiler_suit_runner.peer_replication import BroadcastSender
 
 
-# ``run_subprocess`` accepts argv (list[str]) and returns a tuple of
+# ``run_subprocess`` accepts argv (list[str]) plus an optional
+# ``input`` kwarg of bytes piped to stdin, and returns a tuple of
 # (stdout_bytes, stderr_bytes, returncode). Mirrors the
 # ``RunSubprocess`` callable shape in ``preflight.py`` so the same
-# fakes can be reused.
-RunSubprocess = Callable[[list[str]], tuple[bytes, bytes, int]]
+# fakes can be reused. ``Callable[..., ...]`` keeps the alias
+# permissive for callers that don't pass ``input=``.
+RunSubprocess = Callable[..., tuple[bytes, bytes, int]]
 
 
 MATRIX_EVAL_ITEM_CLASS = "matrix_eval"
@@ -129,13 +131,24 @@ _SAFE_SUFFIX_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # ---------------------------------------------------------------------------
 
 
-def _default_run_subprocess(argv: list[str]) -> tuple[bytes, bytes, int]:
-    """Real ``subprocess.run`` invocation; never goes through a shell."""
+def _default_run_subprocess(
+    argv: list[str],
+    *,
+    input: Optional[bytes] = None,
+) -> tuple[bytes, bytes, int]:
+    """Real ``subprocess.run`` invocation; never goes through a shell.
+
+    ``input`` is forwarded to ``subprocess.run(input=...)`` so callers
+    can stream large filter payloads / store-path lists via stdin
+    instead of stuffing them into argv (which trips MAX_ARG_STRLEN at
+    full LMU scale).
+    """
     proc = subprocess.run(  # noqa: S603 - argv constructed in-module
         argv,
         check=False,
         capture_output=True,
         shell=False,
+        input=input,
     )
     return proc.stdout, proc.stderr, proc.returncode
 
@@ -294,7 +307,11 @@ def _eval_jobs_for_binary(
 
     ``sampled_by_arch`` is the per-arch sampled-suffix map: archs with
     an empty suffix list are dropped from the select expression entirely
-    (a missing key matches no cells).
+    (a missing key matches no cells). The filter is shipped to
+    nix-eval-jobs as a JSON ``{arch: [suffix, ...]}`` map via stdin
+    (``--arg-from-stdin``); the ``--select`` lambda decodes it with
+    ``builtins.fromJSON`` so argv stays bounded regardless of variant
+    count.
 
     The ``--select`` lambda walks the nested ``{ arch: { suffix: drv } }``
     layout and filters BOTH levels in one go:
@@ -346,36 +363,42 @@ def _eval_jobs_for_binary(
                     " to splice into nix-eval-jobs --select"
                 )
 
-    # Build the per-arch suffix filter map, e.g.
-    #   { "x86_64" = { "O0" = null; "O2" = null; };
-    #     "aarch64" = { "O0" = null; }; }
-    arch_blocks: list[str] = []
-    for arch in sorted(effective):
-        keys = " ".join(f'"{s}" = null;' for s in effective[arch])
-        arch_blocks.append(f'"{arch}" = {{ {keys} }};')
-    arch_filter = "{ " + " ".join(arch_blocks) + " }"
+    # Ship the per-arch suffix filter as JSON via stdin so argv stays
+    # well under MAX_ARG_STRLEN even at full-LMU variant counts (where
+    # the inline-attrset form pushed argv past 128 KB and exec failed
+    # with ``Argument list too long``).
+    payload_bytes = json.dumps(effective, sort_keys=True).encode("utf-8")
 
-    # The select lambda: filter outer archs first, then per surviving
-    # arch intersectAttrs against THAT arch's sampled suffixes. The
-    # ``filter`` attrset lookup ``filter.${a}`` is safe because the
-    # outer intersectAttrs guarantees ``a`` is one of our keys.
-    select_expr = (
-        f"m: let filter = {arch_filter}; in "
-        "builtins.mapAttrs (a: v: builtins.intersectAttrs filter.${a} v) "
-        "(builtins.intersectAttrs filter m)"
-    )
+    # The select lambda: decode the JSON filter map, then filter outer
+    # archs first and per surviving arch intersectAttrs against THAT
+    # arch's sampled suffixes. The ``filter.${a}`` lookup is safe
+    # because the outer intersectAttrs guarantees ``a`` is one of our
+    # keys.
+    select_expr = """\
+m: let
+  archMap = builtins.fromJSON __filterJson;
+  toSet  = lst: builtins.listToAttrs
+    (builtins.map (s: { name = s; value = null; }) lst);
+  filter = builtins.mapAttrs (_: toSet) archMap;
+in
+  builtins.mapAttrs
+    (a: v: builtins.intersectAttrs filter.${a} v)
+    (builtins.intersectAttrs filter m)\
+"""
 
     argv: list[str] = [
         "nix-eval-jobs",
         "--flake",
         f"{flake_ref}#{attr}",
+        "--arg-from-stdin",
+        "__filterJson",
         "--select",
         select_expr,
         "--force-recurse",
         "--max-jobs",
         "1",
     ]
-    stdout, stderr, rc = run_subprocess(argv)
+    stdout, stderr, rc = run_subprocess(argv, input=payload_bytes)
     if rc != 0:
         decoded_err = stderr.decode("utf-8", errors="replace").strip()
         # RuntimeError → framework harness maps to ErrorType::Errored
@@ -502,11 +525,13 @@ def _export_kept_closure(
 ) -> None:
     """Export the closure of ``kept_drvs`` into ``archive``.
 
-    Two subprocess invocations:
+    Two subprocess invocations, each fed its store-path list as
+    newline-delimited bytes on stdin via ``--stdin`` so argv stays
+    bounded at production scale:
 
-      1. ``nix-store --query --requisites <kept_drvs...>`` to enumerate
+      1. ``nix-store --query --requisites --stdin`` to enumerate
          every store path in the transitive closure.
-      2. ``nix-store --export <closure_paths...>`` whose stdout is the
+      2. ``nix-store --export --stdin`` whose stdout is the
          self-contained archive byte stream we redirect to disk.
 
     The archive is written atomically via ``.tmp`` + ``os.replace`` so a
@@ -536,9 +561,10 @@ def _export_kept_closure(
         "nix-store",
         "--query",
         "--requisites",
-        *kept_drvs,
+        "--stdin",
     ]
-    req_stdout, req_stderr, req_rc = run_subprocess(req_argv)
+    req_stdin = "\n".join(kept_drvs).encode("utf-8")
+    req_stdout, req_stderr, req_rc = run_subprocess(req_argv, input=req_stdin)
     if req_rc != 0:
         raise RuntimeError(
             f"nix-store --query --requisites failed (rc={req_rc}): "
@@ -567,9 +593,10 @@ def _export_kept_closure(
     export_argv: list[str] = [
         "nix-store",
         "--export",
-        *closure,
+        "--stdin",
     ]
-    exp_stdout, exp_stderr, exp_rc = run_subprocess(export_argv)
+    exp_stdin = "\n".join(closure).encode("utf-8")
+    exp_stdout, exp_stderr, exp_rc = run_subprocess(export_argv, input=exp_stdin)
     if exp_rc != 0:
         try:
             tmp_archive.unlink()
