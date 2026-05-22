@@ -80,13 +80,14 @@ class _EvalJobsStub:
 
     * ``nix-eval-jobs``: ONE bulk invocation per binary. The ``--flake``
       argument is ``<flake_ref>#<attr>`` (no per-arch suffix); the
-      per-arch suffix filter is encoded in the ``--select`` lambda as
-      a nested ``{ <arch> = { <suffix> = null; ... }; ... }`` attrset.
-      The stub parses that nested map out of the select expression and
-      emits one JSONL line per surviving (arch, suffix) → drvPath,
-      using ``attrPath = [arch, suffix]`` (matching what nix-eval-jobs
-      itself emits with ``--force-recurse``). ``arch``/``suffix`` drvs
-      come from ``drv_map[arch]``.
+      per-arch suffix filter is shipped as a JSON ``{arch: [suffix, ...]}``
+      map on stdin (``--arg-from-stdin __filterJson``) and the
+      ``--select`` lambda decodes it with ``builtins.fromJSON``. The
+      stub decodes the ``input`` kwarg and emits one JSONL line per
+      surviving (arch, suffix) → drvPath, using ``attrPath = [arch,
+      suffix]`` (matching what nix-eval-jobs itself emits with
+      ``--force-recurse``). ``arch``/``suffix`` drvs come from
+      ``drv_map[arch]``.
     * ``nix``: emits the JSON dict from ``meta_map[arch]`` for
       ``_meta.<sys>.<binary>.<arch>`` lookups. When ``meta_map`` is
       omitted (``None``) the stub auto-synthesises a passing meta dict
@@ -95,14 +96,20 @@ class _EvalJobsStub:
       across every arch in ``table.md`` and the entry sails through
       ``is_known_bad_combo``). Pass ``meta_map={}`` to suppress the
       auto-derivation (an empty mapping is honoured as-is).
-    * ``nix-store --query --requisites``: synthesises the closure as
-      ``[<drv>, <drv>-input] for drv in argv[3:]`` so the export step
-      has paths to act on. Override the synthesis by setting
+    * ``nix-store --query --requisites --stdin``: reads the
+      newline-joined kept-drv list from the ``input`` kwarg and
+      synthesises the closure as ``[<drv>, <drv>-input] for drv in
+      seeds``. Override the synthesis by setting
       ``requisites_for[<drv>] = [<closure>, ...]``.
-    * ``nix-store --export``: returns the synthetic byte payload
-      ``b"NIX_EXPORT:" + b",".join(argv[2:])`` so tests can decode
+    * ``nix-store --export --stdin``: reads the newline-joined closure
+      paths from ``input`` and returns the synthetic byte payload
+      ``b"NIX_EXPORT:" + b",".join(closure_paths)`` so tests can decode
       what closure was exported. Set ``export_fail=True`` to make this
       arm return rc=1.
+
+    Every call appends ``(argv, input)`` to ``self.invocations``; the
+    legacy ``self.calls`` list still records just ``argv`` for callers
+    that only assert on the argv shape.
 
     Set ``bulk_eval_fail`` to make the (single) bulk nix-eval-jobs
     invocation return rc=1 with the supplied stderr; used to test
@@ -129,6 +136,9 @@ class _EvalJobsStub:
         self.export_fail = export_fail
         self.requisites_fail = requisites_fail
         self.calls: list[list[str]] = []
+        # (argv, input) tuples — tests that want to introspect the
+        # stdin payload assert against this list.
+        self.invocations: list[tuple[list[str], Optional[bytes]]] = []
 
     def _meta_for(self, arch: str) -> dict[str, dict]:
         """Return meta for ``arch``: explicit map if set, else auto-synth.
@@ -147,25 +157,23 @@ class _EvalJobsStub:
             for suffix in self.drv_map.get(arch, {})
         }
 
-    def __call__(self, argv: list[str]) -> tuple[bytes, bytes, int]:
+    def __call__(
+        self,
+        argv: list[str],
+        *,
+        input: Optional[bytes] = None,
+    ) -> tuple[bytes, bytes, int]:
         self.calls.append(list(argv))
+        self.invocations.append((list(argv), input))
         if argv and argv[0] == "nix-eval-jobs":
             if self.bulk_eval_fail is not None:
                 return b"", self.bulk_eval_fail.encode(), 1
-            # Parse the per-arch suffix filter out of the --select
-            # expression: form is
-            #   m: let filter = { "<a>" = { "<s>" = null; ... }; ... }; in ...
-            select_expr = argv[4] if len(argv) > 4 else ""
-            import re as _re
-            # Match each outer arch block: "arch" = { ...inner... };
-            arch_blocks = _re.findall(
-                r'"([A-Za-z0-9._-]+)"\s*=\s*\{([^}]*)\};', select_expr,
-            )
-            requested: dict[str, set[str]] = {}
-            for arch, inner in arch_blocks:
-                requested[arch] = set(
-                    _re.findall(r'"([A-Za-z0-9._-]+)"\s*=\s*null;', inner)
-                )
+            # The per-arch suffix filter arrives as JSON on stdin via
+            # --arg-from-stdin __filterJson.
+            payload = json.loads(input.decode("utf-8")) if input else {}
+            requested: dict[str, set[str]] = {
+                arch: set(suffixes) for arch, suffixes in payload.items()
+            }
             lines = []
             for arch in sorted(requested):
                 drvs = self.drv_map.get(arch, {})
@@ -180,10 +188,12 @@ class _EvalJobsStub:
                         })
                     )
             return ("\n".join(lines) + "\n").encode(), b"", 0
-        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+        if argv[:4] == ["nix-store", "--query", "--requisites", "--stdin"]:
             if self.requisites_fail:
                 return b"", b"requisites stub forced failure", 1
-            seeds = argv[3:]
+            seeds = (
+                input.decode("utf-8").splitlines() if input else []
+            )
             closure: list[str] = []
             for seed in seeds:
                 if seed in self.requisites_for:
@@ -194,11 +204,14 @@ class _EvalJobsStub:
                     closure.append(seed)
                     closure.append(seed + "-input")
             return ("\n".join(closure) + "\n").encode(), b"", 0
-        if argv[:2] == ["nix-store", "--export"]:
+        if argv[:3] == ["nix-store", "--export", "--stdin"]:
             if self.export_fail:
                 return b"", b"export stub forced failure", 1
-            payload = b"NIX_EXPORT:" + ",".join(argv[2:]).encode()
-            return payload, b"", 0
+            closure_paths = (
+                input.decode("utf-8").splitlines() if input else []
+            )
+            payload_bytes = b"NIX_EXPORT:" + ",".join(closure_paths).encode()
+            return payload_bytes, b"", 0
         if argv and argv[0] == "nix":
             # nix eval --json <flake>#_meta.<sys>.<binary>.<arch>
             for piece in argv:
@@ -499,17 +512,31 @@ def test_run_eval_task_happy_path(
     assert len(eval_calls) == 1
     # --flake points at the binary attr (no per-arch tail).
     assert eval_calls[0][2] == ".#dataset.x86_64-linux.hello"
-    # --select must encode the per-arch suffix filter and use
-    # intersectAttrs at both levels.
-    select_expr = eval_calls[0][4]
+    # The per-arch filter map is fed via --arg-from-stdin __filterJson;
+    # the --select lambda decodes it with builtins.fromJSON. argv stays
+    # bounded regardless of variant count.
+    eval_argv = eval_calls[0]
+    arg_idx = eval_argv.index("--arg-from-stdin")
+    assert eval_argv[arg_idx + 1] == "__filterJson"
+    select_idx = eval_argv.index("--select")
+    select_expr = eval_argv[select_idx + 1]
+    assert "builtins.fromJSON __filterJson" in select_expr
+    assert "listToAttrs" in select_expr
     assert "intersectAttrs" in select_expr
+    # The stdin payload is the JSON-encoded per-arch suffix map.
+    eval_invocations = [
+        inv for inv in runner.invocations if inv[0] and inv[0][0] == "nix-eval-jobs"
+    ]
+    assert len(eval_invocations) == 1
+    _, eval_input = eval_invocations[0]
+    assert eval_input is not None
+    decoded = json.loads(eval_input.decode("utf-8"))
+    assert set(decoded.keys()) == {"x86_64", "aarch64"}
     for arch in ("x86_64", "aarch64"):
-        assert f'"{arch}"' in select_expr
-    for suffix in ("O0", "O2"):
-        assert f'"{suffix}"' in select_expr
+        assert set(decoded[arch]) == {"O0", "O2"}
     # --force-recurse must be passed so nix-eval-jobs walks both
     # nested levels (arch → suffix) and emits leaves.
-    assert "--force-recurse" in eval_calls[0]
+    assert "--force-recurse" in eval_argv
 
     # BroadcastSender.enqueue_broadcast: one call per (arch × suffix) = 4.
     assert sender.enqueue_broadcast.call_count == 4
@@ -543,24 +570,35 @@ def test_run_eval_task_happy_path(
     assert wrap_call["name"] == "matrix-hello"
     assert wrap_call["system"] == "x86_64-linux"
 
-    # nix-store --query --requisites called once seeded with ONLY the
-    # matrix aggregate (closure expansion follows inputDrvs to every
-    # leaf and the toolchain aggregate). The pre-refactor seeding with
-    # raw leaf drvs is gone — the aggregate is the single export root.
-    req_calls = [
-        c for c in runner.calls
-        if c[:3] == ["nix-store", "--query", "--requisites"]
+    # nix-store --query --requisites --stdin called once seeded with
+    # ONLY the matrix aggregate (closure expansion follows inputDrvs to
+    # every leaf and the toolchain aggregate). The pre-refactor seeding
+    # with raw leaf drvs is gone — the aggregate is the single export
+    # root. The seed list now travels via stdin, not argv.
+    req_invocations = [
+        inv for inv in runner.invocations
+        if inv[0][:4] == ["nix-store", "--query", "--requisites", "--stdin"]
     ]
-    assert len(req_calls) == 1
-    assert req_calls[0][3:] == ["/nix/store/wrap-matrix-hello.drv"]
-    export_calls = [
-        c for c in runner.calls if c[:2] == ["nix-store", "--export"]
+    assert len(req_invocations) == 1
+    req_argv, req_input = req_invocations[0]
+    assert req_argv == ["nix-store", "--query", "--requisites", "--stdin"]
+    assert req_input is not None
+    assert req_input.decode("utf-8").splitlines() == [
+        "/nix/store/wrap-matrix-hello.drv",
     ]
-    assert len(export_calls) == 1
-    # Closure passed to --export is what the stub synthesised from the
-    # requisites argv (seed + seed-input for the aggregate).
-    assert "/nix/store/wrap-matrix-hello.drv" in export_calls[0]
-    assert "/nix/store/wrap-matrix-hello.drv-input" in export_calls[0]
+    export_invocations = [
+        inv for inv in runner.invocations
+        if inv[0][:3] == ["nix-store", "--export", "--stdin"]
+    ]
+    assert len(export_invocations) == 1
+    export_argv, export_input = export_invocations[0]
+    assert export_argv == ["nix-store", "--export", "--stdin"]
+    assert export_input is not None
+    closure_paths = export_input.decode("utf-8").splitlines()
+    # Closure piped to --export is what the stub synthesised from the
+    # requisites stdin (seed + seed-input for the aggregate).
+    assert "/nix/store/wrap-matrix-hello.drv" in closure_paths
+    assert "/nix/store/wrap-matrix-hello.drv-input" in closure_paths
 
     # Archive written with the stub's synthetic export payload.
     archive = tmp_path / "matrix-hello.drv.archive"
@@ -984,10 +1022,12 @@ def test_run_eval_task_empty_kept_drvs_writes_empty_archive(
     assert archive.stat().st_size == 0
     # No requisites / export subprocesses fired (no kept drvs).
     assert not any(
-        c[:3] == ["nix-store", "--query", "--requisites"]
+        c[:4] == ["nix-store", "--query", "--requisites", "--stdin"]
         for c in runner.calls
     )
-    assert not any(c[:2] == ["nix-store", "--export"] for c in runner.calls)
+    assert not any(
+        c[:3] == ["nix-store", "--export", "--stdin"] for c in runner.calls
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1169,14 +1209,56 @@ def test_bulk_eval_drops_archs_with_no_sampled_suffixes(
     # Only x86_64 produced a variant.
     assert len(result["variants"]) == 1
     assert result["variants"][0]["arch"] == "x86_64"
-    # The --select expression must not name aarch64 at all (empty
-    # block would still leak the arch key into the outer
+    # The JSON filter payload must not name aarch64 at all (empty
+    # entry would still leak the arch key into the outer
     # intersectAttrs and confuse downstream readers).
-    eval_calls = [c for c in runner.calls if c and c[0] == "nix-eval-jobs"]
-    assert len(eval_calls) == 1
-    select_expr = eval_calls[0][4]
-    assert '"x86_64"' in select_expr
-    assert '"aarch64"' not in select_expr
+    eval_invocations = [
+        inv for inv in runner.invocations
+        if inv[0] and inv[0][0] == "nix-eval-jobs"
+    ]
+    assert len(eval_invocations) == 1
+    _, eval_input = eval_invocations[0]
+    decoded = json.loads(eval_input.decode("utf-8"))
+    assert "x86_64" in decoded
+    assert "aarch64" not in decoded
+
+
+def test_bulk_eval_filter_payload_round_trips_via_stdin(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The per-arch suffix filter is JSON-encoded with ``sort_keys=True``
+    and shipped via ``input=`` (not stuffed inline into ``--select``).
+    The decoded payload must round-trip to the per-arch suffix map the
+    worker assembled from the sample / filter chain.
+    """
+    _install_wrapper_stub(monkeypatch)
+    payload = _make_payload(
+        archs=["x86_64", "aarch64"], suffixes=["O0", "O2"],
+    )
+    runner = _EvalJobsStub(
+        drv_map={
+            "x86_64": {"O0": "/nix/store/a.drv", "O2": "/nix/store/b.drv"},
+            "aarch64": {"O0": "/nix/store/c.drv", "O2": "/nix/store/d.drv"},
+        },
+    )
+    sender = _make_broadcast_sender()
+    run_eval_task(
+        payload, tmp_path, sender, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
+    )
+    eval_invocations = [
+        inv for inv in runner.invocations
+        if inv[0] and inv[0][0] == "nix-eval-jobs"
+    ]
+    assert len(eval_invocations) == 1
+    _, eval_input = eval_invocations[0]
+    decoded = json.loads(eval_input.decode("utf-8"))
+    assert decoded == {
+        "aarch64": ["O0", "O2"],
+        "x86_64": ["O0", "O2"],
+    }
+    # sort_keys=True: arch keys appear in sorted order in the raw bytes.
+    assert eval_input == json.dumps(decoded, sort_keys=True).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -1262,15 +1344,67 @@ def test_matrix_aggregate_is_export_seed_for_archive(
         payload, tmp_path, sender, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
-    req_calls = [
-        c for c in runner.calls
-        if c[:3] == ["nix-store", "--query", "--requisites"]
+    req_invocations = [
+        inv for inv in runner.invocations
+        if inv[0][:4] == ["nix-store", "--query", "--requisites", "--stdin"]
     ]
-    assert len(req_calls) == 1
-    # Exactly one seed: the matrix aggregate. The raw leaves are NOT
-    # passed directly — they would be redundant (the aggregate carries
-    # them transitively).
-    assert req_calls[0][3:] == ["/nix/store/wrap-matrix-hello.drv"]
+    assert len(req_invocations) == 1
+    # Exactly one seed: the matrix aggregate, fed via stdin. The raw
+    # leaves are NOT passed directly — they would be redundant (the
+    # aggregate carries them transitively).
+    _, req_input = req_invocations[0]
+    assert req_input is not None
+    assert req_input.decode("utf-8").splitlines() == [
+        "/nix/store/wrap-matrix-hello.drv",
+    ]
+
+
+def test_export_closure_pipes_paths_via_stdin(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both ``nix-store`` invocations in the export step carry their
+    path lists on stdin (``--stdin``) rather than via argv splatting,
+    so argv stays bounded at production scale.
+    """
+    _install_wrapper_stub(monkeypatch)
+    payload = _make_payload(archs=["x86_64"], suffixes=["O0", "O2"])
+    runner = _EvalJobsStub(
+        drv_map={"x86_64": {
+            "O0": "/nix/store/o0.drv",
+            "O2": "/nix/store/o2.drv",
+        }},
+    )
+    sender = _make_broadcast_sender()
+    run_eval_task(
+        payload, tmp_path, sender, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
+    )
+    # --requisites: argv ends with --stdin; the kept-drv list (just the
+    # aggregate) travels via input.
+    req_invocations = [
+        inv for inv in runner.invocations
+        if inv[0][:3] == ["nix-store", "--query", "--requisites"]
+    ]
+    assert len(req_invocations) == 1
+    req_argv, req_input = req_invocations[0]
+    assert req_argv[-1] == "--stdin"
+    assert req_input is not None
+    assert req_input.decode("utf-8").splitlines() == [
+        "/nix/store/wrap-matrix-hello.drv",
+    ]
+    # --export: argv ends with --stdin; the closure paths travel via input.
+    export_invocations = [
+        inv for inv in runner.invocations
+        if inv[0][:2] == ["nix-store", "--export"]
+    ]
+    assert len(export_invocations) == 1
+    export_argv, export_input = export_invocations[0]
+    assert export_argv[-1] == "--stdin"
+    assert export_input is not None
+    closure = export_input.decode("utf-8").splitlines()
+    # Stub-synthesised closure: seed + seed-input for the aggregate.
+    assert "/nix/store/wrap-matrix-hello.drv" in closure
+    assert "/nix/store/wrap-matrix-hello.drv-input" in closure
 
 
 # ---------------------------------------------------------------------------
