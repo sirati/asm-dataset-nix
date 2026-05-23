@@ -1185,21 +1185,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "variant_seed": meta.get("sample_seed"),
                 "tier": meta.get("tier"),
                 "toolchain_aggregate_drv": tc_aggregate_drv,
-                # Threaded so emit_dependency_graph_manifests can
-                # include the bind-mounted matrix_eval output dir in
-                # each dep_graph payload — the worker imports
-                # <out_dir>/matrix-<binary>.drv.archive from there. The
-                # matrix_aggregate drv path arrives via the framework's
-                # keyed-outputs wire (task.predecessor_outputs[
-                # matrix_eval_id]["matrix_aggregate_drv"]["value"]),
-                # not from disk. bash is dispatch-time resolved inside
-                # the worker via _resolve_bash_store_path_default()
-                # (no need to thread). ``config`` isn't built yet at
-                # this point — recompute the path from args + shared_fs
-                # the same way _config_from_args does at line 700.
-                "matrix_eval_out_dir": str(
-                    shared_fs / "dataset" / "_matrix_eval"
-                ),
+                # ``matrix_eval_out_dir`` is deliberately NOT carried
+                # in per_binary_metadata or in the dep_graph payload:
+                # the submitter-host path is invalid inside the
+                # secondary container. The dep_graph worker reads its
+                # archive root from the BuildWorkerEnv (synthesised
+                # from ``--matrix-eval-out-dir`` at the container's
+                # call site, cli.py ``container_namespace``), so the
+                # container view is the single source of truth.
             }
         log.info(
             "submit pre-flight: %d toolchains, %d binaries queued for matrix_eval",
