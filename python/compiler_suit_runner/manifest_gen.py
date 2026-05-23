@@ -294,7 +294,6 @@ def make_dependency_graph_header(
     sys_name: str,
     *,
     toolchain_aggregate_drv: str,
-    matrix_eval_out_dir: str,
 ) -> ManifestHeader:
     """Build a dependency_graph (Phase-3 framework-task) manifest.
 
@@ -302,11 +301,13 @@ def make_dependency_graph_header(
     path from ``task.predecessor_outputs[matrix_eval_task_id(binary)
     ]["matrix_aggregate_drv"]["value"]`` (published by the upstream
     matrix_eval task via ``Task.publish_string``), imports
-    ``<matrix_eval_out_dir>/matrix-<binary>.drv.archive``, runs the streaming
-    planner against the toolchain aggregate + this binary's matrix
-    aggregate, and emits per-(compiler, arch) sidecar manifests at
-    ``<matrix_eval_out_dir>/_manifests/<binary>__<compiler>__<arch>.json``
-    for the placeholder build_variant tasks to consume.
+    ``<matrix_eval_out_dir>/matrix-<binary>.drv.archive`` (where
+    ``matrix_eval_out_dir`` comes from the worker's
+    ``--matrix-eval-out-dir`` flag — the container-view archive root
+    — not from this payload), runs the streaming planner against the
+    toolchain aggregate + this binary's matrix aggregate, and emits
+    per-(compiler, arch) sidecar manifests for the placeholder
+    build_variant tasks to consume.
 
     ``task_depends_on=[matrix_eval_task_id(binary)]`` — the CRDT
     activates this task atomically with matrix_eval's TaskCompleted
@@ -322,7 +323,6 @@ def make_dependency_graph_header(
         "binary": binary,
         "sys": sys_name,
         "toolchain_aggregate_drv": toolchain_aggregate_drv,
-        "matrix_eval_out_dir": matrix_eval_out_dir,
     }
     return ManifestHeader(
         item_class="dependency_graph",
@@ -737,7 +737,6 @@ def emit_dependency_graph_manifests(
     per_binary_metadata: dict[str, dict],
     *,
     sys_name: str,
-    matrix_eval_out_dir: str,
 ) -> list[ManifestHeader]:
     """Build one ``dependency_graph`` manifest header per binary.
 
@@ -750,6 +749,9 @@ def emit_dependency_graph_manifests(
     Per-binary metadata is the same shape :func:`emit_matrix_eval_manifests`
     consumes; the only required field is
     ``toolchain_aggregate_drv`` (re-used as the planner's anchor drv).
+    The archive root is resolved on the worker side from the
+    container's ``--matrix-eval-out-dir`` flag, not from per-binary
+    metadata — submitter-host paths do not exist inside secondaries.
     """
     headers: list[ManifestHeader] = []
     for binary in sorted(per_binary_metadata.keys()):
@@ -766,7 +768,6 @@ def emit_dependency_graph_manifests(
                 binary=binary,
                 sys_name=sys_name,
                 toolchain_aggregate_drv=toolchain_aggregate_drv,
-                matrix_eval_out_dir=matrix_eval_out_dir,
             )
         )
     return headers
@@ -883,22 +884,19 @@ def emit_all_manifests(
     # (same shape as matrix_eval consumes). The framework activates
     # each dep_graph task atomically with the matching matrix_eval
     # completion via task_depends_on=[matrix_eval__<binary>] — no
-    # in-process spawn from on_phase_end. ``matrix_eval_out_dir`` is
-    # taken from the metadata (cli.py threads it through the same
-    # SuitTaskConfig field used by the legacy in-process planner);
-    # bash is resolved by the worker via
+    # in-process spawn from on_phase_end. The archive root is NOT
+    # threaded here: the dep_graph worker reads it from its
+    # BuildWorkerEnv (populated from ``--matrix-eval-out-dir`` at
+    # the container call site), so the container view is the only
+    # source of truth. bash is resolved by the worker via
     # _resolve_bash_store_path_default().
     if "dependency_graph" in active_classes and per_binary_metadata:
-        sample_meta = next(iter(per_binary_metadata.values()), {})
-        dep_graph_out_dir = sample_meta.get("matrix_eval_out_dir", "")
-        if dep_graph_out_dir:
-            headers.extend(
-                emit_dependency_graph_manifests(
-                    per_binary_metadata,
-                    sys_name=sys_name,
-                    matrix_eval_out_dir=dep_graph_out_dir,
-                )
+        headers.extend(
+            emit_dependency_graph_manifests(
+                per_binary_metadata,
+                sys_name=sys_name,
             )
+        )
 
     # build_compilers / toolchain_validate, then build_common_dep.
     # Toolchain manifests carry the realised drv path when available

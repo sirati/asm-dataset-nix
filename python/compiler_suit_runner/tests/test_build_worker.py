@@ -1198,6 +1198,186 @@ def test_main_handle_matrix_eval_without_matrix_eval_out_dir_is_non_recoverable(
     assert "matrix-eval-out-dir" in str(exc_info.value)
 
 
+# ---------------------------------------------------------------------------
+# dependency_graph dispatch — archive root sourced from BuildWorkerEnv,
+# NOT from the payload (container vs submitter-host path divergence
+# would otherwise wipe phase 4 to 0/0; see fix-dep-graph-path-resolution).
+# ---------------------------------------------------------------------------
+
+
+def _dependency_graph_wrapper_payload(
+    *,
+    binary: str = "hello",
+    sys_name: str = "x86_64-linux",
+    tc_drv: str = "/nix/store/aaaa-toolchains.drv",
+) -> dict:
+    """Build a dep_graph wrapper as :class:`SuitTask._header_to_task_info`
+    would emit. Crucially the inner payload does NOT carry
+    ``matrix_eval_out_dir`` — the new contract is that the worker
+    reads the archive root from the BuildWorkerEnv (synthesised from
+    ``--matrix-eval-out-dir``)."""
+    return {
+        "item_class": "dependency_graph",
+        "name": f"dependency_graph__{binary}",
+        "size": 1,
+        "payload": {
+            "binary": binary,
+            "sys": sys_name,
+            "toolchain_aggregate_drv": tc_drv,
+        },
+    }
+
+
+def test_main_handle_dependency_graph_uses_env_matrix_eval_out_dir(
+    monkeypatch, tmp_path
+):
+    """dep_graph dispatch must resolve ``matrix_eval_out_dir`` from the
+    BuildWorkerEnv (populated from ``--matrix-eval-out-dir``), i.e. the
+    container view, NOT from the payload."""
+    container_archive_root = tmp_path / "app_out_network_matrix_eval"
+    container_archive_root.mkdir()
+    handle, _ = _run_build_worker_main_with_capture(
+        monkeypatch,
+        [
+            "--socket-path", str(tmp_path / "sock"),
+            "--flake-ref", ".",
+            "--dataset-output-dir", str(tmp_path / "dataset"),
+            "--shared-fs", str(tmp_path),
+            "--matrix-eval-out-dir", str(container_archive_root),
+        ],
+    )
+
+    captured: dict = {}
+
+    def _fake_run_dg(*, matrix_eval_out_dir, **kwargs):
+        captured["matrix_eval_out_dir"] = matrix_eval_out_dir
+        captured.update(kwargs)
+        return None
+
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        run as dg_run,
+    )
+
+    monkeypatch.setattr(dg_run, "run_dependency_graph_task", _fake_run_dg)
+    monkeypatch.setattr(
+        bw, "_resolve_bash_store_path_default",
+        lambda: "/nix/store/fake-bash",
+    )
+
+    import sys as _sys
+    fake_mod = _sys.modules["dynamic_runner.worker"]
+    Task = fake_mod.Task
+
+    wrapper = _dependency_graph_wrapper_payload(binary="hello")
+    task = Task(payload=wrapper, task_id="dependency_graph__hello")
+    task.predecessor_outputs = {
+        "matrix_eval__hello": {
+            "matrix_aggregate_drv": {"value": "/nix/store/m-hello.drv"},
+        },
+    }
+
+    handle(task)
+
+    assert captured["matrix_eval_out_dir"] == container_archive_root
+    assert captured["binary"] == "hello"
+    assert captured["matrix_drv"] == "/nix/store/m-hello.drv"
+    assert captured["toolchain_aggregate_drv"] == (
+        "/nix/store/aaaa-toolchains.drv"
+    )
+
+
+def test_main_handle_dependency_graph_ignores_legacy_payload_field(
+    monkeypatch, tmp_path
+):
+    """Forward-compat: if a legacy payload still carries a stale
+    ``matrix_eval_out_dir`` (e.g. submitter-host path), the worker
+    must IGNORE it and use the env-derived container path. This
+    guards the regression that drove phase build to 0/0."""
+    container_archive_root = tmp_path / "container_view"
+    container_archive_root.mkdir()
+    legacy_host_path = "/home/some-user/BIG/slurm/asm-dataset/dataset/_matrix_eval"
+
+    handle, _ = _run_build_worker_main_with_capture(
+        monkeypatch,
+        [
+            "--socket-path", str(tmp_path / "sock"),
+            "--flake-ref", ".",
+            "--dataset-output-dir", str(tmp_path / "dataset"),
+            "--shared-fs", str(tmp_path),
+            "--matrix-eval-out-dir", str(container_archive_root),
+        ],
+    )
+
+    captured: dict = {}
+
+    def _fake_run_dg(*, matrix_eval_out_dir, **kwargs):
+        captured["matrix_eval_out_dir"] = matrix_eval_out_dir
+        return None
+
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        run as dg_run,
+    )
+
+    monkeypatch.setattr(dg_run, "run_dependency_graph_task", _fake_run_dg)
+    monkeypatch.setattr(
+        bw, "_resolve_bash_store_path_default",
+        lambda: "/nix/store/fake-bash",
+    )
+
+    import sys as _sys
+    fake_mod = _sys.modules["dynamic_runner.worker"]
+    Task = fake_mod.Task
+
+    wrapper = _dependency_graph_wrapper_payload(binary="hello")
+    # Inject a stale host-path field a legacy submitter might still emit.
+    wrapper["payload"]["matrix_eval_out_dir"] = legacy_host_path
+    task = Task(payload=wrapper, task_id="dependency_graph__hello")
+    task.predecessor_outputs = {
+        "matrix_eval__hello": {
+            "matrix_aggregate_drv": {"value": "/nix/store/m-hello.drv"},
+        },
+    }
+
+    handle(task)
+
+    # The env path wins; the legacy host path is discarded.
+    assert captured["matrix_eval_out_dir"] == container_archive_root
+    assert str(captured["matrix_eval_out_dir"]) != legacy_host_path
+
+
+def test_main_handle_dependency_graph_without_matrix_eval_out_dir_is_non_recoverable(
+    monkeypatch, tmp_path
+):
+    """A dep_graph task arriving at a worker started without
+    ``--matrix-eval-out-dir`` is a structural misconfig:
+    NonRecoverableError, not a silent degrade."""
+    handle, _ = _run_build_worker_main_with_capture(
+        monkeypatch,
+        [
+            "--socket-path", str(tmp_path / "sock"),
+            "--flake-ref", ".",
+            "--dataset-output-dir", str(tmp_path / "dataset"),
+            "--shared-fs", str(tmp_path),
+            # --matrix-eval-out-dir OMITTED on purpose.
+        ],
+    )
+
+    import sys as _sys
+    fake_mod = _sys.modules["dynamic_runner.worker"]
+    Task = fake_mod.Task
+    NonRecoverable = fake_mod.NonRecoverableError
+
+    wrapper = _dependency_graph_wrapper_payload(binary="hello")
+    task = Task(payload=wrapper, task_id="dependency_graph__hello")
+    task.predecessor_outputs = {
+        "matrix_eval__hello": {
+            "matrix_aggregate_drv": {"value": "/nix/store/m-hello.drv"},
+        },
+    }
+    with pytest.raises(NonRecoverable) as exc_info:
+        handle(task)
+    assert "matrix-eval-out-dir" in str(exc_info.value)
+
 
 # ---------------------------------------------------------------------------
 # Per-binary matrix-eval archive import (build_variant prelude)

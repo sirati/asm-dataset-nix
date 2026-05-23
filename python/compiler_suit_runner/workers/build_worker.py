@@ -1506,12 +1506,20 @@ def main() -> int:
         # ``task.predecessor_outputs`` since dynamic-runner 58931e4),
         # resolves bash on the fly, then invokes
         # :func:`run_dependency_graph_task` against this single binary.
+        #
+        # ``matrix_eval_out_dir`` is the **container-view** archive root
+        # (e.g. ``/app/out-network/_matrix_eval``) and is supplied to
+        # this process via ``--matrix-eval-out-dir`` — the same flag
+        # the matrix_eval branch above consults. The submitter-host
+        # path is NOT valid inside the secondary container, so the
+        # dep_graph payload deliberately does NOT carry it; reading
+        # the host path here would make ``discover_archives`` return
+        # an empty list and silently degrade phase-4 to 0/0.
         dg_payload = _extract_class_payload(payload, "dependency_graph")
         if dg_payload is not None:
             binary = dg_payload.get("binary")
             sys_name = dg_payload.get("sys") or "x86_64-linux"
             tc_drv = dg_payload.get("toolchain_aggregate_drv")
-            out_dir_raw = dg_payload.get("matrix_eval_out_dir")
             if not isinstance(binary, str) or not binary:
                 raise NonRecoverableError(
                     "dependency_graph payload missing 'binary'"
@@ -1520,11 +1528,13 @@ def main() -> int:
                 raise NonRecoverableError(
                     "dependency_graph payload missing 'toolchain_aggregate_drv'"
                 )
-            if not isinstance(out_dir_raw, str) or not out_dir_raw:
+            if env.matrix_eval_out_dir is None:
                 raise NonRecoverableError(
-                    "dependency_graph payload missing 'matrix_eval_out_dir'"
+                    "dependency_graph requires --matrix-eval-out-dir"
+                    " (container-view shared archive root); refusing"
+                    " to proceed without it"
                 )
-            out_dir = pathlib.Path(out_dir_raw)
+            out_dir = env.matrix_eval_out_dir
             matrix_eval_id = matrix_eval_task_id(binary)
             preds = task.predecessor_outputs.get(matrix_eval_id, {})
             entry = preds.get("matrix_aggregate_drv", {})

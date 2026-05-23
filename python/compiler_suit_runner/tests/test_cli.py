@@ -794,25 +794,24 @@ def test_cmd_submit_populates_per_binary_toolchain_aggregate_drv(
     assert "hello" in pbm
     # New flatten shape: archs, variant_sample, variant_seed, tier,
     # toolchain_aggregate_drv. Per-arch suffix selection now lives in
-    # eval_worker, not the submit-time flatten loop.
+    # eval_worker, not the submit-time flatten loop. The dep_graph
+    # archive root is NOT threaded via per_binary_metadata anymore —
+    # the worker reads it from BuildWorkerEnv (container view), so
+    # this dict carries no path field.
     assert "suffixes" not in pbm["hello"]
+    assert "matrix_eval_out_dir" not in pbm["hello"]
     assert set(pbm["hello"].keys()) == {
         "archs",
         "variant_sample",
         "variant_seed",
         "tier",
         "toolchain_aggregate_drv",
-        # dep_graph framework task carries the matrix_eval out_dir in
-        # its payload; bash is resolved by the worker at dispatch via
-        # _resolve_bash_store_path_default().
-        "matrix_eval_out_dir",
     }
     assert pbm["hello"]["toolchain_aggregate_drv"] == aggregate_drv
     assert pbm["hello"]["archs"] == ["x86_64"]
     assert pbm["hello"]["variant_sample"] == 2
     assert pbm["hello"]["variant_seed"] == 42
     assert pbm["hello"]["tier"] == 1
-    assert pbm["hello"]["matrix_eval_out_dir"].endswith("_matrix_eval")
 
 
 def test_serialize_then_restore_preflight_roundtrip(tmp_path: pathlib.Path):

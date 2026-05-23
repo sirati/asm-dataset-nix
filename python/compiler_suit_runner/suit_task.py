@@ -2325,6 +2325,16 @@ class SuitTask:
                     "on_phase_end: dependency_graph spawn failed at %s",
                     pickle_path,
                 )
+                # Surface a clearly-marked CRITICAL line so the
+                # follow-on ``phase build ended: 0 completed, 0
+                # failed`` is unambiguously attributable to this
+                # degradation, not to "phase 4 found nothing to do".
+                self._logger.critical(
+                    "on_phase_end: dependency_graph descriptor load"
+                    " failed at %s — phase build will spawn ZERO"
+                    " tasks (degradation; see ERROR above)",
+                    pickle_path,
+                )
 
     # ── Broadcast-receive placement gossip ────────────────────────────
 
