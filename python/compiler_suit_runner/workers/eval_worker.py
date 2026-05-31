@@ -24,8 +24,8 @@ worker:
 3. Exports the aggregate closure to
    ``<matrix_eval_out_dir>/matrix-<binary>.drv.archive`` via
    ``nix-store --query --requisites`` + ``nix-store --export`` so the
-   primary's ``_MatrixEvalQuiesceWatcher`` + ``dependency_graph_worker``
-   (phase 3) AND every secondary's ``build_worker`` (phase 4) can
+   ``dependency_graph_worker`` (phase 3) AND every secondary's
+   ``build_worker`` (phase 4) can
    re-import the full drv graph (toolchain aggregate + matrix
    aggregate + every leaf) into their local store without re-
    evaluating the flake. The archive filename mirrors the

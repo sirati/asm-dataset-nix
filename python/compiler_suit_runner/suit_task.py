@@ -61,7 +61,6 @@ deployments go through the framework's worker protocol.
 from __future__ import annotations
 
 import dataclasses
-import json
 import logging
 import os
 import pathlib
@@ -81,7 +80,6 @@ from compiler_suit_runner.holding_matcher import (
 )
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
-    matrix_eval_task_id,
     read_manifest,
 )
 from compiler_suit_runner.peer_cache import (
@@ -329,12 +327,13 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
     output directory. :meth:`SuitTask.on_phase_end` then reads that
     pickle when ``phase_id == "dependency_graph"``, translates the
     descriptor list to :class:`ManifestHeader` instances via
-    :func:`dependency_graph_planner.headers_from_descriptors`, and
-    hands them to :meth:`_MatrixEvalQuiesceWatcher._spawn_tasks`
-    which in turn drives ``primary_handle.spawn_tasks`` for the
-    ``build`` phase. The spawn fan-out stays primary-affined because
-    "task creation can only be done by the manager (primary)" is
-    still a framework invariant.
+    :func:`dependency_graph_planner.headers_from_descriptors`,
+    converts each to a framework ``TaskInfo`` via
+    :func:`_header_to_task_info`, and hands them to
+    ``self._primary_handle.spawn_tasks`` for the ``build`` phase. The
+    spawn fan-out stays primary-affined because "task creation can
+    only be done by the manager (primary)" is still a framework
+    invariant.
     """
     from dynamic_runner.task_protocol import (  # type: ignore[import-not-found]
         PhaseSpec,
@@ -582,272 +581,43 @@ class _PeerLifecycleListener:
 
 
 # ---------------------------------------------------------------------------
-# matrix_eval quiesce watcher
+# dependency_graph → build header conversion
 # ---------------------------------------------------------------------------
 
 
-class _MatrixEvalQuiesceWatcher:
-    """Wait for every ``matrix_eval__<binary>`` task to complete.
+def _header_to_task_info(header: ManifestHeader):
+    """Convert one :class:`ManifestHeader` directly into a framework
+    ``TaskInfo``. Mirrors the call shape used by
+    :func:`_make_task_info` (the disk-round-trip path used by
+    :meth:`SuitTask.discover_items`) so spawn-side and discover-side
+    items differ only by source, not by encoding.
 
-    The framework drives phase-3 via its own ``dependency_graph``
-    PhaseSpec; this watcher only records matrix_eval task completions
-    so :meth:`SuitTask.on_phase_end` can observe quiesce. The spawn
-    primitives :meth:`_spawn_tasks` / :meth:`_header_to_task_info`
-    are invoked from :meth:`SuitTask.on_phase_end` after the framework
-    reports phase-3 quiesce.
-
-    Calls to :meth:`on_task_completed` are guarded by an internal lock
-    so concurrent completions from a worker pool are safe.
+    The ``payload`` carried on the resulting TaskInfo is the same
+    header_dict shape ``discover_items`` emits, so downstream
+    workers see a uniform payload regardless of whether the item
+    came from preflight or from Phase 1 planning.
     """
-
-    def __init__(
-        self,
-        expected_task_ids: Iterable[str],
-        out_dir: pathlib.Path,
-        *,
-        logger: Optional[logging.Logger] = None,
-        primary_handle: Optional[Any] = None,
-    ) -> None:
-        self._expected: frozenset[str] = frozenset(expected_task_ids)
-        self._completed: set[str] = set()
-        self._out_dir = pathlib.Path(out_dir)
-        self._primary_handle = primary_handle
-        self._lock = threading.Lock()
-        self._logger = logger or logging.getLogger(__name__)
-
-    # ── Public read-only inspection (used by tests) ────────────────────
-
-    @property
-    def expected(self) -> frozenset[str]:
-        return self._expected
-
-    @property
-    def completed(self) -> frozenset[str]:
-        return frozenset(self._completed)
-
-    # ── Event entry point ──────────────────────────────────────────────
-
-    def on_task_completed(
-        self, task_id: str, result: Any = None
-    ) -> None:
-        """Bookkeeping-only: record one matrix_eval task's completion.
-
-        No-op when:
-
-        * ``task_id`` is empty.
-        * ``task_id`` is not in the expected set (the watcher coexists
-          with other listeners on the same hook surface).
-        * The task_id has already been marked complete (idempotent).
-        """
-        if not task_id:
-            return
-        with self._lock:
-            if task_id not in self._expected:
-                return
-            if task_id in self._completed:
-                return
-            self._completed.add(task_id)
-
-    # ── spawn_tasks dispatch ──────────────────────────────────────────
-
-    def _dump_dependency_graph(
-        self, headers: list[ManifestHeader],
-    ) -> pathlib.Path:
-        """Serialise ``headers`` to ``_dependency_graph_headers.json``
-        (the descriptors-as-headers companion file) for offline
-        inspection.
-
-        The dependency_graph worker writes the authoritative descriptor
-        payload to ``_dependency_graph.pkl`` (pickle, hard cutover).
-        This helper emits a parallel ManifestHeader-equivalent JSON
-        view under a distinct name so operators eyeballing the spawn
-        output see what the framework will consume, without colliding
-        with the pickle path.
-
-        Best-effort: an OSError is logged + swallowed so the spawn
-        path can still proceed.
-        """
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        graph_path = self._out_dir / "_dependency_graph_headers.json"
-        serialised = [
-            {
-                "item_class": h.item_class,
-                "name": h.name,
-                "size": h.size,
-                "payload": h.payload,
-                "task_id": h.task_id,
-                "task_depends_on": list(h.task_depends_on),
-            }
-            for h in headers
-        ]
-        try:
-            graph_path.write_text(
-                json.dumps(serialised, indent=2, sort_keys=True),
-                encoding="utf-8",
-            )
-        except OSError:
-            self._logger.exception(
-                "_MatrixEvalQuiesceWatcher: failed writing %s",
-                graph_path,
-            )
-        return graph_path
-
-    def _spawn_tasks(
-        self, headers: list[ManifestHeader]
-    ) -> None:
-        """Spawn-dispatch path.
-
-        Always overwrites ``_dependency_graph_headers.json`` with the
-        ManifestHeader-shaped view of the descriptor list (useful for
-        offline inspection / resume). When ``self._primary_handle``
-        is bound:
-
-        1. Convert each :class:`ManifestHeader` into a framework
-           ``TaskInfo`` via :meth:`_header_to_task_info`.
-        2. Call ``primary_handle.spawn_tasks(task_infos)``.
-        3. Log spawn count + error count. Per-error log severity:
-           - ``duplicate_task_hash`` → WARN (we expect a fresh
-             content-hash for every header; a duplicate means we hit
-             the framework's idempotent-respawn guard for a hash that
-             we believed was new).
-           - ``unknown_dependency`` → WARN with the offending
-             ``task_hash`` + ``dep_task_id`` (graph builder produced a
-             dep that doesn't exist — real bug).
-           - any other ``kind`` → WARN with the raw dict.
-
-        When ``self._primary_handle`` is None (single-process tests,
-        framework-pin gap) the JSON dump is the only side effect; an
-        INFO log explains the degradation.
-        """
-        graph_path = self._dump_dependency_graph(headers)
-
-        if self._primary_handle is None:
-            self._logger.info(
-                "_MatrixEvalQuiesceWatcher: primary_handle unbound;"
-                " wrote %s (build phase falls back to JSON-only)",
-                graph_path,
-            )
-            return
-
-        task_infos: list = []
-        for header in headers:
-            try:
-                task_infos.append(self._header_to_task_info(header))
-            except Exception:  # noqa: BLE001 — log + skip
-                self._logger.exception(
-                    "_MatrixEvalQuiesceWatcher: header→TaskInfo"
-                    " conversion failed for %s (task_id=%s); skipping",
-                    header.name,
-                    header.task_id,
-                )
-
-        if not task_infos:
-            self._logger.warning(
-                "_MatrixEvalQuiesceWatcher: no valid TaskInfo entries"
-                " to spawn (received %d header(s)); wrote %s",
-                len(headers),
-                graph_path,
-            )
-            return
-
-        try:
-            errors = self._primary_handle.spawn_tasks(task_infos)
-        except Exception:  # noqa: BLE001 — log + degrade
-            self._logger.exception(
-                "_MatrixEvalQuiesceWatcher: primary_handle.spawn_tasks"
-                " raised for %d task(s); build phase may stall",
-                len(task_infos),
-            )
-            return
-
-        errors_list = list(errors) if errors is not None else []
-        self._logger.info(
-            "_MatrixEvalQuiesceWatcher: spawn_tasks dispatched %d"
-            " task(s) with %d error(s); wrote %s",
-            len(task_infos),
-            len(errors_list),
-            graph_path,
-        )
-        for idx_err in errors_list:
-            try:
-                idx, err = idx_err
-            except (TypeError, ValueError):
-                self._logger.warning(
-                    "_MatrixEvalQuiesceWatcher: malformed spawn error"
-                    " entry %r; skipping",
-                    idx_err,
-                )
-                continue
-            kind = err.get("kind") if isinstance(err, dict) else ""
-            task_hash = err.get("task_hash") if isinstance(err, dict) else ""
-            offending = (
-                headers[idx] if 0 <= idx < len(headers) else None
-            )
-            offending_name = offending.name if offending is not None else "?"
-            if kind == "duplicate_task_hash":
-                # Plan builder produced a hash collision with the
-                # ledger. This is a real signal: the framework does
-                # NOT silently re-spawn Failed / Unfulfillable entries
-                # on duplicate hash, so a hit here means the planner
-                # re-emitted a hash we'd already submitted (e.g. on a
-                # planner retry). WARN so operators see it.
-                self._logger.warning(
-                    "_MatrixEvalQuiesceWatcher: spawn_tasks duplicate"
-                    " task_hash for header %s (idx=%d task_hash=%s)",
-                    offending_name, idx, task_hash,
-                )
-            elif kind == "unknown_dependency":
-                dep_task_id = (
-                    err.get("dep_task_id")
-                    if isinstance(err, dict)
-                    else ""
-                )
-                self._logger.warning(
-                    "_MatrixEvalQuiesceWatcher: spawn_tasks unknown"
-                    " dependency for header %s (idx=%d"
-                    " task_hash=%s dep_task_id=%s)",
-                    offending_name, idx, task_hash, dep_task_id,
-                )
-            else:
-                self._logger.warning(
-                    "_MatrixEvalQuiesceWatcher: spawn_tasks unrecognised"
-                    " error kind for header %s (idx=%d err=%r)",
-                    offending_name, idx, err,
-                )
-
-    def _header_to_task_info(self, header: ManifestHeader):
-        """Convert one :class:`ManifestHeader` directly into a framework
-        ``TaskInfo``. Mirrors the call shape used by
-        :func:`_make_task_info` (the disk-round-trip path used by
-        :meth:`SuitTask.discover_items`) so spawn-side and discover-side
-        items differ only by source, not by encoding.
-
-        The ``payload`` carried on the resulting TaskInfo is the same
-        header_dict shape ``discover_items`` emits, so downstream
-        workers see a uniform payload regardless of whether the item
-        came from preflight or from Phase 1 planning.
-        """
-        phase_id, type_id, affinity_id = _classify(header)
-        header_dict = {
-            "item_class": header.item_class,
-            "name": header.name,
-            "size": header.size,
-            "payload": dict(header.payload),
-        }
-        # ManifestHeader carries a synthetic "path" only by name; the
-        # framework treats path as an opaque tag for non-file-based
-        # tasks (SuitTask.uses_file_based_items = False), so we just
-        # use the header name as the path component.
-        return _make_task_info(
-            pathlib.Path(f"{header.name}.json"),
-            header.size,
-            phase_id=phase_id,
-            type_id=type_id,
-            affinity_id=affinity_id,
-            payload=header_dict,
-            task_id=header.task_id or "",
-            task_depends_on=tuple(header.task_depends_on),
-        )
+    phase_id, type_id, affinity_id = _classify(header)
+    header_dict = {
+        "item_class": header.item_class,
+        "name": header.name,
+        "size": header.size,
+        "payload": dict(header.payload),
+    }
+    # ManifestHeader carries a synthetic "path" only by name; the
+    # framework treats path as an opaque tag for non-file-based
+    # tasks (SuitTask.uses_file_based_items = False), so we just
+    # use the header name as the path component.
+    return _make_task_info(
+        pathlib.Path(f"{header.name}.json"),
+        header.size,
+        phase_id=phase_id,
+        type_id=type_id,
+        affinity_id=affinity_id,
+        payload=header_dict,
+        task_id=header.task_id or "",
+        task_depends_on=tuple(header.task_depends_on),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1002,12 +772,6 @@ class SuitTask:
         # land on a no-op callback that returns False, so the cluster
         # never actually fetches the broadcast drvs.
         self._broadcast_receiver: Optional[BroadcastReceiver] = None
-        # matrix_eval → build quiesce watcher. Populated by
-        # on_run_start when matrix_eval items are present in the
-        # manifest dir. Reference held so the listener doesn't get
-        # GC'd; framework task-completion events drive its
-        # on_task_completed method.
-        self._matrix_eval_watcher: Optional[_MatrixEvalQuiesceWatcher] = None
         # Q4 peer-lifecycle listener (constructed by on_run_start).
         # Held on ``self`` so callers wiring it onto the framework's
         # ``RustPrimaryCoordinator(..., peer_lifecycle_listener=)``
@@ -1057,46 +821,6 @@ class SuitTask:
     @property
     def peer_lifecycle_listener(self) -> Optional["_PeerLifecycleListener"]:
         return self._peer_lifecycle_listener
-
-    @property
-    def task_completed_listener(
-        self,
-    ) -> Callable[[Optional[str], bool, Optional[str]], None]:
-        """Return the duck-typed callable the framework picks off
-        ``getattr(task, "task_completed_listener", None)``.
-
-        The framework invokes the returned callable on every
-        ``TaskCompleted`` / ``TaskFailed`` apply with
-        ``(task_id, success, error_kind)``. We forward the event into
-        ``self._matrix_eval_watcher.on_task_completed`` when the
-        watcher is active AND the task_id is in its expected set;
-        non-matching ids (e.g. toolchain completions) and absent-watcher
-        conditions are NoOps. The watcher itself is already idempotent
-        on duplicate fires, so the dispatch can be invoked freely.
-
-        Exceptions are swallowed so a buggy consumer-side listener can
-        not stall the framework's apply path.
-        """
-        def _dispatch(
-            task_id: Optional[str],
-            success: bool,
-            error_kind: Optional[str],
-        ) -> None:
-            del success, error_kind  # not consumed by the watcher today
-            try:
-                watcher = self._matrix_eval_watcher
-                if watcher is None or not task_id:
-                    return
-                if task_id not in watcher.expected:
-                    return
-                watcher.on_task_completed(task_id)
-            except Exception:  # noqa: BLE001 — never raise out
-                self._logger.exception(
-                    "task_completed_listener: dispatch raised for"
-                    " task_id=%s",
-                    task_id,
-                )
-        return _dispatch
 
     # ── Worker-function injection seams (used by tests) ────────────────
 
@@ -1308,20 +1032,20 @@ class SuitTask:
 
         ``primary_handle`` is the in-flight runtime control surface
         the framework's modern dispatcher (post-``5fa212c``) passes via
-        kwarg. Captured onto ``self._primary_handle`` so subsequent
-        matrix_eval → build dispatch via
-        ``_MatrixEvalQuiesceWatcher`` can drive
+        kwarg. Captured onto ``self._primary_handle`` so the
+        ``dependency_graph`` → ``build`` dispatch in
+        :meth:`on_phase_end` can drive
         ``primary_handle.spawn_tasks(...)``. When the kwarg is absent
-        (legacy callers, single-process tests) the watcher degrades to
-        the JSON-only fallback.
+        (legacy callers, single-process tests) :meth:`on_phase_end`
+        logs a warning and skips the build-phase spawn.
         """
-        del source_dir, args  # unused (output_dir consumed below)
+        del source_dir, args, output_dir  # unused
         with self._setup_lock:
             if self._setup_done:
                 # Late-binding the handle on a re-entry is harmless;
-                # the watcher reads ``self._primary_handle`` through
-                # the SuitTask reference, so a flip after construction
-                # still takes effect for any later spawn fire.
+                # :meth:`on_phase_end` reads ``self._primary_handle``
+                # through the SuitTask reference, so a flip after
+                # construction still takes effect for the later spawn.
                 if primary_handle is not None:
                     self._primary_handle = primary_handle
                 return
@@ -1781,39 +1505,6 @@ class SuitTask:
                         "on_run_start: PeerNixConfWatcher start failed"
                     )
 
-            # 6b. matrix_eval → build quiesce watcher.
-            #
-            # Scan the manifest dir for matrix_eval items. If any
-            # exist, spin up a _MatrixEvalQuiesceWatcher whose
-            # on_task_completed method is the framework's
-            # task-completion hook target. The watcher's
-            # ``_spawn_tasks`` is invoked from
-            # :meth:`SuitTask.on_phase_end` when the framework signals
-            # the ``dependency_graph`` phase has ended; that handler
-            # reads the worker-written pickle and fans out the
-            # resulting headers into ``primary_handle.spawn_tasks``
-            # for the ``build`` phase.
-            #
-            # We register the watcher best-effort against whatever
-            # task-completion surface the framework currently exposes
-            # — the consumer drives it directly when no hook is
-            # available. The reference is held on ``self`` so it is
-            # not garbage-collected mid-run.
-            try:
-                self._matrix_eval_watcher = self._build_matrix_eval_watcher(
-                    output_dir=output_dir,
-                )
-                if self._matrix_eval_watcher is not None:
-                    self._register_matrix_eval_watcher(
-                        self._matrix_eval_watcher,
-                    )
-            except Exception:  # noqa: BLE001 — log + continue
-                self._logger.exception(
-                    "on_run_start: _MatrixEvalQuiesceWatcher setup"
-                    " failed; build phase will not auto-fire"
-                )
-                self._matrix_eval_watcher = None
-
             # 7. ssh_debug (opt-in) — spawn sshd as a detached session
             # leader on ``config.ssh_debug_port`` and drop a ready
             # marker on the gateway-readable mount. Survives this
@@ -1971,11 +1662,6 @@ class SuitTask:
                     "on_run_end: withdraw_self failed"
                 )
 
-            # Drop the matrix_eval watcher reference; if it never
-            # fired (e.g. run aborted mid-matrix_eval) it just gets
-            # GC'd. No cleanup work — the watcher owns no threads,
-            # files, or sockets of its own.
-            self._matrix_eval_watcher = None
             self._signing_key = None
             self._setup_done = False
 
@@ -2293,47 +1979,120 @@ class SuitTask:
             completed,
             failed,
         )
-        if (
-            phase_id == "dependency_graph"
-            and self._matrix_eval_watcher is not None
-        ):
-            # Late imports keep planner machinery off the import path
-            # in single-process tests that never reach phase 3.
-            from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
-                headers_from_descriptors,
-                load_phase4_descriptors,
+        if phase_id != "dependency_graph":
+            return
+        if self._primary_handle is None:
+            # Secondary, or a framework-pin gap where the handle was
+            # never delivered to on_run_start. Task creation is a
+            # primary-only operation, so there is nothing to do here.
+            self._logger.warning(
+                "on_phase_end(\"dependency_graph\"): no primary_handle"
+                " (secondary or framework-pin gap); cannot spawn build"
+                " phase"
             )
-            from compiler_suit_runner.workers.dependency_graph_worker.output import (  # noqa: PLC0415
-                DEPENDENCY_GRAPH_PICKLE,
+            return
+
+        # Late imports keep planner machinery off the import path
+        # in single-process tests that never reach phase 3.
+        from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
+            headers_from_descriptors,
+            load_phase4_descriptors,
+        )
+        from compiler_suit_runner.workers.dependency_graph_worker.output import (  # noqa: PLC0415
+            DEPENDENCY_GRAPH_PICKLE,
+        )
+
+        # Container-view path: the dependency_graph worker writes
+        # ``_dependency_graph.pkl`` under matrix_eval_out_dir
+        # (the fa7b604 archive-root resolution rule). No manifest scan.
+        pickle_path = self.config.matrix_eval_out_dir / DEPENDENCY_GRAPH_PICKLE
+        try:
+            descriptors, _summary = load_phase4_descriptors(pickle_path)
+            headers = headers_from_descriptors(descriptors)
+            task_infos: list = []
+            for header in headers:
+                try:
+                    task_infos.append(_header_to_task_info(header))
+                except Exception:  # noqa: BLE001 — log + skip
+                    self._logger.exception(
+                        "on_phase_end: header→TaskInfo failed for %s"
+                        " (task_id=%s); skipping",
+                        header.name,
+                        header.task_id,
+                    )
+            self._logger.info(
+                "on_phase_end(\"dependency_graph\"): loaded %d"
+                " descriptors; spawning %d task(s)",
+                len(descriptors), len(task_infos),
+            )
+            errors = self._primary_handle.spawn_tasks(task_infos) or []
+            self._log_spawn_errors(errors, headers)
+        except Exception:  # noqa: BLE001 — log + degrade
+            self._logger.exception(
+                "on_phase_end: dependency_graph spawn failed at %s",
+                pickle_path,
+            )
+            # Surface a clearly-marked CRITICAL line so the
+            # follow-on ``phase build ended: 0 completed, 0
+            # failed`` is unambiguously attributable to this
+            # degradation, not to "phase 4 found nothing to do".
+            self._logger.critical(
+                "on_phase_end: dependency_graph descriptor load"
+                " failed at %s — phase build will spawn ZERO"
+                " tasks (degradation; see ERROR above)",
+                pickle_path,
             )
 
-            out_dir = self._matrix_eval_watcher._out_dir
-            pickle_path = out_dir / DEPENDENCY_GRAPH_PICKLE
+    def _log_spawn_errors(
+        self, errors: Iterable, headers: list[ManifestHeader],
+    ) -> None:
+        """Port of the old watcher's per-error WARN diagnostics.
+
+        ``primary_handle.spawn_tasks`` returns a list of
+        ``(idx, error_dict)`` pairs (empty = all spawned cleanly).
+        Each entry is logged at WARN with severity-specific context:
+
+        * ``duplicate_task_hash`` — the planner re-emitted a hash the
+          framework already holds (the framework does NOT silently
+          re-spawn Failed / Unfulfillable entries on duplicate hash).
+        * ``unknown_dependency`` — the graph builder produced a dep
+          that doesn't exist (real bug); logged with ``dep_task_id``.
+        * any other ``kind`` — logged with the raw dict.
+        """
+        for idx_err in errors:
             try:
-                descriptors, _summary = load_phase4_descriptors(
-                    pickle_path
+                idx, err = idx_err
+            except (TypeError, ValueError):
+                self._logger.warning(
+                    "on_phase_end: malformed spawn error entry %r;"
+                    " skipping",
+                    idx_err,
                 )
-                headers = headers_from_descriptors(descriptors)
-                self._logger.info(
-                    "on_phase_end(\"dependency_graph\"): loaded %d "
-                    "phase-4 descriptors; spawning %d tasks",
-                    len(descriptors), len(headers),
+                continue
+            kind = err.get("kind") if isinstance(err, dict) else ""
+            task_hash = err.get("task_hash") if isinstance(err, dict) else ""
+            offending = headers[idx] if 0 <= idx < len(headers) else None
+            offending_name = offending.name if offending is not None else "?"
+            if kind == "duplicate_task_hash":
+                self._logger.warning(
+                    "on_phase_end: spawn_tasks duplicate task_hash for"
+                    " header %s (idx=%d task_hash=%s)",
+                    offending_name, idx, task_hash,
                 )
-                self._matrix_eval_watcher._spawn_tasks(headers)
-            except Exception:  # noqa: BLE001 — log + degrade
-                self._logger.exception(
-                    "on_phase_end: dependency_graph spawn failed at %s",
-                    pickle_path,
+            elif kind == "unknown_dependency":
+                dep_task_id = (
+                    err.get("dep_task_id") if isinstance(err, dict) else ""
                 )
-                # Surface a clearly-marked CRITICAL line so the
-                # follow-on ``phase build ended: 0 completed, 0
-                # failed`` is unambiguously attributable to this
-                # degradation, not to "phase 4 found nothing to do".
-                self._logger.critical(
-                    "on_phase_end: dependency_graph descriptor load"
-                    " failed at %s — phase build will spawn ZERO"
-                    " tasks (degradation; see ERROR above)",
-                    pickle_path,
+                self._logger.warning(
+                    "on_phase_end: spawn_tasks unknown dependency for"
+                    " header %s (idx=%d task_hash=%s dep_task_id=%s)",
+                    offending_name, idx, task_hash, dep_task_id,
+                )
+            else:
+                self._logger.warning(
+                    "on_phase_end: spawn_tasks unrecognised error kind"
+                    " for header %s (idx=%d err=%r)",
+                    offending_name, idx, err,
                 )
 
     # ── Broadcast-receive placement gossip ────────────────────────────
@@ -2377,115 +2136,6 @@ class SuitTask:
                 )
 
         return _record
-
-    # ── matrix_eval watcher wiring ────────────────────────────────────
-
-    def _build_matrix_eval_watcher(
-        self,
-        *,
-        output_dir: Optional[pathlib.Path],
-    ) -> Optional[_MatrixEvalQuiesceWatcher]:
-        """Scan the manifest dir and return a watcher if matrix_eval is active.
-
-        Returns ``None`` (no watcher) when no ``matrix_eval`` manifest
-        is present — there's nothing to wait for so the build phase
-        can dispatch immediately when the framework gets to it.
-
-        ``config.matrix_eval_out_dir`` (when set) is used as the
-        archive root; it overrides ``output_dir`` and the legacy
-        ``shared_fs/'out'`` fallback. ``output_dir`` is the
-        framework-supplied per-run output directory used only when
-        ``matrix_eval_out_dir`` is absent.
-        """
-        manifest_dir = self.config.manifest_dir
-        try:
-            entries = sorted(manifest_dir.iterdir())
-        except (FileNotFoundError, NotADirectoryError):
-            return None
-
-        expected_ids: set[str] = set()
-
-        for entry in entries:
-            if not entry.is_file():
-                continue
-            if entry.name.startswith((".", "_")):
-                continue
-            if entry.suffix != ".json":
-                continue
-            try:
-                header = read_manifest(entry)
-            except Exception:  # noqa: BLE001 — corrupt manifest
-                continue
-            if header.item_class == "matrix_eval":
-                binary = header.payload.get("binary", "")
-                if isinstance(binary, str) and binary:
-                    expected_ids.add(
-                        header.task_id or matrix_eval_task_id(binary)
-                    )
-
-        if not expected_ids:
-            return None
-
-        resolved_out_dir = (
-            self.config.matrix_eval_out_dir
-            if self.config.matrix_eval_out_dir is not None
-            else (
-                pathlib.Path(output_dir)
-                if output_dir is not None
-                else self.config.shared_fs / "out"
-            )
-        )
-
-        return _MatrixEvalQuiesceWatcher(
-            expected_task_ids=expected_ids,
-            out_dir=resolved_out_dir,
-            primary_handle=self._primary_handle,
-            logger=self._logger,
-        )
-
-    def _register_matrix_eval_watcher(
-        self, watcher: _MatrixEvalQuiesceWatcher
-    ) -> None:
-        """Best-effort wire the watcher onto the framework's hook surface.
-
-        The framework's task-completion event seam is still in flight.
-        Try a few duck-typed registration surfaces in priority order;
-        if none exist the watcher remains callable from the consumer's
-        own dispatch loop (legacy single-process CLI drives it
-        directly). Either way we hold the reference on ``self`` so it
-        isn't GC'd.
-        """
-        try:
-            from dynamic_runner import run as dynrunner_run  # type: ignore[import-not-found]
-        except Exception:  # noqa: BLE001 — framework absent
-            self._logger.debug(
-                "_register_matrix_eval_watcher: dynamic_runner.run not"
-                " importable; watcher attached to SuitTask only"
-            )
-            return
-
-        for attr in ("register_task_completed_listener",
-                     "add_task_completed_listener",
-                     "on_task_completed"):
-            hook = getattr(dynrunner_run, attr, None)
-            if callable(hook):
-                try:
-                    hook(watcher.on_task_completed)
-                    self._logger.info(
-                        "_register_matrix_eval_watcher: wired via"
-                        " dynamic_runner.run.%s",
-                        attr,
-                    )
-                    return
-                except Exception:  # noqa: BLE001
-                    self._logger.exception(
-                        "_register_matrix_eval_watcher: %s raised", attr,
-                    )
-        self._logger.info(
-            "_register_matrix_eval_watcher: framework task_completed"
-            " hook not found; watcher reachable via"
-            " SuitTask._matrix_eval_watcher.on_task_completed"
-        )
 
     # ==================================================================
     # Legacy in-process dispatch surface

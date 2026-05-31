@@ -12,15 +12,14 @@ cleanly:
   binary (exactly three), each task lands on a secondary, runs
   :func:`compiler_suit_runner.workers.eval_worker.run_eval_task`, and
   publishes the kept-variant closure at
-  ``<matrix_eval_out_dir>/matrix-<binary>.drv.archive`` (the
-  matrix-eval quiesce signal — archive presence alone tells the
-  watcher this binary's eval is done; no JSON sidecar is written, the
-  dependency_graph_worker derives variant_lookup from the imported
-  .drv paths).
-* After matrix_eval quiesces, the
-  :class:`compiler_suit_runner.suit_task._MatrixEvalQuiesceWatcher`
-  shells out to ``workers.dependency_graph_worker`` and translates
-  the resulting descriptors into ``build_variant`` /
+  ``<matrix_eval_out_dir>/matrix-<binary>.drv.archive`` (archive
+  presence alone signals this binary's eval is done; no JSON sidecar
+  is written, the dependency_graph_worker derives variant_lookup from
+  the imported .drv paths).
+* The framework ``dependency_graph`` phase runs
+  ``workers.dependency_graph_worker``, which writes
+  ``_dependency_graph.pkl``. :meth:`SuitTask.on_phase_end` then loads
+  that pickle and translates the descriptors into ``build_variant`` /
   ``build_common_dep`` headers spawned via
   ``primary_handle.spawn_tasks``.
 * Final ``<dataset_dir>/<pkg>/<variant_dir>/`` directories are
@@ -192,21 +191,20 @@ def _assert_matrix_eval_archive(
 ) -> pathlib.Path:
     """Assert the per-binary matrix-eval archive exists and is non-empty.
 
-    Returns the archive path. The archive's presence IS the matrix-eval
-    quiesce signal (the ``_MatrixEvalQuiesceWatcher`` keys off it), so
-    a missing or empty archive means the eval worker either never ran
-    or crashed before writing. The JSON sidecar has been retired —
-    the dependency_graph_worker derives variant_lookup from the
-    imported .drv paths via ``parse_variant_path``.
+    Returns the archive path. The archive's presence signals this
+    binary's matrix-eval is done, so a missing or empty archive means
+    the eval worker either never ran or crashed before writing. The
+    JSON sidecar has been retired — the dependency_graph_worker derives
+    variant_lookup from the imported .drv paths via
+    ``parse_variant_path``.
     """
     out_dir = _matrix_eval_out_dir(shared_fs)
     archive = out_dir / f"matrix-{binary}.drv.archive"
     assert archive.is_file(), (
         f"matrix-eval archive missing for {binary!r}: "
-        f"expected {archive} to exist (presence of the archive is "
-        f"the _MatrixEvalQuiesceWatcher's quiesce signal; a missing "
-        f"file means the eval worker either never ran or crashed "
-        f"before writing)"
+        f"expected {archive} to exist (presence of the archive signals "
+        f"this binary's matrix-eval is done; a missing file means the "
+        f"eval worker either never ran or crashed before writing)"
     )
     assert archive.stat().st_size > 0, (
         f"matrix-eval archive empty for {binary!r}: {archive} has "
@@ -461,8 +459,8 @@ def test_t20_matrix_eval_happy(
     )
 
     # Assertion (3): matrix-eval archive per binary (non-empty). The
-    # archive is the _MatrixEvalQuiesceWatcher's quiesce signal;
-    # missing or empty here means the eval worker landed but produced
+    # archive signals this binary's matrix-eval is done; missing or
+    # empty here means the eval worker landed but produced
     # no drvs (typically a flake-eval failure inside the secondary).
     # The JSON sidecar was retired post-migration — the
     # dependency_graph_worker derives variant_lookup from the imported
@@ -500,9 +498,9 @@ def test_t20_matrix_eval_happy(
 
     assert build_variant_manifests, (
         "dependency_graph produced no build_variant manifests for "
-        f"{detail}; the _MatrixEvalQuiesceWatcher likely never fired "
-        f"(check the submitter stderr for "
-        f"'_MatrixEvalQuiesceWatcher' log lines). manifests_dir "
+        f"{detail}; on_phase_end likely never spawned the build phase "
+        f"(check the submitter stderr for 'on_phase_end' / "
+        f"'dependency_graph' log lines). manifests_dir "
         f"= {manifests_dir}"
     )
 
