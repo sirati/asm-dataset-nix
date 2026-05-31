@@ -1,16 +1,15 @@
 """Unit tests for :mod:`compiler_suit_runner.suit_task`.
 
-Tests for ``SuitTask`` wiring and the matrix_eval quiesce watcher's
-spawn bridge. Phase 3 (``dependency_graph``) is dispatched by the
-framework as a task; this module covers ``on_task_completed``
-bookkeeping, ``_spawn_tasks`` translation, and the
-``on_phase_end("dependency_graph")`` pickle-read + spawn path.
+Tests for ``SuitTask`` wiring and the phase-3→4 spawn bridge. Phase 3
+(``dependency_graph``) is dispatched by the framework as a task; this
+module covers the ``_header_to_task_info`` conversion and the
+``on_phase_end("dependency_graph")`` pickle-read + direct
+``primary_handle.spawn_tasks`` path.
 """
 
 from __future__ import annotations
 
 import dataclasses as _dataclasses
-import json
 import logging
 import pathlib
 from unittest import mock
@@ -19,14 +18,12 @@ import pytest
 
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
-    matrix_eval_task_id,
     build_compilers_task_id,
-    write_manifest,
 )
 from compiler_suit_runner.suit_task import (
     SuitTask,
     SuitTaskConfig,
-    _MatrixEvalQuiesceWatcher,
+    _header_to_task_info,
 )
 from compiler_suit_runner.dependency_graph_planner import (
     Phase4Descriptor,
@@ -56,52 +53,6 @@ def _make_config(tmp_path: pathlib.Path) -> SuitTaskConfig:
         run_id="r1",
         secondary_id="primary",
         hostname="host",
-    )
-
-
-_TC_AGG_DRV_FIXTURE = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-toolchains.drv"
-
-
-def _matrix_eval_header(
-    binary: str,
-    *,
-    toolchain_aggregate_drv: str = _TC_AGG_DRV_FIXTURE,
-) -> ManifestHeader:
-    return ManifestHeader(
-        item_class="matrix_eval",
-        name=f"matrix_eval__{binary}",
-        size=0,
-        payload={
-            "binary": binary,
-            "sys": _SYS,
-            "archs": ["x86_64"],
-            "suffixes": ["O0"],
-            "attr": f"dataset.{_SYS}.{binary}",
-            "toolchain_aggregate_drv": toolchain_aggregate_drv,
-        },
-        task_id=matrix_eval_task_id(binary),
-        task_depends_on=(),
-    )
-
-
-def _toolchain_header(
-    arch: str, compiler_label: str, drv: str,
-) -> ManifestHeader:
-    return ManifestHeader(
-        item_class="toolchain_validate",
-        name=f"toolchain_validate__{arch}__{compiler_label}",
-        size=0,
-        payload={
-            "sys": _SYS,
-            "arch": arch,
-            "compiler_label": compiler_label,
-            "attr": (
-                f"_crossToolchainMap.{_SYS}.{arch}.{compiler_label}"
-            ),
-            "drv": drv,
-            "validate_only": True,
-        },
-        task_id=build_compilers_task_id(_SYS, arch, compiler_label),
     )
 
 
@@ -142,298 +93,30 @@ def _variant_header(binary: str, label: str, compiler_id: str = "gcc15"):
 
 
 # ---------------------------------------------------------------------------
-# _MatrixEvalQuiesceWatcher bookkeeping
+# _header_to_task_info free-function conversion
 # ---------------------------------------------------------------------------
 
 
-def test_watcher_initialises_with_expected_set(
-    tmp_path: pathlib.Path,
-) -> None:
-    expected = {matrix_eval_task_id("hello"),
-                matrix_eval_task_id("busybox")}
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids=expected,
-        out_dir=tmp_path / "out",
-    )
-    assert w.expected == frozenset(expected)
-    assert w.completed == frozenset()
+def test_header_to_task_info_common_dep() -> None:
+    """A ``build_common_dep`` header converts to a ``common_dep`` task
+    in the ``build`` phase with the header_dict payload preserved."""
+    header = _common_dep_header("glibc", "/nix/store/x-glibc.drv")
+    ti = _header_to_task_info(header)
+    assert ti.phase_id == "build"
+    assert ti.type_id == "common_dep"
+    assert ti.payload["item_class"] == "build_common_dep"
+    assert ti.payload["name"] == "common_dep__glibc"
 
 
-def test_watcher_noops_for_non_matrix_eval_task(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A toolchain (or any) task_id that is not in ``expected`` is
-    ignored. The watcher coexists with other listeners on the same hook
-    surface (K=3 replication, etc.) so it must not raise."""
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={matrix_eval_task_id("hello")},
-        out_dir=tmp_path / "out",
-    )
-    w.on_task_completed("toolchain__gcc15__x86_64")
-    w.on_task_completed("")  # empty id — defensive guard
-    w.on_task_completed("merge__singleton")
-    assert w.completed == frozenset()
-
-
-def test_watcher_records_matrix_eval_completion(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A matching matrix_eval task moves into ``completed``."""
-    hello = matrix_eval_task_id("hello")
-    busybox = matrix_eval_task_id("busybox")
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={hello, busybox},
-        out_dir=tmp_path / "out",
-    )
-    w.on_task_completed(hello)
-    assert w.completed == frozenset({hello})
-
-
-# ---------------------------------------------------------------------------
-# _spawn_tasks dispatch path (used by tests + on_phase_end translation)
-# ---------------------------------------------------------------------------
-
-
-def test_spawn_tasks_no_handle_writes_dependency_graph_and_logs_count(
-    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
-) -> None:
-    """With ``primary_handle=None`` the spawn path falls back to
-    writing ``_dependency_graph_headers.json`` (the operator-debug
-    headers view) and emits an INFO log explaining the degradation."""
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    logger = logging.getLogger("test_spawn_no_handle")
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={matrix_eval_task_id("hello")},
-        out_dir=out_dir,
-        primary_handle=None,
-        logger=logger,
-    )
-    headers = [
-        _common_dep_header("glibc", "/nix/store/x-glibc.drv"),
-        _variant_header("hello", "hello-x86_64-gcc15-O0"),
-    ]
-    with caplog.at_level(logging.INFO, logger="test_spawn_no_handle"):
-        w._spawn_tasks(headers)
-    graph_path = out_dir / "_dependency_graph_headers.json"
-    assert graph_path.is_file()
-    parsed = json.loads(graph_path.read_text(encoding="utf-8"))
-    assert isinstance(parsed, list)
-    assert len(parsed) == 2
-    assert parsed[0]["item_class"] == "build_common_dep"
-    assert parsed[1]["item_class"] == "build_variant"
-    assert parsed[1]["task_depends_on"]
-    # INFO log line mentions the JSON-only fallback.
-    assert any(
-        "primary_handle unbound" in rec.message
-        for rec in caplog.records
-    )
-
-
-def test_spawn_tasks_no_handle_creates_missing_out_dir(
-    tmp_path: pathlib.Path,
-) -> None:
-    """The fallback path mkdirs ``out_dir`` if absent so the planner
-    can fire on a fresh shared-fs."""
-    out_dir = tmp_path / "fresh-out"
-    assert not out_dir.exists()
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={matrix_eval_task_id("hello")},
-        out_dir=out_dir,
-        primary_handle=None,
-    )
-    w._spawn_tasks([])
-    assert (out_dir / "_dependency_graph_headers.json").is_file()
-
-
-def test_spawn_tasks_with_handle_calls_primary_handle(
-    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
-) -> None:
-    """When a primary_handle is bound, ``_spawn_tasks`` converts each
-    header into a TaskInfo and calls ``primary_handle.spawn_tasks(...)``."""
-    out_dir = tmp_path / "out"
-    handle = mock.MagicMock()
-    handle.spawn_tasks.return_value = []
-    logger = logging.getLogger("test_spawn_with_handle")
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={matrix_eval_task_id("hello")},
-        out_dir=out_dir,
-        primary_handle=handle,
-        logger=logger,
-    )
-    headers = [
-        _common_dep_header("glibc", "/nix/store/x-glibc.drv"),
-        _variant_header("hello", "hello-x86_64-gcc15-O0"),
-    ]
-    with caplog.at_level(logging.INFO, logger="test_spawn_with_handle"):
-        w._spawn_tasks(headers)
-    handle.spawn_tasks.assert_called_once()
-    args, _ = handle.spawn_tasks.call_args
-    task_infos = list(args[0])
-    assert len(task_infos) == 2
-    ti0 = task_infos[0]
-    assert ti0.payload["item_class"] == "build_common_dep"
-    ti1 = task_infos[1]
-    assert ti1.payload["item_class"] == "build_variant"
-    assert (out_dir / "_dependency_graph_headers.json").is_file()
-    assert any(
-        "spawn_tasks dispatched 2 task(s) with 0 error(s)" in rec.message
-        for rec in caplog.records
-    )
-
-
-def test_spawn_tasks_duplicate_task_hash_logs_warning(
-    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A ``duplicate_task_hash`` error from spawn_tasks gets logged at
-    WARNING — we expected a fresh hash and the framework deduped."""
-    handle = mock.MagicMock()
-    handle.spawn_tasks.return_value = [
-        (0, {"kind": "duplicate_task_hash", "task_hash": "abc123"}),
-    ]
-    logger = logging.getLogger("test_spawn_dup")
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={matrix_eval_task_id("hello")},
-        out_dir=tmp_path / "out",
-        primary_handle=handle,
-        logger=logger,
-    )
-    headers = [_common_dep_header("glibc", "/nix/store/x-glibc.drv")]
-    with caplog.at_level(logging.WARNING, logger="test_spawn_dup"):
-        w._spawn_tasks(headers)
-    handle.spawn_tasks.assert_called_once()
-    assert any(
-        "duplicate task_hash" in rec.message
-        and "common_dep__glibc" in rec.message
-        and rec.levelno == logging.WARNING
-        for rec in caplog.records
-    )
-
-
-def test_spawn_tasks_unknown_dependency_logs_warning(
-    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
-) -> None:
-    """An ``unknown_dependency`` error logs WARN with task_hash +
-    dep_task_id; that's a real planner bug."""
-    handle = mock.MagicMock()
-    handle.spawn_tasks.return_value = [
-        (
-            0,
-            {
-                "kind": "unknown_dependency",
-                "task_hash": "deadbeef",
-                "dep_task_id": "missing-dep-id",
-            },
-        ),
-    ]
-    logger = logging.getLogger("test_spawn_unknown_dep")
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={matrix_eval_task_id("hello")},
-        out_dir=tmp_path / "out",
-        primary_handle=handle,
-        logger=logger,
-    )
-    headers = [_variant_header("hello", "hello-x86_64-gcc15-O0")]
-    with caplog.at_level(logging.WARNING, logger="test_spawn_unknown_dep"):
-        w._spawn_tasks(headers)
-    assert any(
-        "unknown dependency" in rec.message
-        and "deadbeef" in rec.message
-        and "missing-dep-id" in rec.message
-        and rec.levelno == logging.WARNING
-        for rec in caplog.records
-    )
-
-
-def test_spawn_tasks_swallows_handle_exception(
-    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
-) -> None:
-    """primary_handle.spawn_tasks raising must not propagate; we log
-    + degrade (build phase stalls, which is operator-visible)."""
-    handle = mock.MagicMock()
-    handle.spawn_tasks.side_effect = RuntimeError("boom")
-    logger = logging.getLogger("test_spawn_handle_raises")
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={matrix_eval_task_id("hello")},
-        out_dir=tmp_path / "out",
-        primary_handle=handle,
-        logger=logger,
-    )
-    headers = [_common_dep_header("glibc", "/nix/store/x-glibc.drv")]
-    with caplog.at_level(logging.ERROR, logger="test_spawn_handle_raises"):
-        w._spawn_tasks(headers)  # must not raise
-    assert any(
-        "primary_handle.spawn_tasks" in rec.message
-        for rec in caplog.records
-    )
-
-
-# ---------------------------------------------------------------------------
-# SuitTask._build_matrix_eval_watcher integration
-# ---------------------------------------------------------------------------
-
-
-def _seed_manifest_dir(
-    config: SuitTaskConfig,
-    headers: list[ManifestHeader],
-) -> None:
-    config.manifest_dir.mkdir(parents=True, exist_ok=True)
-    for header in headers:
-        write_manifest(config.manifest_dir, header)
-
-
-def test_build_matrix_eval_watcher_returns_none_when_no_matrix_eval(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Without any matrix_eval manifests the builder returns None."""
-    config = _make_config(tmp_path)
-    _seed_manifest_dir(config, [
-        _toolchain_header("x86_64", "gcc15", "/nix/store/x-gcc15.drv"),
-    ])
-    task = SuitTask(config)
-    assert task._build_matrix_eval_watcher(
-        output_dir=tmp_path / "out",
-    ) is None
-
-
-def test_build_matrix_eval_watcher_returns_none_when_manifest_dir_missing(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Manifest dir absent → no watcher, no exception."""
-    config = _make_config(tmp_path)
-    # Don't create config.manifest_dir.
-    task = SuitTask(config)
-    assert task._build_matrix_eval_watcher(
-        output_dir=tmp_path / "out",
-    ) is None
-
-
-def test_build_matrix_eval_watcher_falls_back_to_shared_fs(
-    tmp_path: pathlib.Path,
-) -> None:
-    """If the framework doesn't pass an output_dir (legacy/test path)
-    and config.matrix_eval_out_dir is None, the watcher defaults to
-    ``shared_fs / 'out'``."""
-    config = _make_config(tmp_path)
-    _seed_manifest_dir(config, [_matrix_eval_header("hello")])
-    task = SuitTask(config)
-    w = task._build_matrix_eval_watcher(output_dir=None)
-    assert w is not None
-    assert w._out_dir == config.shared_fs / "out"
-
-
-def test_build_matrix_eval_watcher_uses_config_matrix_eval_out_dir(
-    tmp_path: pathlib.Path,
-) -> None:
-    """``config.matrix_eval_out_dir`` (when set) takes precedence."""
-    explicit = tmp_path / "explicit-archive-dir"
-    base = _make_config(tmp_path)
-    config = _dataclasses.replace(base, matrix_eval_out_dir=explicit)
-    _seed_manifest_dir(config, [_matrix_eval_header("hello")])
-    task = SuitTask(config)
-    w = task._build_matrix_eval_watcher(output_dir=tmp_path / "other")
-    assert w is not None
-    assert w._out_dir == explicit
+def test_header_to_task_info_variant_carries_phase_and_type() -> None:
+    """A ``build_variant`` header converts to a ``variant`` task in the
+    ``build`` phase, carrying its ``task_depends_on`` edge."""
+    header = _variant_header("hello", "hello-x86_64-gcc15-O0")
+    ti = _header_to_task_info(header)
+    assert ti.phase_id == "build"
+    assert ti.type_id == "variant"
+    assert ti.payload["item_class"] == "build_variant"
+    assert ti.task_depends_on
 
 
 # ---------------------------------------------------------------------------
@@ -1005,7 +688,7 @@ def test_replication_context_callables_route_through_self(
 
 
 # ---------------------------------------------------------------------------
-# on_run_start primary_handle kwarg + task_completed_listener
+# on_run_start primary_handle kwarg capture
 # ---------------------------------------------------------------------------
 
 
@@ -1047,112 +730,25 @@ def test_on_run_start_backward_compat_without_kwarg(
         task.on_run_end(success=True)
 
 
-def test_task_completed_listener_forwards_to_watcher(
-    tmp_path: pathlib.Path,
-) -> None:
-    """The ``task_completed_listener`` property returns a callable that
-    routes matching task_ids into the matrix_eval watcher's
-    ``on_task_completed``; non-matching ids are NoOp."""
-    config = _make_config(tmp_path)
-    task = SuitTask(config)
-
-    hello = matrix_eval_task_id("hello")
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    watcher = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={hello},
-        out_dir=out_dir,
-    )
-    task._matrix_eval_watcher = watcher
-    listener = task.task_completed_listener
-    assert callable(listener)
-
-    listener("toolchain__gcc15__x86_64", True, None)
-    assert watcher.completed == frozenset()
-    listener("", True, None)
-    listener(None, True, None)
-    assert watcher.completed == frozenset()
-
-    listener(hello, True, None)
-    assert watcher.completed == frozenset({hello})
-
-
-def test_task_completed_listener_noop_without_watcher(
-    tmp_path: pathlib.Path,
-) -> None:
-    """No watcher constructed → the listener callable still answers
-    and silently no-ops on every call."""
-    config = _make_config(tmp_path)
-    task = SuitTask(config)
-    assert task._matrix_eval_watcher is None
-    listener = task.task_completed_listener
-    listener("anything", True, None)
-    listener("else", False, "recoverable")
-
-
-def test_task_completed_listener_swallows_watcher_exception(
-    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A buggy watcher must not propagate into the framework's apply
-    path."""
-    config = _make_config(tmp_path)
-    task = SuitTask(config)
-
-    fake_watcher = mock.MagicMock()
-    fake_watcher.expected = frozenset({"task-x"})
-    fake_watcher.on_task_completed.side_effect = RuntimeError("boom")
-    task._matrix_eval_watcher = fake_watcher
-
-    listener = task.task_completed_listener
-    with caplog.at_level(logging.ERROR):
-        listener("task-x", True, None)
-
-    assert any(
-        "task_completed_listener: dispatch raised" in rec.message
-        for rec in caplog.records
-    )
-
-
-def test_build_matrix_eval_watcher_threads_primary_handle(
-    tmp_path: pathlib.Path,
-) -> None:
-    """``_build_matrix_eval_watcher`` reads ``self._primary_handle``
-    and threads it onto the constructed watcher."""
-    config = _make_config(tmp_path)
-    config.manifest_dir.mkdir(parents=True, exist_ok=True)
-    write_manifest(config.manifest_dir, _matrix_eval_header("hello"))
-    task = SuitTask(config)
-    handle = mock.MagicMock()
-    task._primary_handle = handle
-
-    w = task._build_matrix_eval_watcher(output_dir=tmp_path / "out")
-    assert w is not None
-    assert w._primary_handle is handle
-
-
-def test_task_completed_listener_attribute_signature(
-    tmp_path: pathlib.Path,
-) -> None:
-    """The ``task_completed_listener`` callable accepts the framework's
-    ``(task_id, success, error_kind)`` shape."""
-    config = _make_config(tmp_path)
-    task = SuitTask(config)
-    listener = task.task_completed_listener
-    listener("some-task", False, "recoverable")
-    listener("other-task", True, None)
-    listener(None, True, None)
-
-
 # ---------------------------------------------------------------------------
-# on_phase_end("dependency_graph") pickle-read + spawn bridge
+# on_phase_end("dependency_graph") pickle-read + direct spawn bridge
 # ---------------------------------------------------------------------------
 
 
-def test_on_phase_end_dependency_graph_reads_pickle_and_spawns(
-    tmp_path,
-) -> None:
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
+class _FakePrimaryHandle:
+    """Capture the ``spawn_tasks`` argument; report no spawn errors."""
+
+    def __init__(self) -> None:
+        self.calls: list[list] = []
+
+    def spawn_tasks(self, task_infos):
+        captured = list(task_infos)
+        self.calls.append(captured)
+        return []
+
+
+def _write_two_descriptor_pickle(out_dir: pathlib.Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
     descriptors = [
         Phase4Descriptor(
             kind="build_common_dep",
@@ -1162,28 +758,115 @@ def test_on_phase_end_dependency_graph_reads_pickle_and_spawns(
             depends_on=(),
             priority_hint=0,
         ),
+        Phase4Descriptor(
+            kind="build_variant",
+            task_id="build_variant__x86_64__hello__hello-O0",
+            name="hello-O0",
+            payload={
+                "sys": _SYS,
+                "pkg": "hello",
+                "arch": "x86_64",
+                "label": "hello-O0",
+                "drv": "/nix/store/v-hello-O0.drv",
+                "variant_dir": "hello-O0",
+                "metadata_name": "hello-O0.json",
+                "compiler_id": "gcc15",
+                "tier": 1,
+                "attr": f"dataset.{_SYS}.hello.x86_64.hello-O0",
+            },
+            depends_on=("build_common_dep__abc.drv",),
+            priority_hint=0,
+        ),
     ]
     write_phase4_descriptors(
         descriptors=descriptors,
         summary={},
         out_path=out_dir / DEPENDENCY_GRAPH_PICKLE,
     )
-    config = _make_config(tmp_path)
+
+
+def test_on_phase_end_dependency_graph_spawns_via_primary_handle(
+    tmp_path,
+) -> None:
+    """``on_phase_end("dependency_graph")`` loads the pickle from
+    ``config.matrix_eval_out_dir`` and hands the converted TaskInfos
+    to ``primary_handle.spawn_tasks`` exactly once, each carrying the
+    ``build`` phase + the right type_id."""
+    out_dir = tmp_path / "out"
+    _write_two_descriptor_pickle(out_dir)
+    base = _make_config(tmp_path)
+    config = _dataclasses.replace(base, matrix_eval_out_dir=out_dir)
     task = SuitTask(config)
-    primary_handle = mock.Mock()
-    primary_handle.spawn_tasks.return_value = []
-    hello = matrix_eval_task_id("hello")
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={hello},
-        out_dir=out_dir,
-        primary_handle=primary_handle,
-    )
-    task._matrix_eval_watcher = w
+    handle = _FakePrimaryHandle()
+    task._primary_handle = handle
+
     task.on_phase_end("dependency_graph", completed=1, failed=0)
-    primary_handle.spawn_tasks.assert_called_once()
-    task_infos = primary_handle.spawn_tasks.call_args[0][0]
-    assert len(task_infos) == 1
-    assert task_infos[0].task_id == "build_common_dep__abc.drv"
+
+    assert len(handle.calls) == 1
+    task_infos = handle.calls[0]
+    assert len(task_infos) == 2
+    assert all(ti.phase_id == "build" for ti in task_infos)
+    by_id = {ti.task_id: ti for ti in task_infos}
+    assert by_id["build_common_dep__abc.drv"].type_id == "common_dep"
+    variant_ti = by_id["build_variant__x86_64__hello__hello-O0"]
+    assert variant_ti.type_id == "variant"
+    # No JSON sidecar of any kind is written; the pickle is the only
+    # on-disk artifact in the matrix_eval_out_dir.
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_on_phase_end_dependency_graph_no_primary_handle_warns(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With ``_primary_handle = None`` the handler logs a warning, does
+    not raise, and writes no JSON sidecar."""
+    out_dir = tmp_path / "out"
+    _write_two_descriptor_pickle(out_dir)
+    base = _make_config(tmp_path)
+    config = _dataclasses.replace(base, matrix_eval_out_dir=out_dir)
+    task = SuitTask(config)
+    assert task._primary_handle is None
+
+    with caplog.at_level(logging.WARNING):
+        task.on_phase_end("dependency_graph", completed=1, failed=0)
+
+    assert any(
+        "no primary_handle" in rec.message
+        for rec in caplog.records
+    )
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_on_phase_end_dependency_graph_logs_spawn_errors(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Per-task spawn errors returned by ``spawn_tasks`` are logged at
+    WARNING with severity-specific context (ported diagnostics)."""
+    out_dir = tmp_path / "out"
+    _write_two_descriptor_pickle(out_dir)
+    base = _make_config(tmp_path)
+    config = _dataclasses.replace(base, matrix_eval_out_dir=out_dir)
+    task = SuitTask(config)
+    handle = mock.Mock()
+    handle.spawn_tasks.return_value = [
+        (0, {"kind": "duplicate_task_hash", "task_hash": "abc123"}),
+        (
+            1,
+            {
+                "kind": "unknown_dependency",
+                "task_hash": "deadbeef",
+                "dep_task_id": "missing-dep-id",
+            },
+        ),
+    ]
+    task._primary_handle = handle
+
+    with caplog.at_level(logging.WARNING):
+        task.on_phase_end("dependency_graph", completed=1, failed=0)
+
+    msgs = " ".join(rec.message for rec in caplog.records)
+    assert "duplicate task_hash" in msgs and "abc123" in msgs
+    assert "unknown dependency" in msgs and "missing-dep-id" in msgs
 
 
 @pytest.mark.parametrize(
@@ -1194,15 +877,10 @@ def test_on_phase_end_other_phases_noop(
 ) -> None:
     config = _make_config(tmp_path)
     task = SuitTask(config)
-    primary_handle = mock.Mock()
-    w = _MatrixEvalQuiesceWatcher(
-        expected_task_ids={matrix_eval_task_id("hello")},
-        out_dir=tmp_path / "out",
-        primary_handle=primary_handle,
-    )
-    task._matrix_eval_watcher = w
+    handle = mock.Mock()
+    task._primary_handle = handle
     task.on_phase_end(phase_id, completed=1, failed=0)
-    primary_handle.spawn_tasks.assert_not_called()
+    handle.spawn_tasks.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

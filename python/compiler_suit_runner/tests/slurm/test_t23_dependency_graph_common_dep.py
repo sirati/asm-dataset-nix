@@ -8,25 +8,25 @@ listing that input ends up with the common dep's ``task_id`` in its
 glibc / cross-toolchain runtime libs from source, which defeats the
 whole point of moving eval into matrix_eval.
 
-The signal we assert against is the watcher's on-disk dump: at
-matrix_eval quiesce, ``_MatrixEvalQuiesceWatcher._dump_dependency_graph``
-(see ``suit_task.py``) serialises the synthesised
-:class:`ManifestHeader` list to
-``<matrix_eval_out_dir>/_dependency_graph_headers.json``. Reading that file
-post-run gives the test full visibility into the synthesised DAG
-independent of whether ``primary_handle.spawn_tasks`` actually fired
-(the dump is unconditional; the spawn is gated on a bound
-primary_handle).
+The signal we assert against is the dependency_graph worker's
+authoritative on-disk artifact: ``_dependency_graph.pkl`` written
+under ``<matrix_eval_out_dir>`` (defaults to
+``<shared_fs>/dataset/_matrix_eval``). We load it with
+:func:`dependency_graph_planner.load_phase4_descriptors` and translate
+the descriptors back into :class:`ManifestHeader` instances via
+:func:`dependency_graph_planner.headers_from_descriptors` — the exact
+conversion :meth:`SuitTask.on_phase_end` performs before
+``primary_handle.spawn_tasks``. This gives the test full visibility
+into the synthesised DAG independent of whether the spawn fired.
 
 What this test asserts:
 
 * Run completes cleanly (standard 7-invariant audit;
   ``expected_failure_count=0``).
-* ``_dependency_graph_headers.json`` exists under
-  ``<matrix_eval_out_dir>`` (defaults to
-  ``<shared_fs>/dataset/_matrix_eval``).
-* The JSON is a list of header dicts; at least one entry has
-  ``item_class == "build_common_dep"``.
+* ``_dependency_graph.pkl`` exists under ``<matrix_eval_out_dir>``
+  (defaults to ``<shared_fs>/dataset/_matrix_eval``).
+* The pickle decodes to descriptors; at least one converts to a
+  header with ``item_class == "build_common_dep"``.
 * At least one of those common-dep ``task_id`` values is referenced
   by ≥ 2 ``build_variant`` headers' ``task_depends_on`` arrays —
   the dedup contract.
@@ -47,7 +47,6 @@ from __future__ import annotations
 
 import collections
 import dataclasses
-import json
 import os
 import pathlib
 from typing import Any, Callable, Optional
@@ -133,23 +132,28 @@ def _candidate_graph_paths(
     shared_fs: pathlib.Path,
     log_dir: Optional[pathlib.Path],
 ) -> list[pathlib.Path]:
-    """Return every plausible location for ``_dependency_graph_headers.json``.
+    """Return every plausible location for ``_dependency_graph.pkl``.
 
-    The watcher writes to the configured ``matrix_eval_out_dir`` —
-    which defaults to ``<shared_fs>/dataset/_matrix_eval`` per
-    :func:`cli._build_config`. Older worktrees / framework-supplied
-    output_dir overrides may land the file elsewhere under
-    ``shared_fs``; we probe a small set of candidates and fall back
-    to a recursive scan so the test stays robust to wiring changes.
+    The dependency_graph worker writes to the configured
+    ``matrix_eval_out_dir`` — which defaults to
+    ``<shared_fs>/dataset/_matrix_eval`` per :func:`cli._build_config`.
+    Older worktrees / framework-supplied output_dir overrides may land
+    the file elsewhere under ``shared_fs``; we probe a small set of
+    candidates and fall back to a recursive scan so the test stays
+    robust to wiring changes.
     """
+    from compiler_suit_runner.workers.dependency_graph_worker.output import (
+        DEPENDENCY_GRAPH_PICKLE,
+    )
+
     candidates: list[pathlib.Path] = [
-        shared_fs / "dataset" / "_matrix_eval" / "_dependency_graph_headers.json",
-        shared_fs / "dataset" / "_dependency_graph_headers.json",
-        shared_fs / "out" / "_dependency_graph_headers.json",
-        shared_fs / "_dependency_graph_headers.json",
+        shared_fs / "dataset" / "_matrix_eval" / DEPENDENCY_GRAPH_PICKLE,
+        shared_fs / "dataset" / DEPENDENCY_GRAPH_PICKLE,
+        shared_fs / "out" / DEPENDENCY_GRAPH_PICKLE,
+        shared_fs / DEPENDENCY_GRAPH_PICKLE,
     ]
     if log_dir is not None:
-        candidates.append(log_dir / "_dependency_graph_headers.json")
+        candidates.append(log_dir / DEPENDENCY_GRAPH_PICKLE)
     return candidates
 
 
@@ -158,6 +162,10 @@ def _find_graph_file(
     log_dir: Optional[pathlib.Path],
 ) -> Optional[pathlib.Path]:
     """Pick the first existing candidate; fall back to a recursive scan."""
+    from compiler_suit_runner.workers.dependency_graph_worker.output import (
+        DEPENDENCY_GRAPH_PICKLE,
+    )
+
     for c in _candidate_graph_paths(shared_fs, log_dir):
         if c.is_file():
             return c
@@ -166,40 +174,46 @@ def _find_graph_file(
     # candidate list and the framework's actual output_dir shows up
     # here rather than as an opaque AssertionError.
     if shared_fs.is_dir():
-        for hit in shared_fs.rglob("_dependency_graph_headers.json"):
+        for hit in shared_fs.rglob(DEPENDENCY_GRAPH_PICKLE):
             return hit
     return None
 
 
 def _parse_graph(path: pathlib.Path) -> list[dict[str, Any]]:
-    """Decode ``_dependency_graph_headers.json`` into the header-dict list.
+    """Decode ``_dependency_graph.pkl`` into a header-dict list.
 
-    :meth:`_MatrixEvalQuiesceWatcher._dump_dependency_graph`
-    serialises each :class:`ManifestHeader` as a JSON object with
-    ``item_class``, ``name``, ``size``, ``payload``, ``task_id`` and
-    ``task_depends_on`` (a list of strings). We tolerate a corrupt
-    or empty file by raising AssertionError directly -- that surfaces
-    the real failure (planner emitted nothing) rather than a generic
-    JSONDecodeError.
+    Loads the descriptors via
+    :func:`dependency_graph_planner.load_phase4_descriptors`, converts
+    them back to :class:`ManifestHeader` instances via
+    :func:`dependency_graph_planner.headers_from_descriptors`, then
+    projects each header into the dict shape the dedup assertions
+    below consume (``item_class``, ``name``, ``task_id`` and
+    ``task_depends_on`` as a list of strings). A decode failure raises
+    AssertionError directly -- that surfaces the real failure (planner
+    emitted nothing / wrote a malformed pickle) rather than a generic
+    pickle error.
     """
+    from compiler_suit_runner.dependency_graph_planner import (
+        headers_from_descriptors,
+        load_phase4_descriptors,
+    )
+
     try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
+        descriptors, _summary = load_phase4_descriptors(path)
+    except Exception as exc:  # noqa: BLE001 — surface as assertion
         raise AssertionError(
-            f"failed reading {path}: {exc!r}"
+            f"failed to load phase-4 descriptors from {path}: {exc!r}"
         ) from exc
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise AssertionError(
-            f"{path} is not valid JSON: {exc!r}; raw[:500]={raw[:500]!r}"
-        ) from exc
-    if not isinstance(data, list):
-        raise AssertionError(
-            f"{path} must decode to a list of header dicts, got "
-            f"{type(data).__name__}"
-        )
-    return data
+    headers = headers_from_descriptors(descriptors)
+    return [
+        {
+            "item_class": h.item_class,
+            "name": h.name,
+            "task_id": h.task_id,
+            "task_depends_on": list(h.task_depends_on),
+        }
+        for h in headers
+    ]
 
 
 @pytest.mark.slurm_live
@@ -223,9 +237,9 @@ def test_t23_dependency_graph_common_dep_dedup(
     matrix_eval + dependency_graph split is the only mode now; no
     extra CLI flag is required to engage it.
 
-    Post-flight: standard 7-invariant audit, then locate the
-    watcher's ``_dependency_graph_headers.json`` under the shared FS, parse
-    it, and assert:
+    Post-flight: standard 7-invariant audit, then locate the worker's
+    ``_dependency_graph.pkl`` under the shared FS, decode it, and
+    assert:
 
     * ≥ 1 ``build_common_dep`` task was emitted.
     * At least one common-dep ``task_id`` is referenced by ≥ 2
@@ -341,20 +355,20 @@ def test_t23_dependency_graph_common_dep_dedup(
     )
 
     # ------------------------------------------------------------------
-    # T23 core assertions: dependency_graph dump + common-dep dedup
+    # T23 core assertions: dependency_graph pickle + common-dep dedup
     # contract.
     # ------------------------------------------------------------------
     graph_path = _find_graph_file(invocation.shared_fs, result.log_dir)
     assert graph_path is not None, (
-        f"_dependency_graph_headers.json not found under "
+        f"_dependency_graph.pkl not found under "
         f"{invocation.shared_fs!s}; checked candidates: "
         + ", ".join(
             str(c) for c in _candidate_graph_paths(
                 invocation.shared_fs, result.log_dir,
             )
         )
-        + f" ({detail}). Did the _MatrixEvalQuiesceWatcher fire? "
-        f"Check log_dir for '_MatrixEvalQuiesceWatcher' INFO lines."
+        + f" ({detail}). Did the dependency_graph worker run? "
+        f"Check log_dir for dependency_graph worker output."
     )
 
     headers = _parse_graph(graph_path)

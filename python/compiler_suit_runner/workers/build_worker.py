@@ -1361,7 +1361,7 @@ def main() -> int:
         The framework wraps the ``ManifestHeader`` into
         ``TaskInfo.payload`` so ``task.payload`` is the header_dict
         ``{item_class, name, size, payload: {...}}`` (see
-        :meth:`SuitTask._header_to_task_info`). The inner payload is
+        :func:`suit_task._header_to_task_info`). The inner payload is
         what :func:`eval_worker.run_eval_task` consumes; the
         ``item_class == "matrix_eval"`` marker is the
         unambiguous signal that this task targets the eval path.

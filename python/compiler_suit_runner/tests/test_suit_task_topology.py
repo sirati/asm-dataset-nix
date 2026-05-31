@@ -5,11 +5,12 @@ schedule the run; every dependency edge is load-bearing. These tests
 validate the post-rename ``build_compilers -> matrix_eval -> build``
 topology end-to-end without spinning up the framework.
 
-The ``dependency_graph`` step (plan's phase 3) is intentionally NOT a
-framework PhaseSpec — it runs primary-only via
-:class:`_MatrixEvalQuiesceWatcher` invoking the dependency_graph
-worker as a subprocess. The test below pins that absence so a future
-revert doesn't silently turn it into a framework dispatch.
+The ``dependency_graph`` step (plan's phase 3) is a first-class
+framework PhaseSpec depending on ``matrix_eval``; the ``build`` phase
+is spawned at runtime by the primary from
+:meth:`SuitTask.on_phase_end` via ``primary_handle.spawn_tasks``. The
+tests below pin that topology so a future change doesn't silently
+alter the dependency edges.
 """
 
 from __future__ import annotations

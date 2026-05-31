@@ -1120,9 +1120,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # build_compilers (when --build-compilers) + matrix_eval
         # manifests. The slow per-binary drv-instantiation is deferred
         # to matrix_eval workers on secondaries (see
-        # ``workers/eval_worker.py``). Phase 3+ tasks (dependency_graph,
-        # build) are spawned at runtime by the primary's quiesce
-        # watcher (``_MatrixEvalQuiesceWatcher`` in suit_task.py).
+        # ``workers/eval_worker.py``). The dependency_graph phase runs
+        # as a framework PhaseSpec; the build phase is spawned at
+        # runtime by the primary from
+        # ``SuitTask.on_phase_end("dependency_graph")`` via
+        # ``primary_handle.spawn_tasks`` (in suit_task.py).
         log.info("running pre-flight (toolchains + per-binary metadata only)")
         try:
             tc_pairs, tc_drvs, tc_aggregate_drv = enumerate_toolchains_only(
