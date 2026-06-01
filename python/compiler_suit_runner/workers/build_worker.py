@@ -1341,9 +1341,6 @@ def main() -> int:
     #     (below) imports lazily.
     #   * everything else is a build manifest;
     #     dispatched to :func:`build_worker` (this module).
-    from compiler_suit_runner.manifest_gen import (  # noqa: PLC0415
-        matrix_eval_task_id,
-    )
     from compiler_suit_runner.workers import (  # noqa: PLC0415
         build_compilers_worker as _build_compilers_worker,
         eval_worker as _eval_worker,
@@ -1517,13 +1514,8 @@ def main() -> int:
         # an empty list and silently degrade phase-4 to 0/0.
         dg_payload = _extract_class_payload(payload, "dependency_graph")
         if dg_payload is not None:
-            binary = dg_payload.get("binary")
             sys_name = dg_payload.get("sys") or "x86_64-linux"
             tc_drv = dg_payload.get("toolchain_aggregate_drv")
-            if not isinstance(binary, str) or not binary:
-                raise NonRecoverableError(
-                    "dependency_graph payload missing 'binary'"
-                )
             if not isinstance(tc_drv, str) or not tc_drv:
                 raise NonRecoverableError(
                     "dependency_graph payload missing 'toolchain_aggregate_drv'"
@@ -1535,14 +1527,39 @@ def main() -> int:
                     " to proceed without it"
                 )
             out_dir = env.matrix_eval_out_dir
-            matrix_eval_id = matrix_eval_task_id(binary)
-            preds = task.predecessor_outputs.get(matrix_eval_id, {})
-            entry = preds.get("matrix_aggregate_drv", {})
-            matrix_drv = entry.get("value")
-            if not matrix_drv:
+            # Single all-binaries dependency_graph task: gather the
+            # matrix_aggregate_drv from EVERY matrix_eval predecessor
+            # (one per binary) out of ``task.predecessor_outputs``.
+            # Each key is ``matrix_eval__<binary>`` and the published
+            # output is ``matrix_aggregate_drv`` (set by the upstream
+            # eval task via ``Task.publish_string``). We recover the
+            # binary name from the predecessor task-id so the worker
+            # never needs a per-binary payload.
+            matrix_drvs: dict[str, str] = {}
+            for pred_id, preds in task.predecessor_outputs.items():
+                if not isinstance(pred_id, str):
+                    continue
+                if not pred_id.startswith("matrix_eval__"):
+                    continue
+                bname = pred_id[len("matrix_eval__"):]
+                if not bname:
+                    continue
+                entry = preds.get("matrix_aggregate_drv", {}) if isinstance(
+                    preds, dict
+                ) else {}
+                value = entry.get("value") if isinstance(entry, dict) else None
+                if not value:
+                    raise NonRecoverableError(
+                        "build_worker dep_graph: no matrix_aggregate_drv "
+                        f"from {pred_id}; available keys: "
+                        f"{sorted(preds.keys()) if isinstance(preds, dict) else preds!r}"
+                    )
+                matrix_drvs[bname] = value
+            if not matrix_drvs:
                 raise NonRecoverableError(
-                    f"build_worker dep_graph: no matrix_aggregate_drv from {matrix_eval_id}; "
-                    f"available keys: {sorted(preds.keys())}"
+                    "build_worker dep_graph: no matrix_eval predecessor "
+                    "outputs found; available predecessor task-ids: "
+                    f"{sorted(task.predecessor_outputs.keys())}"
                 )
             bash_path = _resolve_bash_store_path_default() or ""
             if not bash_path:
@@ -1553,16 +1570,15 @@ def main() -> int:
                     " on PATH and a usable nixpkgs channel"
                 )
             _handle_log.info(
-                "handle: dispatching dependency_graph task binary=%r",
-                binary,
+                "handle: dispatching dependency_graph task over %d binaries: %r",
+                len(matrix_drvs), sorted(matrix_drvs),
             )
             try:
                 _dependency_graph_run.run_dependency_graph_task(
                     matrix_eval_out_dir=out_dir,
                     bash_path=bash_path,
                     toolchain_aggregate_drv=tc_drv,
-                    binary=binary,
-                    matrix_drv=matrix_drv,
+                    matrix_drvs=matrix_drvs,
                     sys_name=sys_name,
                 )
             except BaseException as exc:  # noqa: BLE001

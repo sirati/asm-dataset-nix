@@ -11,10 +11,19 @@ constant, so the framework's resource scheduler treats all items as
 zero-cost and packs purely by ``--jobs N`` worker count. Phase / type
 ordering is owned by :class:`PhaseSpec.depends_on` declared on the task.
 
-This module produces manifests for all known item classes in the plan's
-phase sequence:
+This module produces on-disk JSON manifests for the build-shaped item
+classes only. The ``matrix_eval`` (phase 2) and ``dependency_graph``
+(phase 3) phases are 100% JSON-free: nothing is written here and
+nothing is read back by :meth:`SuitTask.discover_items` for them.
+matrix_eval is exactly one task per binary and dependency_graph is
+exactly ONE all-binaries task, both built directly in-memory in
+:meth:`SuitTask.discover_items` from the preflight's per-binary
+metadata (threaded onto ``SuitTaskConfig.per_binary_metadata``).
+``make_matrix_eval_header`` remains as the in-memory constructor for
+the matrix_eval TaskInfos; its output is never serialised here.
 
-* ``matrix_eval``         — one per binary, distributed-eval task
+JSON-backed item classes:
+
 * ``build_compilers``     — one per (arch, compiler_label) cross-toolchain
                             (optional; gated by ``--build-compilers``)
 * ``toolchain_validate``  — one per (arch, compiler_label) when the
@@ -26,18 +35,14 @@ Iteration order in the returned :class:`ManifestSet` follows the phase
 sequence.
 
 Stage taxonomy (see :func:`emit_all_manifests` ``stages`` kwarg) groups
-item classes by submission lifecycle:
+JSON-backed item classes by submission lifecycle:
 
-* ``"matrix_eval"``     — distributed eval tasks (``matrix_eval``)
 * ``"build_compilers"`` — toolchain bootstrap tasks (``build_compilers``,
                           ``toolchain_validate``)
 * ``"build"``           — common-dep + variant build tasks (everything
                           else; emitted by the primary at runtime via
                           ``primary.spawn_tasks`` from the
                           dependency_graph planner)
-* ``"dependency_graph"`` — primary-only worker that translates
-                           ``matrix_eval`` outputs into the ``build``
-                           task list; no manifests emitted here
 """
 
 from __future__ import annotations
@@ -65,12 +70,18 @@ ItemClass = Literal[
 ]
 
 
-# All known item classes, in the canonical iteration order. Used so
+# Item classes emitted as on-disk JSON manifests by
+# :func:`emit_all_manifests`, in the canonical iteration order. Used so
 # ``ManifestSet.by_class`` can return an empty tuple for absent classes
 # rather than raising ``KeyError``.
+#
+# matrix_eval / dependency_graph are deliberately absent: those phases
+# are JSON-free (their TaskInfos are built in-memory in
+# :meth:`SuitTask.discover_items`), so emit_all_manifests never writes
+# a manifest for them. ``make_matrix_eval_header`` still exists — it is
+# used to build the matrix_eval TaskInfos in-memory — but its output is
+# never serialised through this module.
 _ALL_ITEM_CLASSES: tuple[ItemClass, ...] = (
-    "matrix_eval",
-    "dependency_graph",
     "build_compilers",
     "toolchain_validate",
     "build_common_dep",
@@ -83,25 +94,23 @@ _ALL_ITEM_CLASSES: tuple[ItemClass, ...] = (
 # only a subset of manifests when the submitter is only producing the
 # pre-dependency-graph slice (the ``build`` stage's tasks land later via
 # ``primary.spawn_tasks``).
+#
+# matrix_eval (phase 2) and dependency_graph (phase 3) are NOT in this
+# taxonomy: those phases are 100% JSON-free. Their TaskInfos are built
+# directly in-memory by :meth:`SuitTask.discover_items` from the
+# preflight's per-binary metadata (threaded onto ``SuitTaskConfig``),
+# so :func:`emit_all_manifests` neither writes nor reads any manifest
+# for them. This module's JSON machinery covers only build_compilers /
+# toolchain_validate / build phases.
 Stage = Literal[
-    "matrix_eval",
     "build_compilers",
-    "dependency_graph",
     "build",
 ]
 
 _STAGE_TO_CLASSES: dict[Stage, frozenset[ItemClass]] = {
-    "matrix_eval": frozenset({"matrix_eval"}),
     "build_compilers": frozenset({
         "build_compilers", "toolchain_validate",
     }),
-    # Dependency_graph as a framework task (per
-    # plan/placeholder-pattern-restructure.md PH-A): one task per
-    # binary, depends_on=[matrix_eval__<binary>], writes per-cell
-    # sidecar manifests for the placeholder build_variant + common_dep
-    # workers. Pre-PH-A this stage emitted nothing — the planner ran
-    # in-process from the watcher.
-    "dependency_graph": frozenset({"dependency_graph"}),
     "build": frozenset({
         "build_common_dep",
         "build_variant",
@@ -109,9 +118,7 @@ _STAGE_TO_CLASSES: dict[Stage, frozenset[ItemClass]] = {
 }
 
 _ALL_STAGES: tuple[Stage, ...] = (
-    "matrix_eval",
     "build_compilers",
-    "dependency_graph",
     "build",
 )
 
@@ -211,20 +218,12 @@ def matrix_eval_task_id(binary: str) -> str:
     return f"matrix_eval__{binary}"
 
 
-def dependency_graph_task_id(binary: str) -> str:
-    """Stable id for a per-binary dependency_graph framework task.
-
-    One task per binary, mirrors :func:`matrix_eval_task_id`. The
-    dep-graph worker imports ``<out_dir>/matrix-<binary>.drv.archive`` and
-    pulls the matrix_aggregate drv path from the upstream
-    matrix_eval task's keyed outputs (``task.predecessor_outputs[
-    matrix_eval_task_id(binary)]["matrix_aggregate_drv"]["value"]``,
-    published via ``Task.publish_string``), runs the streaming
-    planner, and writes per-(compiler, arch) sidecar manifests under
-    ``<out_dir>/_manifests/``. The placeholder build_variant tasks
-    declare ``task_depends_on=[dependency_graph_task_id(binary)]``.
-    """
-    return f"dependency_graph__{binary}"
+# The dependency_graph phase is a SINGLE all-binaries framework task
+# (NOT one per binary): its id is a stable constant and it depends on
+# every phase-2 ``matrix_eval__<binary>`` task. The worker is invoked
+# once over all binaries and writes one ``_dependency_graph.pkl``
+# covering the whole run.
+DEPENDENCY_GRAPH_TASK_ID = "dependency_graph"
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +239,12 @@ def make_matrix_eval_header(
     variant_sample: Optional[int] = None,
     variant_seed: Optional[str] = None,
 ) -> ManifestHeader:
-    """Build a matrix_eval (distributed-eval) manifest.
+    """Build a matrix_eval (distributed-eval) :class:`ManifestHeader`.
+
+    matrix_eval is JSON-free: this header is consumed in-memory by
+    :meth:`SuitTask.discover_items` (one TaskInfo per binary) and is
+    never serialised through :func:`write_manifest` / read back via
+    :func:`read_manifest`.
 
     One task per binary. The eval worker (``workers/eval_worker.py``)
     runs ``nix-eval-jobs --flake .#dataset.<sys>.<binary>.<arch>`` for
@@ -286,51 +290,6 @@ def make_matrix_eval_header(
         payload=payload,
         task_id=matrix_eval_task_id(binary),
         task_depends_on=(),
-    )
-
-
-def make_dependency_graph_header(
-    binary: str,
-    sys_name: str,
-    *,
-    toolchain_aggregate_drv: str,
-) -> ManifestHeader:
-    """Build a dependency_graph (Phase-3 framework-task) manifest.
-
-    One task per binary. The worker reads the matrix_aggregate drv
-    path from ``task.predecessor_outputs[matrix_eval_task_id(binary)
-    ]["matrix_aggregate_drv"]["value"]`` (published by the upstream
-    matrix_eval task via ``Task.publish_string``), imports
-    ``<matrix_eval_out_dir>/matrix-<binary>.drv.archive`` (where
-    ``matrix_eval_out_dir`` comes from the worker's
-    ``--matrix-eval-out-dir`` flag — the container-view archive root
-    — not from this payload), runs the streaming planner against the
-    toolchain aggregate + this binary's matrix aggregate, and emits
-    per-(compiler, arch) sidecar manifests for the placeholder
-    build_variant tasks to consume.
-
-    ``task_depends_on=[matrix_eval_task_id(binary)]`` — the CRDT
-    activates this task atomically with matrix_eval's TaskCompleted
-    apply, avoiding the eager-spawn race that bit the on_phase_end
-    shape (see dynrunner-owner consult 2026-05-21 12:04).
-    """
-    if not isinstance(toolchain_aggregate_drv, str) or not toolchain_aggregate_drv:
-        raise ValueError(
-            "make_dependency_graph_header: 'toolchain_aggregate_drv'"
-            f" must be a non-empty string, got {toolchain_aggregate_drv!r}"
-        )
-    payload: dict = {
-        "binary": binary,
-        "sys": sys_name,
-        "toolchain_aggregate_drv": toolchain_aggregate_drv,
-    }
-    return ManifestHeader(
-        item_class="dependency_graph",
-        name=f"dependency_graph__{binary}",
-        size=0,
-        payload=payload,
-        task_id=dependency_graph_task_id(binary),
-        task_depends_on=(matrix_eval_task_id(binary),),
     )
 
 
@@ -670,109 +629,6 @@ class ManifestSet:
         return {cls: tuple(items) for cls, items in groups.items()}
 
 
-def emit_matrix_eval_manifests(
-    per_binary_metadata: dict[str, dict],
-    *,
-    sys_name: str,
-) -> list[ManifestHeader]:
-    """Build one matrix_eval (distributed-eval) manifest header per binary.
-
-    ``per_binary_metadata`` maps a binary name to a metadata dict of
-    shape::
-
-        {
-            "archs": ["x86_64", "aarch64", ...],
-            "toolchain_aggregate_drv": "/nix/store/...-toolchains.drv",
-            "variant_sample": 64,    # optional
-            "variant_seed": "...",   # optional
-        }
-
-    This shape is what :func:`compiler_suit_runner.preflight
-    .enumerate_variants` returns (per-binary metadata for matrix_eval
-    workers; submitter never instantiates variant drvs).
-
-    ``toolchain_aggregate_drv`` is required on each metadata entry —
-    a missing/empty value is treated as a schema-version mismatch
-    (manifests built before the field was wired need a fresh
-    preflight) and raises :class:`ValueError`.
-
-    Each emitted header has ``task_depends_on=()`` for now. Once
-    ``build_compilers`` is wired (gated by ``--build-compilers``),
-    this should reference the relevant build_compilers task ids.
-
-    The function returns the list of headers; the caller is
-    responsible for writing them to disk (typically via
-    :func:`emit_all_manifests(stages=["build_compilers", "matrix_eval"])`,
-    which delegates here).
-    """
-    headers: list[ManifestHeader] = []
-    # Sort binaries for deterministic iteration order so test
-    # assertions and operator log lines are stable across runs.
-    for binary in sorted(per_binary_metadata.keys()):
-        meta = per_binary_metadata[binary]
-        archs = meta.get("archs", ())
-        variant_sample = meta.get("variant_sample")
-        variant_seed = meta.get("variant_seed")
-        toolchain_aggregate_drv = meta.get("toolchain_aggregate_drv")
-        if not toolchain_aggregate_drv:
-            raise ValueError(
-                f"emit_matrix_eval_manifests: binary {binary!r} metadata"
-                " is missing required 'toolchain_aggregate_drv' field;"
-                " re-run pre-flight to regenerate manifests."
-            )
-        headers.append(
-            make_matrix_eval_header(
-                binary=binary,
-                sys_name=sys_name,
-                archs=archs,
-                toolchain_aggregate_drv=toolchain_aggregate_drv,
-                variant_sample=variant_sample,
-                variant_seed=variant_seed,
-            )
-        )
-    return headers
-
-
-def emit_dependency_graph_manifests(
-    per_binary_metadata: dict[str, dict],
-    *,
-    sys_name: str,
-) -> list[ManifestHeader]:
-    """Build one ``dependency_graph`` manifest header per binary.
-
-    Symmetric with :func:`emit_matrix_eval_manifests`. Each header has
-    ``task_depends_on=[matrix_eval_task_id(binary)]`` so the framework
-    CRDT activates the dep_graph task atomically with the matrix_eval
-    completion (no on_phase_end-driven spawn race; see
-    plan/placeholder-pattern-restructure.md PH-A).
-
-    Per-binary metadata is the same shape :func:`emit_matrix_eval_manifests`
-    consumes; the only required field is
-    ``toolchain_aggregate_drv`` (re-used as the planner's anchor drv).
-    The archive root is resolved on the worker side from the
-    container's ``--matrix-eval-out-dir`` flag, not from per-binary
-    metadata — submitter-host paths do not exist inside secondaries.
-    """
-    headers: list[ManifestHeader] = []
-    for binary in sorted(per_binary_metadata.keys()):
-        meta = per_binary_metadata[binary]
-        toolchain_aggregate_drv = meta.get("toolchain_aggregate_drv")
-        if not toolchain_aggregate_drv:
-            raise ValueError(
-                f"emit_dependency_graph_manifests: binary {binary!r} metadata"
-                " is missing required 'toolchain_aggregate_drv' field;"
-                " re-run pre-flight to regenerate manifests."
-            )
-        headers.append(
-            make_dependency_graph_header(
-                binary=binary,
-                sys_name=sys_name,
-                toolchain_aggregate_drv=toolchain_aggregate_drv,
-            )
-        )
-    return headers
-
-
 def emit_all_manifests(
     *,
     target_dir: pathlib.Path,
@@ -789,12 +645,14 @@ def emit_all_manifests(
     per_binary_metadata: Optional[dict[str, dict]] = None,
     stages: Optional[list[str]] = None,
 ) -> ManifestSet:
-    """Produce one ManifestHeader per queue item; write each to disk.
+    """Produce one ManifestHeader per JSON-backed queue item; write
+    each to disk.
 
     Ordering of the returned ``headers`` tuple is deterministic and
-    follows the phase sequence: matrix_eval, build_compilers /
-    toolchain_validate, build_common_dep, build_variant. Phase
-    ordering is enforced by the framework's
+    follows the phase sequence: build_compilers / toolchain_validate,
+    build_common_dep, build_variant. (matrix_eval / dependency_graph
+    are JSON-free — see the module docstring.) Phase ordering is
+    enforced by the framework's
     :class:`PhaseSpec.depends_on` graph; no explicit barrier sentinels
     are emitted.
 
@@ -814,25 +672,23 @@ def emit_all_manifests(
     callers; it is no longer used (the framework sizes its worker pool
     independently).
 
-    ``per_binary_metadata`` carries the per-binary input for the
-    matrix_eval tasks (see :func:`emit_matrix_eval_manifests` for the
-    shape). When None, no matrix_eval manifests are emitted regardless
-    of ``stages``.
+    ``per_binary_metadata`` is accepted for call-site compatibility but
+    is no longer used here: matrix_eval (phase 2) and dependency_graph
+    (phase 3) are JSON-free and built in-memory by
+    :meth:`SuitTask.discover_items`.
 
     ``stages`` selects which lifecycle stages to emit:
 
-    * ``None`` (default, legacy): emit every class — used by callers
-      that still run the monolithic submitter flow.
-    * a list of values from
-      ``{"matrix_eval", "build_compilers", "dependency_graph", "build"}``:
-      emit only the classes whose stage is in the list. The new
-      submit-time path passes
-      ``stages=["build_compilers", "matrix_eval"]`` (when
-      ``--build-compilers`` is set) or ``stages=["matrix_eval"]``
-      so that ``build`` tasks can be spawned at runtime by the
-      primary via ``primary.spawn_tasks`` instead.
+    * ``None`` (default, legacy): emit every JSON-backed class — used
+      by callers that still run the monolithic submitter flow.
+    * a list of values from ``{"build_compilers", "build"}``: emit only
+      the classes whose stage is in the list. The submit-time path
+      passes ``stages=["build_compilers"]`` (when ``--build-compilers``
+      is set) or ``stages=[]`` so that ``build`` tasks can be spawned
+      at runtime by the primary via ``primary.spawn_tasks`` instead.
     """
     del num_workers  # accepted for compatibility; no longer used
+    del per_binary_metadata  # JSON-free phases 2/3 built in discover_items
 
     target_dir = pathlib.Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -870,33 +726,14 @@ def emit_all_manifests(
 
     headers: list[ManifestHeader] = []
 
-    # matrix_eval — distributed-eval tasks (one per binary). Emitted
-    # only when ``per_binary_metadata`` is provided AND the matrix_eval
-    # stage is active; legacy callers don't pass either.
-    if "matrix_eval" in active_classes and per_binary_metadata:
-        headers.extend(
-            emit_matrix_eval_manifests(
-                per_binary_metadata, sys_name=sys_name
-            )
-        )
-
-    # dependency_graph manifests piggy-back on per_binary_metadata
-    # (same shape as matrix_eval consumes). The framework activates
-    # each dep_graph task atomically with the matching matrix_eval
-    # completion via task_depends_on=[matrix_eval__<binary>] — no
-    # in-process spawn from on_phase_end. The archive root is NOT
-    # threaded here: the dep_graph worker reads it from its
-    # BuildWorkerEnv (populated from ``--matrix-eval-out-dir`` at
-    # the container call site), so the container view is the only
-    # source of truth. bash is resolved by the worker via
-    # _resolve_bash_store_path_default().
-    if "dependency_graph" in active_classes and per_binary_metadata:
-        headers.extend(
-            emit_dependency_graph_manifests(
-                per_binary_metadata,
-                sys_name=sys_name,
-            )
-        )
+    # matrix_eval (phase 2) and dependency_graph (phase 3) are NOT
+    # emitted here: those phases are JSON-free. Their TaskInfos are
+    # built directly in-memory by :meth:`SuitTask.discover_items` from
+    # the preflight's per-binary metadata threaded onto
+    # ``SuitTaskConfig.per_binary_metadata`` — no manifest written, no
+    # manifest read. ``per_binary_metadata`` is accepted here only for
+    # call-site compatibility (older callers pass it through); it has
+    # no effect on the on-disk manifests.
 
     # build_compilers / toolchain_validate, then build_common_dep.
     # Toolchain manifests carry the realised drv path when available

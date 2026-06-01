@@ -1211,17 +1211,24 @@ def _dependency_graph_wrapper_payload(
     sys_name: str = "x86_64-linux",
     tc_drv: str = "/nix/store/aaaa-toolchains.drv",
 ) -> dict:
-    """Build a dep_graph wrapper as :class:`SuitTask._header_to_task_info`
-    would emit. Crucially the inner payload does NOT carry
-    ``matrix_eval_out_dir`` — the new contract is that the worker
-    reads the archive root from the BuildWorkerEnv (synthesised from
-    ``--matrix-eval-out-dir``)."""
+    """Build the single all-binaries dep_graph wrapper as
+    :meth:`SuitTask._task_info_from_header` would emit. The inner
+    payload carries NO per-binary ``binary`` field and NO
+    ``matrix_eval_out_dir``: the dispatch gathers each binary's
+    matrix_aggregate_drv from ``task.predecessor_outputs`` (one
+    ``matrix_eval__<binary>`` key per binary) and reads the archive
+    root from the BuildWorkerEnv (synthesised from
+    ``--matrix-eval-out-dir``).
+
+    ``binary`` is retained only to keep call-sites terse; it is not
+    embedded in the payload anymore.
+    """
+    del binary  # no longer embedded — dep_graph is a single task
     return {
         "item_class": "dependency_graph",
-        "name": f"dependency_graph__{binary}",
+        "name": "dependency_graph",
         "size": 1,
         "payload": {
-            "binary": binary,
             "sys": sys_name,
             "toolchain_aggregate_drv": tc_drv,
         },
@@ -1268,19 +1275,30 @@ def test_main_handle_dependency_graph_uses_env_matrix_eval_out_dir(
     fake_mod = _sys.modules["dynamic_runner.worker"]
     Task = fake_mod.Task
 
-    wrapper = _dependency_graph_wrapper_payload(binary="hello")
-    task = Task(payload=wrapper, task_id="dependency_graph__hello")
+    wrapper = _dependency_graph_wrapper_payload()
+    task = Task(payload=wrapper, task_id="dependency_graph")
+    # Single all-binaries task: one matrix_eval predecessor per binary.
     task.predecessor_outputs = {
         "matrix_eval__hello": {
             "matrix_aggregate_drv": {"value": "/nix/store/m-hello.drv"},
+        },
+        "matrix_eval__busybox": {
+            "matrix_aggregate_drv": {"value": "/nix/store/m-busybox.drv"},
         },
     }
 
     handle(task)
 
     assert captured["matrix_eval_out_dir"] == container_archive_root
-    assert captured["binary"] == "hello"
-    assert captured["matrix_drv"] == "/nix/store/m-hello.drv"
+    # The dispatch gathers EVERY matrix_eval predecessor's aggregate
+    # drv into a {binary: drv} mapping and hands the full set to the
+    # worker — no single ``binary`` / ``matrix_drv`` anymore.
+    assert "binary" not in captured
+    assert "matrix_drv" not in captured
+    assert captured["matrix_drvs"] == {
+        "hello": "/nix/store/m-hello.drv",
+        "busybox": "/nix/store/m-busybox.drv",
+    }
     assert captured["toolchain_aggregate_drv"] == (
         "/nix/store/aaaa-toolchains.drv"
     )
@@ -1328,10 +1346,10 @@ def test_main_handle_dependency_graph_ignores_legacy_payload_field(
     fake_mod = _sys.modules["dynamic_runner.worker"]
     Task = fake_mod.Task
 
-    wrapper = _dependency_graph_wrapper_payload(binary="hello")
+    wrapper = _dependency_graph_wrapper_payload()
     # Inject a stale host-path field a legacy submitter might still emit.
     wrapper["payload"]["matrix_eval_out_dir"] = legacy_host_path
-    task = Task(payload=wrapper, task_id="dependency_graph__hello")
+    task = Task(payload=wrapper, task_id="dependency_graph")
     task.predecessor_outputs = {
         "matrix_eval__hello": {
             "matrix_aggregate_drv": {"value": "/nix/store/m-hello.drv"},
@@ -1367,8 +1385,8 @@ def test_main_handle_dependency_graph_without_matrix_eval_out_dir_is_non_recover
     Task = fake_mod.Task
     NonRecoverable = fake_mod.NonRecoverableError
 
-    wrapper = _dependency_graph_wrapper_payload(binary="hello")
-    task = Task(payload=wrapper, task_id="dependency_graph__hello")
+    wrapper = _dependency_graph_wrapper_payload()
+    task = Task(payload=wrapper, task_id="dependency_graph")
     task.predecessor_outputs = {
         "matrix_eval__hello": {
             "matrix_aggregate_drv": {"value": "/nix/store/m-hello.drv"},
