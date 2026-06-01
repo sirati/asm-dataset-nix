@@ -224,8 +224,12 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
     if item_class == "build_common_dep":
         return ("build", "common_dep", None)
     if item_class == "build_variant":
-        compiler = header.payload.get("compiler_id", "?")
-        arch = header.payload.get("arch", "?")
+        # Treat an empty compiler_id the same as a missing one so the
+        # affinity bucket never degrades to a leading-dash form like
+        # ``"-aarch64"`` (which mis-buckets every compiler-less variant
+        # together and breaks page-cache co-location with its toolchain).
+        compiler = header.payload.get("compiler_id") or "?"
+        arch = header.payload.get("arch") or "?"
         return ("build", "variant", f"{compiler}-{arch}")
     raise ValueError(f"unknown item_class {item_class!r}")
 

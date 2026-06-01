@@ -211,12 +211,31 @@ class TestDeriveVariantLookupFromAggregate:
         )
         assert ("x86_64", h_label) in lookup
         assert ("aarch64", w_label) in lookup
+        from compiler_suit_runner.preflight import (  # noqa: PLC0415
+            _short_dataset_name,
+        )
+        expected_vd = _short_dataset_name(
+            compiler_id="gcc15", arch="x86_64", optimization="O0",
+            full_label=h_label,
+        )
         assert lookup[("x86_64", h_label)] == {
             "drv": v_hello,
+            "pkg": "hello",
             "arch": "x86_64",
             "label": h_label,
             "suffix": "gcc15-O0-baseline-default-san-off-march-default",
+            "compiler_id": "gcc15",
+            "compiler_family": "gcc",
+            "compiler_version": "15",
+            "optimization": "O0",
+            "variant_dir": expected_vd,
+            "metadata_name": f"{expected_vd}.json",
         }
+        # variant_dir / compiler_id MUST be non-empty so the spawned
+        # build_variant task is complete (the build worker hard-fails
+        # on an empty payload.variant_dir).
+        assert lookup[("x86_64", h_label)]["variant_dir"]
+        assert lookup[("x86_64", h_label)]["compiler_id"] == "gcc15"
         # The helper made exactly one nix-store call.
         assert len(stub.calls) == 1
         assert stub.calls[0] == [
@@ -291,6 +310,93 @@ class TestDeriveVariantLookupFromAggregate:
             self.AGG_DRV, run_subprocess=stub,
         )
         assert len(lookup) == 1
+
+
+class TestVariantSpawnPayloadEndToEnd:
+    """The phase-3 → phase-4 spawn chain: a variant leaf in the matrix
+    aggregate must become a ``build_variant`` TaskInfo whose payload
+    carries every key the build worker reads — at minimum a non-empty
+    ``variant_dir`` (the worker hard-fails on
+    ``build_variant manifest missing 'payload.variant_dir'``) and a
+    non-empty ``compiler_id`` (so ``_classify`` yields a
+    ``"<compiler>-<arch>"`` affinity, never a leading-dash
+    ``"-<arch>"``).
+
+    Exercises the real chain end-to-end:
+    ``derive_variant_lookup_from_aggregate`` -> ``_variant_descriptor``
+    -> ``headers_from_descriptors`` -> ``_header_to_task_info``.
+    """
+
+    AGG_DRV = (
+        "/nix/store/ffffffffffffffffffffffffffffffff-matrix-hello.drv"
+    )
+
+    def _build_taskinfo_for(self, drv: str):
+        from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415,E501
+            headers_from_descriptors,
+        )
+        from compiler_suit_runner.dependency_graph_planner.descriptors import (  # noqa: PLC0415,E501
+            _variant_descriptor,
+        )
+        from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+            _header_to_task_info,
+        )
+
+        stub = _RefsStub(stdout=(drv + "\n").encode("utf-8"))
+        lookup = dgw.derive_variant_lookup_from_aggregate(
+            self.AGG_DRV, run_subprocess=stub,
+        )
+        assert len(lookup) == 1
+        (arch, label), spec = next(iter(lookup.items()))
+        descriptor = _variant_descriptor(
+            binary="hello",
+            arch=arch,
+            sys_name="x86_64-linux",
+            label=label,
+            variant_spec=spec,
+            depends_on=(),
+        )
+        headers = headers_from_descriptors([descriptor])
+        assert len(headers) == 1
+        return _header_to_task_info(headers[0]), spec
+
+    def test_payload_carries_variant_dir_and_compiler(self):
+        drv = _variant_drv(
+            "hello", "x86_64", "O2", comp="clang20", hash_prefix="hh1",
+        )
+        ti, spec = self._build_taskinfo_for(drv)
+        # _header_to_task_info wraps the header into the same outer
+        # ``{item_class, name, size, payload}`` dict discover_items
+        # emits; the build worker reads ``manifest.get("payload")`` to
+        # get the inner variant payload. Assert on that inner dict.
+        assert ti.payload["item_class"] == "build_variant"
+        payload = ti.payload["payload"]
+        # The key the build worker hard-requires.
+        assert payload["variant_dir"]
+        assert payload["variant_dir"] == spec["variant_dir"]
+        # Compiler axes the affinity + sidecar read.
+        assert payload["compiler_id"] == "clang20"
+        assert payload["compiler_family"] == "clang"
+        assert payload["pkg"] == "hello"
+        assert payload["arch"] == "x86_64"
+        assert payload["optimization"] == "O2"
+        assert payload["metadata_name"] == f"{spec['variant_dir']}.json"
+        # ``attr`` is reconstructed by headers_from_descriptors and the
+        # build drv path is threaded through unchanged.
+        assert payload["attr"] == (
+            f"dataset.x86_64-linux.hello.x86_64.{payload['label']}"
+        )
+        assert payload["drv"] == drv
+
+    def test_affinity_is_compiler_dash_arch(self):
+        drv = _variant_drv(
+            "hello", "aarch64", "O0", comp="gcc15", hash_prefix="bb2",
+        )
+        ti, _spec = self._build_taskinfo_for(drv)
+        # The bug was ``"-aarch64"`` (empty compiler prefix); assert the
+        # compiler half is present and non-empty.
+        assert ti.affinity_id == "gcc15-aarch64"
+        assert not ti.affinity_id.startswith("-")
 
 
 def lookup_key_for(drv_path: str) -> str:
