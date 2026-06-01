@@ -30,6 +30,8 @@ from typing import Optional
 
 from template_graph.tree_walker import VARIANT_SUFFIX, parse_variant_path
 
+from compiler_suit_runner.preflight import _short_dataset_name
+
 from .subproc import RunSubprocess, default_run_subprocess
 
 
@@ -197,8 +199,15 @@ def derive_variant_lookup_from_aggregate(
     drv-basename substring between ``<binary>-<arch>-`` and
     ``-elf-folder.drv``.
 
-    Returns ``{(arch, label): {"drv": <store_path>, "arch": <arch>,
-    "label": <label>, "suffix": <suffix>}}``. Non-elf-folder
+    Returns ``{(arch, label): <variant_spec>}`` where each
+    ``variant_spec`` is the full worker-visible mapping built by
+    :func:`_variant_spec_from_parsed` — ``drv``, ``pkg``, ``arch``,
+    ``label``, ``suffix``, ``compiler_id``, ``compiler_family``,
+    ``compiler_version``, ``optimization``, ``variant_dir`` and
+    ``metadata_name``. ``variant_dir`` is what the build worker uses
+    for ELF placement, so it MUST be non-empty; deriving it here (not
+    leaving it for the descriptor to default to ``""``) is what keeps
+    the spawned ``build_variant`` task complete. Non-elf-folder
     references (toolchain aggregate, bash, ...) are filtered out.
     Leaves whose basename fails ``parse_variant_path`` are skipped
     with a WARN log line — they are not legitimate variant roots, so
@@ -240,7 +249,7 @@ def derive_variant_lookup_from_aggregate(
         if drv_basename is None:
             continue
         try:
-            binary, arch, _comp, _opt = parse_variant_path(drv_basename)
+            binary, arch, comp, opt = parse_variant_path(drv_basename)
         except Exception as exc:  # noqa: BLE001 - TreeWalkError + future kinds
             logger.warning(
                 "skipping unparseable variant drv %r: %s", path, exc,
@@ -258,13 +267,71 @@ def derive_variant_lookup_from_aggregate(
                 f"{path!r} — the matrix is supposed to deduplicate "
                 "at sampling time"
             )
-        lookup[key] = {
-            "drv": path,
-            "arch": arch,
-            "label": label,
-            "suffix": suffix,
-        }
+        lookup[key] = _variant_spec_from_parsed(
+            path=path,
+            binary=binary,
+            arch=arch,
+            comp=comp,
+            opt=opt,
+            label=label,
+            suffix=suffix,
+        )
     return lookup
+
+
+def _variant_spec_from_parsed(
+    *,
+    path: str,
+    binary: str,
+    arch: str,
+    comp: str,
+    opt: str,
+    label: str,
+    suffix: str,
+) -> dict[str, str]:
+    """Build the worker-visible variant_spec from a parsed variant drv.
+
+    The legacy JSON / preflight path filled ``variant_dir``,
+    ``compiler_id`` and the rest from the Nix-side ``_meta`` map. On
+    the dependency-graph path the matrix-aggregate references give us
+    only the drv store path, so we recover every field the build
+    worker reads from the post-hash basename instead:
+
+    * ``compiler_id`` / ``optimization`` come straight from
+      :func:`parse_variant_path` (``comp`` / ``opt``).
+    * ``compiler_family`` is the alphabetic prefix of ``comp``
+      (``gcc15`` -> ``gcc``); ``compiler_version`` is the remainder
+      (``15``), with underscores normalised to dots (``4_4`` -> ``4.4``)
+      to match the dotted versions the metadata sidecar expects.
+    * ``variant_dir`` / ``metadata_name`` use the SAME
+      :func:`compiler_suit_runner.preflight._short_dataset_name`
+      formatter the legacy path uses, hashed over ``label`` so the
+      ELF placement subdir is stable + collision-free
+      (``dataset/<pkg>/<variant_dir>/<elf>``).
+
+    ``flag_set`` / ``hardening`` / ``sanitizer`` / ``march`` are not
+    recoverable from the drv basename (they collapse into ``suffix``);
+    they stay empty here and only feed the best-effort sidecar JSON,
+    never build correctness.
+    """
+    family = comp.rstrip("0123456789_")
+    version = comp[len(family):].lstrip("-_").replace("_", ".")
+    variant_dir = _short_dataset_name(
+        compiler_id=comp, arch=arch, optimization=opt, full_label=label,
+    )
+    return {
+        "drv": path,
+        "pkg": binary,
+        "arch": arch,
+        "label": label,
+        "suffix": suffix,
+        "compiler_id": comp,
+        "compiler_family": family,
+        "compiler_version": version,
+        "optimization": opt,
+        "variant_dir": variant_dir,
+        "metadata_name": f"{variant_dir}.json",
+    }
 
 
 def _post_hash_basename(store_path: str) -> Optional[str]:
