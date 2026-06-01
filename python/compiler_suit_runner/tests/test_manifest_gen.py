@@ -12,7 +12,6 @@ from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
     ManifestSet,
     emit_all_manifests,
-    emit_matrix_eval_manifests,
     make_build_common_dep_header,
     make_build_compilers_header,
     make_build_variant_header,
@@ -332,10 +331,12 @@ def test_emit_all_manifests_full_shape(tmp_path: pathlib.Path):
     assert result.target_dir == tmp_path
 
     grouped = result.by_class
-    # matrix_eval not requested in this fixture (no per_binary_metadata
-    # passed) so zero matrix_eval headers; toolchain falls back to the
-    # build_compilers class because no resolved drvs were supplied.
-    assert len(grouped["matrix_eval"]) == 0
+    # matrix_eval / dependency_graph are JSON-free (built in-memory by
+    # discover_items), so they never appear in a ManifestSet; toolchain
+    # falls back to the build_compilers class because no resolved drvs
+    # were supplied.
+    assert "matrix_eval" not in grouped
+    assert "dependency_graph" not in grouped
     assert len(grouped["build_compilers"]) == 4
     assert len(grouped["build_common_dep"]) == 2
     assert len(grouped["build_variant"]) == 12
@@ -386,7 +387,7 @@ def test_emit_all_manifests_empty_inputs(tmp_path: pathlib.Path):
         common_deps=[],
     )
     grouped = result.by_class
-    assert grouped["matrix_eval"] == ()
+    assert "matrix_eval" not in grouped
     assert grouped["build_compilers"] == ()
     assert grouped["toolchain_validate"] == ()
     assert grouped["build_common_dep"] == ()
@@ -396,8 +397,10 @@ def test_emit_all_manifests_empty_inputs(tmp_path: pathlib.Path):
 def test_manifest_set_by_class_includes_all_known_classes(
     tmp_path: pathlib.Path,
 ):
-    """``by_class`` returns a tuple for every known ItemClass even when
-    no items in that class are present, so iteration is KeyError-free."""
+    """``by_class`` returns a tuple for every JSON-backed ItemClass even
+    when no items in that class are present, so iteration is
+    KeyError-free. matrix_eval / dependency_graph are JSON-free and so
+    are deliberately absent from this taxonomy."""
     result = emit_all_manifests(
         target_dir=tmp_path,
         sys_name="x86_64-linux",
@@ -407,8 +410,6 @@ def test_manifest_set_by_class_includes_all_known_classes(
     )
     grouped = result.by_class
     expected_keys = {
-        "matrix_eval",
-        "dependency_graph",
         "build_compilers",
         "toolchain_validate",
         "build_common_dep",
@@ -675,69 +676,33 @@ def test_matrix_eval_header_round_trips_toolchain_aggregate_drv(
     assert loaded.payload["toolchain_aggregate_drv"] == drv
 
 
-def test_emit_matrix_eval_manifests_one_per_binary():
-    metadata = _matrix_eval_metadata()
-    headers = emit_matrix_eval_manifests(metadata, sys_name="x86_64-linux")
-    assert len(headers) == 2
-    # Deterministic ordering — sorted by binary.
-    names = [h.name for h in headers]
-    assert names == ["matrix_eval__busybox", "matrix_eval__hello"]
-    for h in headers:
-        assert h.item_class == "matrix_eval"
-        # Empty depends_on — TODO: wire build_compilers task hashes.
-        assert h.task_depends_on == ()
-        assert isinstance(h.payload, dict)
-        assert "binary" in h.payload
-        assert "archs" in h.payload
-        assert "suffixes" not in h.payload
-        assert h.payload["toolchain_aggregate_drv"] == (
-            _DEFAULT_TC_AGGREGATE_DRV
-        )
-
-
-def test_emit_matrix_eval_manifests_rejects_missing_toolchain_aggregate_drv():
-    """Metadata without ``toolchain_aggregate_drv`` is rejected loudly
-    — that's the schema-mismatch signal for stale preflight outputs."""
-    metadata = {
-        "hello": {
-            "archs": ["x86_64"],
-            # toolchain_aggregate_drv deliberately omitted.
-        },
-    }
-    with pytest.raises(ValueError, match="toolchain_aggregate_drv"):
-        emit_matrix_eval_manifests(metadata, sys_name="x86_64-linux")
-
-
-def test_emit_matrix_eval_manifests_empty():
-    headers = emit_matrix_eval_manifests({}, sys_name="x86_64-linux")
-    assert headers == []
-
-
 # ---------------------------------------------------------------------------
 # Stage-filtered emission
+#
+# matrix_eval (phase 2) + dependency_graph (phase 3) are JSON-free: they
+# are NOT a valid emit_all_manifests stage and are never written here.
+# The build-side stages remain JSON-backed.
 
 
-def test_emit_all_manifests_stages_build_compilers_and_matrix_eval(
+def test_emit_all_manifests_stages_build_compilers_only(
     tmp_path: pathlib.Path,
 ):
-    """Submit-time slice: emit only build_compilers (toolchains) +
-    matrix_eval (per-binary eval). ``build`` stage manifests stay out —
-    those land later via ``primary.spawn_tasks`` from the
-    dependency_graph planner.
+    """Submit-time slice: emit only build_compilers (toolchains).
+    matrix_eval / dependency_graph are JSON-free and never written;
+    ``build`` stage manifests stay out — those land later via
+    ``primary.spawn_tasks`` from the dependency_graph planner.
     """
     variants, toolchain_specs, common_deps = _build_full_input()
-    metadata = _matrix_eval_metadata()
     result = emit_all_manifests(
         target_dir=tmp_path,
         sys_name="x86_64-linux",
         variants=variants,
         toolchain_specs=toolchain_specs,
         common_deps=common_deps,
-        per_binary_metadata=metadata,
-        stages=["build_compilers", "matrix_eval"],
+        stages=["build_compilers"],
     )
     grouped = result.by_class
-    assert len(grouped["matrix_eval"]) == 2
+    assert "matrix_eval" not in grouped
     assert len(grouped["build_compilers"]) == 4
     # build stage classes must be empty.
     assert grouped["build_common_dep"] == ()
@@ -746,33 +711,31 @@ def test_emit_all_manifests_stages_build_compilers_and_matrix_eval(
 
 def test_emit_all_manifests_stages_build_only(tmp_path: pathlib.Path):
     """build slice: emit only common_dep + variant build records.
-    matrix_eval + toolchain bootstrap stays out.
+    toolchain bootstrap stays out.
     """
     variants, toolchain_specs, common_deps = _build_full_input()
-    metadata = _matrix_eval_metadata()
     result = emit_all_manifests(
         target_dir=tmp_path,
         sys_name="x86_64-linux",
         variants=variants,
         toolchain_specs=toolchain_specs,
         common_deps=common_deps,
-        per_binary_metadata=metadata,
         stages=["build"],
     )
     grouped = result.by_class
-    assert grouped["matrix_eval"] == ()
+    assert "matrix_eval" not in grouped
     assert grouped["build_compilers"] == ()
     assert grouped["toolchain_validate"] == ()
     assert len(grouped["build_common_dep"]) == 2
     assert len(grouped["build_variant"]) == 12
 
 
-def test_emit_all_manifests_stages_dependency_graph_emits_nothing(
+def test_emit_all_manifests_stages_empty_emits_nothing(
     tmp_path: pathlib.Path,
 ):
-    """The dependency_graph stage is primary-only; no dispatch
-    manifests come out of it. Requesting it via ``stages`` must be
-    accepted (not raise) but produce no headers."""
+    """An empty stages list (the submit path's non-build-compilers
+    default) emits zero manifests — matrix_eval / dependency_graph come
+    from discover_items, and build tasks come from primary spawn."""
     variants, toolchain_specs, common_deps = _build_full_input()
     result = emit_all_manifests(
         target_dir=tmp_path,
@@ -780,19 +743,35 @@ def test_emit_all_manifests_stages_dependency_graph_emits_nothing(
         variants=variants,
         toolchain_specs=toolchain_specs,
         common_deps=common_deps,
-        stages=["dependency_graph"],
+        stages=[],
     )
     assert result.headers == ()
+
+
+def test_emit_all_manifests_matrix_eval_stage_rejected(
+    tmp_path: pathlib.Path,
+):
+    """matrix_eval / dependency_graph are no longer valid stages —
+    requesting them is an unknown-stage error (the phases are
+    JSON-free)."""
+    for bad in ("matrix_eval", "dependency_graph"):
+        with pytest.raises(ValueError, match="unknown stage"):
+            emit_all_manifests(
+                target_dir=tmp_path,
+                sys_name="x86_64-linux",
+                variants=[],
+                toolchain_specs=[],
+                common_deps=[],
+                stages=[bad],
+            )
 
 
 def test_emit_all_manifests_stages_none_matches_legacy(
     tmp_path: pathlib.Path,
 ):
-    """Regression guard: stages=None must keep the legacy behaviour
-    (every class emitted as long as inputs are present). Without
-    ``per_binary_metadata`` no matrix_eval headers should appear —
-    matches today's monolithic flow.
-    """
+    """Regression guard: stages=None emits every JSON-backed class as
+    long as inputs are present. matrix_eval / dependency_graph never
+    appear (JSON-free)."""
     variants, toolchain_specs, common_deps = _build_full_input()
     result = emit_all_manifests(
         target_dir=tmp_path,
@@ -805,16 +784,14 @@ def test_emit_all_manifests_stages_none_matches_legacy(
     assert len(grouped["build_compilers"]) == 4
     assert len(grouped["build_common_dep"]) == 2
     assert len(grouped["build_variant"]) == 12
-    # No matrix_eval headers without per_binary_metadata.
-    assert grouped["matrix_eval"] == ()
+    assert "matrix_eval" not in grouped
 
 
-def test_emit_all_manifests_stages_none_with_metadata_emits_matrix_eval(
+def test_emit_all_manifests_per_binary_metadata_emits_no_matrix_eval(
     tmp_path: pathlib.Path,
 ):
-    """When stages=None (legacy) AND ``per_binary_metadata`` is
-    populated, matrix_eval still emits — legacy behaviour is "emit
-    everything you have inputs for"."""
+    """Passing ``per_binary_metadata`` no longer emits matrix_eval JSON
+    — the phase is JSON-free; the kwarg is accepted but inert."""
     variants, toolchain_specs, common_deps = _build_full_input()
     metadata = _matrix_eval_metadata()
     result = emit_all_manifests(
@@ -826,10 +803,13 @@ def test_emit_all_manifests_stages_none_with_metadata_emits_matrix_eval(
         per_binary_metadata=metadata,
     )
     grouped = result.by_class
-    assert len(grouped["matrix_eval"]) == 2
+    assert "matrix_eval" not in grouped
     assert len(grouped["build_compilers"]) == 4
     assert len(grouped["build_common_dep"]) == 2
     assert len(grouped["build_variant"]) == 12
+    # No matrix_eval__* files on disk either.
+    assert not list(tmp_path.glob("matrix_eval__*.json"))
+    assert not list(tmp_path.glob("dependency_graph*.json"))
 
 
 def test_emit_all_manifests_stages_unknown_raises(tmp_path: pathlib.Path):
@@ -842,23 +822,3 @@ def test_emit_all_manifests_stages_unknown_raises(tmp_path: pathlib.Path):
             common_deps=[],
             stages=["bogus"],
         )
-
-
-def test_emit_all_manifests_matrix_eval_writes_files(tmp_path: pathlib.Path):
-    """matrix_eval emission writes one JSON file per binary that
-    round-trips via read_manifest."""
-    metadata = _matrix_eval_metadata()
-    result = emit_all_manifests(
-        target_dir=tmp_path,
-        sys_name="x86_64-linux",
-        variants=[],
-        toolchain_specs=[],
-        common_deps=[],
-        per_binary_metadata=metadata,
-        stages=["matrix_eval"],
-    )
-    for header in result.headers:
-        path = tmp_path / f"{header.name}.json"
-        assert path.exists()
-        loaded = read_manifest(path)
-        assert loaded == header

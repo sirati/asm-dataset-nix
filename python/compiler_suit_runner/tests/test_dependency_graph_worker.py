@@ -1081,6 +1081,99 @@ class TestRunDependencyGraphTask:
             f"{len(nix_eval_calls)} calls — drift back to per-leaf eval"
         )
 
+    def test_all_binaries_single_sum_drv_single_plan(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        """Single all-binaries dispatch: passing ``matrix_drvs`` (a
+        {binary: drv} mapping) assembles ONE sum-drv wrapping every
+        binary's matrix aggregate and runs ONE plan_total pass over all
+        of them — one ``_dependency_graph.pkl`` covering the whole run.
+        """
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        self._seed_archive(matrix_dir, "hello")
+        self._seed_archive(matrix_dir, "busybox")
+        agg_hello = self._matrix_agg("hello", hash_prefix="he")
+        agg_bb = self._matrix_agg("busybox", hash_prefix="bb")
+        self._patch_derive(monkeypatch, {
+            agg_hello: self._stub_lookup_for("hello"),
+            agg_bb: self._stub_lookup_for("busybox"),
+        })
+
+        stub = _SubprocessStub()
+        stub.tree_stdout = b"/nix/store/sum-drv.drv\n"
+
+        sum_drv_calls: list[dict] = []
+        plan_calls: list[dict] = []
+
+        def fake_build_sum_drv_multi(*, bash_path, toolchain_drvs,
+                                      matrix_drvs, system):
+            sum_drv_calls.append({
+                "toolchain_drvs": list(toolchain_drvs),
+                "matrix_drvs": {k: list(v) for k, v in matrix_drvs.items()},
+            })
+            return "/nix/store/sum-drv-multi"
+
+        def fake_plan_total(*, sum_drv, binaries, variant_lookups,
+                            toolchain_task_ids, sys_name):
+            plan_calls.append({"binaries": list(binaries)})
+            return [Phase4Descriptor(
+                kind="build_variant", task_id=f"bv_{b}",
+                name=f"build_variant__{b}",
+                payload={"binary": b}, depends_on=(),
+            ) for b in binaries]
+
+        monkeypatch.setattr(dgw, "build_sum_drv_multi", fake_build_sum_drv_multi)
+        monkeypatch.setattr(dgw, "plan_total", fake_plan_total)
+
+        result = dgw.run_dependency_graph_task(
+            matrix_eval_out_dir=matrix_dir,
+            bash_path="/nix/store/bash",
+            toolchain_aggregate_drv=self._TC_AGG,
+            matrix_drvs={"hello": agg_hello, "busybox": agg_bb},
+            run_subprocess=stub,
+        )
+        assert result.binary_count == 2
+        assert result.descriptor_count == 2
+        # ONE sum-drv build + ONE plan_total call spanning both binaries.
+        assert len(sum_drv_calls) == 1
+        assert len(plan_calls) == 1
+        assert sum_drv_calls[0]["toolchain_drvs"] == [self._TC_AGG]
+        assert sum_drv_calls[0]["matrix_drvs"] == {
+            "matrix-busybox": [agg_bb],
+            "matrix-hello": [agg_hello],
+        }
+        # Both binaries land in the single plan_total pass (sorted).
+        assert plan_calls[0]["binaries"] == ["busybox", "hello"]
+
+    def test_matrix_drvs_and_single_binary_are_mutually_exclusive(
+        self, tmp_path: pathlib.Path,
+    ):
+        """Passing both ``matrix_drvs`` and the single-binary pair is a
+        usage error (loud ValueError, not silent precedence)."""
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        with pytest.raises(ValueError, match="either matrix_drvs OR"):
+            dgw.run_dependency_graph_task(
+                matrix_eval_out_dir=matrix_dir,
+                bash_path="/nix/store/bash",
+                toolchain_aggregate_drv=self._TC_AGG,
+                matrix_drvs={"hello": self._matrix_agg("hello")},
+                binary="hello",
+                matrix_drv=self._matrix_agg("hello"),
+            )
+
+    def test_empty_matrix_drvs_raises(self, tmp_path: pathlib.Path):
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        with pytest.raises(ValueError, match="matrix_drvs is empty"):
+            dgw.run_dependency_graph_task(
+                matrix_eval_out_dir=matrix_dir,
+                bash_path="/nix/store/bash",
+                toolchain_aggregate_drv=self._TC_AGG,
+                matrix_drvs={},
+            )
+
 
 # ---------------------------------------------------------------------------
 # CLI argument parser

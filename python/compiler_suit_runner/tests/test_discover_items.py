@@ -81,7 +81,11 @@ def _tmp_path_on_tmpfs(tmp_path_factory: pytest.TempPathFactory):
 # Helpers
 
 
-def _make_config(tmp_path: pathlib.Path) -> SuitTaskConfig:
+def _make_config(
+    tmp_path: pathlib.Path,
+    *,
+    per_binary_metadata: dict[str, dict] | None = None,
+) -> SuitTaskConfig:
     return SuitTaskConfig(
         flake_ref=".",
         sys_name="x86_64-linux",
@@ -92,7 +96,31 @@ def _make_config(tmp_path: pathlib.Path) -> SuitTaskConfig:
         run_id="r1",
         secondary_id="primary",
         hostname="host",
+        per_binary_metadata=per_binary_metadata,
     )
+
+
+_TC_AGG = "/nix/store/aaaa-toolchains.drv"
+
+
+def _per_binary_metadata() -> dict[str, dict]:
+    """Two binaries' worth of phase-2/3 preflight metadata."""
+    return {
+        "hello": {
+            "archs": ["x86_64", "aarch64"],
+            "variant_sample": 64,
+            "variant_seed": "seed-hello",
+            "tier": 1,
+            "toolchain_aggregate_drv": _TC_AGG,
+        },
+        "busybox": {
+            "archs": ["x86_64"],
+            "variant_sample": 32,
+            "variant_seed": "seed-busybox",
+            "tier": 1,
+            "toolchain_aggregate_drv": _TC_AGG,
+        },
+    }
 
 
 def _variant(
@@ -277,3 +305,119 @@ def test_discover_items_strips_task_depends_on_when_disabled(
     items_with_deps = list(SuitTask(base_config).discover_items())
     variant = next(item for item in items_with_deps if item.type_id == "variant")
     assert variant.task_depends_on  # non-empty
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (matrix_eval) + phase 3 (dependency_graph): JSON-free, built
+# in-memory from config.per_binary_metadata.
+
+
+def test_discover_items_matrix_eval_one_per_binary_no_json(
+    tmp_path: pathlib.Path,
+) -> None:
+    """One matrix_eval TaskInfo per binary, built from
+    ``per_binary_metadata`` — and NOT a single byte of JSON is written
+    or read for phase 2/3 (the manifest dir is never even created)."""
+    config = _make_config(tmp_path, per_binary_metadata=_per_binary_metadata())
+    # Deliberately do NOT create manifest_dir: phase 2/3 must not touch
+    # it at all.
+    items = list(SuitTask(config).discover_items())
+
+    matrix_eval = [i for i in items if i.phase_id == "matrix_eval"]
+    assert {i.task_id for i in matrix_eval} == {
+        "matrix_eval__hello",
+        "matrix_eval__busybox",
+    }
+    assert all(i.type_id == "eval" for i in matrix_eval)
+    # No matrix_eval task carries a dep (build_compilers wiring is TODO).
+    assert all(i.task_depends_on == () for i in matrix_eval)
+
+    # JSON-free: discover_items wrote nothing to the manifest dir.
+    assert not config.manifest_dir.exists()
+
+
+def test_discover_items_single_dependency_graph_depends_on_all_matrix_eval(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Exactly ONE dependency_graph TaskInfo (task_id =
+    "dependency_graph", affinity None) whose task_depends_on is every
+    matrix_eval task id in the run."""
+    config = _make_config(tmp_path, per_binary_metadata=_per_binary_metadata())
+    items = list(SuitTask(config).discover_items())
+
+    dep_graphs = [i for i in items if i.phase_id == "dependency_graph"]
+    assert len(dep_graphs) == 1
+    dg = dep_graphs[0]
+    assert dg.task_id == "dependency_graph"
+    assert dg.type_id == "dep_graph"
+    assert dg.affinity_id is None
+
+    matrix_eval_ids = {
+        i.task_id for i in items if i.phase_id == "matrix_eval"
+    }
+    assert set(dg.task_depends_on) == matrix_eval_ids
+    assert len(dg.task_depends_on) == len(matrix_eval_ids)
+    # Payload carries the toolchain aggregate (the planner anchor drv)
+    # but NO single binary.
+    assert dg.payload["payload"]["toolchain_aggregate_drv"] == _TC_AGG
+    assert "binary" not in dg.payload["payload"]
+
+
+def test_discover_items_no_per_binary_metadata_yields_no_phase23(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With no per_binary_metadata (e.g. secondary config), phase 2/3
+    yield nothing — and still no JSON is touched for them."""
+    config = _make_config(tmp_path, per_binary_metadata=None)
+    items = list(SuitTask(config).discover_items())
+    assert [i for i in items if i.phase_id == "matrix_eval"] == []
+    assert [i for i in items if i.phase_id == "dependency_graph"] == []
+
+
+def test_discover_items_phase23_coexist_with_build_manifests(
+    tmp_path: pathlib.Path,
+) -> None:
+    """In-memory phase 2/3 items and disk-based build manifests are
+    both yielded from a single discover_items pass."""
+    config = _make_config(tmp_path, per_binary_metadata=_per_binary_metadata())
+    config.manifest_dir.mkdir(parents=True, exist_ok=True)
+    write_manifest(
+        config.manifest_dir,
+        make_build_compilers_header("x86_64-linux", "x86_64", "gcc15"),
+    )
+    items = list(SuitTask(config).discover_items())
+    phases = {i.phase_id for i in items}
+    assert "matrix_eval" in phases
+    assert "dependency_graph" in phases
+    assert "build_compilers" in phases
+    # Still exactly one dependency_graph task.
+    assert len([i for i in items if i.phase_id == "dependency_graph"]) == 1
+
+
+def test_discover_items_ignores_stale_matrix_eval_json(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stale matrix_eval / dependency_graph JSON manifest from a
+    pre-rip-out run must be ignored (not double-emitted) — phase 2/3
+    come only from in-memory metadata."""
+    from compiler_suit_runner.manifest_gen import make_matrix_eval_header
+
+    config = _make_config(tmp_path, per_binary_metadata=_per_binary_metadata())
+    config.manifest_dir.mkdir(parents=True, exist_ok=True)
+    # Drop a stale matrix_eval JSON on disk.
+    write_manifest(
+        config.manifest_dir,
+        make_matrix_eval_header(
+            "ghost", "x86_64-linux", archs=["x86_64"],
+            toolchain_aggregate_drv=_TC_AGG,
+        ),
+    )
+    items = list(SuitTask(config).discover_items())
+    matrix_eval_ids = {
+        i.task_id for i in items if i.phase_id == "matrix_eval"
+    }
+    # Only the in-memory binaries — the stale "ghost" JSON is ignored.
+    assert matrix_eval_ids == {
+        "matrix_eval__hello",
+        "matrix_eval__busybox",
+    }

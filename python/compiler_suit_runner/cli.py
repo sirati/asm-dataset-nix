@@ -671,6 +671,7 @@ def _config_from_args(
     *,
     run_id: str,
     secondary_id: str,
+    per_binary_metadata: Optional[dict[str, dict]] = None,
 ) -> SuitTaskConfig:
     """Translate the parsed argparse namespace into a SuitTaskConfig.
 
@@ -741,6 +742,10 @@ def _config_from_args(
         unfulfillable_reinject_max_per_task=getattr(
             args, "unfulfillable_reinject_max_per_task", None,
         ),
+        # JSON-free phase-2/3 input: discover_items builds the
+        # matrix_eval (one per binary) + single dependency_graph
+        # TaskInfos directly from this in-memory metadata.
+        per_binary_metadata=per_binary_metadata or None,
     )
 
 
@@ -1076,6 +1081,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # needed there (workers find peers via gossip).
     tc_drvs: dict[tuple[str, str], str] = {}
     partition_drv_outpaths: Optional[dict[str, str]] = None
+    # Per-binary metadata for the JSON-free phase-2 (matrix_eval) +
+    # phase-3 (dependency_graph) TaskInfos. Populated on the preflight
+    # path; threaded onto the SuitTaskConfig so discover_items builds
+    # those tasks in-memory. The cache-hit path leaves it empty (the
+    # cache persists only the build-phase PreflightResult subset, not
+    # per-binary matrix_eval metadata), matching the prior behaviour
+    # where restore never re-emitted matrix_eval manifests.
+    per_binary_metadata: dict[str, dict] = {}
 
     if cache_hit is not None:
         log.info("cache hit: %s", input_hash)
@@ -1174,7 +1187,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # emit_matrix_eval_manifests / eval_worker.parse_payload expect.
         # Per-arch suffix selection now happens inside the matrix_eval
         # worker (eval_worker._sample_per_arch) with the same seed.
-        per_binary_metadata: dict[str, dict] = {}
+        per_binary_metadata = {}
         for pkg, meta in per_binary_meta_raw.items():
             if not isinstance(meta, dict):
                 continue
@@ -1263,19 +1276,16 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 )
                 dist_eval_drv_outpaths = {}
 
-        # Stages literal: matrix_eval is always emitted; build_compilers
-        # is added when --build-compilers is on. ``--debug-testbuild
-        # <binary>`` would additionally inject Phase 1.5
-        # ``toolchain_validate`` headers between build_compilers and
-        # matrix_eval, but emit_all_manifests currently picks
-        # build_compilers OR toolchain_validate per the
-        # ``allow_toolchain_build`` arg — so the debug-testbuild flow
-        # needs a manifest_gen extension before both classes can be
-        # emitted simultaneously. The flag is captured here and threaded
-        # forward; the validate emission itself is a follow-up.
-        stages: list[str] = ["matrix_eval", "dependency_graph"]
+        # Stages literal: matrix_eval (phase 2) + dependency_graph
+        # (phase 3) are JSON-free and built in-memory by
+        # ``SuitTask.discover_items`` from ``per_binary_metadata`` — they
+        # are NOT emitted here. The only JSON-backed stage at submit
+        # time is build_compilers (gated by --build-compilers or
+        # --debug-testbuild); the build stage's tasks are spawned at
+        # runtime by the primary via ``primary.spawn_tasks``.
+        stages: list[str] = []
         if build_compilers_on:
-            stages = ["build_compilers", "matrix_eval", "dependency_graph"]
+            stages = ["build_compilers"]
         if debug_testbuild and "build_compilers" not in stages:
             stages.insert(0, "build_compilers")
 
@@ -1327,6 +1337,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         args,
         run_id=run_id,
         secondary_id="primary",
+        per_binary_metadata=per_binary_metadata,
     )
 
     rc = 0
