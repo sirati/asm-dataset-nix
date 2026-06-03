@@ -324,10 +324,9 @@ def test_discover_items_matrix_eval_one_per_binary_no_json(
     items = list(SuitTask(config).discover_items())
 
     matrix_eval = [i for i in items if i.phase_id == "matrix_eval"]
-    assert {i.task_id for i in matrix_eval} == {
-        "matrix_eval__hello",
-        "matrix_eval__busybox",
-    }
+    # task_id is the bare binary (phase-local; the MATRIX_EVAL phase
+    # disambiguates), NOT "matrix_eval__<binary>".
+    assert {i.task_id for i in matrix_eval} == {"hello", "busybox"}
     assert all(i.type_id == "eval" for i in matrix_eval)
     # No matrix_eval task carries a dep (build_compilers wiring is TODO).
     assert all(i.task_depends_on == () for i in matrix_eval)
@@ -355,7 +354,14 @@ def test_discover_items_single_dependency_graph_depends_on_all_matrix_eval(
     matrix_eval_ids = {
         i.task_id for i in items if i.phase_id == "matrix_eval"
     }
-    assert set(dg.task_depends_on) == matrix_eval_ids
+    # The dependency_graph task's deps are CROSS-phase TaskDeps: each
+    # names a matrix_eval prerequisite by its bare-binary task_id AND
+    # its phase ("matrix_eval"), since it lives in a different phase. A
+    # bare string would resolve to the dependency_graph task's own phase
+    # and be flagged a missing dep.
+    assert {(d.task_id, str(d.phase_id)) for d in dg.task_depends_on} == {
+        (binary, "matrix_eval") for binary in matrix_eval_ids
+    }
     assert len(dg.task_depends_on) == len(matrix_eval_ids)
     # Payload carries the toolchain aggregate (the planner anchor drv)
     # but NO single binary.
@@ -416,8 +422,6 @@ def test_discover_items_ignores_stale_matrix_eval_json(
     matrix_eval_ids = {
         i.task_id for i in items if i.phase_id == "matrix_eval"
     }
-    # Only the in-memory binaries — the stale "ghost" JSON is ignored.
-    assert matrix_eval_ids == {
-        "matrix_eval__hello",
-        "matrix_eval__busybox",
-    }
+    # Only the in-memory binaries (bare-binary task ids) — the stale
+    # "ghost" JSON is ignored.
+    assert matrix_eval_ids == {"hello", "busybox"}

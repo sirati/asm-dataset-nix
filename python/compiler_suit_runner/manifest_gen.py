@@ -52,6 +52,7 @@ import json
 import os
 import pathlib
 from collections.abc import Iterable
+from enum import StrEnum
 from typing import Literal, Optional
 
 from compiler_suit_runner.partition import VariantSpec
@@ -59,6 +60,30 @@ from compiler_suit_runner.partition import VariantSpec
 
 # ---------------------------------------------------------------------------
 # Types
+
+
+class Phase(StrEnum):
+    """The four dynamic_runner phase ids, defined once.
+
+    Single source of truth so phase names can't drift or be misspelled
+    across ``_classify`` / ``_phase_specs`` / ``on_phase_end`` and the
+    cross-phase ``TaskDep`` wiring. Members are plain strings (StrEnum),
+    so they pass straight through to ``PhaseSpec(phase_id=...)`` /
+    ``TaskDep(phase_id=...)`` and compare equal to the bare framework
+    strings the runtime hands back.
+
+    NOTE: a task's id should be phase-LOCAL — the phase is carried by
+    the framework's ``(phase_id, task_id)`` identity, not embedded in
+    the ``task_id`` string (see :func:`matrix_eval_task_id`).
+    :func:`build_compilers_task_id` still embeds its prefix pending the
+    deferred toolchain-dep follow-up.
+    """
+
+    BUILD_COMPILERS = "build_compilers"
+    MATRIX_EVAL = "matrix_eval"
+    DEPENDENCY_GRAPH = "dependency_graph"
+    BUILD = "build"
+
 
 ItemClass = Literal[
     "matrix_eval",
@@ -169,7 +194,18 @@ class ManifestHeader:
 
 
 def build_compilers_task_id(sys_name: str, arch: str, compiler_label: str) -> str:
-    """Stable id for a build_compilers task."""
+    """Stable id for a build_compilers task.
+
+    NOTE: this id still embeds the ``build_compilers__`` phase prefix.
+    De-prefixing it (to match the framework's phase-local
+    ``(phase_id, task_id)`` identity, like :func:`matrix_eval_task_id`)
+    is a deferred follow-up: it requires routing the variant→toolchain
+    cross-phase edge through a dedicated ``TaskDep(phase_id=BUILD_COMPILERS)``
+    field across Phase4Descriptor / ManifestHeader / manifest_glue /
+    counters, and that whole path is inert unless ``--build-compilers``
+    emits toolchain tasks. Tracked separately so it lands with its own
+    tests rather than riding the matrix_eval fix.
+    """
     return f"build_compilers__{sys_name}__{arch}__{compiler_label}"
 
 
@@ -208,14 +244,21 @@ def variant_task_id(variant: VariantSpec, sys_name: str) -> str:
 
 
 def matrix_eval_task_id(binary: str) -> str:
-    """Stable id for a matrix_eval task. One task per binary (NOT per
-    (binary, arch)).
+    """Phase-local id for a matrix_eval task: the bare binary name.
+
+    One task per binary (NOT per (binary, arch)). The id does NOT embed
+    the phase — the framework's ``(phase_id, task_id)`` identity carries
+    it (``phase_id`` = :attr:`Phase.MATRIX_EVAL`); a dependant in another
+    phase names this task with
+    ``TaskDep(task_id=binary, phase_id=Phase.MATRIX_EVAL)``. The id
+    doubles as the ``predecessor_outputs`` key, so the dependency_graph
+    worker reads the binary name straight off it.
 
     The eval worker, given the binary, walks every requested arch
     locally inside the single task and broadcasts every produced drv
     to its peers.
     """
-    return f"matrix_eval__{binary}"
+    return binary
 
 
 # The dependency_graph phase is a SINGLE all-binaries framework task

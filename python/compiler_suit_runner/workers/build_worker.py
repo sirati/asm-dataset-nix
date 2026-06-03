@@ -1530,20 +1530,19 @@ def main() -> int:
             # Single all-binaries dependency_graph task: gather the
             # matrix_aggregate_drv from EVERY matrix_eval predecessor
             # (one per binary) out of ``task.predecessor_outputs``.
-            # Each key is ``matrix_eval__<binary>`` and the published
-            # output is ``matrix_aggregate_drv`` (set by the upstream
-            # eval task via ``Task.publish_string``). We recover the
-            # binary name from the predecessor task-id so the worker
-            # never needs a per-binary payload.
+            # The dependency_graph task depends ONLY on matrix_eval
+            # tasks, whose task_id IS the bare binary name (a phase-local
+            # id — the MATRIX_EVAL phase disambiguates, so the phase is
+            # not embedded in the id). So each predecessor key is the
+            # binary directly, and its published ``matrix_aggregate_drv``
+            # (set by the upstream eval task via ``Task.publish_string``)
+            # is what we need — the worker never needs a per-binary
+            # payload.
             matrix_drvs: dict[str, str] = {}
             for pred_id, preds in task.predecessor_outputs.items():
-                if not isinstance(pred_id, str):
+                if not isinstance(pred_id, str) or not pred_id:
                     continue
-                if not pred_id.startswith("matrix_eval__"):
-                    continue
-                bname = pred_id[len("matrix_eval__"):]
-                if not bname:
-                    continue
+                bname = pred_id
                 entry = preds.get("matrix_aggregate_drv", {}) if isinstance(
                     preds, dict
                 ) else {}
@@ -1551,7 +1550,7 @@ def main() -> int:
                 if not value:
                     raise NonRecoverableError(
                         "build_worker dep_graph: no matrix_aggregate_drv "
-                        f"from {pred_id}; available keys: "
+                        f"from predecessor {pred_id!r}; available keys: "
                         f"{sorted(preds.keys()) if isinstance(preds, dict) else preds!r}"
                     )
                 matrix_drvs[bname] = value

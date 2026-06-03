@@ -609,9 +609,11 @@ def test_matrix_eval_header_payload_shape():
         variant_seed="abc123",
     )
     assert h.item_class == "matrix_eval"
+    # name is the readable path/label; task_id is the phase-local id
+    # (bare binary — the MATRIX_EVAL phase disambiguates).
     assert h.name == "matrix_eval__hello"
     assert h.size == 0
-    assert h.task_id == "matrix_eval__hello"
+    assert h.task_id == "hello"
     # Empty depends_on for now — build_compilers wiring is a TODO.
     assert h.task_depends_on == ()
     assert h.payload["binary"] == "hello"

@@ -12,9 +12,16 @@ let
   # derivation we callPackage here.
   shutdownManagerBin = pkgs.callPackage
     "${dynamicRunnerSrc}/nix/shutdown-manager-bin.nix" { };
+  # The wheel now also requires the musl-static slurm-wrapper binary
+  # (added in the primary-coordinator-unification rewrite). Build it
+  # via the framework's wrapper-bin derivation, same `pkgs` (not
+  # `python313Packages`) scope as shutdownManagerBin since it needs
+  # `pkgsCross`. Mirrors the framework overlay's wiring.
+  wrapperManagerBin = pkgs.callPackage
+    "${dynamicRunnerSrc}/nix/wrapper-bin.nix" { };
   dynamicRunner = pkgs.python313Packages.callPackage
     "${dynamicRunnerSrc}/nix/wheel.nix"
-    { inherit shutdownManagerBin; };
+    { inherit shutdownManagerBin wrapperManagerBin; };
 
   devPythonPackages = python-pkgs: with python-pkgs; [
     pip

@@ -1278,11 +1278,13 @@ def test_main_handle_dependency_graph_uses_env_matrix_eval_out_dir(
     wrapper = _dependency_graph_wrapper_payload()
     task = Task(payload=wrapper, task_id="dependency_graph")
     # Single all-binaries task: one matrix_eval predecessor per binary.
+    # The matrix_eval task_id is the bare binary (phase-local id), so
+    # the predecessor_outputs key IS the binary name directly.
     task.predecessor_outputs = {
-        "matrix_eval__hello": {
+        "hello": {
             "matrix_aggregate_drv": {"value": "/nix/store/m-hello.drv"},
         },
-        "matrix_eval__busybox": {
+        "busybox": {
             "matrix_aggregate_drv": {"value": "/nix/store/m-busybox.drv"},
         },
     }

@@ -87,6 +87,7 @@ from compiler_suit_runner.holding_matcher import (
 from compiler_suit_runner.manifest_gen import (
     DEPENDENCY_GRAPH_TASK_ID,
     ManifestHeader,
+    Phase,
     make_matrix_eval_header,
     matrix_eval_task_id,
     read_manifest,
@@ -194,24 +195,24 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
         # we get a stable affinity bucket per package (handy for log
         # grepping; framework just treats it as a tag).
         binary = header.payload.get("binary", "?")
-        return ("matrix_eval", "eval", binary)
+        return (Phase.MATRIX_EVAL, "eval", binary)
     if item_class == "dependency_graph":
-        # Exactly ONE all-binaries dependency_graph task (task_id =
-        # "dependency_graph"); it depends on every phase-2
-        # matrix_eval__<binary> task. The worker is invoked once over
-        # all binaries: it imports every matrix-<binary> archive,
-        # gathers each binary's matrix_aggregate_drv from the
-        # corresponding matrix_eval predecessor's keyed outputs
-        # (``task.predecessor_outputs[matrix_eval__<binary>]
+        # Exactly ONE all-binaries dependency_graph task; it depends on
+        # every phase-2 matrix_eval task (one per binary). The worker is
+        # invoked once over all binaries: it imports every
+        # matrix-<binary> archive, gathers each binary's
+        # matrix_aggregate_drv from the corresponding matrix_eval
+        # predecessor's keyed outputs (the predecessor task_id IS the
+        # bare binary, so ``task.predecessor_outputs[<binary>]
         # ["matrix_aggregate_drv"]["value"]``, published via
         # ``Task.publish_string``), runs the streaming planner ONCE,
         # and writes one ``_dependency_graph.pkl`` covering the whole
         # run. There is no single binary, so ``affinity_id`` is None.
-        return ("dependency_graph", "dep_graph", None)
+        return (Phase.DEPENDENCY_GRAPH, "dep_graph", None)
     if item_class == "build_compilers":
         compiler = header.payload.get("compiler_label", "?")
         arch = header.payload.get("arch", "?")
-        return ("build_compilers", "build_compilers", f"{compiler}-{arch}")
+        return (Phase.BUILD_COMPILERS, "build_compilers", f"{compiler}-{arch}")
     # All remaining build-shaped tasks share the single ``build``
     # phase. Nix's daemon serializes shared dependencies via its
     # build lock, so toolchain validates / common deps land before
@@ -220,9 +221,9 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
     if item_class == "toolchain_validate":
         compiler = header.payload.get("compiler_label", "?")
         arch = header.payload.get("arch", "?")
-        return ("build", "toolchain_validate", f"{compiler}-{arch}")
+        return (Phase.BUILD, "toolchain_validate", f"{compiler}-{arch}")
     if item_class == "build_common_dep":
-        return ("build", "common_dep", None)
+        return (Phase.BUILD, "common_dep", None)
     if item_class == "build_variant":
         # Treat an empty compiler_id the same as a missing one so the
         # affinity bucket never degrades to a leading-dash form like
@@ -230,7 +231,7 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
         # together and breaks page-cache co-location with its toolchain).
         compiler = header.payload.get("compiler_id") or "?"
         arch = header.payload.get("arch") or "?"
-        return ("build", "variant", f"{compiler}-{arch}")
+        return (Phase.BUILD, "variant", f"{compiler}-{arch}")
     raise ValueError(f"unknown item_class {item_class!r}")
 
 
@@ -255,7 +256,9 @@ def _make_task_info(
     ``task_id`` + ``task_depends_on`` are populated when the manifest
     has them (Phase 1 of the framework's task-deps API,
     ``a1ebbaa``); empty defaults so legacy manifests / older
-    framework builds round-trip cleanly.
+    framework builds round-trip cleanly. Entries may be bare strings
+    (intra-phase) or :class:`TaskDep` (cross-phase, phase-tagged by the
+    caller that knows the prerequisite's phase).
     """
     try:
         from dynamic_runner._shared import (  # type: ignore[import-not-found]
@@ -306,6 +309,53 @@ def _make_task_info(
             type_id=type_id,
             affinity_id=affinity_id,
             payload=dict(payload),
+        )
+
+
+def _make_task_dep(task_id: str, *, phase_id: str = "", inherit_outputs: bool = False):
+    """Return a framework :class:`TaskDep`, or an attribute-compatible stub.
+
+    A dependency's full identity is ``(phase_id, task_id)``. At the
+    framework's PyO3 boundary a BARE-STRING dep resolves to the
+    ENCLOSING task's phase — correct only for an intra-phase
+    prerequisite. A CROSS-phase prerequisite must name its phase
+    explicitly via ``TaskDep(phase_id=...)`` or the primary marks the
+    declaring task ``invalid_task`` ("missing dep") at ingest (e.g. the
+    all-binaries ``dependency_graph`` task depending on each
+    ``matrix_eval__<binary>`` task, or a ``build_variant`` depending on
+    its ``build_compilers__*`` toolchain). The dependent task then never
+    runs and its downstream phase spawns ZERO tasks.
+
+    Falls back to a :class:`types.SimpleNamespace` stub when
+    :mod:`dynamic_runner` is absent so unit tests run without the
+    framework on ``sys.path`` (mirrors :func:`_make_task_info`).
+    """
+    try:
+        from dynamic_runner._shared import TaskDep  # type: ignore[import-not-found]
+    except Exception:  # noqa: BLE001 — framework absent
+        return SimpleNamespace(
+            task_id=task_id,
+            phase_id=phase_id,
+            inherit_outputs=inherit_outputs,
+        )
+    # ``TaskDep`` gained the cross-phase ``phase_id`` kwarg in the
+    # primary-coordinator-unification. Older framework pins reject it;
+    # fall back to an attribute-compatible stub carrying the phase so
+    # consumers (and unit tests) still see it. The live dispatch runs
+    # the current wheel where the real TaskDep supports phase_id. Mirrors
+    # the ``except TypeError`` forward-compat fallback in
+    # :func:`_make_task_info`.
+    try:
+        return TaskDep(
+            task_id=task_id,
+            phase_id=phase_id,
+            inherit_outputs=inherit_outputs,
+        )
+    except TypeError:
+        return SimpleNamespace(
+            task_id=task_id,
+            phase_id=phase_id,
+            inherit_outputs=inherit_outputs,
         )
 
 
@@ -371,7 +421,7 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
     # for compile-throttling.
     return (
         PhaseSpec(
-            phase_id="build_compilers",
+            phase_id=Phase.BUILD_COMPILERS,
             types=(
                 TaskTypeSpec(
                     type_id="build_compilers",
@@ -389,8 +439,8 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
             ),
         ),
         PhaseSpec(
-            phase_id="matrix_eval",
-            depends_on=("build_compilers",),
+            phase_id=Phase.MATRIX_EVAL,
+            depends_on=(Phase.BUILD_COMPILERS,),
             types=(
                 TaskTypeSpec(
                     type_id="eval",
@@ -399,8 +449,8 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
             ),
         ),
         PhaseSpec(
-            phase_id="dependency_graph",
-            depends_on=("matrix_eval",),
+            phase_id=Phase.DEPENDENCY_GRAPH,
+            depends_on=(Phase.MATRIX_EVAL,),
             types=(
                 TaskTypeSpec(
                     type_id="dep_graph",
@@ -409,8 +459,8 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
             ),
         ),
         PhaseSpec(
-            phase_id="build",
-            depends_on=("dependency_graph",),
+            phase_id=Phase.BUILD,
+            depends_on=(Phase.DEPENDENCY_GRAPH,),
             types=(
                 TaskTypeSpec(
                     type_id="toolchain_validate",
@@ -1053,7 +1103,16 @@ class SuitTask:
                 "toolchain_aggregate_drv": toolchain_aggregate_drv,
             },
             task_id=DEPENDENCY_GRAPH_TASK_ID,
-            task_depends_on=tuple(matrix_eval_ids),
+            # The matrix_eval prerequisites (task_id = bare binary) are
+            # declared in the MATRIX_EVAL phase — a different phase than
+            # this task — so configure each as a cross-phase
+            # TaskDep(phase_id=...). A bare string would resolve to this
+            # task's own (DEPENDENCY_GRAPH) phase and be flagged a
+            # missing dep.
+            task_depends_on=tuple(
+                _make_task_dep(mid, phase_id=Phase.MATRIX_EVAL)
+                for mid in matrix_eval_ids
+            ),
         )
         yield self._task_info_from_header(dep_graph_header)
 
@@ -1063,7 +1122,9 @@ class SuitTask:
 
         Mirrors the disk path's payload shape so the build_worker sees
         a uniform header_dict regardless of source. Honours
-        ``disable_task_deps`` the same way the disk loop does.
+        ``disable_task_deps`` the same way the disk loop does. Any
+        cross-phase ``task_depends_on`` edge is phase-tagged centrally
+        in :func:`_make_task_info`.
         """
         phase_id, type_id, affinity_id = _classify(header)
         header_dict = {
@@ -2027,9 +2088,9 @@ class SuitTask:
                 # object we fall through to the task_id fallback.
                 try:
                     phase_id = (
-                        "build_compilers"
+                        Phase.BUILD_COMPILERS
                         if header.item_class == "build_compilers"
-                        else "build"
+                        else Phase.BUILD
                     )
                     type_id = (
                         "build_compilers"
@@ -2142,7 +2203,7 @@ class SuitTask:
             completed,
             failed,
         )
-        if phase_id != "dependency_graph":
+        if phase_id != Phase.DEPENDENCY_GRAPH:
             return
         if self._primary_handle is None:
             # Secondary, or a framework-pin gap where the handle was
