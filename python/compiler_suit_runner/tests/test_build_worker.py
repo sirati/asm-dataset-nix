@@ -339,7 +339,7 @@ def test_copy_elf_folder_atomic_replace(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_build_worker_build_common_dep_passes_skip_existing(tmp_path):
+def test_build_worker_build_common_dep_uses_plain_nix_build(tmp_path):
     manifest = _write_manifest(
         tmp_path / "m.json",
         item_class=ITEM_CLASS_BUILD_COMMON_DEP,
@@ -362,8 +362,10 @@ def test_build_worker_build_common_dep_passes_skip_existing(tmp_path):
     assert result.item_class == ITEM_CLASS_BUILD_COMMON_DEP
     assert result.name == "some-common-dep"
     assert result.duration_seconds > 0.0
+    # nix build is idempotent for existing outputs; the bogus
+    # --skip-existing flag (which nix rejects) must NOT be passed.
     argv = runner.calls[0]
-    assert "--skip-existing" in argv
+    assert "--skip-existing" not in argv
 
 
 def test_build_worker_build_variant_copies_elf_folder(tmp_path):

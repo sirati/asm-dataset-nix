@@ -323,9 +323,9 @@ def build_attr(
 
     * peer substituter args read fresh from
       ``env.substituters_file`` on each invocation (when set).
-    * caller-supplied ``extra_args`` (e.g. ``--skip-existing`` for
-      common-deps so the build short-circuits when the output is
-      already in the local store).
+    * caller-supplied ``extra_args`` appended verbatim to the ``nix
+      build`` argv (a hook for valid per-build nix flags; the caller
+      owns validity).
 
     Returns ``(success, stdout, stderr)`` where ``success`` is True iff
     the subprocess returned 0. The subprocess inherits the parent
@@ -915,10 +915,9 @@ def build_worker(
 
     1. Parse the manifest. Failure -> failed result with the parse error.
     2. Read ``payload.attr``. Missing -> failed result.
-    3. For ``item_class == build_common_dep`` add ``--skip-existing`` so
-       a path that's already in the local store is a no-op (variants are
-       best-effort substituted but always allowed to rebuild — common-deps
-       are the only class where partial pre-build progress is expected).
+    3. ``build_common_dep`` relies on ``nix build`` being idempotent (an
+       output already in the local store is a no-op); variants are
+       best-effort substituted but always allowed to rebuild.
     4. ``build_attr`` to actually invoke nix.
     5. On success for ``item_class == build_variant``: locate the
        realised output path from the last stdout line and
@@ -1001,9 +1000,9 @@ def build_worker(
             error="manifest payload missing both 'drv' and 'attr'",
         )
 
-    extra_args: list[str] = []
-    if item_class == ITEM_CLASS_BUILD_COMMON_DEP:
-        extra_args.append("--skip-existing")
+    # No per-class nix flags: `nix build` is idempotent (an output already
+    # in the local store is a no-op), so build_common_dep needs no skip
+    # flag. Do NOT re-add `--skip-existing` here — nix rejects it.
 
     # Variant prelude: import the per-binary matrix-eval archive (once
     # per binary per worker process) so the matrix-aggregate drv graph
@@ -1030,7 +1029,7 @@ def build_worker(
         _prefetch_variant_inputs(payload, env)
 
     try:
-        success, stdout, stderr = build_attr(attr, env, extra_args=extra_args)
+        success, stdout, stderr = build_attr(attr, env)
     except Exception as exc:  # noqa: BLE001 - never raise out
         return BuildWorkerResult(
             item_class=item_class,
