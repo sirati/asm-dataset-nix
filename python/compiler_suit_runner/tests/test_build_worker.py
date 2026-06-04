@@ -340,11 +340,16 @@ def test_copy_elf_folder_atomic_replace(tmp_path):
 
 
 def test_build_worker_build_common_dep_uses_plain_nix_build(tmp_path):
+    # The descriptor ships a bare store basename; the worker reconstructs
+    # the absolute /nix/store/<ident> drv path. matrix_eval_out_dir is
+    # left unset so the archive-import prelude no-ops, isolating the
+    # path-reconstruction behaviour.
+    ident = "bvds533r8bjg379a68m3skkpp1giy0hh-source.drv"
     manifest = _write_manifest(
         tmp_path / "m.json",
         item_class=ITEM_CLASS_BUILD_COMMON_DEP,
         name="some-common-dep",
-        payload={"attr": "_drvDeps.foo"},
+        payload={"attr": ident, "binary": "hello"},
     )
     runner = RecordingRunner(stdout=b"/nix/store/bbb\n")
     clock = FakeClock(start=10.0, step=2.5)
@@ -362,9 +367,10 @@ def test_build_worker_build_common_dep_uses_plain_nix_build(tmp_path):
     assert result.item_class == ITEM_CLASS_BUILD_COMMON_DEP
     assert result.name == "some-common-dep"
     assert result.duration_seconds > 0.0
-    # nix build is idempotent for existing outputs; the bogus
-    # --skip-existing flag (which nix rejects) must NOT be passed.
     argv = runner.calls[0]
+    # Built by absolute drv path (`nix build /nix/store/<ident>^*`), not a
+    # flake ref; and the bogus --skip-existing flag must NOT be present.
+    assert f"/nix/store/{ident}^*" in argv
     assert "--skip-existing" not in argv
 
 
@@ -1569,6 +1575,46 @@ def test_build_worker_build_variant_imports_archive_first_time(
     result = build_worker(manifest, env)
     assert result.success is True
     assert captured == [("import", out_dir / "matrix-hello.drv.archive")]
+    _reset_imported_binaries()
+
+
+def test_build_worker_build_common_dep_imports_archive(monkeypatch, tmp_path):
+    """A ``build_common_dep`` task imports the per-binary archive (so the
+    common-dep ``.drv`` is local) using the binary from
+    ``payload["binary"]``, then builds the reconstructed drv path."""
+    _reset_imported_binaries()
+    captured: list[tuple[str, pathlib.Path]] = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        captured.append(("import", archive))
+        return True, b"", []
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.dependency_graph_worker"
+        ".archive.import_archive",
+        _fake_import,
+    )
+
+    out_dir = tmp_path / "phase0"
+    out_dir.mkdir()
+    ident = "bvds533r8bjg379a68m3skkpp1giy0hh-source.drv"
+    manifest = _write_manifest(
+        tmp_path / "m.json",
+        item_class=ITEM_CLASS_BUILD_COMMON_DEP,
+        name="cd",
+        payload={"attr": ident, "binary": "hello"},
+    )
+    runner = RecordingRunner(stdout=b"/nix/store/out\n")
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "dataset",
+        run_subprocess=runner,
+        matrix_eval_out_dir=out_dir,
+    )
+    result = build_worker(manifest, env)
+    assert result.success is True
+    assert captured == [("import", out_dir / "matrix-hello.drv.archive")]
+    assert f"/nix/store/{ident}^*" in runner.calls[0]
     _reset_imported_binaries()
 
 

@@ -1000,18 +1000,36 @@ def build_worker(
             error="manifest payload missing both 'drv' and 'attr'",
         )
 
+    # build_common_dep descriptors carry a bare store basename
+    # (``<hash>-<name>.drv``, the ``.drv`` already in the name);
+    # reconstruct the absolute drv path so build_attr takes the
+    # ``nix build /nix/store/<ident>^*`` branch instead of the flake-ref
+    # fallback (which needs a flake.nix on the secondary's /app cwd).
+    if (
+        item_class == ITEM_CLASS_BUILD_COMMON_DEP
+        and attr.endswith(".drv")
+        and not attr.startswith("/nix/store/")
+    ):
+        attr = "/nix/store/" + attr
+
     # No per-class nix flags: `nix build` is idempotent (an output already
     # in the local store is a no-op), so build_common_dep needs no skip
     # flag. Do NOT re-add `--skip-existing` here — nix rejects it.
 
-    # Variant prelude: import the per-binary matrix-eval archive (once
-    # per binary per worker process) so the matrix-aggregate drv graph
-    # is local; then pre-fetch any input deps the placement map knows
-    # about from a single targeted peer. Pre-fetch is best-effort;
-    # archive import is fatal (the drv must exist locally before the
-    # nix build below).
-    if item_class == ITEM_CLASS_BUILD_VARIANT:
-        binary = payload.get("pkg") if isinstance(payload.get("pkg"), str) else ""
+    # Build prelude: import the per-binary matrix-eval archive (once per
+    # binary per worker process) so the matrix-aggregate drv graph — every
+    # variant AND common-dep ``.drv`` — is local; then (variants only)
+    # pre-fetch input deps the placement map knows about from a single
+    # targeted peer. Pre-fetch is best-effort; archive import is fatal
+    # (the drv must exist locally before the nix build below). The
+    # common-dep ``.drv`` is part of the variants' drv closure the archive
+    # captures, so the same import makes it available.
+    if item_class in (ITEM_CLASS_BUILD_VARIANT, ITEM_CLASS_BUILD_COMMON_DEP):
+        binary = (
+            payload.get("pkg") if isinstance(payload.get("pkg"), str)
+            else payload.get("binary") if isinstance(payload.get("binary"), str)
+            else ""
+        )
         try:
             ensure_binary_archive_imported(
                 binary or "",
@@ -1026,7 +1044,8 @@ def build_worker(
                 duration_seconds=max(0.0, clock() - start),
                 error=str(exc),
             )
-        _prefetch_variant_inputs(payload, env)
+        if item_class == ITEM_CLASS_BUILD_VARIANT:
+            _prefetch_variant_inputs(payload, env)
 
     try:
         success, stdout, stderr = build_attr(attr, env)
