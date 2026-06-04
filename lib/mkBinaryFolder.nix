@@ -39,6 +39,7 @@ pkgs.runCommand "${variantLabel}-elf-folder"
     nativeBuildInputs = with pkgs; [
       file
       findutils
+      gawk
     ];
     passthru = {
       datasetMeta = meta;
@@ -47,22 +48,45 @@ pkgs.runCommand "${variantLabel}-elf-folder"
   ''
     mkdir -p $out/elf
 
+    # Enumerate every ELF entry across ALL outputs — regular files AND
+    # symlinks that resolve to an ELF (packages expose several named
+    # binaries as symlinks to one executable, e.g. lz4cat, unlz4 -> lz4).
+    # One row per entry: <real-target> <TAB> <is-symlink 0|1> <TAB>
+    # <name-length> <TAB> <name>. `file -bL` types through the link;
+    # `readlink -f` canonicalises to the real ELF.
+    : > entries.tsv
     for src in ${lib.concatStringsSep " " outPaths}; do
-      find "$src" -type f -print0 | while IFS= read -r -d "" f; do
-        if file -b "$f" | grep -q "^ELF"; then
-          basename=$(basename "$f")
-          if [ -e "$out/elf/$basename" ]; then
-            hash=$(echo "$f" | md5sum | cut -c1-8)
-            ln -s "$f" "$out/elf/''${hash}_''${basename}"
-          else
-            ln -s "$f" "$out/elf/$basename"
-          fi
+      find "$src" \( -type f -o -type l \) -print0 | while IFS= read -r -d "" f; do
+        if file -bL "$f" 2>/dev/null | grep -q "^ELF"; then
+          real=$(readlink -f "$f")
+          if [ -L "$f" ]; then sym=1; else sym=0; fi
+          bn=$(basename "$f")
+          printf '%s\t%s\t%s\t%s\n' "$real" "$sym" "''${#bn}" "$bn" >> entries.tsv
         fi
       done
     done
 
+    # Keep only UNIQUE ELFs (symlinks to the same target are the SAME
+    # binary). Per unique target choose ONE name: prefer a non-symlink
+    # entry; else the longest name; ties broken by natural (version) order
+    # taking the last (e10o after e9o and e009o). The sort puts the winner
+    # first within each target group (k1); awk keeps the first row per group.
+    TAB="$(printf '\t')"
+    if [ -s entries.tsv ]; then
+      sort -t"$TAB" -k1,1 -k2,2n -k3,3nr -k4,4Vr entries.tsv \
+        | awk -F"$TAB" '!seen[$1]++ { print $1 "\t" $4 }' \
+        | while IFS="$TAB" read -r real name; do
+            if [ -e "$out/elf/$name" ] || [ -L "$out/elf/$name" ]; then
+              h=$(printf '%s' "$real" | md5sum | cut -c1-8)
+              ln -s "$real" "$out/elf/''${h}_''${name}"
+            else
+              ln -s "$real" "$out/elf/$name"
+            fi
+          done
+    fi
+
     count=$(find $out/elf -mindepth 1 -type l | wc -l)
-    echo "Linked $count ELF files for ${variantLabel}"
+    echo "Linked $count unique ELF(s) for ${variantLabel}"
 
     cat > $out/meta.json <<'METAEOF'
     ${builtins.toJSON meta}
