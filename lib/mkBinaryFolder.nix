@@ -51,9 +51,9 @@ pkgs.runCommand "${variantLabel}-elf-folder"
     # Enumerate every ELF entry across ALL outputs — regular files AND
     # symlinks that resolve to an ELF (packages expose several named
     # binaries as symlinks to one executable, e.g. lz4cat, unlz4 -> lz4).
-    # One row per entry: <real-target> <TAB> <is-symlink 0|1> <TAB>
-    # <name-length> <TAB> <name>. `file -bL` types through the link;
-    # `readlink -f` canonicalises to the real ELF.
+    # One row per entry: <real-target> <TAB> <is-symlink 0|1> <TAB> <name>.
+    # `file -bL` types through the link; `readlink -f` canonicalises to the
+    # real ELF.
     : > entries.tsv
     for src in ${lib.concatStringsSep " " outPaths}; do
       find "$src" \( -type f -o -type l \) -print0 | while IFS= read -r -d "" f; do
@@ -61,20 +61,22 @@ pkgs.runCommand "${variantLabel}-elf-folder"
           real=$(readlink -f "$f")
           if [ -L "$f" ]; then sym=1; else sym=0; fi
           bn=$(basename "$f")
-          printf '%s\t%s\t%s\t%s\n' "$real" "$sym" "''${#bn}" "$bn" >> entries.tsv
+          printf '%s\t%s\t%s\n' "$real" "$sym" "$bn" >> entries.tsv
         fi
       done
     done
 
     # Keep only UNIQUE ELFs (symlinks to the same target are the SAME
     # binary). Per unique target choose ONE name: prefer a non-symlink
-    # entry; else the longest name; ties broken by natural (version) order
-    # taking the last (e10o after e9o and e009o). The sort puts the winner
-    # first within each target group (k1); awk keeps the first row per group.
+    # entry; otherwise the natural (version) order last — the highest
+    # version (v10.0 after v9.0.1.2). Natural order already yields the
+    # "longest" for a plain version chain without mis-ranking a deeper but
+    # lower version. The sort puts the winner first per target group (k1);
+    # awk keeps the first row per group.
     TAB="$(printf '\t')"
     if [ -s entries.tsv ]; then
-      sort -t"$TAB" -k1,1 -k2,2n -k3,3nr -k4,4Vr entries.tsv \
-        | awk -F"$TAB" '!seen[$1]++ { print $1 "\t" $4 }' \
+      sort -t"$TAB" -k1,1 -k2,2n -k3,3Vr entries.tsv \
+        | awk -F"$TAB" '!seen[$1]++ { print $1 "\t" $3 }' \
         | while IFS="$TAB" read -r real name; do
             if [ -e "$out/elf/$name" ] || [ -L "$out/elf/$name" ]; then
               h=$(printf '%s' "$real" | md5sum | cut -c1-8)
