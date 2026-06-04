@@ -26,10 +26,10 @@ from .shapes import (
     _variant_array_fields,
 )
 
-# Match ``/nix/store/<hash>-`` so the remaining basename can be fed
-# into ``parse_variant_path``. The hash segment is alphanumeric only,
-# so a non-greedy match up to the first ``-`` works for real nix paths
-# (32-char base32 hash) and shorter test fixtures alike.
+# Match ``/nix/store/<hash>-`` so the remaining basename can be fed into
+# ``parse_variant_path``. The hash segment is alphanumeric only, so a
+# non-greedy match to the first ``-`` works for real nix paths (32-char
+# base32 hash) and shorter test fixtures alike.
 _STORE_HASH_PREFIX_RE = re.compile(r"^/nix/store/[^-]+-")
 
 
@@ -39,13 +39,14 @@ def _variant_toolchain_task_id(
     comp: str,
     known_task_ids: frozenset[str],
 ) -> Optional[str]:
-    """Compose the canonical ``build_compilers__*`` task_id for one
-    variant's ``(arch, comp)`` and return it iff phase-1 emitted it.
-    Mirrors :func:`manifest_gen.build_compilers_task_id`. ``None``
-    skips wiring for operator-provided toolchains (no task to depend
-    on).
+    """Compose the bare ``<sys>__<arch>__<comp>`` build_compilers
+    task_id for one variant's ``(arch, comp)`` and return it iff phase-1
+    emitted it. Mirrors :func:`manifest_gen.build_compilers_task_id`
+    (phase-local; the BUILD_COMPILERS phase is carried by the downstream
+    cross-phase ``TaskDep``). ``None`` skips wiring for operator-provided
+    toolchains (no task to depend on).
     """
-    task_id = f"build_compilers__{sys_name}__{arch}__{comp}"
+    task_id = f"{sys_name}__{arch}__{comp}"
     return task_id if task_id in known_task_ids else None
 
 
@@ -237,9 +238,10 @@ def _plan_cell(
     _tid, _arch, variants, hashes = _variant_array_fields(arr)
     classes = classification_map.get((tmpl_id, arch), {})
 
-    # Snapshot the set of phase-1 ``build_compilers__*`` task_ids once
-    # so per-variant wiring can compose-then-check without rebuilding
-    # the lookup for every variant in this cell.
+    # Snapshot the set of phase-1 build_compilers task_ids (bare
+    # ``<sys>__<arch>__<comp>``) once so per-variant wiring can
+    # compose-then-check without rebuilding the lookup for every variant
+    # in this cell.
     known_task_ids: frozenset[str] = frozenset(toolchain_task_ids.values())
 
     # Seed each variant's dep set with every arch-indep task we minted
@@ -268,23 +270,22 @@ def _plan_cell(
         for deps in per_variant_dep_ids:
             deps.add(descriptor.task_id)
 
-    # Mint a variant descriptor per label.
+    # Mint a variant descriptor per label. Intra-phase deps go to
+    # ``depends_on``; cross-phase toolchain deps accumulate SEPARATELY
+    # into ``tc_deps`` (read ``(arch, comp)`` off the variant drv
+    # basename, which the role-collapsed template node can't distinguish).
     variant_descriptors: list[Phase4Descriptor] = []
     for variant_idx, label in enumerate(variants):
         spec = variant_lookup.get((arch, label))
         if spec is None:
             continue
         deps = per_variant_dep_ids[variant_idx]
-        # Per-variant toolchain wiring: the role-collapsed template
-        # node can't distinguish per-variant compilers, but the
-        # variant drv basename can -- read ``(arch, comp)`` off it.
-        tc_task_id = _variant_toolchain_dep(spec, sys_name, known_task_ids)
-        if tc_task_id is not None:
-            deps = deps | {tc_task_id}
         if meta_extra_variant_deps:
             deps = deps | meta_extra_variant_deps.get((arch, label), set())
-        if meta_toolchain_extras:
-            deps = deps | meta_toolchain_extras.get((arch, label), set())
+        tc_deps = set((meta_toolchain_extras or {}).get((arch, label), ()))
+        tc_task_id = _variant_toolchain_dep(spec, sys_name, known_task_ids)
+        if tc_task_id is not None:
+            tc_deps.add(tc_task_id)
         variant_descriptors.append(_variant_descriptor(
             binary=binary,
             arch=arch,
@@ -292,5 +293,6 @@ def _plan_cell(
             label=label,
             variant_spec=spec,
             depends_on=deps,
+            build_compilers_depends_on=tc_deps,
         ))
     return common_dep_descriptors, variant_descriptors

@@ -35,19 +35,20 @@ the pair).
   - ``build_variant_count == 2`` — both labels survive descriptor
     emission.
   - ``per_variant_toolchain_task`` — both variants wire to the SAME
-    canonical ``build_compilers__x86_64-linux__x86_64__gcc15`` task_id
-    because ``parse_variant_path`` returns the same ``(arch, comp)``
-    pair for both drvs, and that drives ``_variant_toolchain_dep``
-    independently of the inner axes.
+    bare ``x86_64-linux__x86_64__gcc15`` task_id (carried in the
+    cross-phase ``build_compilers_depends_on`` field) because
+    ``parse_variant_path`` returns the same ``(arch, comp)`` pair for
+    both drvs, and that drives ``_variant_toolchain_dep`` independently
+    of the inner axes.
 
 Test convention: the harness will load ``toolchain_task_ids.json``
 (empty here, the per-variant toolchain wiring is gated by phase-1
 having emitted the canonical id) and treat the empty dict as "skip
 the toolchain-wire check" OR thread an injected
-``{"<hash>-wrapped-compiler-suit.drv": "build_compilers__x86_64-linux__x86_64__gcc15"}``
+``{"<hash>-wrapped-compiler-suit.drv": "x86_64-linux__x86_64__gcc15"}``
 + ``known_task_ids`` containing the expected id. The
 ``per_variant_toolchain_task`` value above lists what
-``_variant_toolchain_dep`` will return WHEN ``build_compilers__x86_64-linux__x86_64__gcc15``
+``_variant_toolchain_dep`` will return WHEN ``x86_64-linux__x86_64__gcc15``
 is in ``known_task_ids`` (validated by the prototype).
 
 **variant_lookup.json convention**: list-of-records,

@@ -55,12 +55,13 @@ the descriptor-emission half (planner side, not graph side).
   - ``common_deps_cross_arch_min >= 1`` — at least one
     ``build_common_dep__cross_arch__*`` descriptor present.
   - ``per_variant_toolchain_task`` — explicit ``null`` per label
-    documents that without phase-1 emitted ``build_compilers__*``
+    documents that without phase-1 emitted build_compilers
     task_ids (the fixture's ``toolchain_task_ids`` is empty),
     ``_variant_toolchain_dep`` returns ``None`` and no toolchain
     is wired. The harness reads these as "no required toolchain
-    task_id"; substitute concrete task_ids when threading a non-
-    empty ``toolchain_task_ids`` through this fixture.
+    task_id"; substitute concrete (bare ``<sys>__<arch>__<comp>``)
+    task_ids when threading a non-empty ``toolchain_task_ids``
+    through this fixture.
 
 **variant_lookup.json convention**: list-of-records,
 ``[{"key": [arch, label], "value": {...}}, ...]``.

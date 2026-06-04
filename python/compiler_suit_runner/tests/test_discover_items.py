@@ -175,7 +175,7 @@ def test_discover_items_classifies_each_manifest(tmp_path: pathlib.Path) -> None
         config.manifest_dir,
         make_build_variant_header(
             _variant("hello", "x86_64"), "x86_64-linux",
-            toolchain_task_id="build_compilers__x86_64-linux__x86_64__gcc15",
+            toolchain_task_id="x86_64-linux__x86_64__gcc15",
         ),
     )
 
@@ -275,10 +275,12 @@ def test_discover_items_strips_task_depends_on_when_disabled(
 ) -> None:
     """``disable_task_deps=True`` zeros out ``task_depends_on`` for every item.
 
-    The variant header normally carries a tuple
-    ``(toolchain_task_id(...),)``; with the workaround flag set the
-    framework never sees those edges, and PendingPool.extend() accepts
-    the variant even when its toolchain dep is in-flight.
+    The variant header normally carries its toolchain prerequisite in
+    ``build_compilers_depends_on``, which the runner wraps into a
+    cross-phase ``TaskDep`` on the emitted ``task_depends_on``; with the
+    workaround flag set the framework never sees those edges, and
+    PendingPool.extend() accepts the variant even when its toolchain dep
+    is in-flight.
     """
     base_config = _make_config(tmp_path)
     config = dataclasses.replace(base_config, disable_task_deps=True)
@@ -292,7 +294,7 @@ def test_discover_items_strips_task_depends_on_when_disabled(
         config.manifest_dir,
         make_build_variant_header(
             _variant("hello", "x86_64"), "x86_64-linux",
-            toolchain_task_id="build_compilers__x86_64-linux__x86_64__gcc15",
+            toolchain_task_id="x86_64-linux__x86_64__gcc15",
         ),
     )
 

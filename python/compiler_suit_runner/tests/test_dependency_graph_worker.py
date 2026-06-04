@@ -844,7 +844,7 @@ class TestRunDependencyGraphTask:
             binary="hello",
             matrix_drv=matrix_agg,
             toolchain_task_ids={
-                "zzzz-gcc15.drv": "build_compilers__aarch64__gcc15",
+                "zzzz-gcc15.drv": "x86_64-linux__aarch64__gcc15",
             },
             sys_name="x86_64-linux",
             run_subprocess=stub,
@@ -860,7 +860,7 @@ class TestRunDependencyGraphTask:
         }
         # Planner saw the toolchain task ids and the binary list.
         assert plan_calls[0]["toolchain_task_ids"] == {
-            "zzzz-gcc15.drv": "build_compilers__aarch64__gcc15",
+            "zzzz-gcc15.drv": "x86_64-linux__aarch64__gcc15",
         }
         assert plan_calls[0]["binaries"] == ["hello"]
         # Variant lookup the planner sees is the stubbed one
@@ -1668,7 +1668,7 @@ class TestDependencyGraphCounters:
                 task_id="build_variant__x86_64-linux__hello__gcc15-O2",
                 name="build_variant__hello__gcc15-O2",
                 payload={"binary": "hello"},
-                depends_on=("build_compilers__x86_64__gcc15",),
+                build_compilers_depends_on=("x86_64-linux__x86_64__gcc15",),
             ),
             Phase4Descriptor(
                 kind="build_variant",
@@ -1696,8 +1696,8 @@ class TestDependencyGraphCounters:
         assert counters["common_deps_uni_arch"] == 1
         assert counters["common_deps_arch_indep"] == 1
         assert counters["source_terminal_skipped"] == 5
-        # Only one of the two build_variant descriptors has a
-        # ``build_compilers__`` task in its depends_on.
+        # Only one of the two build_variant descriptors carries a
+        # toolchain task in its build_compilers_depends_on.
         assert counters["toolchain_wired"] == 1
         assert counters["stdenv_subtrees"] == 1
         assert counters["violations"] == 2

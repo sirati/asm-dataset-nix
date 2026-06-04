@@ -43,8 +43,19 @@ class Phase4Descriptor:
     ``kind`` is either ``"build_common_dep"`` or ``"build_variant"``;
     integration code maps these to the current ``manifest_gen``
     constructor names. ``payload`` carries the worker-visible
-    arguments; ``depends_on`` is the tuple of task_ids whose completion
-    gates this task.
+    arguments; ``depends_on`` is the tuple of INTRA-phase task_ids
+    (other phase-4 ``build_common_dep`` tasks) whose completion gates
+    this task.
+
+    ``build_compilers_depends_on`` carries CROSS-phase toolchain
+    prerequisites — the bare ``build_compilers`` task_ids (living in
+    :attr:`Phase.BUILD_COMPILERS`) a ``build_variant`` needs. They are
+    kept SEPARATE from ``depends_on`` because a dependency's full
+    identity is ``(phase_id, task_id)``: a toolchain id mixed into the
+    intra-phase ``depends_on`` would resolve to the variant's own (BUILD)
+    phase and be flagged a missing dep. The integration layer threads it
+    onto :attr:`manifest_gen.ManifestHeader.build_compilers_depends_on`,
+    which the runner wraps in a phase-tagged ``TaskDep``.
 
     ``priority_hint`` is a non-negative scheduling-priority bias passed
     through to the framework: ``0`` is the neutral default (the value
@@ -65,6 +76,7 @@ class Phase4Descriptor:
     name: str
     payload: dict
     depends_on: tuple[str, ...] = ()
+    build_compilers_depends_on: tuple[str, ...] = ()
     priority_hint: int = 0
 
 
@@ -89,8 +101,11 @@ class BinaryPlanInput:
     ``toolchain_task_ids`` maps a toolchain drv identifier
     (``"<hash>-<name>"`` -- the format returned by
     :func:`convert_toolchain_drvs`) to its phase-1 ``build_compilers``
-    task_id. Variants whose template touches that toolchain get the
-    id wired into their ``depends_on``. The streaming planner's
+    task_id (the BARE ``<sys>__<arch>__<comp>`` id minted by
+    :func:`manifest_gen.build_compilers_task_id`). Variants whose
+    template touches that toolchain get the id wired into their
+    CROSS-phase ``build_compilers_depends_on`` (NOT the intra-phase
+    ``depends_on``). The streaming planner's
     ``toolchain_node_ids_per_template`` map identifies which template
     nodes are toolchains (the cowalk short-circuits their subtrees so
     ``arr.hashes`` rows stay empty); we resolve those node_ids to
@@ -232,6 +247,7 @@ def _variant_descriptor(
     label: str,
     variant_spec: Mapping[str, Any],
     depends_on: Sequence[str],
+    build_compilers_depends_on: Sequence[str] = (),
 ) -> Phase4Descriptor:
     """Build a ``build_variant`` descriptor for one matrix variant.
 
@@ -239,6 +255,13 @@ def _variant_descriptor(
     integration site can hand-roll a ``ManifestHeader`` with no
     field-by-field reconstruction. We do NOT call ``manifest_gen`` at
     all -- see module docstring for the decoupling rationale.
+
+    ``depends_on`` carries only INTRA-phase prerequisites (common_dep /
+    arch_indep task_ids); ``build_compilers_depends_on`` carries the
+    CROSS-phase toolchain task_ids. Keeping them apart is required so
+    the cross-phase toolchain edge is tagged with
+    ``phase_id=Phase.BUILD_COMPILERS`` downstream (see
+    :class:`Phase4Descriptor`).
     """
     payload = {
         "sys": sys_name,
@@ -259,12 +282,15 @@ def _variant_descriptor(
         "tier": variant_spec.get("tier", 0),
     }
     task_id = _variant_task_id(binary, sys_name, label)
-    # Deterministic ordering of deps so observers comparing manifests
-    # across runs see stable diffs.
+    # Deterministic ordering of both dep tuples so observers comparing
+    # manifests across runs see stable diffs.
     return Phase4Descriptor(
         kind="build_variant",
         task_id=task_id,
         name=f"build_variant__{binary}__{label}",
         payload=payload,
         depends_on=tuple(sorted(set(depends_on))),
+        build_compilers_depends_on=tuple(
+            sorted(set(build_compilers_depends_on))
+        ),
     )

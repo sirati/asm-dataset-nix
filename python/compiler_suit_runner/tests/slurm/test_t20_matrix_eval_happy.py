@@ -505,29 +505,17 @@ def test_t20_matrix_eval_happy(
     )
 
     for path, doc in build_variant_manifests:
-        depends = doc.get("task_depends_on") or []
-        assert depends, (
-            f"build_variant manifest {path.name} has empty "
-            f"task_depends_on -- the planner did not wire its "
-            f"toolchain dependency ({detail})"
-        )
-        # Toolchain task_ids are stamped per-class by
-        # ``manifest_gen.{build_compilers,toolchain_validate}_task_id``
-        # as ``build_compilers__<sys>__<arch>__<compiler>`` (when
-        # --build-compilers is set) or ``toolchain_validate__<sys>__
-        # <arch>__<compiler>`` (default mode). At least one entry in
-        # depends_on must follow one of those shapes; the planner may
-        # add build_common_dep__<...> as well (transitive provenance),
-        # but the toolchain dep is mandatory.
-        toolchain_deps = [
-            d for d in depends
-            if isinstance(d, str)
-            and d.startswith(("build_compilers__", "toolchain_validate__"))
-        ]
+        # The toolchain dep is CROSS-phase (Phase.BUILD_COMPILERS) and is
+        # carried in the dedicated ``build_compilers_depends_on`` field —
+        # NOT the intra-phase ``task_depends_on``. The bare task_id
+        # (``<sys>__<arch>__<comp>``) is minted by
+        # ``manifest_gen.build_compilers_task_id``; the runner wraps it
+        # in a phase-tagged TaskDep when emitting the framework TaskInfo.
+        toolchain_deps = doc.get("build_compilers_depends_on") or []
         assert toolchain_deps, (
-            f"build_variant manifest {path.name} has no "
-            f"build_compilers__* / toolchain_validate__* entry in "
-            f"task_depends_on={depends!r} ({detail})"
+            f"build_variant manifest {path.name} has empty "
+            f"build_compilers_depends_on -- the planner did not wire its "
+            f"toolchain dependency ({detail})"
         )
 
     # Assertion (5): final dataset directories populated for every

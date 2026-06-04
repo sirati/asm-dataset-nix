@@ -214,10 +214,14 @@ def eval_sampled_matrix_leaves(
 def toolchain_task_ids_for_combos(
     compilers_per_arch: dict[str, list[str]],
 ) -> dict[str, str]:
-    """``ident -> build_compilers__*`` map (synthetic ident keys)."""
+    """``ident -> <sys>__<arch>__<comp>`` map (synthetic ident keys).
+
+    Values are the bare, phase-local build_compilers task_ids (the
+    BUILD_COMPILERS phase carries the namespace, not the id string).
+    """
     return {
         f"__synth__{arch}__{comp}":
-            f"build_compilers__{SYS_NAME}__{arch}__{comp}"
+            f"{SYS_NAME}__{arch}__{comp}"
         for arch, comps in compilers_per_arch.items()
         for comp in comps
     }

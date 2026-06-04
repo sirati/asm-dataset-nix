@@ -74,9 +74,8 @@ class Phase(StrEnum):
 
     NOTE: a task's id should be phase-LOCAL — the phase is carried by
     the framework's ``(phase_id, task_id)`` identity, not embedded in
-    the ``task_id`` string (see :func:`matrix_eval_task_id`).
-    :func:`build_compilers_task_id` still embeds its prefix pending the
-    deferred toolchain-dep follow-up.
+    the ``task_id`` string (see :func:`matrix_eval_task_id` and
+    :func:`build_compilers_task_id`).
     """
 
     BUILD_COMPILERS = "build_compilers"
@@ -160,10 +159,21 @@ class ManifestHeader:
     task-deps API; required once the framework's PendingPool starts
     enforcing). Stable + unique across the run.
 
-    ``task_depends_on`` is the tuple of ``task_id``s that must complete
-    before this task is dispatchable. Empty means no deps (e.g.
-    toolchains). Variants reference their toolchain's task_id so the
-    scheduler can hold them until the toolchain build finishes.
+    ``task_depends_on`` is the tuple of INTRA-phase ``task_id``s that
+    must complete before this task is dispatchable. Bare strings resolve
+    to the enclosing task's own phase at the framework's PyO3 boundary,
+    so this field is for same-phase prerequisites only (e.g. a variant's
+    ``build_common_dep`` siblings). Empty means no intra-phase deps.
+
+    ``build_compilers_depends_on`` carries CROSS-phase prerequisites that
+    live in :attr:`Phase.BUILD_COMPILERS` (a ``build_variant`` in
+    :attr:`Phase.BUILD` naming its toolchain build). These are carried
+    separately from ``task_depends_on`` because a dependency's full
+    identity is ``(phase_id, task_id)``: a bare-string dep would resolve
+    to the variant's own (BUILD) phase and be flagged a missing dep. The
+    runner wraps each id here in a ``TaskDep(phase_id=BUILD_COMPILERS)``
+    before handing it to the framework (see
+    ``SuitTask._task_info_from_header``).
 
     ``priority_hint`` is a non-negative scheduling-priority bias (0 is
     the default neutral value; higher = earlier). The dependency_graph
@@ -180,6 +190,7 @@ class ManifestHeader:
     payload: dict
     task_id: str = ""
     task_depends_on: tuple[str, ...] = ()
+    build_compilers_depends_on: tuple[str, ...] = ()
     priority_hint: int = 0
 
 
@@ -194,19 +205,23 @@ class ManifestHeader:
 
 
 def build_compilers_task_id(sys_name: str, arch: str, compiler_label: str) -> str:
-    """Stable id for a build_compilers task.
+    """Phase-local id for a build_compilers task: the bare
+    ``<sys>__<arch>__<compiler>`` tuple.
 
-    NOTE: this id still embeds the ``build_compilers__`` phase prefix.
-    De-prefixing it (to match the framework's phase-local
-    ``(phase_id, task_id)`` identity, like :func:`matrix_eval_task_id`)
-    is a deferred follow-up: it requires routing the variant→toolchain
-    cross-phase edge through a dedicated ``TaskDep(phase_id=BUILD_COMPILERS)``
-    field across Phase4Descriptor / ManifestHeader / manifest_glue /
-    counters, and that whole path is inert unless ``--build-compilers``
-    emits toolchain tasks. Tracked separately so it lands with its own
-    tests rather than riding the matrix_eval fix.
+    One task per (sys, arch, compiler). The id does NOT embed the phase
+    — the framework's ``(phase_id, task_id)`` identity carries it
+    (``phase_id`` = :attr:`Phase.BUILD_COMPILERS`); a dependant in
+    another phase (a ``build_variant`` in :attr:`Phase.BUILD`) names this
+    task via ``TaskDep(task_id=..., phase_id=Phase.BUILD_COMPILERS)``,
+    threaded through ``build_compilers_depends_on`` (see
+    :class:`ManifestHeader`).
+
+    Distinct from :func:`toolchain_validate_task_id` (which keeps its
+    ``toolchain_validate__`` prefix) because both classes can fire on the
+    same ``(arch, compiler_label)`` and live in different phases; the
+    framework rejects duplicate task ids within a phase.
     """
-    return f"build_compilers__{sys_name}__{arch}__{compiler_label}"
+    return f"{sys_name}__{arch}__{compiler_label}"
 
 
 def toolchain_validate_task_id(sys_name: str, arch: str, compiler_label: str) -> str:
@@ -453,12 +468,18 @@ def make_build_variant_header(
 ) -> ManifestHeader:
     """Build a build_variant manifest.
 
-    ``task_depends_on`` references the corresponding toolchain task —
-    when the framework's task-dep scheduler enforces (Phase 2 of the
-    task-deps API), this variant won't be dispatched until its
-    toolchain has been built/substituted, eliminating the worker-slot
-    waste of variants spinning on nix-daemon's build-lock waiting for
-    their toolchain to come online.
+    ``build_compilers_depends_on`` references the corresponding
+    toolchain task — a CROSS-phase prerequisite in
+    :attr:`Phase.BUILD_COMPILERS` (the variant itself lives in
+    :attr:`Phase.BUILD`). When the framework's task-dep scheduler
+    enforces (Phase 2 of the task-deps API), this variant won't be
+    dispatched until its toolchain has been built/substituted,
+    eliminating the worker-slot waste of variants spinning on
+    nix-daemon's build-lock waiting for their toolchain to come online.
+    The id is routed through the dedicated cross-phase field (not the
+    intra-phase ``task_depends_on``) so the runner can tag it with
+    ``phase_id=Phase.BUILD_COMPILERS``; there are no intra-phase deps on
+    a variant today, so ``task_depends_on`` stays empty.
 
     ``input_drvs`` (when provided) carries the variant's transitive
     ``inputDrvs`` set — every drv path the variant build can read
@@ -522,7 +543,10 @@ def make_build_variant_header(
         size=0,
         payload=payload,
         task_id=variant_task_id(variant, sys_name),
-        task_depends_on=(toolchain_task_id,) if toolchain_task_id else (),
+        task_depends_on=(),
+        build_compilers_depends_on=(
+            (toolchain_task_id,) if toolchain_task_id else ()
+        ),
     )
 
 
@@ -537,14 +561,18 @@ def _header_to_jsonable(header: ManifestHeader) -> dict:
         "size": header.size,
         "payload": header.payload,
     }
-    # task_id / task_depends_on / priority_hint are emitted only when
-    # populated so legacy manifests round-trip unchanged (older
-    # preflight outputs without these fields parse cleanly via the
-    # read-side defaults).
+    # task_id / task_depends_on / build_compilers_depends_on /
+    # priority_hint are emitted only when populated so legacy manifests
+    # round-trip unchanged (older preflight outputs without these fields
+    # parse cleanly via the read-side defaults).
     if header.task_id:
         out["task_id"] = header.task_id
     if header.task_depends_on:
         out["task_depends_on"] = list(header.task_depends_on)
+    if header.build_compilers_depends_on:
+        out["build_compilers_depends_on"] = list(
+            header.build_compilers_depends_on
+        )
     if header.priority_hint:
         out["priority_hint"] = header.priority_hint
     return out
@@ -619,6 +647,13 @@ def read_manifest(path: pathlib.Path) -> ManifestHeader:
         raise ValueError(
             f"{path}: 'task_depends_on' must be a list of strings"
         )
+    raw_bc_deps = parsed.get("build_compilers_depends_on", [])
+    if not isinstance(raw_bc_deps, list) or not all(
+        isinstance(d, str) for d in raw_bc_deps
+    ):
+        raise ValueError(
+            f"{path}: 'build_compilers_depends_on' must be a list of strings"
+        )
     raw_priority = parsed.get("priority_hint", 0)
     # ``bool`` is a subclass of ``int``; reject explicitly so a JSON
     # ``true`` doesn't sneak in as 1.
@@ -641,6 +676,7 @@ def read_manifest(path: pathlib.Path) -> ManifestHeader:
         payload=parsed["payload"],
         task_id=raw_task_id,
         task_depends_on=tuple(raw_deps),
+        build_compilers_depends_on=tuple(raw_bc_deps),
         priority_hint=raw_priority,
     )
 

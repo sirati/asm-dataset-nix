@@ -4,17 +4,19 @@ Pins per-variant toolchain resolution: when a single
 ``(template_id, arch)`` cell contains variants built with
 different compilers (gcc14 + clang20) that share a role-
 collapsed wrapper name (``wrapped-compiler-suit.drv``), each
-variant MUST wire to its own ``build_compilers__*`` task_id,
-not the union of every compiler's task_id. The fix at
+variant MUST wire to its own bare ``<sys>__<arch>__<comp>``
+build_compilers task_id (in the cross-phase
+``build_compilers_depends_on`` field), not the union of every
+compiler's task_id. The fix at
 ``dependency_graph_planner/plan_cell.py:_variant_toolchain_dep``
 parses ``(arch, comp)`` off the variant's drv basename via
-``parse_variant_path`` and composes the canonical phase-1
-task_id ``build_compilers__<sys>__<arch>__<comp>``.
+``parse_variant_path`` and composes the bare phase-1 task_id
+``<sys>__<arch>__<comp>``.
 
 Regressing to the cell-level / role-keyed resolver would
-produce a 2-task ``depends_on`` for each variant (gcc14 +
-clang20 both wired into both variants), which this fixture's
-``per_variant_toolchain_task`` assertion catches.
+produce a 2-task ``build_compilers_depends_on`` for each variant
+(gcc14 + clang20 both wired into both variants), which this
+fixture's ``per_variant_toolchain_task`` assertion catches.
 
 **Tree**: 1 binary `hello` x 1 cell (`x86_64`) x 2 variants
 (gcc14-O2, clang20-O2). The ``toolchains.drv`` depth-1 section
@@ -23,7 +25,7 @@ role name); each variant backrefs its own.
 
 **Expected**: ``build_variant_count == 2`` and
 ``per_variant_toolchain_task`` maps each variant label to its
-canonical ``build_compilers__x86_64-linux__x86_64__<comp>`` id.
+bare ``x86_64-linux__x86_64__<comp>`` id.
 
 **variant_lookup.json convention**: list-of-records,
 ``[{"key": [arch, label], "value": {...}}, ...]``.

@@ -11,10 +11,12 @@ Each fixture under ``tests/fixtures/phase3_debug_cases/`` carries
 Two cross-fixture invariants are also enforced:
 
   * one ``build_variant`` per lookup entry, and
-  * every non-toolchain dep task has >= 2 dependents -- a one-consumer
-    dep should have been inlined; emitting it as its own task wastes
-    dispatch. ``build_compilers__*`` (pull-to-node) is exempt; per-
-    fixture opt-out via ``relax_dependent_count: true``.
+  * every common-dep task has >= 2 dependents -- a one-consumer dep
+    should have been inlined; emitting it as its own task wastes
+    dispatch. Toolchain deps are cross-phase (in each variant's
+    ``build_compilers_depends_on``, never an intra-phase ``depends_on``
+    edge) so they don't participate in this count; per-fixture opt-out
+    via ``relax_dependent_count: true``.
 
 Expected.json fields (all optional, unknown ignored):
 
@@ -143,11 +145,12 @@ def _assert_planner_invariants(
     expected: dict[str, Any],
 ) -> None:
     """Cross-fixture invariants: exactly one ``build_variant`` per
-    lookup entry, and every non-toolchain dep task carries >= 2
-    dependents. Toolchain pull-to-node tasks (``build_compilers__*``)
-    are the documented exception (emit on presence, not on dedup).
-    Fixtures may opt out of the dedup check via
-    ``relax_dependent_count: true`` in ``expected.json``.
+    lookup entry, and every common-dep task carries >= 2 dependents.
+    Toolchain deps are cross-phase (each variant's
+    ``build_compilers_depends_on``, not an intra-phase ``depends_on``
+    edge) so they never appear in the dependent count. Fixtures may opt
+    out of the dedup check via ``relax_dependent_count: true`` in
+    ``expected.json``.
     """
     variants = [d for d in descriptors if d.kind == "build_variant"]
     assert len(variants) == len(variant_lookup), (
@@ -159,14 +162,17 @@ def _assert_planner_invariants(
         return
     counts = _dependent_counts(descriptors)
     variant_task_ids = {d.task_id for d in variants}
+    # Phase-4 descriptors are only build_common_dep / build_variant;
+    # toolchain tasks live in phase-1 and reach variants via the
+    # cross-phase build_compilers_depends_on field, so they never show
+    # up as descriptors here.
     violators = sorted(
         d.task_id for d in descriptors
         if d.task_id not in variant_task_ids
-        and not d.task_id.startswith("build_compilers__")
         and counts.get(d.task_id, 0) < 2
     )
     assert not violators, (
-        f"fixture {case_name!r}: non-toolchain dep tasks with < 2 "
+        f"fixture {case_name!r}: common-dep tasks with < 2 "
         f"dependents (one-consumer dep should have been inlined): "
         f"{violators}"
     )
@@ -263,16 +269,15 @@ def test_phase3_debug_case(case_dir: pathlib.Path) -> None:
                 f"fixture {case_name!r}: no build_variant descriptor "
                 f"with label {label!r}"
             )
-            deps = descriptor.depends_on
-            # ``bad`` is the set of build_compilers__* deps OTHER than
-            # the expected one (or any, when expected is None). Catches
-            # over-wiring (a regression mixing gcc14 + clang20 task ids
-            # into a gcc14-O2 variant would slip past `in deps` alone).
-            bad = [
-                d for d in deps
-                if d.startswith("build_compilers__")
-                and d != expected_task_id
-            ]
+            # Toolchain deps are CROSS-phase: they live in the dedicated
+            # build_compilers_depends_on field (bare ids), no longer in
+            # the intra-phase depends_on.
+            deps = descriptor.build_compilers_depends_on
+            # ``bad`` is the set of toolchain deps OTHER than the
+            # expected one. Every entry in this field is a toolchain dep,
+            # so a regression mixing gcc14 + clang20 task ids into a
+            # gcc14-O2 variant surfaces here.
+            bad = [d for d in deps if d != expected_task_id]
             if expected_task_id is not None:
                 assert expected_task_id in deps, (
                     f"fixture {case_name!r}: variant {label!r} missing "

@@ -128,6 +128,7 @@ def headers_from_descriptors(descriptors: Iterable[Phase4Descriptor]) -> list:
     # invocation, not per descriptor).
     header_field_names = {f.name for f in dataclasses.fields(ManifestHeader)}
     supports_priority = "priority_hint" in header_field_names
+    supports_bc_deps = "build_compilers_depends_on" in header_field_names
 
     headers: list = []
     for d in descriptors:
@@ -142,6 +143,7 @@ def headers_from_descriptors(descriptors: Iterable[Phase4Descriptor]) -> list:
                 descriptor=d,
                 payload=payload,
                 supports_priority=supports_priority,
+                supports_bc_deps=supports_bc_deps,
             ))
             continue
         if d.kind == "build_variant":
@@ -158,6 +160,7 @@ def headers_from_descriptors(descriptors: Iterable[Phase4Descriptor]) -> list:
                 descriptor=d,
                 payload=payload,
                 supports_priority=supports_priority,
+                supports_bc_deps=supports_bc_deps,
             ))
             continue
         # Unknown kind -- skip silently; caller logs the gap.
@@ -171,14 +174,18 @@ def _build_header(
     descriptor: Phase4Descriptor,
     payload: dict,
     supports_priority: bool,
+    supports_bc_deps: bool,
 ):
-    """Mint a ManifestHeader; thread ``priority_hint`` when supported.
+    """Mint a ManifestHeader; thread ``priority_hint`` /
+    ``build_compilers_depends_on`` when supported.
 
     Falls back to omitting the kwarg (and emitting a one-shot debug
     log line per process) when an older ``ManifestHeader`` predates
     plan §E7. The descriptor's hint is still observable via
     ``Phase4Descriptor.priority_hint`` for callers that bypass the
-    framework wrapper.
+    framework wrapper. The cross-phase ``build_compilers_depends_on``
+    field is threaded the same way; when absent the toolchain edge is
+    simply not enforced (the inert ``--build-compilers`` path).
     """
     kwargs = {
         "item_class": item_class,
@@ -188,6 +195,10 @@ def _build_header(
         "task_id": descriptor.task_id,
         "task_depends_on": tuple(descriptor.depends_on),
     }
+    if descriptor.build_compilers_depends_on and supports_bc_deps:
+        kwargs["build_compilers_depends_on"] = tuple(
+            descriptor.build_compilers_depends_on
+        )
     if descriptor.priority_hint:
         if supports_priority:
             kwargs["priority_hint"] = descriptor.priority_hint

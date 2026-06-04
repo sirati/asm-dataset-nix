@@ -1,7 +1,7 @@
 {
   "build_variant_count": 2,
   "per_variant_toolchain_task": {
-    "hello__x86_64__clang20-O2-baseline-default-san-off-march-default": "build_compilers__x86_64-linux__x86_64__clang20",
-    "hello__x86_64__gcc14-O2-baseline-default-san-off-march-default": "build_compilers__x86_64-linux__x86_64__gcc14"
+    "hello__x86_64__clang20-O2-baseline-default-san-off-march-default": "x86_64-linux__x86_64__clang20",
+    "hello__x86_64__gcc14-O2-baseline-default-san-off-march-default": "x86_64-linux__x86_64__gcc14"
   }
 }

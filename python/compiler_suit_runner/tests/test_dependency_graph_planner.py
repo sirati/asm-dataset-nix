@@ -523,7 +523,7 @@ class TestToolchainWiring:
         }
         toolchain_task_ids = {
             "ccwh-gcc-wrapper-15.drv":
-                "build_compilers__x86_64-linux__x86_64__gcc15",
+                "x86_64-linux__x86_64__gcc15",
         }
         descs = plan_phase4_for_binary(
             "hello",
@@ -533,10 +533,13 @@ class TestToolchainWiring:
         )
         variants = [d for d in descs if d.kind == "build_variant"]
         assert len(variants) == 1
+        # Toolchain dep is cross-phase: it lands in
+        # build_compilers_depends_on, NOT the intra-phase depends_on.
         assert (
-            "build_compilers__x86_64-linux__x86_64__gcc15"
-            in variants[0].depends_on
+            "x86_64-linux__x86_64__gcc15"
+            in variants[0].build_compilers_depends_on
         )
+        assert "x86_64-linux__x86_64__gcc15" not in variants[0].depends_on
 
     def test_unknown_toolchain_ident_is_skipped(self):
         """A toolchain ident that's not in the task-id map is silently
@@ -575,17 +578,20 @@ class TestToolchainWiring:
         variants = [d for d in descs if d.kind == "build_variant"]
         assert len(variants) == 1
         # No toolchain mapping known → no toolchain dep in variant.
-        # Common-dep deps from the root may still be present.
-        assert all(not dep.startswith("build_compilers__") for dep in variants[0].depends_on)
+        # Common-dep deps from the root may still be present in the
+        # intra-phase depends_on, but the cross-phase field is empty.
+        assert variants[0].build_compilers_depends_on == ()
 
     def test_unified_wrapper_role_wires_per_variant_compiler(self):
         """A toolchain node whose role unifies multiple compiler
         versions (e.g. ``wrapped-compiler-suit.drv``) must wire EACH
-        variant to its own compiler's ``build_compilers__*`` task,
+        variant to its own compiler's ``build_compilers`` task,
         not the union of every compiler that shares the cell. The
         role-collapsed template node hides the per-variant compiler
         choice, but the variant's drv basename carries it -- so
         per-variant resolution recovers it via ``parse_variant_path``.
+        The toolchain id lands in the cross-phase
+        ``build_compilers_depends_on`` field.
         """
         template = _template([
             _node("hello-root", [1]),
@@ -622,9 +628,9 @@ class TestToolchainWiring:
         }
         toolchain_task_ids = {
             "g14h-wrapped-compiler-suit.drv":
-                "build_compilers__x86_64-linux__x86_64__gcc14",
+                "x86_64-linux__x86_64__gcc14",
             "g15h-wrapped-compiler-suit.drv":
-                "build_compilers__x86_64-linux__x86_64__gcc15",
+                "x86_64-linux__x86_64__gcc15",
         }
         descs = plan_phase4_for_binary(
             "hello", streaming, variant_lookup,
@@ -635,19 +641,20 @@ class TestToolchainWiring:
         by_label = {v.payload["label"]: v for v in variants}
         # Each variant gets EXACTLY its own compiler's task_id, not the
         # union -- the per-variant resolver reads ``(arch, comp)`` off
-        # the variant drv basename.
-        g14_id = "build_compilers__x86_64-linux__x86_64__gcc14"
-        g15_id = "build_compilers__x86_64-linux__x86_64__gcc15"
-        assert g14_id in by_label["gcc14-O2"].depends_on
-        assert g15_id not in by_label["gcc14-O2"].depends_on
-        assert g15_id in by_label["gcc15-O2"].depends_on
-        assert g14_id not in by_label["gcc15-O2"].depends_on
+        # the variant drv basename. The id lands in the cross-phase
+        # build_compilers_depends_on field.
+        g14_id = "x86_64-linux__x86_64__gcc14"
+        g15_id = "x86_64-linux__x86_64__gcc15"
+        assert g14_id in by_label["gcc14-O2"].build_compilers_depends_on
+        assert g15_id not in by_label["gcc14-O2"].build_compilers_depends_on
+        assert g15_id in by_label["gcc15-O2"].build_compilers_depends_on
+        assert g14_id not in by_label["gcc15-O2"].build_compilers_depends_on
 
     def test_two_compilers_one_cell_wire_independently(self):
         """Sharp regression for the original cell-level conflation
         bug: two DISTINCT wrappers (gcc14 + clang20, cross-family,
         distinct hashes) in the same cell must each wire ONLY to
-        their own ``build_compilers__*`` task. Pre-fix, both wrappers
+        their own ``build_compilers`` task. Pre-fix, both wrappers
         got unioned into every variant; the negative assertions
         below are what that bug violated."""
         g14_hash = "0000000000000000000000000000gcc14"  # 32-char-style
@@ -662,8 +669,8 @@ class TestToolchainWiring:
             variants=["gcc14-O2", "clang20-O2"],
             hashes=[[("rg", "hello.drv"), ("rc", "hello.drv")], [], []],
         )
-        g14_id = "build_compilers__x86_64-linux__x86_64__gcc14"
-        cl20_id = "build_compilers__x86_64-linux__x86_64__clang20"
+        g14_id = "x86_64-linux__x86_64__gcc14"
+        cl20_id = "x86_64-linux__x86_64__clang20"
         streaming = {
             "templates": [template],
             "variant_arrays": {(0, "x86_64"): arr},
@@ -691,19 +698,20 @@ class TestToolchainWiring:
             for v in descs if v.kind == "build_variant"
         }
         assert len(by_label) == 2
-        assert g14_id in by_label["gcc14-O2"].depends_on
-        assert cl20_id not in by_label["gcc14-O2"].depends_on
-        assert cl20_id in by_label["clang20-O2"].depends_on
-        assert g14_id not in by_label["clang20-O2"].depends_on
+        assert g14_id in by_label["gcc14-O2"].build_compilers_depends_on
+        assert cl20_id not in by_label["gcc14-O2"].build_compilers_depends_on
+        assert cl20_id in by_label["clang20-O2"].build_compilers_depends_on
+        assert g14_id not in by_label["clang20-O2"].build_compilers_depends_on
 
     def test_unknown_toolchain_task_id_skipped(self):
-        """Per-variant wiring composes ``build_compilers__<sys>__<arch>__<comp>``
-        from the variant drv and looks it up in ``toolchain_task_ids``'s
-        VALUE set. A task_id not present in that set (e.g. an
-        operator-provided toolchain the framework never built) yields
-        no dep -- empty toolchain_task_ids maps to no toolchain wiring
-        at all. The old ``toolchain_node_ids_per_template`` gating is
-        gone; this test asserts the value-set lookup directly.
+        """Per-variant wiring composes the bare ``<sys>__<arch>__<comp>``
+        build_compilers task_id from the variant drv and looks it up in
+        ``toolchain_task_ids``'s VALUE set. A task_id not present in that
+        set (e.g. an operator-provided toolchain the framework never
+        built) yields no dep -- empty toolchain_task_ids maps to no
+        toolchain wiring at all. The old
+        ``toolchain_node_ids_per_template`` gating is gone; this test
+        asserts the value-set lookup directly.
         """
         template = _template([
             _node("hello-root", [1]),
@@ -728,11 +736,11 @@ class TestToolchainWiring:
             ("x86_64", "gcc15-O0"): _variant_spec("gcc15-O0", "hello", "x86_64"),
         }
         # Phase-1 emitted a DIFFERENT compiler's task; the variant's
-        # composed id ``build_compilers__x86_64-linux__x86_64__gcc15``
-        # isn't present, so no wiring fires.
+        # composed id ``x86_64-linux__x86_64__gcc15`` isn't present, so
+        # no wiring fires.
         toolchain_task_ids = {
             "otherh-clang-wrapper-19.drv":
-                "build_compilers__x86_64-linux__x86_64__clang19",
+                "x86_64-linux__x86_64__clang19",
         }
         descs = plan_phase4_for_binary(
             "hello", streaming, variant_lookup,
@@ -740,10 +748,8 @@ class TestToolchainWiring:
         )
         variants = [d for d in descs if d.kind == "build_variant"]
         assert len(variants) == 1
-        assert all(
-            not dep.startswith("build_compilers__")
-            for dep in variants[0].depends_on
-        )
+        # No matching toolchain task → empty cross-phase field.
+        assert variants[0].build_compilers_depends_on == ()
 
 
 # ---------------------------------------------------------------------------
@@ -1073,14 +1079,14 @@ class TestJsonRoundtrippedInput:
             "hello", streaming, variant_lookup,
             toolchain_task_ids={
                 "ccwh-gcc-wrapper-15.drv":
-                    "build_compilers__x86_64-linux__x86_64__gcc15",
+                    "x86_64-linux__x86_64__gcc15",
             },
         )
         variants = [d for d in descs if d.kind == "build_variant"]
         assert len(variants) == 1
         assert (
-            "build_compilers__x86_64-linux__x86_64__gcc15"
-            in variants[0].depends_on
+            "x86_64-linux__x86_64__gcc15"
+            in variants[0].build_compilers_depends_on
         )
 
 
@@ -1404,8 +1410,9 @@ class TestMetaTemplateShortCircuits:
 
     def test_toolchain_role_wires_existing_task_id(self):
         """A cross_arch position whose role is a toolchain name wires
-        the matching ``build_compilers__*`` task ids without minting a
-        new descriptor."""
+        the matching ``build_compilers`` task ids (into the cross-phase
+        build_compilers_depends_on field) without minting a new
+        descriptor."""
         cc_ident = ("ccwh", "gcc-wrapper-15.drv")
         tmpl_x = _template([
             _node("hello-x86_64-root", [1]),
@@ -1447,7 +1454,7 @@ class TestMetaTemplateShortCircuits:
         }
         toolchain_task_ids = {
             "ccwh-gcc-wrapper-15.drv":
-                "build_compilers__x86_64-linux__x86_64__gcc15",
+                "x86_64-linux__x86_64__gcc15",
         }
         descs = plan_phase4_for_binary(
             "hello", streaming, lookup,
@@ -1462,8 +1469,8 @@ class TestMetaTemplateShortCircuits:
         variants = [d for d in descs if d.kind == "build_variant"]
         assert len(variants) == 1
         assert (
-            "build_compilers__x86_64-linux__x86_64__gcc15"
-            in variants[0].depends_on
+            "x86_64-linux__x86_64__gcc15"
+            in variants[0].build_compilers_depends_on
         )
 
 

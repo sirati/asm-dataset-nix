@@ -321,10 +321,10 @@ def _make_task_dep(task_id: str, *, phase_id: str = "", inherit_outputs: bool = 
     prerequisite. A CROSS-phase prerequisite must name its phase
     explicitly via ``TaskDep(phase_id=...)`` or the primary marks the
     declaring task ``invalid_task`` ("missing dep") at ingest (e.g. the
-    all-binaries ``dependency_graph`` task depending on each
-    ``matrix_eval__<binary>`` task, or a ``build_variant`` depending on
-    its ``build_compilers__*`` toolchain). The dependent task then never
-    runs and its downstream phase spawns ZERO tasks.
+    all-binaries ``dependency_graph`` task depending on each MATRIX_EVAL
+    ``<binary>`` task, or a ``build_variant`` in BUILD depending on its
+    BUILD_COMPILERS ``<sys>__<arch>__<comp>`` toolchain). The dependent
+    task then never runs and its downstream phase spawns ZERO tasks.
 
     Falls back to a :class:`types.SimpleNamespace` stub when
     :mod:`dynamic_runner` is absent so unit tests run without the
@@ -648,6 +648,24 @@ class _PeerLifecycleListener:
 # ---------------------------------------------------------------------------
 
 
+def _header_depends_on(header: ManifestHeader) -> tuple:
+    """Assemble a header's full ``task_depends_on`` tuple.
+
+    Intra-phase deps in ``header.task_depends_on`` pass through as bare
+    strings (the framework resolves them to the enclosing phase).
+    Cross-phase toolchain ids in ``header.build_compilers_depends_on``
+    are each wrapped in a phase-tagged ``TaskDep`` so they resolve to
+    :attr:`Phase.BUILD_COMPILERS` rather than the declaring task's own
+    phase. Shared by the spawn-side :func:`_header_to_task_info` and the
+    in-memory :meth:`SuitTask._task_info_from_header`.
+    """
+    toolchain_deps = tuple(
+        _make_task_dep(tc_id, phase_id=Phase.BUILD_COMPILERS)
+        for tc_id in header.build_compilers_depends_on
+    )
+    return tuple(header.task_depends_on) + toolchain_deps
+
+
 def _header_to_task_info(header: ManifestHeader):
     """Convert one :class:`ManifestHeader` directly into a framework
     ``TaskInfo``. Mirrors the call shape used by
@@ -659,6 +677,11 @@ def _header_to_task_info(header: ManifestHeader):
     header_dict shape ``discover_items`` emits, so downstream
     workers see a uniform payload regardless of whether the item
     came from preflight or from Phase 1 planning.
+
+    Cross-phase toolchain deps (``build_compilers_depends_on``) are
+    phase-tagged via :func:`_header_depends_on`; this is the live
+    spawn path (``on_phase_end`` → ``headers_from_descriptors``) that
+    emits each ``build_variant``'s BUILD_COMPILERS toolchain edge.
     """
     phase_id, type_id, affinity_id = _classify(header)
     header_dict = {
@@ -679,7 +702,7 @@ def _header_to_task_info(header: ManifestHeader):
         affinity_id=affinity_id,
         payload=header_dict,
         task_id=header.task_id or "",
-        task_depends_on=tuple(header.task_depends_on),
+        task_depends_on=_header_depends_on(header),
     )
 
 
@@ -1020,9 +1043,10 @@ class SuitTask:
                 "size": header.size,
                 "payload": dict(header.payload),
             }
-            task_depends_on = (
-                () if self.config.disable_task_deps else header.task_depends_on
-            )
+            # Intra-phase deps pass through bare; cross-phase toolchain
+            # deps are phase-tagged (and the whole set is dropped when
+            # disable_task_deps is set) by the shared helper.
+            task_depends_on = self._header_task_depends_on(header)
             yield _make_task_info(
                 pathlib.Path(entry.name),
                 header.size,
@@ -1122,9 +1146,17 @@ class SuitTask:
 
         Mirrors the disk path's payload shape so the build_worker sees
         a uniform header_dict regardless of source. Honours
-        ``disable_task_deps`` the same way the disk loop does. Any
-        cross-phase ``task_depends_on`` edge is phase-tagged centrally
-        in :func:`_make_task_info`.
+        ``disable_task_deps`` the same way the disk loop does.
+
+        ``task_depends_on`` is assembled as the union of (a) the
+        intra-phase deps in ``header.task_depends_on`` — bare strings
+        that the framework resolves to this task's own phase — and (b)
+        the cross-phase toolchain deps in
+        ``header.build_compilers_depends_on``, each explicitly wrapped in
+        a ``TaskDep(phase_id=Phase.BUILD_COMPILERS)``. ``_make_task_info``
+        forwards the tuple verbatim and does NOT phase-tag bare strings,
+        so the explicit wrap MUST happen here (same as the
+        matrix_eval→dependency_graph edge in :meth:`discover_items`).
         """
         phase_id, type_id, affinity_id = _classify(header)
         header_dict = {
@@ -1133,9 +1165,7 @@ class SuitTask:
             "size": header.size,
             "payload": dict(header.payload),
         }
-        task_depends_on = (
-            () if self.config.disable_task_deps else header.task_depends_on
-        )
+        task_depends_on = self._header_task_depends_on(header)
         return _make_task_info(
             pathlib.Path(f"{header.name}.json"),
             header.size,
@@ -1146,6 +1176,21 @@ class SuitTask:
             task_id=header.task_id,
             task_depends_on=task_depends_on,
         )
+
+    def _header_task_depends_on(self, header: ManifestHeader) -> tuple:
+        """Resolve a header's full ``task_depends_on`` tuple, honouring
+        ``disable_task_deps``.
+
+        Returns ``()`` when ``disable_task_deps`` is set. Otherwise
+        delegates to :func:`_header_depends_on`, which passes intra-phase
+        deps through as bare strings and wraps every cross-phase
+        toolchain id in a phase-tagged ``TaskDep`` so it resolves to
+        :attr:`Phase.BUILD_COMPILERS` rather than the variant's own
+        (BUILD) phase.
+        """
+        if self.config.disable_task_deps:
+            return ()
+        return _header_depends_on(header)
 
     # ── Memory estimator (disabled) ───────────────────────────────────
 

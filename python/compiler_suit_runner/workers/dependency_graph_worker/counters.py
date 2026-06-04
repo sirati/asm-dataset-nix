@@ -30,7 +30,6 @@ _PREFIX_FAMILY = "build_common_dep__family__"
 _PREFIX_ARCH_INDEP = "build_common_dep__arch_indep__"
 _PREFIX_COMMON_DEP = "build_common_dep__"
 _PREFIX_VARIANT = "build_variant__"
-_PREFIX_TOOLCHAIN = "build_compilers__"
 
 
 def compute_dependency_graph_counters(
@@ -98,9 +97,11 @@ def _variant_metrics(descriptors: list[Any]) -> tuple[int, int]:
     """Return ``(variants_total, toolchain_wired)``.
 
     ``toolchain_wired`` counts the number of ``build_variant``
-    descriptors whose ``depends_on`` contains at least one
-    ``build_compilers__`` task_id (i.e. the variant transitively
-    depends on a framework-emitted toolchain build task).
+    descriptors that carry at least one cross-phase toolchain dep in
+    ``build_compilers_depends_on`` (i.e. the variant depends on a
+    framework-emitted ``build_compilers`` task). The toolchain edge now
+    lives in its own field (bare ``<sys>__<arch>__<comp>`` ids), no
+    longer mixed into the intra-phase ``depends_on``.
     """
     variants_total = 0
     toolchain_wired = 0
@@ -108,8 +109,7 @@ def _variant_metrics(descriptors: list[Any]) -> tuple[int, int]:
         if _kind_of(d) != "build_variant":
             continue
         variants_total += 1
-        deps = _depends_on(d)
-        if any(dep.startswith(_PREFIX_TOOLCHAIN) for dep in deps):
+        if _build_compilers_depends_on(d):
             toolchain_wired += 1
     return variants_total, toolchain_wired
 
@@ -154,10 +154,10 @@ def _task_id_of(descriptor: Any) -> str:
     return str(task_id) if task_id is not None else ""
 
 
-def _depends_on(descriptor: Any) -> tuple[str, ...]:
-    deps = getattr(descriptor, "depends_on", None)
+def _build_compilers_depends_on(descriptor: Any) -> tuple[str, ...]:
+    deps = getattr(descriptor, "build_compilers_depends_on", None)
     if deps is None and isinstance(descriptor, Mapping):
-        deps = descriptor.get("depends_on", ())
+        deps = descriptor.get("build_compilers_depends_on", ())
     if not deps:
         return ()
     return tuple(str(d) for d in deps)

@@ -110,9 +110,11 @@ def _resolve_toolchain_for_archs(
     Role-collapsed meta positions can't distinguish per-variant
     compilers; per-arch we pick one variant, parse its drv path back
     to ``(arch, comp)`` via :func:`plan_cell._variant_toolchain_dep`,
-    compose the canonical ``build_compilers__*`` task_id. Per-cell
-    already wires each variant's own toolchain dep; meta-level extras
-    are additive so per-arch broadcast is harmless over-wiring.
+    compose the bare ``<sys>__<arch>__<comp>`` build_compilers task_id.
+    Per-cell already wires each variant's own toolchain dep; meta-level
+    extras are additive (folded into the variant's cross-phase
+    ``build_compilers_depends_on``) so per-arch broadcast is harmless
+    over-wiring.
     """
     out: set[str] = set()
     for arch in target_archs:

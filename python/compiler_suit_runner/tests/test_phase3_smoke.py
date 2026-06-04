@@ -20,10 +20,11 @@ Scope:
 Validation contract (mirrors ``test_phase3_debug_cases.py``):
 
   * ``len(descriptors) > 0``, ``len(build_variants) > 0``;
-  * every ``build_variant`` carries EXACTLY the canonical
-    ``build_compilers__<sys>__<arch>__<comp>`` task_id in
-    ``depends_on`` — pins ``plan_cell._variant_toolchain_dep`` to the
-    RIGHT toolchain, not just SOME toolchain;
+  * every ``build_variant`` carries EXACTLY the canonical bare
+    ``<sys>__<arch>__<comp>`` task_id in its cross-phase
+    ``build_compilers_depends_on`` — pins
+    ``plan_cell._variant_toolchain_dep`` to the RIGHT toolchain, not
+    just SOME toolchain;
   * descriptor task_ids unique across the plan;
   * ``counters["source_terminal_skipped"] >= 1``;
   * ``len(violations) == 0`` in lax mode.
@@ -88,8 +89,8 @@ def _skip_unless_nix_available() -> None:
 
 
 def _canonical_toolchain_task_id_for(descriptor) -> str:
-    """Derive ``build_compilers__<sys>__<arch>__<comp>`` from the
-    descriptor's variant drv basename via ``parse_variant_path``.
+    """Derive the bare ``<sys>__<arch>__<comp>`` build_compilers task_id
+    from the descriptor's variant drv basename via ``parse_variant_path``.
 
     Phase-A per-variant resolver uses the same composition; mirroring
     it here means a regression that wires "a" toolchain instead of
@@ -107,7 +108,7 @@ def _canonical_toolchain_task_id_for(descriptor) -> str:
     assert binary == BINARY, (
         f"descriptor drv {basename!r} parsed binary={binary!r} != {BINARY!r}"
     )
-    return f"build_compilers__{SYS_NAME}__{arch_v}__{comp}"
+    return f"{SYS_NAME}__{arch_v}__{comp}"
 
 
 def _assert_descriptors_contract(
@@ -141,14 +142,15 @@ def _assert_descriptors_contract(
         for dep in (d.depends_on or ()):
             counts[dep] = counts.get(dep, 0) + 1
     variant_task_ids = {d.task_id for d in build_variant_descs}
+    # Toolchain deps are cross-phase (build_compilers_depends_on), so
+    # they never appear as phase-4 descriptors or depends_on edges.
     violators = sorted(
         d.task_id for d in descriptors
         if d.task_id not in variant_task_ids
-        and not d.task_id.startswith("build_compilers__")
         and counts.get(d.task_id, 0) < 2
     )
     assert not violators, (
-        f"non-toolchain dep tasks with < 2 dependents (planner output "
+        f"common-dep tasks with < 2 dependents (planner output "
         f"bug -- a one-consumer dep should have been inlined): "
         f"{violators}"
     )
@@ -156,8 +158,10 @@ def _assert_descriptors_contract(
     wrong_tc: list[tuple[str, str, tuple[str, ...]]] = []
     for d in build_variant_descs:
         expected_id = _canonical_toolchain_task_id_for(d)
-        if expected_id not in d.depends_on:
-            wrong_tc.append((d.task_id, expected_id, d.depends_on))
+        if expected_id not in d.build_compilers_depends_on:
+            wrong_tc.append(
+                (d.task_id, expected_id, d.build_compilers_depends_on)
+            )
     assert not wrong_tc, (
         f"{len(wrong_tc)} build_variant descriptor(s) missing the "
         f"canonical toolchain task id; first 3: "

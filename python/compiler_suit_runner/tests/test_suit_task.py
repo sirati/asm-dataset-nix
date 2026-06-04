@@ -18,6 +18,7 @@ import pytest
 
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
+    Phase,
     build_compilers_task_id,
 )
 from compiler_suit_runner.suit_task import (
@@ -88,7 +89,11 @@ def _variant_header(binary: str, label: str, compiler_id: str = "gcc15"):
             "attr": f"dataset.{_SYS}.{binary}.x86_64.{label}",
         },
         task_id=f"build_variant__{_SYS}__{binary}__{label}",
-        task_depends_on=(build_compilers_task_id(_SYS, "x86_64", compiler_id),),
+        # Toolchain dep is CROSS-phase (Phase.BUILD_COMPILERS); it goes
+        # in the dedicated field, not the intra-phase task_depends_on.
+        build_compilers_depends_on=(
+            build_compilers_task_id(_SYS, "x86_64", compiler_id),
+        ),
     )
 
 
@@ -110,13 +115,47 @@ def test_header_to_task_info_common_dep() -> None:
 
 def test_header_to_task_info_variant_carries_phase_and_type() -> None:
     """A ``build_variant`` header converts to a ``variant`` task in the
-    ``build`` phase, carrying its ``task_depends_on`` edge."""
+    ``build`` phase, carrying its toolchain edge as a CROSS-phase
+    ``TaskDep(phase_id=Phase.BUILD_COMPILERS)`` (not a bare string)."""
     header = _variant_header("hello", "hello-x86_64-gcc15-O0")
     ti = _header_to_task_info(header)
     assert ti.phase_id == "build"
     assert ti.type_id == "variant"
     assert ti.payload["item_class"] == "build_variant"
     assert ti.task_depends_on
+    # The single dep is the toolchain edge, phase-tagged BUILD_COMPILERS.
+    tc_id = build_compilers_task_id(_SYS, "x86_64", "gcc15")
+    assert any(
+        getattr(dep, "phase_id", None) == Phase.BUILD_COMPILERS
+        and getattr(dep, "task_id", None) == tc_id
+        for dep in ti.task_depends_on
+    )
+
+
+def test_header_to_task_info_variant_toolchain_dep_is_cross_phase() -> None:
+    """Focused assertion: a build_variant header carrying
+    ``build_compilers_depends_on=("x86_64-linux__aarch64__gcc15",)``
+    yields a TaskInfo whose ``task_depends_on`` contains a dep with
+    ``phase_id == Phase.BUILD_COMPILERS`` and matching ``task_id``,
+    while leaving any intra-phase deps as bare strings."""
+    header = ManifestHeader(
+        item_class="build_variant",
+        name="hello-x86_64-gcc15-O0",
+        size=0,
+        payload={"sys": _SYS, "pkg": "hello", "arch": "aarch64"},
+        task_id="build_variant__x86_64-linux__hello__gcc15-O0",
+        task_depends_on=("build_common_dep__some-glibc.drv",),
+        build_compilers_depends_on=("x86_64-linux__aarch64__gcc15",),
+    )
+    ti = _header_to_task_info(header)
+    # Cross-phase toolchain dep is phase-tagged.
+    assert any(
+        getattr(dep, "phase_id", None) == Phase.BUILD_COMPILERS
+        and getattr(dep, "task_id", None) == "x86_64-linux__aarch64__gcc15"
+        for dep in ti.task_depends_on
+    )
+    # Intra-phase dep survives as a bare string (no phase tag).
+    assert "build_common_dep__some-glibc.drv" in ti.task_depends_on
 
 
 # ---------------------------------------------------------------------------

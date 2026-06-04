@@ -11,6 +11,7 @@ import pytest
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
     ManifestSet,
+    build_compilers_task_id,
     emit_all_manifests,
     make_build_common_dep_header,
     make_build_compilers_header,
@@ -18,6 +19,7 @@ from compiler_suit_runner.manifest_gen import (
     make_matrix_eval_header,
     make_toolchain_validate_header,
     read_manifest,
+    toolchain_validate_task_id,
     write_manifest,
 )
 from compiler_suit_runner.partition import VariantSpec
@@ -64,7 +66,9 @@ def test_build_compilers_header_without_drv():
         "x86_64-linux", "aarch64", "gcc14"
     )
     assert h.item_class == "build_compilers"
+    # The manifest FILE name keeps its prefix; the task_id is phase-local.
     assert h.name == "build_compilers__aarch64__gcc14"
+    assert h.task_id == "x86_64-linux__aarch64__gcc14"
     assert h.payload == {
         "sys": "x86_64-linux",
         "arch": "aarch64",
@@ -73,6 +77,38 @@ def test_build_compilers_header_without_drv():
     }
     assert "drv" not in h.payload
     assert h.size == 0
+
+
+def test_build_compilers_task_id_is_bare():
+    """``build_compilers_task_id`` is phase-local: no ``build_compilers__``
+    prefix (the BUILD_COMPILERS phase carries the namespace). The
+    toolchain_validate id stays distinct via its own prefix so the two
+    classes never collide on a shared (arch, compiler)."""
+    bc = build_compilers_task_id("x86_64-linux", "aarch64", "gcc15")
+    assert bc == "x86_64-linux__aarch64__gcc15"
+    assert not bc.startswith("build_compilers__")
+    tv = toolchain_validate_task_id("x86_64-linux", "aarch64", "gcc15")
+    assert tv == "toolchain_validate__x86_64-linux__aarch64__gcc15"
+    assert bc != tv
+
+
+def test_build_variant_header_routes_toolchain_cross_phase():
+    """The toolchain dep goes into the dedicated cross-phase field, not
+    the intra-phase ``task_depends_on``."""
+    v = _variant("hello", "aarch64", "O2")
+    tc_id = build_compilers_task_id("x86_64-linux", "aarch64", "gcc15")
+    h = make_build_variant_header(
+        v, "x86_64-linux", toolchain_task_id=tc_id,
+    )
+    assert h.build_compilers_depends_on == (tc_id,)
+    assert h.task_depends_on == ()
+
+
+def test_build_variant_header_no_toolchain_leaves_both_empty():
+    v = _variant("hello", "aarch64", "O2")
+    h = make_build_variant_header(v, "x86_64-linux")
+    assert h.build_compilers_depends_on == ()
+    assert h.task_depends_on == ()
 
 
 def test_build_compilers_header_with_drv():
@@ -237,6 +273,52 @@ def test_write_manifest_payload_round_trip(tmp_path: pathlib.Path):
     assert loaded.payload == h.payload
     assert loaded.size == h.size
     assert loaded.item_class == "build_variant"
+
+
+def test_build_compilers_depends_on_round_trips(tmp_path: pathlib.Path):
+    """The cross-phase ``build_compilers_depends_on`` field survives a
+    write -> read round-trip and is emitted in the JSON document only
+    when non-empty (legacy manifests round-trip unchanged)."""
+    v = _variant("sqlite", "aarch64", "O2")
+    tc_id = build_compilers_task_id("x86_64-linux", "aarch64", "gcc15")
+    h = make_build_variant_header(
+        v, "x86_64-linux", toolchain_task_id=tc_id,
+    )
+    written = write_manifest(tmp_path, h)
+    on_disk = json.loads(written.read_text())
+    assert on_disk["build_compilers_depends_on"] == [tc_id]
+    loaded = read_manifest(written)
+    assert loaded.build_compilers_depends_on == (tc_id,)
+    assert loaded == h
+
+
+def test_build_compilers_depends_on_omitted_when_empty(tmp_path: pathlib.Path):
+    """No toolchain dep -> the key is absent on disk (byte-identical to
+    legacy manifests) and reads back as the empty default."""
+    v = _variant("sqlite", "x86_64", "O2")
+    h = make_build_variant_header(v, "x86_64-linux")
+    written = write_manifest(tmp_path, h)
+    on_disk = json.loads(written.read_text())
+    assert "build_compilers_depends_on" not in on_disk
+    loaded = read_manifest(written)
+    assert loaded.build_compilers_depends_on == ()
+
+
+def test_read_manifest_rejects_non_string_build_compilers_dep(
+    tmp_path: pathlib.Path,
+):
+    """A malformed ``build_compilers_depends_on`` (non-string entries)
+    is rejected at load time, mirroring ``task_depends_on``."""
+    target = tmp_path / "bad.json"
+    target.write_text(json.dumps({
+        "item_class": "build_variant",
+        "name": "bad",
+        "size": 0,
+        "payload": {},
+        "build_compilers_depends_on": [123],
+    }))
+    with pytest.raises(ValueError, match="build_compilers_depends_on"):
+        read_manifest(target)
 
 
 def test_read_manifest_handles_legacy_sparse_padded_file(

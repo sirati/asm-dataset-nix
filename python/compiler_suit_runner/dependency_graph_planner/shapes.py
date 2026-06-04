@@ -238,9 +238,8 @@ def _toolchain_ident_strs(raw: Any) -> frozenset[str]:
 
     The meta-pass tests for toolchain positions by direct ident-string
     match; per-variant resolution in ``plan_cell`` and ``plan_meta``
-    composes the canonical ``build_compilers__<sys>__<arch>__<comp>``
-    task_id from the variant's parsed drv name, so no role-name index
-    is needed.
+    composes the bare ``<sys>__<arch>__<comp>`` build_compilers task_id
+    from the variant's parsed drv name, so no role-name index is needed.
     """
     out: set[str] = set()
     if not raw:
