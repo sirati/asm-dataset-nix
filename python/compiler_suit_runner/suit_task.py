@@ -519,7 +519,7 @@ class _PeerLifecycleListener:
     ``on_peer_removed(secondary_id, cause)``:
 
     * ``cause`` is a dict ``{"kind": str, "reason": str | None}``.
-      Possible kinds: ``"keepalive_miss"``, ``"mass_death_escalation"``,
+      Possible kinds: ``"keepalive_miss"`` (a sustained ~2 min outage),
       ``"fatal_error"``.
     * Every cause kind triggers a standard
       :meth:`ReplicationRepairWorker.on_peer_removed` repair sweep —

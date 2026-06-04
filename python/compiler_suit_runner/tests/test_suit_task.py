@@ -343,15 +343,6 @@ def test_listener_on_peer_removed_routes_to_repair_worker_with_cause(
         "peer-b", "OOMKilled",
     )
 
-    repair.reset_mock()
-    listener.on_peer_removed(
-        "peer-c",
-        {"kind": "mass_death_escalation", "reason": None},
-    )
-    repair.on_peer_removed.assert_called_once_with(
-        "peer-c", "mass_death_escalation",
-    )
-
 
 def test_listener_on_peer_added_observer_records_holdings(
     tmp_path: pathlib.Path,
