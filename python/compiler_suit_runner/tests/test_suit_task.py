@@ -3,8 +3,10 @@
 Tests for ``SuitTask`` wiring and the phase-3→4 spawn bridge. Phase 3
 (``dependency_graph``) is dispatched by the framework as a task; this
 module covers the ``_header_to_task_info`` conversion. The
-``on_phase_end("dependency_graph")`` descriptor handoff transport was
-removed pending its replacement.
+``on_phase_end("dependency_graph")`` descriptor handoff now rides the
+streamed custom-message transport (``worker_message_listener`` /
+``custom_message_handler``); ``on_phase_end`` is a reconciliation
+barrier only.
 """
 
 from __future__ import annotations
@@ -774,7 +776,7 @@ def test_on_run_start_backward_compat_without_kwarg(
 
 
 # ---------------------------------------------------------------------------
-# on_phase_end("dependency_graph") — transport removed
+# on_phase_end("dependency_graph") — reconciliation barrier
 # ---------------------------------------------------------------------------
 
 
