@@ -279,8 +279,8 @@ def matrix_eval_task_id(binary: str) -> str:
 # The dependency_graph phase is a SINGLE all-binaries framework task
 # (NOT one per binary): its id is a stable constant and it depends on
 # every phase-2 ``matrix_eval__<binary>`` task. The worker is invoked
-# once over all binaries and writes one ``_dependency_graph.pkl``
-# covering the whole run.
+# once over all binaries and plans one descriptor list covering the
+# whole run.
 DEPENDENCY_GRAPH_TASK_ID = "dependency_graph"
 
 

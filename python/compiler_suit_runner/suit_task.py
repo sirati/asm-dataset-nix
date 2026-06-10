@@ -22,17 +22,18 @@ Protocol under the new phase taxonomy:
   predecessor's keyed outputs (``task.predecessor_outputs[
   matrix_eval__<binary>]["matrix_aggregate_drv"]["value"]``, published
   by the upstream matrix_eval task via ``Task.publish_string``),
-  imports every per-binary matrix-aggregate drv archive, runs the
-  streaming planner ONCE over the combined tree, and writes one
-  ``_dependency_graph.pkl`` covering all binaries. matrix_eval and
+  imports every per-binary matrix-aggregate drv archive, and runs the
+  streaming planner ONCE over the combined tree, producing one
+  descriptor list covering all binaries. matrix_eval and
   dependency_graph are JSON-free: their TaskInfos are built in-memory
   by :meth:`discover_items` from ``config.per_binary_metadata`` — no
   manifest written, none read.
 * ``build`` (phase 4) — distributed ``build_common_dep`` +
   ``build_variant`` workers; ``toolchain_validate`` shares the same
   dispatch (rarely emitted, gated by ``--debug-testbuild``). The build
-  phase is spawned at runtime by the primary from the
-  ``_dependency_graph.pkl`` the single dependency_graph task wrote.
+  phase is spawned at runtime by the primary from the descriptor list
+  the single dependency_graph task planned (handoff transport pending
+  replacement).
 
 Responsibilities:
 
@@ -66,7 +67,6 @@ deployments go through the framework's worker protocol.
 
 from __future__ import annotations
 
-import base64
 import dataclasses
 import logging
 import os
@@ -206,9 +206,9 @@ def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
         # predecessor's keyed outputs (the predecessor task_id IS the
         # bare binary, so ``task.predecessor_outputs[<binary>]
         # ["matrix_aggregate_drv"]["value"]``, published via
-        # ``Task.publish_string``), runs the streaming planner ONCE,
-        # and writes one ``_dependency_graph.pkl`` covering the whole
-        # run. There is no single binary, so ``affinity_id`` is None.
+        # ``Task.publish_string``), and runs the streaming planner ONCE
+        # over the whole run. There is no single binary, so
+        # ``affinity_id`` is None.
         return (Phase.DEPENDENCY_GRAPH, "dep_graph", None)
     if item_class == "build_compilers":
         compiler = header.payload.get("compiler_label", "?")
@@ -386,18 +386,17 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
       come out of that phase.
 
     The ``dependency_graph`` step (phase 3 in the plan) runs as a
-    first-class framework PhaseSpec task dispatched by the runner;
-    the worker writes ``_dependency_graph.pkl`` under the matrix_eval
-    output directory. :meth:`SuitTask.on_phase_end` then reads that
-    pickle when ``phase_id == "dependency_graph"``, translates the
-    descriptor list to :class:`ManifestHeader` instances via
+    first-class framework PhaseSpec task dispatched by the runner; it
+    plans the phase-4 descriptor list. The descriptor handoff to
+    :meth:`SuitTask.on_phase_end` (which translates descriptors to
+    :class:`ManifestHeader` instances via
     :func:`dependency_graph_planner.headers_from_descriptors`,
     converts each to a framework ``TaskInfo`` via
     :func:`_header_to_task_info`, and hands them to
-    ``self._primary_handle.spawn_tasks`` for the ``build`` phase. The
-    spawn fan-out stays primary-affined because "task creation can
-    only be done by the manager (primary)" is still a framework
-    invariant.
+    ``self._primary_handle.spawn_tasks`` for the ``build`` phase) has
+    its transport removed pending replacement. The spawn fan-out stays
+    primary-affined because "task creation can only be done by the
+    manager (primary)" is still a framework invariant.
     """
     from dynamic_runner.task_protocol import (  # type: ignore[import-not-found]
         PhaseSpec,
@@ -2289,131 +2288,15 @@ class SuitTask:
             )
             return
 
-        # Late imports keep planner machinery off the import path
-        # in single-process tests that never reach phase 3.
-        from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
-            headers_from_descriptors,
-            load_phase4_descriptors,
-            load_phase4_descriptors_from_bytes,
+        # The dependency_graph → build descriptor handoff transport was
+        # removed; its replacement (streamed custom messages) is not
+        # wired up yet. Fail loudly rather than silently spawning zero
+        # build tasks.
+        raise NotImplementedError(
+            "dependency_graph handoff transport removed; build-phase"
+            " spawn from on_phase_end is pending the replacement"
+            " transport"
         )
-        from compiler_suit_runner.workers.dependency_graph_worker.output import (  # noqa: PLC0415
-            DEPENDENCY_GRAPH_PICKLE,
-            DEPENDENCY_GRAPH_PKL_OUTPUT_KEY,
-        )
-
-        # Container-view path: the dependency_graph worker writes
-        # ``_dependency_graph.pkl`` under matrix_eval_out_dir
-        # (the fa7b604 archive-root resolution rule). No manifest scan.
-        pickle_path = self.config.matrix_eval_out_dir / DEPENDENCY_GRAPH_PICKLE
-        # ``source`` names which channel the descriptors came from so a
-        # future total=0 degradation log is unambiguously diagnosable.
-        source = "fs-path"
-        try:
-            descriptors, source = self._load_dependency_graph_descriptors(
-                phase_outputs=phase_outputs,
-                pickle_path=pickle_path,
-                output_key=DEPENDENCY_GRAPH_PKL_OUTPUT_KEY,
-                from_bytes=load_phase4_descriptors_from_bytes,
-                from_path=load_phase4_descriptors,
-            )
-            headers = headers_from_descriptors(descriptors)
-            task_infos: list = []
-            for header in headers:
-                try:
-                    task_infos.append(_header_to_task_info(
-                        header,
-                        disable_task_deps=self.config.disable_task_deps,
-                    ))
-                except Exception:  # noqa: BLE001 — log + skip
-                    self._logger.exception(
-                        "on_phase_end: header→TaskInfo failed for %s"
-                        " (task_id=%s); skipping",
-                        header.name,
-                        header.task_id,
-                    )
-            self._logger.info(
-                "on_phase_end(\"dependency_graph\"): loaded %d"
-                " descriptors from %s; spawning %d task(s)",
-                len(descriptors), source, len(task_infos),
-            )
-            errors = self._primary_handle.spawn_tasks(task_infos) or []
-            self._log_spawn_errors(errors, headers)
-        except Exception:  # noqa: BLE001 — log + degrade
-            self._logger.exception(
-                "on_phase_end: dependency_graph spawn failed"
-                " (descriptor source=%s; fs-path=%s)",
-                source, pickle_path,
-            )
-            # Surface a clearly-marked CRITICAL line so the
-            # follow-on ``phase build ended: 0 completed, 0
-            # failed`` is unambiguously attributable to this
-            # degradation, not to "phase 4 found nothing to do".
-            self._logger.critical(
-                "on_phase_end: dependency_graph descriptor load"
-                " failed (source=%s; fs-path=%s) — phase build will"
-                " spawn ZERO tasks (degradation; see ERROR above)",
-                source, pickle_path,
-            )
-
-    def _load_dependency_graph_descriptors(
-        self,
-        *,
-        phase_outputs: Optional[dict],
-        pickle_path: pathlib.Path,
-        output_key: str,
-        from_bytes: Callable[[bytes], tuple],
-        from_path: Callable[[pathlib.Path], tuple],
-    ) -> tuple[list, str]:
-        """Resolve the phase-4 descriptor list, preferring the published
-        task-output channel and falling back to the on-disk pickle.
-
-        Returns ``(descriptors, source_label)`` where ``source_label``
-        is ``"published-output"`` or ``"fs-path"`` for diagnostics.
-
-        Preferred path (new framework pin): the dependency_graph worker
-        published the pickle bytes (base64) under ``output_key`` on its
-        task output; ``phase_outputs`` is the just-completed phase's
-        ``{task_id: {output_key: {"kind", "value"}}}`` map. Decode +
-        load filesystem-agnostically — works under the
-        submitter-is-primary topology where the on-disk pickle is not
-        local to the primary.
-
-        Fallback (``phase_outputs`` is ``None`` / missing the key — old
-        framework pin, single-process, or relocated-primary topology
-        where the fs path still resolves): read the on-disk pickle.
-        """
-        value = self._published_pickle_value(phase_outputs, output_key)
-        if value is not None:
-            raw = base64.b64decode(value)
-            descriptors, _summary = from_bytes(raw)
-            self._logger.info(
-                "on_phase_end(\"dependency_graph\"): loaded descriptors"
-                " from the task-output channel (key=%s)",
-                output_key,
-            )
-            return descriptors, "published-output"
-        descriptors, _summary = from_path(pickle_path)
-        return descriptors, "fs-path"
-
-    @staticmethod
-    def _published_pickle_value(
-        phase_outputs: Optional[dict],
-        output_key: str,
-    ) -> Optional[str]:
-        """Extract the published pickle ``"value"`` string from
-        ``phase_outputs``, or ``None`` when absent/malformed."""
-        if not phase_outputs:
-            return None
-        dg_outputs = phase_outputs.get("dependency_graph")
-        if not isinstance(dg_outputs, dict):
-            return None
-        entry = dg_outputs.get(output_key)
-        if not isinstance(entry, dict):
-            return None
-        value = entry.get("value")
-        if not isinstance(value, str) or not value:
-            return None
-        return value
 
     def _log_spawn_errors(
         self, errors: Iterable, headers: list[ManifestHeader],

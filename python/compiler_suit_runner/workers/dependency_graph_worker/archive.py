@@ -88,8 +88,7 @@ def discover_archives(matrix_eval_out_dir: pathlib.Path) -> list[pathlib.Path]:
     """Return every ``matrix-<binary>.drv.archive`` under ``matrix_eval_out_dir``.
 
     Sorted by filename for deterministic processing order so the
-    resulting ``_dependency_graph.pkl`` and any operator log line is
-    stable across runs. The ``matrix-<binary>.drv.archive`` filename
+    resulting plan and any operator log line is stable across runs. The ``matrix-<binary>.drv.archive`` filename
     mirrors the matrix-aggregate drv's storename so the archive is
     self-identifying without out-of-band metadata.
     """

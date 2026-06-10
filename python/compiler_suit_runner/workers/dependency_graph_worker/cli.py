@@ -30,8 +30,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
         description=(
             "Primary-side dependency_graph worker. Imports per-binary"
             " matrix_eval archives, runs the template_graph streaming"
-            " planner, writes _dependency_graph.pkl (plus a"
-            " _dependency_graph_summary.txt companion)."
+            " planner, writes a _dependency_graph_summary.txt."
         ),
     )
     parser.add_argument(
