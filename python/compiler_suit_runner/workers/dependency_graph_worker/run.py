@@ -5,8 +5,11 @@ Phase 5.2 collapse: every archive contributes ONE matrix wrapper to a
 single sum-drv; the streaming planner runs ONCE over the resulting
 tree so cross-binary template dedup fires automatically inside the
 single :class:`StreamPlanner` instance. A single descriptor list is
-produced spanning all binaries (a human-readable
-``_dependency_graph_summary.txt`` is written for operator inspection).
+produced spanning all binaries and streamed to the primary as batched
+custom messages via ``task.send_message`` (the
+:mod:`compiler_suit_runner.streamed_spawn` wire codec); a
+human-readable ``_dependency_graph_summary.txt`` is written for
+operator inspection.
 """
 
 from __future__ import annotations
@@ -21,6 +24,11 @@ from typing import Any, Optional, Union
 from . import archive as _archive
 from . import output as _output
 from . import summary as _summary
+from ...streamed_spawn import (
+    SPAWN_TOPIC,
+    SUMMARY_TOPIC,
+    SpawnBatchEncoder,
+)
 from .errors import DependencyGraphResult, DependencyGraphWorkerError
 from .subproc import RunSubprocess, default_run_subprocess
 
@@ -35,6 +43,7 @@ __all__ = [
 
 def run_dependency_graph_task(
     *,
+    task: Any,
     matrix_eval_out_dir: pathlib.Path,
     bash_path: str,
     toolchain_aggregate_drv: str,
@@ -80,10 +89,29 @@ def run_dependency_graph_task(
     ``toolchain_aggregate_drv`` MUST be non-empty — phase 3 cannot run
     without the producer's toolchain output.
 
+    ``task`` is the framework task handle and is REQUIRED: the planned
+    descriptors are streamed to the primary as batched custom messages
+    via ``task.send_message`` (the Wave-1 streamed-spawn handoff, see
+    :mod:`compiler_suit_runner.streamed_spawn`) — spawn batches on
+    :data:`~compiler_suit_runner.streamed_spawn.SPAWN_TOPIC`, then
+    exactly one summary on
+    :data:`~compiler_suit_runner.streamed_spawn.SUMMARY_TOPIC` (an
+    empty plan sends ONLY the total=0 summary). ``send_message``
+    failures propagate: a partially-streamed plan must FAIL the task
+    rather than limp to a clean exit.
+
     Per-binary failures raise :class:`DependencyGraphWorkerError`
     tagged with the binary + stage; the caller's main loop translates
     that into a non-zero exit code.
     """
+    if not hasattr(task, "send_message"):
+        raise RuntimeError(
+            "run_dependency_graph_task: task object has no send_message();"
+            " the streamed-spawn handoff hard-requires the dynrunner"
+            " Wave-1 custom-message API (Task.send_message) — the"
+            " framework pin is too old (or a non-Task object was"
+            " passed). Refusing to plan without a streaming channel."
+        )
     if not toolchain_aggregate_drv:
         raise ValueError(
             "run_dependency_graph_task: toolchain_aggregate_drv is "
@@ -141,6 +169,7 @@ def run_dependency_graph_task(
     archives = _archive.discover_archives(matrix_eval_out_dir)
     if not archives:
         return _empty_result(
+            task=task,
             matrix_eval_out_dir=matrix_eval_out_dir,
             duration=max(0.0, clock_fn() - start),
         )
@@ -169,6 +198,7 @@ def run_dependency_graph_task(
 
     if not plannable_binaries:
         return _empty_result(
+            task=task,
             matrix_eval_out_dir=matrix_eval_out_dir,
             duration=max(0.0, clock_fn() - start),
         )
@@ -199,6 +229,8 @@ def run_dependency_graph_task(
     if counters.get("violations", 0) > 0:
         _summary.emit_violations_log(violation_entries)
 
+    _stream_descriptors(task=task, descriptors=descriptors)
+
     out_path = _write_outputs(
         matrix_eval_out_dir=matrix_eval_out_dir,
         descriptors=descriptors,
@@ -226,6 +258,7 @@ def run_dependency_graph_task(
 
 def _empty_result(
     *,
+    task: Any,
     matrix_eval_out_dir: pathlib.Path,
     duration: float,
 ) -> DependencyGraphResult:
@@ -234,8 +267,12 @@ def _empty_result(
     Used on the two short-circuit paths (no archives discovered and no
     plannable binaries after lookup derivation) so the operator-facing
     ``_dependency_graph_summary.txt`` is well-formed even when there is
-    nothing to plan.
+    nothing to plan. The streamed-spawn handoff still runs: an empty
+    plan sends NO spawn batches and exactly one total=0 summary so the
+    primary's reconciliation barrier sees a complete (empty) stream
+    instead of silence.
     """
+    _stream_descriptors(task=task, descriptors=[])
     out_path = _write_outputs(
         matrix_eval_out_dir=matrix_eval_out_dir,
         descriptors=[],
@@ -247,6 +284,62 @@ def _empty_result(
         binary_count=0,
         descriptor_count=0,
         duration_seconds=duration,
+    )
+
+
+def _stream_descriptors(
+    *,
+    task: Any,
+    descriptors: Sequence[Any],
+) -> None:
+    """Stream the planned descriptors to the primary as batched custom
+    messages (the Wave-1 streamed-spawn handoff).
+
+    Encodes via :class:`SpawnBatchEncoder` in planner order (the
+    planner mints common_deps before the variants that depend on them,
+    so the stream is dependency-safe), sending every full batch on
+    :data:`SPAWN_TOPIC`, the flush remainder (if any) on the same
+    topic, then exactly one summary on :data:`SUMMARY_TOPIC` carrying
+    the authoritative totals plus per-kind descriptor counts. An empty
+    ``descriptors`` sends no batch messages and a total=0 summary.
+
+    ``task.send_message`` failures (and encoder ValueErrors) propagate
+    — a partially-streamed plan must fail the task loudly; the
+    primary's reconciliation barrier catches the missing summary, but
+    failing fast here is the first line of defence.
+    """
+    encoder = SpawnBatchEncoder()
+    streamed = 0
+
+    def _send_batch(message: bytes) -> None:
+        nonlocal streamed
+        task.send_message(SPAWN_TOPIC, message)
+        _LOG.info(
+            "streamed spawn batch %d (%d descriptors, %d bytes)",
+            encoder.batches_emitted - 1,
+            encoder.descriptors_emitted - streamed,
+            len(message),
+        )
+        streamed = encoder.descriptors_emitted
+
+    for descriptor in descriptors:
+        message = encoder.add(descriptor)
+        if message is not None:
+            _send_batch(message)
+    remainder = encoder.flush()
+    if remainder is not None:
+        _send_batch(remainder)
+
+    per_kind_counters = collections.Counter(
+        getattr(d, "kind", "<unknown>") for d in descriptors
+    )
+    task.send_message(
+        SUMMARY_TOPIC, encoder.encode_summary(dict(per_kind_counters)),
+    )
+    _LOG.info(
+        "streamed spawn done: %d descriptors in %d batches; summary sent",
+        encoder.descriptors_emitted,
+        encoder.batches_emitted,
     )
 
 
