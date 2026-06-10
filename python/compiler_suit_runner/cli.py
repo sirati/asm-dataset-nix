@@ -42,6 +42,7 @@ from compiler_suit_runner.incremental_cache import (
     CacheEntry,
     DEFAULT_CACHE_ROOT,
     IncrementalCache,
+    InvocationAxes,
     collect_input_hash_inputs,
     compute_input_hash,
 )
@@ -833,9 +834,36 @@ def _serialize_preflight_for_cache(
     target_path.write_text(json.dumps(payload, sort_keys=True, indent=2))
 
 
-def _compute_input_hash(repo_root: pathlib.Path) -> str:
-    """Compute the cache key from the flake state."""
-    inputs = collect_input_hash_inputs(repo_root)
+def _invocation_axes_from_args(args: argparse.Namespace) -> InvocationAxes:
+    """Build the cache-key invocation axes from the parsed namespace.
+
+    Covers every CLI axis that changes what the pre-flight / matrix
+    planning produces (see :class:`InvocationAxes` for the rationale
+    per field). Values are normalized exactly like the pre-flight call
+    sites in :func:`cmd_submit` normalize them (e.g. the
+    ``variant_sample`` ``or 0`` / ``variant_seed`` ``or "42"``
+    fallbacks), so the key reflects the effective invocation, not the
+    raw flag spelling.
+    """
+    return InvocationAxes.from_values(
+        packages=getattr(args, "packages", None),
+        archs=getattr(args, "archs", None),
+        variant_sample=getattr(args, "variant_sample", 0) or 0,
+        variant_seed=getattr(args, "variant_seed", "42") or "42",
+        sys_name=getattr(args, "sys_name", "x86_64-linux"),
+        build_compilers=bool(getattr(args, "build_compilers", False)),
+        debug_testbuild=getattr(args, "debug_testbuild", None),
+        toolchain_dedup=_resolve_toolchain_dedup(args),
+    )
+
+
+def _compute_input_hash(
+    repo_root: pathlib.Path, args: argparse.Namespace
+) -> str:
+    """Compute the cache key from the flake state + invocation axes."""
+    inputs = collect_input_hash_inputs(
+        repo_root, invocation=_invocation_axes_from_args(args)
+    )
     return compute_input_hash(inputs)
 
 
@@ -1078,7 +1106,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
     input_hash = ""
     repo_root = pathlib.Path(args.flake).resolve() if args.flake != "." else pathlib.Path.cwd()
     try:
-        input_hash = _compute_input_hash(repo_root)
+        input_hash = _compute_input_hash(repo_root, args)
     except Exception:  # noqa: BLE001
         log.warning(
             "failed to compute input hash; continuing without cache",

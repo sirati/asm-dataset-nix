@@ -13,6 +13,7 @@ from compiler_suit_runner.incremental_cache import (
     CacheEntry,
     IncrementalCache,
     InputHashInputs,
+    InvocationAxes,
     collect_input_hash_inputs,
     compute_input_hash,
 )
@@ -119,6 +120,102 @@ def test_compute_input_hash_boundary_swap_distinct():
     assert compute_input_hash(c) != compute_input_hash(d)
 
 
+# --------------------------------------------------------- InvocationAxes
+
+
+def _axes(**overrides) -> InvocationAxes:
+    base = dict(
+        packages=["zlib", "lz4"],
+        archs=["x86_64", "aarch64"],
+        variant_sample=2,
+        variant_seed="42",
+        sys_name="x86_64-linux",
+        build_compilers=False,
+        debug_testbuild=None,
+        toolchain_dedup=True,
+    )
+    base.update(overrides)
+    return InvocationAxes.from_values(**base)
+
+
+def _hash_with_axes(axes: InvocationAxes) -> str:
+    return compute_input_hash(
+        InputHashInputs(
+            flake_lock=b"lock",
+            git_rev="a" * 40,
+            git_diff=b"",
+            invocation=axes.canonical_bytes(),
+        )
+    )
+
+
+def test_invocation_axes_canonicalize_order_and_duplicates():
+    a = InvocationAxes.from_values(
+        packages=["zlib", "lz4", "zlib"], archs=["x86_64", "aarch64"]
+    )
+    b = InvocationAxes.from_values(
+        packages=["lz4", "zlib"], archs=["aarch64", "x86_64"]
+    )
+    assert a == b
+    assert a.canonical_bytes() == b.canonical_bytes()
+
+
+def test_invocation_axes_none_distinct_from_explicit_list():
+    all_pkgs = _axes(packages=None)
+    some_pkgs = _axes(packages=["zlib"])
+    assert all_pkgs.canonical_bytes() != some_pkgs.canonical_bytes()
+    assert _hash_with_axes(all_pkgs) != _hash_with_axes(some_pkgs)
+
+
+def test_input_hash_identical_invocation_is_stable():
+    h1 = _hash_with_axes(_axes(packages=["zlib", "lz4"]))
+    h2 = _hash_with_axes(_axes(packages=["lz4", "zlib"]))
+    assert h1 == h2
+
+
+def test_input_hash_changes_with_packages():
+    nano = _hash_with_axes(_axes(packages=["zlib"]))
+    full = _hash_with_axes(
+        _axes(packages=["zlib", "lz4", "xz", "bzip2"])
+    )
+    assert nano != full
+
+
+def test_input_hash_changes_with_archs():
+    h_two = _hash_with_axes(_axes(archs=["x86_64", "aarch64"]))
+    h_all = _hash_with_axes(_axes(archs=None))
+    h_one = _hash_with_axes(_axes(archs=["x86_64"]))
+    assert len({h_two, h_all, h_one}) == 3
+
+
+def test_input_hash_changes_with_variant_sample():
+    assert _hash_with_axes(_axes(variant_sample=2)) != _hash_with_axes(
+        _axes(variant_sample=0)
+    )
+
+
+def test_input_hash_changes_with_each_remaining_axis():
+    base = _hash_with_axes(_axes())
+    variations = {
+        "variant_seed": _hash_with_axes(_axes(variant_seed="43")),
+        "sys_name": _hash_with_axes(_axes(sys_name="aarch64-linux")),
+        "build_compilers": _hash_with_axes(_axes(build_compilers=True)),
+        "debug_testbuild": _hash_with_axes(_axes(debug_testbuild="hello")),
+        "toolchain_dedup": _hash_with_axes(_axes(toolchain_dedup=False)),
+    }
+    hashes = {base, *variations.values()}
+    assert len(hashes) == 1 + len(variations)
+
+
+def test_input_hash_invocation_distinct_from_repo_only():
+    """A keyed-with-axes hash never collides with the axes-free hash of
+    the same repo state (the contamination scenario)."""
+    repo_only = compute_input_hash(
+        InputHashInputs(flake_lock=b"lock", git_rev="a" * 40, git_diff=b"")
+    )
+    assert repo_only != _hash_with_axes(_axes())
+
+
 # ---------------------------------------------------- collect_input_hash_inputs
 
 
@@ -152,6 +249,32 @@ def test_collect_input_hash_inputs_happy_path(tmp_path: pathlib.Path):
     cmds = [cmd for cmd, _ in calls]
     assert ("git", "rev-parse", "HEAD") in cmds
     assert ("git", "diff") in cmds
+
+
+def test_collect_input_hash_inputs_carries_invocation(tmp_path: pathlib.Path):
+    """``invocation=`` lands as canonical bytes; omitted -> empty."""
+
+    def read_bytes(path: pathlib.Path) -> bytes:
+        return b"lock"
+
+    run_subprocess, _ = _make_run_subprocess()
+    axes = _axes()
+
+    with_axes = collect_input_hash_inputs(
+        tmp_path,
+        invocation=axes,
+        run_subprocess=run_subprocess,
+        read_bytes=read_bytes,
+    )
+    assert with_axes.invocation == axes.canonical_bytes()
+
+    without_axes = collect_input_hash_inputs(
+        tmp_path,
+        run_subprocess=run_subprocess,
+        read_bytes=read_bytes,
+    )
+    assert without_axes.invocation == b""
+    assert compute_input_hash(with_axes) != compute_input_hash(without_axes)
 
 
 def test_collect_input_hash_inputs_subprocess_failure(tmp_path: pathlib.Path):

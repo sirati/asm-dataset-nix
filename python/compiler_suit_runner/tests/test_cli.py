@@ -25,6 +25,8 @@ from compiler_suit_runner.cli import (
 from compiler_suit_runner.incremental_cache import (
     CacheEntry,
     IncrementalCache,
+    InputHashInputs,
+    InvocationAxes,
 )
 from compiler_suit_runner.preflight import PreflightResult
 
@@ -520,7 +522,7 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
 
     monkeypatch.setattr(cli_module, "run_single_process", fake_single_process)
 
-    def fake_compute_input_hash(repo_root):
+    def fake_compute_input_hash(repo_root, args):
         return "test-hash"
 
     monkeypatch.setattr(cli_module, "_compute_input_hash", fake_compute_input_hash)
@@ -559,6 +561,89 @@ def _make_args(tmp_path: pathlib.Path, **overrides) -> argparse.Namespace:
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
+
+
+def test_invocation_axes_from_args_normalizes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+):
+    """The axes derived from the namespace are canonical: package/arch
+    ordering and duplicates don't matter; defaults resolve like the
+    pre-flight call sites resolve them."""
+    monkeypatch.delenv("CSR_TOOLCHAIN_DEDUP", raising=False)
+    args_a = _make_args(
+        tmp_path,
+        packages=["zlib", "lz4", "zlib"],
+        archs=["x86_64", "aarch64"],
+        variant_sample=2,
+    )
+    args_b = _make_args(
+        tmp_path,
+        packages=["lz4", "zlib"],
+        archs=["aarch64", "x86_64"],
+        variant_sample=2,
+    )
+    axes_a = cli_module._invocation_axes_from_args(args_a)
+    axes_b = cli_module._invocation_axes_from_args(args_b)
+    assert isinstance(axes_a, InvocationAxes)
+    assert axes_a == axes_b
+    assert axes_a.packages == ("lz4", "zlib")
+    assert axes_a.archs == ("aarch64", "x86_64")
+    assert axes_a.variant_sample == 2
+    # Namespace fields absent from _make_args fall back to the same
+    # defaults cmd_submit's pre-flight path uses.
+    assert axes_a.variant_seed == "42"
+    assert axes_a.build_compilers is False
+    assert axes_a.debug_testbuild is None
+    assert axes_a.toolchain_dedup is True
+
+
+def test_compute_input_hash_varies_with_invocation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+):
+    """Same repo state, different invocation axes => different cache
+    key (the nano-vs-16-binary contamination); identical invocation =>
+    identical key."""
+    monkeypatch.delenv("CSR_TOOLCHAIN_DEDUP", raising=False)
+
+    def fake_collect(repo_root, *, invocation=None, **_kw):
+        return InputHashInputs(
+            flake_lock=b"lock",
+            git_rev="a" * 40,
+            git_diff=b"",
+            invocation=(
+                invocation.canonical_bytes()
+                if invocation is not None
+                else b""
+            ),
+        )
+
+    monkeypatch.setattr(cli_module, "collect_input_hash_inputs", fake_collect)
+
+    nano = _make_args(tmp_path, packages=["zlib"])
+    full = _make_args(
+        tmp_path,
+        packages=[
+            "bzip2", "lz4", "xz", "zlib", "cjson", "expat", "libyaml",
+            "xxhash", "libb2", "mujs", "duktape", "m4", "bc", "dash",
+            "ed", "mawk",
+        ],
+    )
+    h_nano = cli_module._compute_input_hash(tmp_path, nano)
+    h_full = cli_module._compute_input_hash(tmp_path, full)
+    assert h_nano != h_full
+
+    # Other axes split the key too.
+    h_archs = cli_module._compute_input_hash(
+        tmp_path, _make_args(tmp_path, packages=["zlib"], archs=["x86_64"])
+    )
+    h_sample = cli_module._compute_input_hash(
+        tmp_path, _make_args(tmp_path, packages=["zlib"], variant_sample=5)
+    )
+    assert len({h_nano, h_archs, h_sample}) == 3
+
+    # Identical invocation (re-parsed, different object) is stable.
+    nano_again = _make_args(tmp_path, packages=["zlib"])
+    assert cli_module._compute_input_hash(tmp_path, nano_again) == h_nano
 
 
 def test_cmd_submit_cache_hit_skips_preflight(

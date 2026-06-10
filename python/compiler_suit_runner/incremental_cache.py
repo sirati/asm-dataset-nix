@@ -1,9 +1,15 @@
 """Local on-disk cache for the runner's pre-flight outputs.
 
 Caches partition.json, manifests, and _meta keyed by an input_hash that
-captures the flake state (flake.lock + git rev + git diff). Re-running
-the runner on an unchanged flake should NOT redo the ~5-min local
-pre-flight + ~hours of cluster Phase 1a/1b.
+captures the flake state (flake.lock + git rev + git diff) PLUS the
+invocation axes that shape what the pre-flight produces (packages,
+archs, variant sampling, sys_name, build-compilers mode, ...).
+Re-running the runner on an unchanged flake with the SAME invocation
+should NOT redo the ~5-min local pre-flight + ~hours of cluster Phase
+1a/1b; a different invocation (e.g. a different ``--packages`` set)
+must MISS even on identical repo state — without the axes in the key,
+a 16-binary dispatch can silently reuse a prior nano run's entry and
+plan only the nano's tasks.
 
 Cache layout::
 
@@ -21,12 +27,13 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import os
 import pathlib
 import shutil
 import subprocess
 import tarfile
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 DEFAULT_CACHE_ROOT = pathlib.Path.home() / ".cache" / "compiler_suit_runner"
 
@@ -35,20 +42,132 @@ RunSubprocess = Callable[..., "subprocess.CompletedProcess[bytes]"]
 ReadBytes = Callable[[pathlib.Path], bytes]
 
 
+def _canonical_str_tuple(
+    values: Optional[Sequence[str]],
+) -> Optional[tuple[str, ...]]:
+    """Canonicalize a CLI multi-value axis: sorted, de-duplicated tuple.
+
+    ``None`` (axis not constrained, i.e. "all") is preserved as-is and
+    stays distinct from an explicit empty/short list.
+    """
+    if values is None:
+        return None
+    return tuple(sorted(set(values)))
+
+
+@dataclasses.dataclass(frozen=True)
+class InvocationAxes:
+    """The invocation parameters that shape the pre-flight outputs.
+
+    Every CLI axis that changes what the pre-flight / matrix planning
+    produces MUST be represented here, otherwise two different
+    invocations on the same repo state collide on one cache entry
+    (the observed failure: a 16-binary run cache-hitting a prior nano
+    run's entry and planning only the nano's tasks).
+
+    Axes and why they are included:
+
+    * ``packages`` — ``--packages``: selects which binaries are
+      enumerated for matrix_eval.
+    * ``archs`` — ``--archs``: restricts both the toolchain enumeration
+      and the per-binary variant matrix.
+    * ``variant_sample`` — ``--variant-sample``: down-samples the
+      variant matrix.
+    * ``variant_seed`` — ``--variant-seed``: reshuffles the sample.
+    * ``sys_name`` — ``--system``: flake system attribute everything is
+      evaluated against.
+    * ``build_compilers`` — ``--build-compilers``: flips manifest
+      emission between ``build_compilers`` and ``toolchain_validate``
+      classes and is persisted as ``allow_toolchain_build`` in the
+      cached preflight descriptor.
+    * ``debug_testbuild`` — ``--debug-testbuild``: adds the
+      build_compilers stage / validation binary.
+    * ``toolchain_dedup`` — ``--no-toolchain-dedup`` /
+      ``CSR_TOOLCHAIN_DEDUP``: changes the per-binary matrix_eval
+      payloads (full-closure vs diff archives).
+
+    Deliberately excluded: ``--jobs`` (num_workers no longer affects
+    emitted manifests), ``--flake`` (the repo state behind the flake ref
+    is already captured by flake.lock + git rev + git diff), and
+    ``--max-variants`` (deprecated no-op).
+
+    ``packages`` / ``archs`` use ``None`` for "all" (the CLI default);
+    explicit lists are canonicalized via :func:`_canonical_str_tuple`
+    so flag ordering and duplicates do not change the hash.
+    """
+
+    packages: Optional[tuple[str, ...]] = None
+    archs: Optional[tuple[str, ...]] = None
+    variant_sample: int = 0
+    variant_seed: str = "42"
+    sys_name: str = "x86_64-linux"
+    build_compilers: bool = False
+    debug_testbuild: Optional[str] = None
+    toolchain_dedup: bool = True
+
+    @classmethod
+    def from_values(
+        cls,
+        *,
+        packages: Optional[Sequence[str]] = None,
+        archs: Optional[Sequence[str]] = None,
+        variant_sample: int = 0,
+        variant_seed: str = "42",
+        sys_name: str = "x86_64-linux",
+        build_compilers: bool = False,
+        debug_testbuild: Optional[str] = None,
+        toolchain_dedup: bool = True,
+    ) -> "InvocationAxes":
+        """Build axes from raw CLI values, canonicalizing the
+        order-insensitive multi-value fields."""
+        return cls(
+            packages=_canonical_str_tuple(packages),
+            archs=_canonical_str_tuple(archs),
+            variant_sample=int(variant_sample),
+            variant_seed=str(variant_seed),
+            sys_name=str(sys_name),
+            build_compilers=bool(build_compilers),
+            debug_testbuild=(
+                str(debug_testbuild) if debug_testbuild is not None else None
+            ),
+            toolchain_dedup=bool(toolchain_dedup),
+        )
+
+    def canonical_bytes(self) -> bytes:
+        """Deterministic, order-stable serialization for hashing.
+
+        JSON with sorted keys and fixed separators; tuples serialize as
+        JSON arrays in their (already canonical) order, ``None`` as
+        ``null`` — distinct from any explicit list.
+        """
+        return json.dumps(
+            dataclasses.asdict(self),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+
+
 @dataclasses.dataclass(frozen=True)
 class InputHashInputs:
-    """The three sources combined into the cache key.
+    """The sources combined into the cache key.
 
-    All three are bytes-or-strings to keep the hash deterministic.
+    Three repo-state inputs (bytes-or-strings to keep the hash
+    deterministic) plus the canonical serialization of the invocation
+    axes (see :class:`InvocationAxes`).
     """
 
     flake_lock: bytes  # contents of flake.lock
     git_rev: str  # git rev-parse HEAD output (40-char hex, stripped)
     git_diff: bytes  # git diff worktree contents (may be empty)
+    # Canonical bytes of the invocation axes (InvocationAxes
+    # .canonical_bytes()). Defaults to empty for callers that key on
+    # repo state only (legacy / tests).
+    invocation: bytes = b""
 
 
 def compute_input_hash(inputs: InputHashInputs) -> str:
-    """Return ``sha256`` hex of length-prefixed concatenation of the three
+    """Return ``sha256`` hex of length-prefixed concatenation of the
     inputs.
 
     Length prefixes prevent boundary-confusion attacks (e.g. a flake.lock
@@ -57,7 +176,8 @@ def compute_input_hash(inputs: InputHashInputs) -> str:
 
         sha256( b"flake_lock:" + len(flake_lock).to_bytes(8,'big') + flake_lock
               + b"git_rev:"    + len(git_rev_bytes).to_bytes(8,'big') + git_rev_bytes
-              + b"git_diff:"   + len(git_diff).to_bytes(8,'big') + git_diff )
+              + b"git_diff:"   + len(git_diff).to_bytes(8,'big') + git_diff
+              + b"invocation:" + len(invocation).to_bytes(8,'big') + invocation )
     """
     h = hashlib.sha256()
     git_rev_bytes = inputs.git_rev.encode("utf-8")
@@ -73,6 +193,10 @@ def compute_input_hash(inputs: InputHashInputs) -> str:
     h.update(b"git_diff:")
     h.update(len(inputs.git_diff).to_bytes(8, "big"))
     h.update(inputs.git_diff)
+
+    h.update(b"invocation:")
+    h.update(len(inputs.invocation).to_bytes(8, "big"))
+    h.update(inputs.invocation)
 
     return h.hexdigest()
 
@@ -90,16 +214,22 @@ def _default_read_bytes(path: pathlib.Path) -> bytes:
 def collect_input_hash_inputs(
     repo_root: pathlib.Path,
     *,
+    invocation: Optional["InvocationAxes"] = None,
     run_subprocess: Optional[RunSubprocess] = None,
     read_bytes: Optional[ReadBytes] = None,
 ) -> InputHashInputs:
-    """Collect the three inputs for ``compute_input_hash``.
+    """Collect the inputs for ``compute_input_hash``.
 
     Reads ``flake.lock`` from disk; calls ``git rev-parse HEAD`` and
     ``git diff`` via ``run_subprocess`` (default: :func:`subprocess.run`).
     If git is missing or ``repo_root`` is not a git repo, raises
     :class:`RuntimeError`. Use ``read_bytes`` (default
     :meth:`pathlib.Path.read_bytes`) for testability.
+
+    ``invocation`` carries the invocation axes (:class:`InvocationAxes`)
+    that shape the pre-flight outputs; when omitted, the key covers repo
+    state only (legacy behaviour — callers caching pre-flight artifacts
+    MUST pass it).
     """
     if run_subprocess is None:
         run_subprocess = _default_run_subprocess
@@ -148,6 +278,9 @@ def collect_input_hash_inputs(
         flake_lock=flake_lock,
         git_rev=git_rev,
         git_diff=git_diff,
+        invocation=(
+            invocation.canonical_bytes() if invocation is not None else b""
+        ),
     )
 
 
