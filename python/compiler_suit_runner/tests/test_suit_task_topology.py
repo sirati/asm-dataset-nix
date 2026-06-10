@@ -7,10 +7,14 @@ topology end-to-end without spinning up the framework.
 
 The ``dependency_graph`` step (plan's phase 3) is a first-class
 framework PhaseSpec depending on ``matrix_eval``; the ``build`` phase
-is spawned at runtime by the primary from
-:meth:`SuitTask.on_phase_end` via ``primary_handle.spawn_tasks``. The
-tests below pin that topology so a future change doesn't silently
-alter the dependency edges.
+is spawned incrementally at runtime by the primary's
+:meth:`SuitTask.custom_message_handler` as the worker streams
+descriptor batches over the custom-message channel (see
+:mod:`compiler_suit_runner.streamed_spawn`);
+:meth:`SuitTask.on_phase_end` only reconciles the spawned count
+against the worker's terminal summary. The tests below pin that
+topology so a future change doesn't silently alter the dependency
+edges.
 """
 
 from __future__ import annotations
