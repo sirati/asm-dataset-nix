@@ -31,9 +31,15 @@ Protocol under the new phase taxonomy:
 * ``build`` (phase 4) — distributed ``build_common_dep`` +
   ``build_variant`` workers; ``toolchain_validate`` shares the same
   dispatch (rarely emitted, gated by ``--debug-testbuild``). The build
-  phase is spawned at runtime by the primary from the descriptor list
-  the single dependency_graph task planned (handoff transport pending
-  replacement).
+  phase is spawned at runtime by the primary from the descriptor
+  batches the single dependency_graph task STREAMS as custom messages
+  (:mod:`compiler_suit_runner.streamed_spawn`): the worker's messages
+  reach the secondary's :meth:`SuitTask.worker_message_listener`,
+  which forwards them verbatim to the primary as IMPORTANT messages;
+  the primary's :meth:`SuitTask.custom_message_handler` decodes each
+  batch and spawns it incrementally, and
+  :meth:`SuitTask.on_phase_end("dependency_graph")` is a pure
+  reconciliation barrier against the worker's terminal summary.
 
 Responsibilities:
 
@@ -387,14 +393,17 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
 
     The ``dependency_graph`` step (phase 3 in the plan) runs as a
     first-class framework PhaseSpec task dispatched by the runner; it
-    plans the phase-4 descriptor list. The descriptor handoff to
-    :meth:`SuitTask.on_phase_end` (which translates descriptors to
+    plans the phase-4 descriptor list and STREAMS it as
+    :mod:`compiler_suit_runner.streamed_spawn` batch messages while it
+    plans. Each batch is relayed (secondary →) primary where
+    :meth:`SuitTask.custom_message_handler` translates descriptors to
     :class:`ManifestHeader` instances via
     :func:`dependency_graph_planner.headers_from_descriptors`,
     converts each to a framework ``TaskInfo`` via
     :func:`_header_to_task_info`, and hands them to
-    ``self._primary_handle.spawn_tasks`` for the ``build`` phase) has
-    its transport removed pending replacement. The spawn fan-out stays
+    ``primary_handle.spawn_tasks`` for the ``build`` phase;
+    :meth:`SuitTask.on_phase_end` only reconciles the spawned count
+    against the worker's terminal summary. The spawn fan-out stays
     primary-affined because "task creation can only be done by the
     manager (primary)" is still a framework invariant.
     """
@@ -909,6 +918,18 @@ class SuitTask:
         # binds it the wrappers log + degrade to the legacy NFS-poll
         # fallback path.
         self._primary_handle: Optional[Any] = None
+        # Streamed dependency_graph → build spawn bookkeeping
+        # (primary-local; see custom_message_handler / on_phase_end).
+        # ``_streamed_spawned_count`` accumulates the TaskInfos handed
+        # to ``spawn_tasks`` across spawn_batch messages;
+        # ``_streamed_expected_total`` / ``_streamed_summary_counters``
+        # / ``_streamed_summary_batches`` record the worker's terminal
+        # summary so ``on_phase_end("dependency_graph")`` can act as a
+        # reconciliation barrier.
+        self._streamed_spawned_count: int = 0
+        self._streamed_expected_total: Optional[int] = None
+        self._streamed_summary_counters: Optional[dict] = None
+        self._streamed_summary_batches: Optional[int] = None
         self._setup_done: bool = False
         self._setup_lock = threading.Lock()
 
@@ -1313,12 +1334,13 @@ class SuitTask:
 
         ``primary_handle`` is the in-flight runtime control surface
         the framework's modern dispatcher (post-``5fa212c``) passes via
-        kwarg. Captured onto ``self._primary_handle`` so the
-        ``dependency_graph`` → ``build`` dispatch in
-        :meth:`on_phase_end` can drive
-        ``primary_handle.spawn_tasks(...)``. When the kwarg is absent
-        (legacy callers, single-process tests) :meth:`on_phase_end`
-        logs a warning and skips the build-phase spawn.
+        kwarg. Captured onto ``self._primary_handle`` for the
+        primary-affined control-plane wrappers; the streamed
+        ``dependency_graph`` → ``build`` spawn itself receives its
+        handle per-message via :meth:`custom_message_handler`. When
+        the kwarg is absent (legacy callers, single-process tests)
+        :meth:`on_phase_end` logs a warning and skips the
+        dependency_graph reconciliation.
         """
         del source_dir, args, output_dir  # unused
         with self._setup_lock:
@@ -1326,7 +1348,8 @@ class SuitTask:
                 # Late-binding the handle on a re-entry is harmless;
                 # :meth:`on_phase_end` reads ``self._primary_handle``
                 # through the SuitTask reference, so a flip after
-                # construction still takes effect for the later spawn.
+                # construction still takes effect for the later
+                # reconciliation gate.
                 if primary_handle is not None:
                     self._primary_handle = primary_handle
                 return
@@ -2288,14 +2311,198 @@ class SuitTask:
             )
             return
 
-        # The dependency_graph → build descriptor handoff transport was
-        # removed; its replacement (streamed custom messages) is not
-        # wired up yet. Fail loudly rather than silently spawning zero
-        # build tasks.
-        raise NotImplementedError(
-            "dependency_graph handoff transport removed; build-phase"
-            " spawn from on_phase_end is pending the replacement"
-            " transport"
+        # Reconciliation barrier ONLY. The build tasks were already
+        # spawned incrementally by :meth:`custom_message_handler` as
+        # the dependency_graph worker streamed its descriptor batches;
+        # here we just verify the spawned count against the worker's
+        # authoritative terminal summary so a lost batch (or a missing
+        # summary) fails loudly instead of silently under-spawning.
+        #
+        # KNOWN Wave-1 limitation: these counts are primary-local. A
+        # mid-stream failover replays only the still-Unhandled messages
+        # into a promoted primary whose counters start fresh, so this
+        # reconciliation can false-alarm after failover. Accepted for
+        # now — loud beats silent.
+        if self._streamed_expected_total is None:
+            raise RuntimeError(
+                "dependency_graph handoff incomplete: no summary"
+                " message received"
+                f" (spawned={self._streamed_spawned_count})"
+            )
+        if self._streamed_spawned_count != self._streamed_expected_total:
+            raise RuntimeError(
+                "dependency_graph handoff mismatch:"
+                f" spawned={self._streamed_spawned_count}"
+                f" != total={self._streamed_expected_total}"
+                f" (counters={self._streamed_summary_counters})"
+            )
+        self._logger.info(
+            "dependency_graph handoff reconciled:"
+            " spawned == total == %d (batches=%s, counters=%s)",
+            self._streamed_spawned_count,
+            self._streamed_summary_batches,
+            self._streamed_summary_counters,
+        )
+
+    # ── Streamed dependency_graph → build spawn transport ──────────────
+
+    def worker_message_listener(
+        self,
+        worker_id: int,
+        type_id: str,
+        topic: str,
+        data: bytes,
+        secondary_handle: Any,
+    ) -> None:
+        """Secondary-side relay for worker custom messages.
+
+        Duck-typed framework hook: invoked on the SECONDARY when a
+        worker subprocess sends a custom message. Streamed-spawn
+        traffic (the dependency_graph worker's
+        :data:`streamed_spawn.SPAWN_TOPIC` batches and its terminal
+        :data:`streamed_spawn.SUMMARY_TOPIC`) is forwarded VERBATIM to
+        the primary as an IMPORTANT message — decode-free, so a
+        malformed payload surfaces on the primary via the framework's
+        Unhandled/poison-cap machinery instead of killing the relay.
+        Any other topic is ignored at debug level: the relay must
+        never poison unrelated traffic.
+        """
+        from compiler_suit_runner.streamed_spawn import (  # noqa: PLC0415
+            SPAWN_TOPIC,
+            SUMMARY_TOPIC,
+        )
+
+        if topic in (SPAWN_TOPIC, SUMMARY_TOPIC):
+            self._logger.info(
+                "worker_message_listener: forwarding %s to primary"
+                " (worker_id=%d, %d bytes)",
+                topic, worker_id, len(data),
+            )
+            secondary_handle.send_to_primary(topic, data, important=True)
+            return
+        self._logger.debug(
+            "worker_message_listener: ignoring topic %r"
+            " (worker_id=%d, type_id=%s, %d bytes)",
+            topic, worker_id, type_id, len(data),
+        )
+
+    def custom_message_handler(
+        self,
+        origin: str,
+        topic: str,
+        data: bytes,
+        important: bool,
+        primary_handle: Any,
+    ) -> None:
+        """Primary-side consumer of the streamed-spawn messages.
+
+        Duck-typed framework hook: invoked ON THE PRIMARY for each
+        relayed custom message. ``spawn_batch`` messages are decoded
+        (:func:`streamed_spawn.decode_spawn_message`), translated
+        descriptor → :class:`ManifestHeader` → ``TaskInfo``, and
+        handed to ``primary_handle.spawn_tasks`` immediately; the
+        terminal ``summary`` records the authoritative totals for the
+        :meth:`on_phase_end` reconciliation barrier.
+
+        Raising leaves the message Unhandled — the framework retries
+        with backoff and poison-caps to a structured loud ERROR. That
+        is the intended failure surface here, so this method does NOT
+        catch: ``ValueError`` (malformed payload / unknown topic) and
+        ``RuntimeError`` (no usable primary_handle, conflicting
+        summary) propagate by design.
+        """
+        del important  # relay always marks these important
+        from compiler_suit_runner.streamed_spawn import (  # noqa: PLC0415
+            SPAWN_TOPIC,
+            SUMMARY_TOPIC,
+            decode_spawn_message,
+        )
+
+        if topic not in (SPAWN_TOPIC, SUMMARY_TOPIC):
+            raise ValueError(
+                f"custom_message_handler: unknown topic {topic!r}"
+                f" (origin={origin}); refusing to mark an unrecognised"
+                " important message handled"
+            )
+        msg = decode_spawn_message(data)  # ValueError propagates
+        if msg["kind"] == "summary":
+            self._handle_streamed_summary(origin, msg)
+        else:
+            self._handle_streamed_spawn_batch(origin, msg, primary_handle)
+
+    def _handle_streamed_spawn_batch(
+        self, origin: str, msg: dict, primary_handle: Any,
+    ) -> None:
+        """Spawn one decoded ``spawn_batch`` onto ``primary_handle``."""
+        # Late import keeps planner machinery off the import path in
+        # single-process tests that never reach phase 3.
+        from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
+            headers_from_descriptors,
+        )
+
+        if primary_handle is None or not hasattr(
+            primary_handle, "spawn_tasks"
+        ):
+            # Must stay Unhandled (replayed to a future primary with a
+            # real handle) rather than silently dropping a batch.
+            raise RuntimeError(
+                "custom_message_handler: no usable primary_handle"
+                f" (got {type(primary_handle).__name__}); cannot spawn"
+                f" spawn_batch seq={msg['seq']} from {origin}"
+            )
+        headers = headers_from_descriptors(msg["descriptors"])
+        task_infos = [
+            _header_to_task_info(
+                header,
+                disable_task_deps=self.config.disable_task_deps,
+            )
+            for header in headers
+        ]
+        self._logger.info(
+            "custom_message_handler: spawn_batch seq=%d from %s;"
+            " spawning %d task(s)",
+            msg["seq"], origin, len(task_infos),
+        )
+        errors = primary_handle.spawn_tasks(task_infos) or []
+        self._log_spawn_errors(errors, headers)
+        self._streamed_spawned_count += len(task_infos)
+
+    def _handle_streamed_summary(self, origin: str, msg: dict) -> None:
+        """Record (or reconcile a redelivery of) the terminal summary."""
+        total = msg["total"]
+        batches = msg["batches"]
+        counters = msg["counters"]
+        if self._streamed_expected_total is not None:
+            if (
+                self._streamed_expected_total,
+                self._streamed_summary_batches,
+                self._streamed_summary_counters,
+            ) == (total, batches, counters):
+                # Framework redelivery edge (e.g. replay after
+                # promotion): an identical duplicate is harmless.
+                self._logger.info(
+                    "custom_message_handler: duplicate identical"
+                    " dependency_graph summary from %s (total=%d);"
+                    " ignoring",
+                    origin, total,
+                )
+                return
+            raise RuntimeError(
+                "conflicting dependency_graph summary from"
+                f" {origin}: recorded"
+                f" total={self._streamed_expected_total}"
+                f" batches={self._streamed_summary_batches}"
+                f" counters={self._streamed_summary_counters};"
+                f" new total={total} batches={batches}"
+                f" counters={counters}"
+            )
+        self._streamed_expected_total = total
+        self._streamed_summary_batches = batches
+        self._streamed_summary_counters = dict(counters)
+        self._logger.info(
+            "custom_message_handler: dependency_graph summary from %s:"
+            " total=%d batches=%d counters=%s",
+            origin, total, batches, counters,
         )
 
     def _log_spawn_errors(
@@ -2319,7 +2526,7 @@ class SuitTask:
                 idx, err = idx_err
             except (TypeError, ValueError):
                 self._logger.warning(
-                    "on_phase_end: malformed spawn error entry %r;"
+                    "spawn_tasks: malformed spawn error entry %r;"
                     " skipping",
                     idx_err,
                 )
@@ -2330,7 +2537,7 @@ class SuitTask:
             offending_name = offending.name if offending is not None else "?"
             if kind == "duplicate_task_hash":
                 self._logger.warning(
-                    "on_phase_end: spawn_tasks duplicate task_hash for"
+                    "spawn_tasks: duplicate task_hash for"
                     " header %s (idx=%d task_hash=%s)",
                     offending_name, idx, task_hash,
                 )
@@ -2339,13 +2546,13 @@ class SuitTask:
                     err.get("dep_task_id") if isinstance(err, dict) else ""
                 )
                 self._logger.warning(
-                    "on_phase_end: spawn_tasks unknown dependency for"
+                    "spawn_tasks: unknown dependency for"
                     " header %s (idx=%d task_hash=%s dep_task_id=%s)",
                     offending_name, idx, task_hash, dep_task_id,
                 )
             else:
                 self._logger.warning(
-                    "on_phase_end: spawn_tasks unrecognised error kind"
+                    "spawn_tasks: unrecognised error kind"
                     " for header %s (idx=%d err=%r)",
                     offending_name, idx, err,
                 )
