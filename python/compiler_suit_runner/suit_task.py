@@ -2286,11 +2286,15 @@ class SuitTask:
     def on_phase_start(self, phase_id: str) -> None:
         self._logger.info("phase %s starting", phase_id)
         if phase_id == Phase.DEPENDENCY_GRAPH:
-            # Fresh stream per phase attempt: a dependency_graph retry
-            # (or a reused SuitTask instance) restreams the whole plan,
-            # so counters inherited from a previous attempt would poison
-            # the on_phase_end reconciliation barrier. Reset them here,
-            # before the worker can send its first spawn_batch.
+            # Fresh stream per run: a run-level restart or a reused
+            # SuitTask instance restreams the whole plan, so counters
+            # inherited from a previous run would poison the
+            # on_phase_end reconciliation barrier. Reset them here,
+            # before the worker can send its first spawn_batch. (The
+            # framework fires on_phase_start once per phase per run; a
+            # WITHIN-run dependency_graph task retry restreams without
+            # a reset and trips the barrier loudly — preferable to
+            # risking duplicate spawns.)
             self._streamed_spawned_count = 0
             self._streamed_expected_total = None
             self._streamed_summary_counters = None
