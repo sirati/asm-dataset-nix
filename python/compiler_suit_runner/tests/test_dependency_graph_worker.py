@@ -2008,3 +2008,230 @@ class TestStreamDrvTree:
         ):
             with pytest.raises(RuntimeError, match="no such derivation"):
                 list(dgw.stream_drv_tree("/nix/store/zzzz-sum.drv"))
+
+
+# ---------------------------------------------------------------------------
+# Streamed-spawn handoff (the Wave-1 send_message transport)
+# ---------------------------------------------------------------------------
+
+
+class TestStreamedSpawnHandoff:
+    """``run_dependency_graph_task`` streams its planned descriptors to
+    the primary as :mod:`compiler_suit_runner.streamed_spawn` batch
+    messages on ``task.send_message``: planner-order batches on
+    SPAWN_TOPIC, then exactly one summary on SUMMARY_TOPIC carrying the
+    authoritative total + per-kind counters.
+
+    Setup mirrors :class:`TestRunDependencyGraphTask` (stubbed archive
+    derive + sum-drv builder + planner so no nix / template_graph is
+    touched); assertions decode the captured wire bytes.
+    """
+
+    _TC_AGG = "/nix/store/zzzz-toolchains.drv"
+    _MATRIX_AGG = "/nix/store/" + "ss" + "a" * 30 + "-matrix-hello.drv"
+
+    def _seed(self, tmp_path: pathlib.Path) -> pathlib.Path:
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        (matrix_dir / "toolchains.drv.archive").write_bytes(b"fake-toolchain")
+        (matrix_dir / "matrix-hello.drv.archive").write_bytes(b"fake")
+        return matrix_dir
+
+    def _patch_pipeline(self, monkeypatch, descriptors) -> None:
+        """Stub derive/sum-drv/planner so the worker plans exactly
+        ``descriptors``."""
+        from compiler_suit_runner.workers.dependency_graph_worker import (
+            archive as _archive_mod,
+        )
+
+        suffix = "gcc15-O0-baseline-default-san-off-march-default"
+        label = f"hello__x86_64__{suffix}"
+        monkeypatch.setattr(
+            _archive_mod, "derive_variant_lookup_from_aggregate",
+            lambda _agg: {
+                ("x86_64", label): {
+                    "drv": "/nix/store/" + "v" * 32 + "-hello-elf-folder.drv",
+                    "arch": "x86_64",
+                    "label": label,
+                    "suffix": suffix,
+                },
+            },
+        )
+        monkeypatch.setattr(
+            dgw, "build_sum_drv_multi", lambda **kw: "/nix/store/sum.drv",
+        )
+        monkeypatch.setattr(dgw, "plan_total", lambda **kw: list(descriptors))
+
+    def _run(self, matrix_dir: pathlib.Path, task) -> None:
+        dgw.run_dependency_graph_task(
+            task=task,
+            matrix_eval_out_dir=matrix_dir,
+            bash_path="/nix/store/bash",
+            toolchain_aggregate_drv=self._TC_AGG,
+            binary="hello",
+            matrix_drv=self._MATRIX_AGG,
+            run_subprocess=_SubprocessStub(),
+        )
+
+    @staticmethod
+    def _descriptors(n: int) -> list[Phase4Descriptor]:
+        """``n`` descriptors over both kinds (kind alternates so the
+        summary's per-kind Counter has something to count)."""
+        out: list[Phase4Descriptor] = []
+        for i in range(n):
+            kind = "build_common_dep" if i % 2 else "build_variant"
+            out.append(Phase4Descriptor(
+                kind=kind,
+                task_id=f"{kind}__{i}",
+                name=f"{kind}__{i}",
+                payload={"i": i},
+                depends_on=(),
+            ))
+        return out
+
+    def test_batches_in_planner_order_then_one_summary(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        from compiler_suit_runner.streamed_spawn import (  # noqa: PLC0415
+            SPAWN_TOPIC,
+            SUMMARY_TOPIC,
+            decode_spawn_message,
+        )
+
+        matrix_dir = self._seed(tmp_path)
+        planned = self._descriptors(5)
+        self._patch_pipeline(monkeypatch, planned)
+        task = _FakeStreamTask()
+        self._run(matrix_dir, task)
+
+        assert [t for t, _ in task.messages] == [SPAWN_TOPIC, SUMMARY_TOPIC]
+        batch = decode_spawn_message(task.messages[0][1])
+        assert batch["kind"] == "spawn_batch"
+        assert batch["seq"] == 0
+        # Planner order, full payload fidelity (dataclass equality).
+        assert batch["descriptors"] == planned
+        summary = decode_spawn_message(task.messages[1][1])
+        assert summary == {
+            "kind": "summary",
+            "total": len(planned),
+            "batches": 1,
+            "counters": {"build_variant": 3, "build_common_dep": 2},
+        }
+
+    def test_count_cap_splits_into_multiple_batches(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        from compiler_suit_runner.streamed_spawn import (  # noqa: PLC0415
+            MAX_BATCH_DESCRIPTORS,
+            SPAWN_TOPIC,
+            SUMMARY_TOPIC,
+            decode_spawn_message,
+        )
+
+        matrix_dir = self._seed(tmp_path)
+        planned = self._descriptors(MAX_BATCH_DESCRIPTORS + 50)
+        self._patch_pipeline(monkeypatch, planned)
+        task = _FakeStreamTask()
+        self._run(matrix_dir, task)
+
+        assert [t for t, _ in task.messages] == [
+            SPAWN_TOPIC, SPAWN_TOPIC, SUMMARY_TOPIC,
+        ]
+        first = decode_spawn_message(task.messages[0][1])
+        second = decode_spawn_message(task.messages[1][1])
+        assert (first["seq"], second["seq"]) == (0, 1)
+        assert len(first["descriptors"]) == MAX_BATCH_DESCRIPTORS
+        assert len(second["descriptors"]) == 50
+        # Order preserved across the batch boundary.
+        assert first["descriptors"] + second["descriptors"] == planned
+        summary = decode_spawn_message(task.messages[2][1])
+        assert summary["total"] == len(planned)
+        assert summary["batches"] == 2
+
+    def test_empty_plan_sends_only_total_zero_summary(
+        self, tmp_path: pathlib.Path,
+    ):
+        """No archives discovered → the empty-plan short-circuit still
+        streams: NO spawn batches, exactly one total=0 summary so the
+        primary's barrier sees a complete (empty) stream."""
+        from compiler_suit_runner.streamed_spawn import (  # noqa: PLC0415
+            SUMMARY_TOPIC,
+            decode_spawn_message,
+        )
+
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        task = _FakeStreamTask()
+        self._run(matrix_dir, task)
+        assert [t for t, _ in task.messages] == [SUMMARY_TOPIC]
+        assert decode_spawn_message(task.messages[0][1]) == {
+            "kind": "summary", "total": 0, "batches": 0, "counters": {},
+        }
+
+    def test_planner_returning_zero_descriptors_sends_only_summary(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        from compiler_suit_runner.streamed_spawn import (  # noqa: PLC0415
+            SUMMARY_TOPIC,
+            decode_spawn_message,
+        )
+
+        matrix_dir = self._seed(tmp_path)
+        self._patch_pipeline(monkeypatch, [])
+        task = _FakeStreamTask()
+        self._run(matrix_dir, task)
+        assert [t for t, _ in task.messages] == [SUMMARY_TOPIC]
+        assert decode_spawn_message(task.messages[0][1])["total"] == 0
+
+    def test_task_without_send_message_raises_runtime_error(
+        self, tmp_path: pathlib.Path,
+    ):
+        matrix_dir = self._seed(tmp_path)
+        with pytest.raises(RuntimeError, match="send_message"):
+            self._run(matrix_dir, object())
+
+    def test_send_message_failure_propagates_and_fails_the_task(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        """``task.send_message`` raising mid-stream must propagate out
+        of ``run_dependency_graph_task`` (a partially-streamed plan
+        fails the task loudly; it must not limp to a clean exit)."""
+
+        class _Boom(Exception):
+            pass
+
+        class _ExplodingTask:
+            def send_message(self, topic: str, data: bytes) -> None:
+                raise _Boom("transport down")
+
+        matrix_dir = self._seed(tmp_path)
+        self._patch_pipeline(monkeypatch, self._descriptors(3))
+        with pytest.raises(_Boom, match="transport down"):
+            self._run(matrix_dir, _ExplodingTask())
+
+    def test_streaming_narration_log_lines(
+        self, tmp_path: pathlib.Path, monkeypatch, caplog,
+    ):
+        import logging  # noqa: PLC0415
+
+        matrix_dir = self._seed(tmp_path)
+        planned = self._descriptors(3)
+        self._patch_pipeline(monkeypatch, planned)
+        task = _FakeStreamTask()
+        with caplog.at_level(
+            logging.INFO,
+            logger=(
+                "compiler_suit_runner.workers.dependency_graph_worker.run"
+            ),
+        ):
+            self._run(matrix_dir, task)
+        messages = [rec.getMessage() for rec in caplog.records]
+        batch_bytes = len(task.messages[0][1])
+        assert (
+            f"streamed spawn batch 0 (3 descriptors, {batch_bytes} bytes)"
+            in messages
+        )
+        assert (
+            "streamed spawn done: 3 descriptors in 1 batches; summary sent"
+            in messages
+        )

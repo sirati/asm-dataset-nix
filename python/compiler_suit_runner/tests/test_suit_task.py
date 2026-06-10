@@ -909,3 +909,393 @@ def test_phase_specs_build_carries_validate_common_dep_variant() -> None:
         "common_dep",
         "variant",
     }
+
+
+# ---------------------------------------------------------------------------
+# Streamed dependency_graph → build spawn transport
+# (worker_message_listener relay, custom_message_handler consumer,
+# on_phase_end reconciliation barrier)
+# ---------------------------------------------------------------------------
+#
+# KNOWN ACCEPTED Wave-1 LIMITATIONS, deliberately not asserted against:
+# * failover replay into a fresh-count promoted primary can false-alarm
+#   the on_phase_end barrier (counters are primary-local);
+# * a duplicate spawn_batch redelivery double-counts/double-spawns
+#   (loud via duplicate_task_hash spawn errors, accepted).
+
+
+from compiler_suit_runner.dependency_graph_planner import (  # noqa: E402
+    Phase4Descriptor,
+)
+from compiler_suit_runner.streamed_spawn import (  # noqa: E402
+    SPAWN_TOPIC,
+    SUMMARY_TOPIC,
+    SpawnBatchEncoder,
+)
+
+
+class _FakeSecondaryHandle:
+    """Records ``send_to_primary`` calls (topic, data, important)."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, bytes, bool]] = []
+
+    def send_to_primary(
+        self, topic: str, data: bytes, important: bool = False,
+    ) -> None:
+        self.sent.append((topic, data, important))
+
+
+class _FakePrimaryHandle:
+    """Records ``spawn_tasks`` calls; returns the configured errors."""
+
+    def __init__(self, errors: list | None = None) -> None:
+        self.calls: list[list] = []
+        self._errors = errors or []
+
+    def spawn_tasks(self, task_infos):
+        self.calls.append(list(task_infos))
+        return list(self._errors)
+
+
+def _streamed_task(tmp_path: pathlib.Path, **config_overrides) -> SuitTask:
+    config = _dataclasses.replace(_make_config(tmp_path), **config_overrides)
+    task = SuitTask(config)
+    task._primary_handle = _FakePrimaryHandle()
+    return task
+
+
+def _variant_descriptor(i: int = 0, binary: str = "hello") -> Phase4Descriptor:
+    label = f"{binary}-x86_64-gcc15-O0-v{i}"
+    return Phase4Descriptor(
+        kind="build_variant",
+        task_id=f"build_variant__{_SYS}__{binary}__{label}",
+        name=label,
+        payload={
+            "sys": _SYS,
+            "pkg": binary,
+            "arch": "x86_64",
+            "label": label,
+            "drv": f"/nix/store/v-{label}.drv",
+            "variant_dir": label,
+            "metadata_name": f"{label}.json",
+            "compiler_id": "gcc15",
+        },
+        depends_on=("build_common_dep__some-glibc.drv",),
+        build_compilers_depends_on=(
+            build_compilers_task_id(_SYS, "x86_64", "gcc15"),
+        ),
+    )
+
+
+def _common_dep_descriptor(label: str = "glibc") -> Phase4Descriptor:
+    return Phase4Descriptor(
+        kind="build_common_dep",
+        task_id=f"build_common_dep__some-{label}.drv",
+        name=f"common_dep__{label}",
+        payload={"drv": f"/nix/store/some-{label}.drv", "label": label},
+        depends_on=(),
+    )
+
+
+def _batch_bytes(descriptors: list[Phase4Descriptor]) -> bytes:
+    enc = SpawnBatchEncoder()
+    for d in descriptors:
+        assert enc.add(d) is None, "test batches must fit in one message"
+    return enc.flush()
+
+
+def _summary_bytes(
+    total: int, batches: int = 1, counters: dict | None = None,
+) -> bytes:
+    import json  # noqa: PLC0415
+    return json.dumps(
+        {
+            "v": 1,
+            "kind": "summary",
+            "total": total,
+            "batches": batches,
+            "counters": counters if counters is not None else {},
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+# ── worker_message_listener (secondary-side relay) ─────────────────────
+
+
+@pytest.mark.parametrize("topic", [SPAWN_TOPIC, SUMMARY_TOPIC])
+def test_worker_message_listener_forwards_verbatim_important(
+    tmp_path, topic,
+) -> None:
+    """Streamed-spawn topics are forwarded byte-for-byte (no decode) to
+    the primary with ``important=True``."""
+    task = SuitTask(_make_config(tmp_path))
+    handle = _FakeSecondaryHandle()
+    payload = b"\x00 opaque non-JSON bytes \xff"
+    task.worker_message_listener(7, "dep_graph", topic, payload, handle)
+    assert handle.sent == [(topic, payload, True)]
+
+
+def test_worker_message_listener_ignores_foreign_topic(tmp_path) -> None:
+    """A non-streamed-spawn topic is dropped without raising and never
+    forwarded (the relay must not poison unrelated traffic)."""
+    task = SuitTask(_make_config(tmp_path))
+    handle = _FakeSecondaryHandle()
+    task.worker_message_listener(
+        7, "dep_graph", "matrix_aggregate_drv", b"data", handle,
+    )
+    assert handle.sent == []
+
+
+# ── custom_message_handler (primary-side consumer) ─────────────────────
+
+
+def test_custom_message_handler_spawn_batch_spawns_task_infos(
+    tmp_path,
+) -> None:
+    """A spawn_batch decodes into TaskInfos matching the descriptors via
+    ``headers_from_descriptors`` → ``_header_to_task_info``: task_id /
+    type_id / phase / affinity / deps all line up."""
+    task = _streamed_task(tmp_path)
+    handle = task._primary_handle
+    common = _common_dep_descriptor()
+    variant = _variant_descriptor(0)
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC, _batch_bytes([common, variant]),
+        True, handle,
+    )
+    assert len(handle.calls) == 1
+    infos = handle.calls[0]
+    assert [ti.task_id for ti in infos] == [common.task_id, variant.task_id]
+    assert [ti.type_id for ti in infos] == ["common_dep", "variant"]
+    assert all(ti.phase_id == "build" for ti in infos)
+    assert infos[1].affinity_id == "gcc15-x86_64"
+    # Deps: intra-phase as bare string, toolchain edge phase-tagged.
+    variant_deps = infos[1].task_depends_on
+    assert "build_common_dep__some-glibc.drv" in variant_deps
+    tc_id = build_compilers_task_id(_SYS, "x86_64", "gcc15")
+    assert any(
+        getattr(dep, "phase_id", None) == Phase.BUILD_COMPILERS
+        and getattr(dep, "task_id", None) == tc_id
+        for dep in variant_deps
+    )
+    assert task._streamed_spawned_count == 2
+
+
+def test_custom_message_handler_count_accumulates_across_batches(
+    tmp_path,
+) -> None:
+    task = _streamed_task(tmp_path)
+    handle = task._primary_handle
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC,
+        _batch_bytes([_variant_descriptor(0), _variant_descriptor(1)]),
+        True, handle,
+    )
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC,
+        _batch_bytes([_variant_descriptor(2)]),
+        True, handle,
+    )
+    assert [len(call) for call in handle.calls] == [2, 1]
+    assert task._streamed_spawned_count == 3
+
+
+def test_custom_message_handler_disable_task_deps_drops_deps(
+    tmp_path,
+) -> None:
+    """``config.disable_task_deps`` is threaded into
+    ``_header_to_task_info`` on the streamed spawn path too."""
+    task = _streamed_task(tmp_path, disable_task_deps=True)
+    handle = task._primary_handle
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC, _batch_bytes([_variant_descriptor(0)]),
+        True, handle,
+    )
+    assert tuple(handle.calls[0][0].task_depends_on) == ()
+
+
+def test_custom_message_handler_unknown_topic_raises(tmp_path) -> None:
+    task = _streamed_task(tmp_path)
+    with pytest.raises(ValueError, match="unknown topic 'other_topic'"):
+        task.custom_message_handler(
+            "secondary-1", "other_topic", b"x", True, task._primary_handle,
+        )
+    assert task._primary_handle.calls == []
+
+
+def test_custom_message_handler_malformed_payload_raises(tmp_path) -> None:
+    """decode ValueErrors propagate (the framework poison-cap is the
+    intended failure surface for malformed messages)."""
+    task = _streamed_task(tmp_path)
+    with pytest.raises(ValueError, match="not valid JSON"):
+        task.custom_message_handler(
+            "secondary-1", SPAWN_TOPIC, b"{never-json", True,
+            task._primary_handle,
+        )
+    assert task._primary_handle.calls == []
+    assert task._streamed_spawned_count == 0
+
+
+def test_custom_message_handler_none_primary_handle_raises(tmp_path) -> None:
+    task = _streamed_task(tmp_path)
+    with pytest.raises(RuntimeError, match="no usable primary_handle"):
+        task.custom_message_handler(
+            "secondary-1", SPAWN_TOPIC,
+            _batch_bytes([_variant_descriptor(0)]), True, None,
+        )
+    assert task._streamed_spawned_count == 0
+
+
+def test_custom_message_handler_handle_without_spawn_tasks_raises(
+    tmp_path,
+) -> None:
+    task = _streamed_task(tmp_path)
+    with pytest.raises(RuntimeError, match="no usable primary_handle"):
+        task.custom_message_handler(
+            "secondary-1", SPAWN_TOPIC,
+            _batch_bytes([_variant_descriptor(0)]), True, object(),
+        )
+
+
+def test_custom_message_handler_spawn_errors_logged_not_raised(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """spawn_tasks errors are WARN-logged (duplicate_task_hash etc.) and
+    do not raise; the count still advances (the framework holds the
+    duplicate, nothing was lost)."""
+    task = _streamed_task(tmp_path)
+    handle = _FakePrimaryHandle(errors=[
+        (0, {"kind": "duplicate_task_hash", "task_hash": "h1"}),
+    ])
+    task._primary_handle = handle
+    with caplog.at_level(logging.WARNING):
+        task.custom_message_handler(
+            "secondary-1", SPAWN_TOPIC,
+            _batch_bytes([_variant_descriptor(0)]), True, handle,
+        )
+    assert any(
+        "duplicate task_hash" in rec.getMessage() for rec in caplog.records
+    )
+    assert task._streamed_spawned_count == 1
+
+
+# ── summary recording + on_phase_end reconciliation barrier ────────────
+
+
+def test_summary_then_on_phase_end_reconciles_green(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    task = _streamed_task(tmp_path)
+    handle = task._primary_handle
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC,
+        _batch_bytes([_variant_descriptor(0), _variant_descriptor(1)]),
+        True, handle,
+    )
+    task.custom_message_handler(
+        "secondary-1", SUMMARY_TOPIC,
+        _summary_bytes(total=2, batches=1, counters={"build_variant": 2}),
+        True, handle,
+    )
+    assert task._streamed_expected_total == 2
+    assert task._streamed_summary_batches == 1
+    assert task._streamed_summary_counters == {"build_variant": 2}
+    with caplog.at_level(logging.INFO):
+        task.on_phase_end("dependency_graph", completed=1, failed=0)
+    assert any(
+        "handoff reconciled" in rec.getMessage() for rec in caplog.records
+    )
+
+
+def test_on_phase_end_without_summary_raises_incomplete(tmp_path) -> None:
+    """No summary by phase end = a lost terminal message; the barrier
+    fails loudly with the spawned count in the pinned message."""
+    task = _streamed_task(tmp_path)
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC,
+        _batch_bytes([_variant_descriptor(0), _variant_descriptor(1)]),
+        True, task._primary_handle,
+    )
+    import re  # noqa: PLC0415
+    expected = re.escape(
+        "dependency_graph handoff incomplete: no summary message"
+        " received (spawned=2)"
+    )
+    with pytest.raises(RuntimeError, match=expected):
+        task.on_phase_end("dependency_graph", completed=1, failed=0)
+
+
+def test_on_phase_end_mismatch_raises_with_pinned_message(tmp_path) -> None:
+    """spawned != summary total (a lost batch) trips the barrier with
+    the pinned spawned/total/counters message."""
+    task = _streamed_task(tmp_path)
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC,
+        _batch_bytes([_variant_descriptor(0)]), True, task._primary_handle,
+    )
+    task.custom_message_handler(
+        "secondary-1", SUMMARY_TOPIC,
+        _summary_bytes(total=3, batches=2, counters={"build_variant": 3}),
+        True, task._primary_handle,
+    )
+    import re  # noqa: PLC0415
+    expected = re.escape(
+        "dependency_graph handoff mismatch: spawned=1 != total=3"
+        " (counters={'build_variant': 3})"
+    )
+    with pytest.raises(RuntimeError, match=expected):
+        task.on_phase_end("dependency_graph", completed=1, failed=0)
+
+
+def test_duplicate_identical_summary_ignored_with_info(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Framework redelivery edge: an identical duplicate summary is
+    harmless and logged at INFO; recorded totals stay unchanged."""
+    task = _streamed_task(tmp_path)
+    summary = _summary_bytes(total=1, batches=1, counters={"build_variant": 1})
+    task.custom_message_handler(
+        "secondary-1", SUMMARY_TOPIC, summary, True, task._primary_handle,
+    )
+    with caplog.at_level(logging.INFO):
+        task.custom_message_handler(
+            "secondary-2", SUMMARY_TOPIC, summary, True, task._primary_handle,
+        )
+    assert any(
+        "duplicate identical" in rec.getMessage() for rec in caplog.records
+    )
+    assert task._streamed_expected_total == 1
+    assert task._streamed_summary_batches == 1
+    assert task._streamed_summary_counters == {"build_variant": 1}
+
+
+def test_conflicting_summary_raises_runtime_error(tmp_path) -> None:
+    task = _streamed_task(tmp_path)
+    task.custom_message_handler(
+        "secondary-1", SUMMARY_TOPIC,
+        _summary_bytes(total=1, batches=1, counters={"build_variant": 1}),
+        True, task._primary_handle,
+    )
+    with pytest.raises(RuntimeError, match="conflicting dependency_graph summary"):
+        task.custom_message_handler(
+            "secondary-1", SUMMARY_TOPIC,
+            _summary_bytes(total=2, batches=1, counters={"build_variant": 2}),
+            True, task._primary_handle,
+        )
+    # The first recorded summary stays authoritative.
+    assert task._streamed_expected_total == 1
+
+
+def test_empty_stream_total_zero_reconciles(tmp_path) -> None:
+    """The empty-plan handoff (no batches, total=0 summary) reconciles
+    clean — the barrier distinguishes 'nothing planned' from silence."""
+    task = _streamed_task(tmp_path)
+    task.custom_message_handler(
+        "secondary-1", SUMMARY_TOPIC,
+        _summary_bytes(total=0, batches=0, counters={}),
+        True, task._primary_handle,
+    )
+    task.on_phase_end("dependency_graph", completed=1, failed=0)
+    assert task._primary_handle.calls == []

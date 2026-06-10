@@ -18,10 +18,13 @@ cleanly:
   the imported .drv paths).
 * The framework ``dependency_graph`` phase runs
   ``workers.dependency_graph_worker``, which plans the phase-4
-  descriptors. :meth:`SuitTask.on_phase_end` then translates the
-  descriptors into ``build_variant`` / ``build_common_dep`` headers
-  spawned via ``primary_handle.spawn_tasks`` (descriptor handoff
-  transport pending replacement).
+  descriptors and streams them to the primary as batched custom
+  messages (:mod:`compiler_suit_runner.streamed_spawn`).
+  :meth:`SuitTask.custom_message_handler` translates each batch into
+  ``build_variant`` / ``build_common_dep`` headers spawned via
+  ``primary_handle.spawn_tasks`` as it arrives;
+  :meth:`SuitTask.on_phase_end` only reconciles the spawned count
+  against the worker's terminal summary.
 * Final ``<dataset_dir>/<pkg>/<variant_dir>/`` directories are
   populated for every variant the run produced.
 * The cluster's placement-map gossip files name at least one holder
@@ -498,10 +501,11 @@ def test_t20_matrix_eval_happy(
 
     assert build_variant_manifests, (
         "dependency_graph produced no build_variant manifests for "
-        f"{detail}; on_phase_end likely never spawned the build phase "
-        f"(check the submitter stderr for 'on_phase_end' / "
-        f"'dependency_graph' log lines). manifests_dir "
-        f"= {manifests_dir}"
+        f"{detail}; the streamed-spawn handoff likely never spawned the "
+        f"build phase (check the submitter stderr for "
+        f"'custom_message_handler' spawn_batch lines and the "
+        f"'dependency_graph handoff' reconciliation in on_phase_end). "
+        f"manifests_dir = {manifests_dir}"
     )
 
     for path, doc in build_variant_manifests:
