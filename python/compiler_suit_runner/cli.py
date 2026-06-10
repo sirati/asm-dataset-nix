@@ -967,9 +967,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # Toolchain enumeration (memoized — the ~5-min nix-eval-jobs pass).
     # The slow per-binary drv-instantiation is deferred to matrix_eval
     # workers on secondaries (see ``workers/eval_worker.py``); the
-    # dependency_graph phase runs as a framework PhaseSpec and the build
-    # phase is spawned at runtime by the primary from
-    # ``SuitTask.on_phase_end("dependency_graph")``.
+    # dependency_graph phase runs as a framework PhaseSpec and streams
+    # build-task descriptors to the primary, which spawns them in
+    # ``SuitTask.custom_message_handler`` (``on_phase_end`` reconciles).
     # ------------------------------------------------------------------
     tc_key = ""
     if repo_inputs is not None:
