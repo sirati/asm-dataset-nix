@@ -2363,7 +2363,7 @@ class SuitTask:
         :data:`streamed_spawn.SUMMARY_TOPIC`) is forwarded VERBATIM to
         the primary as an IMPORTANT message — decode-free, so a
         malformed payload surfaces on the primary via the framework's
-        Unhandled/poison-cap machinery instead of killing the relay.
+        terminal-Failed handler-raise path instead of killing the relay.
         Any other topic is ignored at debug level: the relay must
         never poison unrelated traffic.
         """
@@ -2404,12 +2404,18 @@ class SuitTask:
         terminal ``summary`` records the authoritative totals for the
         :meth:`on_phase_end` reconciliation barrier.
 
-        Raising leaves the message Unhandled — the framework retries
-        with backoff and poison-caps to a structured loud ERROR. That
-        is the intended failure surface here, so this method does NOT
-        catch: ``ValueError`` (malformed payload / unknown topic) and
-        ``RuntimeError`` (no usable primary_handle, conflicting
-        summary) propagate by design.
+        Raising is treated by the framework as a USER ERROR: the
+        message goes terminally Failed on the FIRST raise (no retry),
+        with a structured ERROR (origin/seq/topic/exception) in the
+        primary log, and any partially-queued effect from the raising
+        handler is discarded (all-or-nothing). The missing spawns are
+        then caught loudly by the :meth:`on_phase_end` reconciliation
+        barrier. That is the intended failure chain, so this method
+        does NOT catch: ``ValueError`` (malformed payload / unknown
+        topic) and ``RuntimeError`` (no usable primary_handle,
+        conflicting summary) propagate by design. Handler effects and
+        the Handled mark commit as ONE atomic CRDT frame, so a
+        replayed/duplicate spawn-effect cannot double-land.
         """
         del important  # relay always marks these important
         from compiler_suit_runner.streamed_spawn import (  # noqa: PLC0415

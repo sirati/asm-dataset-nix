@@ -1126,8 +1126,9 @@ def test_custom_message_handler_unknown_topic_raises(tmp_path) -> None:
 
 
 def test_custom_message_handler_malformed_payload_raises(tmp_path) -> None:
-    """decode ValueErrors propagate (the framework poison-cap is the
-    intended failure surface for malformed messages)."""
+    """decode ValueErrors propagate (the framework marks the message
+    terminally Failed on the first handler raise — the intended
+    failure surface for malformed messages)."""
     task = _streamed_task(tmp_path)
     with pytest.raises(ValueError, match="not valid JSON"):
         task.custom_message_handler(

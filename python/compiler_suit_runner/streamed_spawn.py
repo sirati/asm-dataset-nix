@@ -21,10 +21,11 @@ custom-message channel instead:
   (the worker's messages are relayed through its secondary).  It calls
   :func:`decode_spawn_message` on each payload, spawns the decoded
   descriptors, and reconciles the summary's totals against what it saw.
-  On any :class:`ValueError` the handler RAISES and relies on the
-  framework poison-cap to surface the malformed message -- which is why
-  every validation error here carries a precise, operator-readable
-  message.
+  On any :class:`ValueError` the handler RAISES; the framework treats
+  a handler raise as a USER ERROR and marks the message terminally
+  Failed on the first raise (no retry, all-or-nothing: no spawns from
+  that batch land), logging a structured ERROR -- which is why every
+  validation error here carries a precise, operator-readable message.
 
 Wire format (JSON, utf-8, compact ``(",", ":")`` separators):
 
