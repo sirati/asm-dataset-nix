@@ -30,6 +30,27 @@ from compiler_suit_runner.dependency_graph_planner import Phase4Descriptor
 
 
 # ---------------------------------------------------------------------------
+# Fake framework task (Wave-1 send_message capture)
+# ---------------------------------------------------------------------------
+
+
+class _FakeStreamTask:
+    """Minimal stand-in for the framework ``Task`` handle.
+
+    ``run_dependency_graph_task`` requires a ``task`` with the Wave-1
+    ``send_message(topic, data)`` API for the streamed-spawn handoff;
+    this fake just captures ``(topic, bytes)`` tuples so the existing
+    tests stay green (streaming behaviour is asserted elsewhere).
+    """
+
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, bytes]] = []
+
+    def send_message(self, topic: str, data: bytes) -> None:
+        self.messages.append((topic, data))
+
+
+# ---------------------------------------------------------------------------
 # Subprocess stub
 # ---------------------------------------------------------------------------
 
@@ -672,6 +693,7 @@ class TestRunDependencyGraphTask:
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
         result = dgw.run_dependency_graph_task(
+            task=_FakeStreamTask(),
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/aaaa-bash",
             toolchain_aggregate_drv=self._TC_AGG,
@@ -698,6 +720,7 @@ class TestRunDependencyGraphTask:
         matrix_dir.mkdir()
         with pytest.raises(ValueError, match="toolchain_aggregate_drv"):
             dgw.run_dependency_graph_task(
+                task=_FakeStreamTask(),
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/aaaa-bash",
                 toolchain_aggregate_drv="",
@@ -716,6 +739,7 @@ class TestRunDependencyGraphTask:
         matrix_dir.mkdir()
         with pytest.raises(ValueError, match="matrix_drv"):
             dgw.run_dependency_graph_task(
+                task=_FakeStreamTask(),
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/aaaa-bash",
                 toolchain_aggregate_drv=self._TC_AGG,
@@ -733,6 +757,7 @@ class TestRunDependencyGraphTask:
         matrix_dir.mkdir()
         with pytest.raises(ValueError, match="binary"):
             dgw.run_dependency_graph_task(
+                task=_FakeStreamTask(),
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/aaaa-bash",
                 toolchain_aggregate_drv=self._TC_AGG,
@@ -793,6 +818,7 @@ class TestRunDependencyGraphTask:
         monkeypatch.setattr(dgw, "plan_total", fake_plan_total)
 
         result = dgw.run_dependency_graph_task(
+            task=_FakeStreamTask(),
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/aaaa-bash",
             toolchain_aggregate_drv=self._TC_AGG,
@@ -858,6 +884,7 @@ class TestRunDependencyGraphTask:
         )
 
         dgw.run_dependency_graph_task(
+            task=_FakeStreamTask(),
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/bash",
             toolchain_aggregate_drv=self._TC_AGG,
@@ -901,6 +928,7 @@ class TestRunDependencyGraphTask:
         )
         with pytest.raises(dgw.DependencyGraphWorkerError) as excinfo:
             dgw.run_dependency_graph_task(
+                task=_FakeStreamTask(),
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/bash",
                 toolchain_aggregate_drv=self._TC_AGG,
@@ -941,6 +969,7 @@ class TestRunDependencyGraphTask:
         )
         with pytest.raises(dgw.DependencyGraphWorkerError) as excinfo:
             dgw.run_dependency_graph_task(
+                task=_FakeStreamTask(),
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/bash",
                 toolchain_aggregate_drv=self._TC_AGG,
@@ -978,6 +1007,7 @@ class TestRunDependencyGraphTask:
         )
         with pytest.raises(dgw.DependencyGraphWorkerError) as excinfo:
             dgw.run_dependency_graph_task(
+                task=_FakeStreamTask(),
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/bash",
                 toolchain_aggregate_drv=self._TC_AGG,
@@ -1027,6 +1057,7 @@ class TestRunDependencyGraphTask:
 
         with pytest.raises(dgw.DependencyGraphWorkerError) as excinfo:
             dgw.run_dependency_graph_task(
+                task=_FakeStreamTask(),
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/bash",
                 toolchain_aggregate_drv=self._TC_AGG,
@@ -1080,6 +1111,7 @@ class TestRunDependencyGraphTask:
         monkeypatch.setattr(dgw, "plan_total", fake_plan_total)
 
         result = dgw.run_dependency_graph_task(
+            task=_FakeStreamTask(),
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/bash",
             toolchain_aggregate_drv=self._TC_AGG,
@@ -1147,6 +1179,7 @@ class TestRunDependencyGraphTask:
         monkeypatch.setattr(dgw, "plan_total", lambda **kw: [])
 
         result = dgw.run_dependency_graph_task(
+            task=_FakeStreamTask(),
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/bash",
             toolchain_aggregate_drv=self._TC_AGG,
@@ -1202,6 +1235,7 @@ class TestRunDependencyGraphTask:
         monkeypatch.setattr(dgw, "plan_total", lambda **kw: [])
 
         dgw.run_dependency_graph_task(
+            task=_FakeStreamTask(),
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/bash",
             toolchain_aggregate_drv=self._TC_AGG,
@@ -1261,6 +1295,7 @@ class TestRunDependencyGraphTask:
         monkeypatch.setattr(dgw, "plan_total", fake_plan_total)
 
         result = dgw.run_dependency_graph_task(
+            task=_FakeStreamTask(),
             matrix_eval_out_dir=matrix_dir,
             bash_path="/nix/store/bash",
             toolchain_aggregate_drv=self._TC_AGG,
@@ -1289,6 +1324,7 @@ class TestRunDependencyGraphTask:
         matrix_dir.mkdir()
         with pytest.raises(ValueError, match="either matrix_drvs OR"):
             dgw.run_dependency_graph_task(
+                task=_FakeStreamTask(),
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/bash",
                 toolchain_aggregate_drv=self._TC_AGG,
@@ -1302,6 +1338,7 @@ class TestRunDependencyGraphTask:
         matrix_dir.mkdir()
         with pytest.raises(ValueError, match="matrix_drvs is empty"):
             dgw.run_dependency_graph_task(
+                task=_FakeStreamTask(),
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/bash",
                 toolchain_aggregate_drv=self._TC_AGG,
@@ -1813,6 +1850,7 @@ class TestDependencyGraphCounters:
             logger="compiler_suit_runner.dependency_graph_worker",
         ):
             result = dgw.run_dependency_graph_task(
+                task=_FakeStreamTask(),
                 matrix_eval_out_dir=matrix_dir,
                 bash_path="/nix/store/bash",
                 toolchain_aggregate_drv=tc_agg,

@@ -1720,6 +1720,7 @@ def main() -> int:
             )
             try:
                 _dependency_graph_run.run_dependency_graph_task(
+                    task=task,
                     matrix_eval_out_dir=out_dir,
                     bash_path=bash_path,
                     toolchain_aggregate_drv=tc_drv,
