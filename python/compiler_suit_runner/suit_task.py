@@ -15,13 +15,15 @@ Protocol under the new phase taxonomy:
   actually emitted.
 * ``dependency_graph`` (phase 3) — a SINGLE framework task
   (``task_id="dependency_graph"``) over ALL binaries;
-  ``task_depends_on`` is every phase-2 ``matrix_eval__<binary>`` task,
-  so the CRDT activates it only after every matrix_eval has applied.
-  The worker is invoked ONCE: it gathers each binary's
-  matrix_aggregate drv from the corresponding matrix_eval
-  predecessor's keyed outputs (``task.predecessor_outputs[
-  matrix_eval__<binary>]["matrix_aggregate_drv"]["value"]``, published
-  by the upstream matrix_eval task via ``Task.publish_string``),
+  ``task_depends_on`` is every phase-2 matrix_eval task (whose
+  task_id is the bare binary name — phase-local, the MATRIX_EVAL
+  phase disambiguates), so the CRDT activates it only after every
+  matrix_eval has applied. The worker is invoked ONCE: it gathers
+  each binary's matrix_aggregate drv from the corresponding
+  matrix_eval predecessor's keyed outputs (``task.
+  predecessor_outputs[<binary>]["matrix_aggregate_drv"]["value"]``,
+  published by the upstream matrix_eval task via
+  ``Task.publish_string``),
   imports every per-binary matrix-aggregate drv archive, and runs the
   streaming planner ONCE over the combined tree, producing one
   descriptor list covering all binaries. matrix_eval and
@@ -2283,6 +2285,16 @@ class SuitTask:
 
     def on_phase_start(self, phase_id: str) -> None:
         self._logger.info("phase %s starting", phase_id)
+        if phase_id == Phase.DEPENDENCY_GRAPH:
+            # Fresh stream per phase attempt: a dependency_graph retry
+            # (or a reused SuitTask instance) restreams the whole plan,
+            # so counters inherited from a previous attempt would poison
+            # the on_phase_end reconciliation barrier. Reset them here,
+            # before the worker can send its first spawn_batch.
+            self._streamed_spawned_count = 0
+            self._streamed_expected_total = None
+            self._streamed_summary_counters = None
+            self._streamed_summary_batches = None
 
     def on_phase_end(
         self,
@@ -2290,6 +2302,9 @@ class SuitTask:
         completed: int = 0,
         failed: int = 0,
         *,
+        # Still supplied by the framework's call shape; retained for
+        # compatibility and intentionally unused since the published-
+        # pickle handoff was replaced by the streamed-spawn messages.
         phase_outputs: Optional[dict] = None,
     ) -> None:
         self._logger.info(
@@ -2408,7 +2423,10 @@ class SuitTask:
         message goes terminally Failed on the FIRST raise (no retry),
         with a structured ERROR (origin/seq/topic/exception) in the
         primary log, and any partially-queued effect from the raising
-        handler is discarded (all-or-nothing). The missing spawns are
+        handler is discarded (all-or-nothing). The framework invokes
+        custom-message handlers serially (never concurrently), so the
+        ``_streamed_*`` counters are deliberately unguarded — no lock.
+        The missing spawns are
         then caught loudly by the :meth:`on_phase_end` reconciliation
         barrier. That is the intended failure chain, so this method
         does NOT catch: ``ValueError`` (malformed payload / unknown

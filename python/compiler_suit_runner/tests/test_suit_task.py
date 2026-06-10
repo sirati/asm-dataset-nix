@@ -1300,3 +1300,43 @@ def test_empty_stream_total_zero_reconciles(tmp_path) -> None:
     )
     task.on_phase_end("dependency_graph", completed=1, failed=0)
     assert task._primary_handle.calls == []
+
+
+def test_phase_start_resets_streamed_counters(tmp_path) -> None:
+    """A dependency_graph phase (re)start zeroes the streamed-spawn
+    counters so a retry / reused SuitTask doesn't inherit a previous
+    attempt's state into the reconciliation barrier; other phases
+    leave them untouched."""
+    task = _streamed_task(tmp_path)
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC,
+        _batch_bytes([_variant_descriptor(0)]), True, task._primary_handle,
+    )
+    task.custom_message_handler(
+        "secondary-1", SUMMARY_TOPIC,
+        _summary_bytes(total=1, batches=1, counters={"build_variant": 1}),
+        True, task._primary_handle,
+    )
+    # Foreign phase start: counters untouched.
+    task.on_phase_start("build")
+    assert task._streamed_spawned_count == 1
+    assert task._streamed_expected_total == 1
+    # dependency_graph (re)start: fresh stream state.
+    task.on_phase_start("dependency_graph")
+    assert task._streamed_spawned_count == 0
+    assert task._streamed_expected_total is None
+    assert task._streamed_summary_counters is None
+    assert task._streamed_summary_batches is None
+    # The poisoned-counter failure mode this guards: without the reset
+    # the retried phase's identical re-stream would double-count and
+    # trip the barrier; after it, the same stream reconciles green.
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC,
+        _batch_bytes([_variant_descriptor(0)]), True, task._primary_handle,
+    )
+    task.custom_message_handler(
+        "secondary-1", SUMMARY_TOPIC,
+        _summary_bytes(total=1, batches=1, counters={"build_variant": 1}),
+        True, task._primary_handle,
+    )
+    task.on_phase_end("dependency_graph", completed=1, failed=0)
