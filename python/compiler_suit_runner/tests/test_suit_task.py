@@ -158,6 +158,26 @@ def test_header_to_task_info_variant_toolchain_dep_is_cross_phase() -> None:
     assert "build_common_dep__some-glibc.drv" in ti.task_depends_on
 
 
+def test_header_to_task_info_disable_task_deps_drops_deps() -> None:
+    """With ``disable_task_deps=True`` the live spawn path drops BOTH the
+    intra-phase deps and the cross-phase toolchain deps — parity with the
+    disk loop / ``_task_info_from_header``. Regression for the gap where
+    the module-level free function ignored the flag."""
+    header = ManifestHeader(
+        item_class="build_variant",
+        name="hello-x86_64-gcc15-O0",
+        size=0,
+        payload={"sys": _SYS, "pkg": "hello", "arch": "aarch64"},
+        task_id="build_variant__x86_64-linux__hello__gcc15-O0",
+        task_depends_on=("build_common_dep__some-glibc.drv",),
+        build_compilers_depends_on=("x86_64-linux__aarch64__gcc15",),
+    )
+    assert tuple(_header_to_task_info(
+        header, disable_task_deps=True).task_depends_on) == ()
+    # Default (flag off) still emits the deps.
+    assert _header_to_task_info(header).task_depends_on
+
+
 # ---------------------------------------------------------------------------
 # Broadcast record_self_has callable assembly
 # ---------------------------------------------------------------------------
@@ -843,6 +863,149 @@ def test_on_phase_end_dependency_graph_spawns_via_primary_handle(
     # No JSON sidecar of any kind is written; the pickle is the only
     # on-disk artifact in the matrix_eval_out_dir.
     assert not list(tmp_path.rglob("*.json"))
+
+
+def _two_descriptor_pickle_bytes() -> bytes:
+    """Serialise the same two-descriptor payload ``_write_two_descriptor
+    _pickle`` writes, but as raw bytes (for the published-output path)."""
+    import pickle  # noqa: PLC0415
+
+    from compiler_suit_runner.dependency_graph_planner.manifest_glue import (
+        PHASE4_PICKLE_FORMAT_VERSION,
+        PHASE4_PICKLE_MAGIC,
+    )
+
+    descriptors = [
+        Phase4Descriptor(
+            kind="build_common_dep",
+            task_id="build_common_dep__abc.drv",
+            name="abc",
+            payload={"drv": "/nix/store/abc.drv", "label": "abc"},
+            depends_on=(),
+            priority_hint=0,
+        ),
+        Phase4Descriptor(
+            kind="build_variant",
+            task_id="build_variant__x86_64__hello__hello-O0",
+            name="hello-O0",
+            payload={
+                "sys": _SYS,
+                "pkg": "hello",
+                "arch": "x86_64",
+                "label": "hello-O0",
+                "drv": "/nix/store/v-hello-O0.drv",
+                "variant_dir": "hello-O0",
+                "metadata_name": "hello-O0.json",
+                "compiler_id": "gcc15",
+                "tier": 1,
+                "attr": f"dataset.{_SYS}.hello.x86_64.hello-O0",
+            },
+            depends_on=("build_common_dep__abc.drv",),
+            priority_hint=0,
+        ),
+    ]
+    payload = {
+        "format": PHASE4_PICKLE_MAGIC,
+        "format_version": PHASE4_PICKLE_FORMAT_VERSION,
+        "descriptors": descriptors,
+        "summary": {},
+    }
+    return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def test_on_phase_end_loads_from_published_task_output(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the framework supplies ``phase_outputs`` carrying the
+    published ``dependency_graph_pkl``, on_phase_end loads descriptors
+    from that channel and spawns the build tasks WITHOUT touching the
+    filesystem pickle (which is deliberately absent here)."""
+    import base64  # noqa: PLC0415
+
+    # matrix_eval_out_dir is a real dir but holds NO pickle — proving
+    # the published path never reads the fs.
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    assert not (out_dir / DEPENDENCY_GRAPH_PICKLE).exists()
+    base = _make_config(tmp_path)
+    config = _dataclasses.replace(base, matrix_eval_out_dir=out_dir)
+    task = SuitTask(config)
+    handle = _FakePrimaryHandle()
+    task._primary_handle = handle
+
+    phase_outputs = {
+        "dependency_graph": {
+            "dependency_graph_pkl": {
+                "kind": "inline",
+                "value": base64.b64encode(
+                    _two_descriptor_pickle_bytes()
+                ).decode(),
+            },
+        },
+    }
+    with caplog.at_level(logging.INFO):
+        task.on_phase_end(
+            "dependency_graph", completed=1, failed=0,
+            phase_outputs=phase_outputs,
+        )
+
+    assert len(handle.calls) == 1
+    task_infos = handle.calls[0]
+    assert {ti.task_id for ti in task_infos} == {
+        "build_common_dep__abc.drv",
+        "build_variant__x86_64__hello__hello-O0",
+    }
+    assert all(ti.phase_id == "build" for ti in task_infos)
+    # The pickle was never written to the fs by this path.
+    assert not (out_dir / DEPENDENCY_GRAPH_PICKLE).exists()
+    # The INFO log names the task-output channel source.
+    assert any(
+        "task-output channel" in rec.message for rec in caplog.records
+    )
+
+
+def test_on_phase_end_falls_back_to_fs_when_no_phase_outputs(
+    tmp_path,
+) -> None:
+    """``phase_outputs=None`` (old framework pin / single-process /
+    relocated-primary) → on_phase_end falls back to the on-disk pickle
+    under ``config.matrix_eval_out_dir`` (existing behavior)."""
+    out_dir = tmp_path / "out"
+    _write_two_descriptor_pickle(out_dir)
+    base = _make_config(tmp_path)
+    config = _dataclasses.replace(base, matrix_eval_out_dir=out_dir)
+    task = SuitTask(config)
+    handle = _FakePrimaryHandle()
+    task._primary_handle = handle
+
+    task.on_phase_end("dependency_graph", completed=1, failed=0,
+                      phase_outputs=None)
+
+    assert len(handle.calls) == 1
+    assert {ti.task_id for ti in handle.calls[0]} == {
+        "build_common_dep__abc.drv",
+        "build_variant__x86_64__hello__hello-O0",
+    }
+
+
+def test_on_phase_end_legacy_three_arg_call_still_works(
+    tmp_path,
+) -> None:
+    """A positional 3-arg call (old framework pin that does NOT pass the
+    ``phase_outputs`` kwarg) still works: phase_outputs defaults to
+    None → fs fallback."""
+    out_dir = tmp_path / "out"
+    _write_two_descriptor_pickle(out_dir)
+    base = _make_config(tmp_path)
+    config = _dataclasses.replace(base, matrix_eval_out_dir=out_dir)
+    task = SuitTask(config)
+    handle = _FakePrimaryHandle()
+    task._primary_handle = handle
+
+    task.on_phase_end("dependency_graph", 1, 0)
+
+    assert len(handle.calls) == 1
+    assert len(handle.calls[0]) == 2
 
 
 def test_on_phase_end_dependency_graph_no_primary_handle_warns(

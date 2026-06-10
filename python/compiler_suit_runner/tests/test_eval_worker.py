@@ -16,13 +16,16 @@ sniffs ``task.payload`` and dispatches matrix_eval tasks into
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
+import shutil
 from typing import Any, Optional
 from unittest.mock import MagicMock
 
 import pytest
 
+from compiler_suit_runner.workers import build_worker as _bw
 from compiler_suit_runner.workers import eval_worker
 from compiler_suit_runner.workers.eval_worker import (
     MATRIX_EVAL_ITEM_CLASS,
@@ -37,6 +40,50 @@ from compiler_suit_runner.workers.eval_worker import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _eval_worker_env(monkeypatch, tmp_path):
+    """Wire the framework publish + toolchain-import seams for every test.
+
+    ``run_eval_task`` now (1) STAGES the per-binary archive under
+    ``DYNRUNNER_PUBLISH_SRC_ROOT`` then publishes it, and (2) on the
+    dedup path IMPORTS the shared toolchain archive (process-memoised in
+    ``build_worker``) before the diff subtract. For the bulk of tests
+    (which exercise sampling / bulk-eval / aggregate mechanics, not
+    delivery) we:
+
+    * pin the publish staging root to a writable per-test dir (the
+      default ``/app/out-tmp`` is unwritable in the sandbox), and
+    * reset ``build_worker._toolchain_imported`` so the per-process memo
+      stays hermetic, and
+    * neutralise the toolchain IMPORT (``_import_toolchain_archive``) to
+      a no-op so incidental tests don't have to seed a toolchain archive
+      in their ``out_dir``.
+
+    Tests that specifically assert publish / import behaviour
+    (``test_run_eval_task_happy_path`` and the dedicated delivery tests)
+    opt OUT of the import neutralisation by marking themselves
+    ``@pytest.mark.real_toolchain_import``; they still benefit from the
+    publish-env pinning and the global reset.
+    """
+    monkeypatch.setenv(
+        "DYNRUNNER_PUBLISH_SRC_ROOT", str(tmp_path / "_publish_staging")
+    )
+    _bw._toolchain_imported = False
+    yield
+    _bw._toolchain_imported = False
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_toolchain_import(monkeypatch, request):
+    """No-op the toolchain IMPORT unless the test opts into the real one."""
+    if request.node.get_closest_marker("real_toolchain_import") is not None:
+        return
+    monkeypatch.setattr(
+        eval_worker, "_import_toolchain_archive",
+        lambda out_dir, *, run_subprocess=None: None,
+    )
+
+
 _DEFAULT_TOOLCHAIN_AGG = "/nix/store/tttt-toolchains.drv"
 
 
@@ -49,6 +96,7 @@ def _make_payload(
     variant_sample: Optional[int] = None,
     variant_seed: Optional[str] = None,
     toolchain_aggregate_drv: str = _DEFAULT_TOOLCHAIN_AGG,
+    toolchain_dedup: Optional[bool] = None,
 ) -> dict:
     """Build a matrix_eval payload matching make_matrix_eval_header.
 
@@ -72,6 +120,8 @@ def _make_payload(
         payload["variant_sample"] = variant_sample
     if variant_seed is not None:
         payload["variant_seed"] = variant_seed
+    if toolchain_dedup is not None:
+        payload["toolchain_dedup"] = toolchain_dedup
     return payload
 
 
@@ -310,14 +360,88 @@ def _install_wrapper_stub(monkeypatch: pytest.MonkeyPatch) -> _WrapperStub:
 def _make_task_mock() -> MagicMock:
     """Return a MagicMock standing in for the dynamic_runner ``Task``.
 
-    ``run_eval_task`` calls ``task.publish_string("matrix_aggregate_drv",
-    drv_path)`` in Step 6b to surface the matrix-aggregate drv to
-    successor tasks via the framework's keyed-outputs API (the
-    JSON sidecar this previously dropped is gone). A bare MagicMock
-    is enough — every attribute access yields a callable that records
-    its arguments.
+    Two methods carry behaviour the tests assert against:
+
+    * ``task.publish_string("matrix_aggregate_drv", drv_path)`` (Step 6b)
+      surfaces the matrix-aggregate drv to successor tasks via the
+      framework's keyed-outputs API. A bare MagicMock records the call.
+    * ``task.publish(src, dst=...)`` is the framework's concurrency-safe
+      stage→destination delivery (replaces the prior hand-rolled
+      ``.tmp`` + ``os.replace`` straight onto the shared mount). The
+      real framework moves the staged file to ``dst``; the stub mirrors
+      that — it records ``(src, dst)`` on ``task.publish_calls`` AND
+      copies ``src`` → ``dst`` so downstream "archive exists on the
+      shared mount" assertions hold. ``run_eval_task`` always passes the
+      explicit ``dst=`` form, so the stub asserts ``dst`` is present.
+
+    Tests read ``task.publish_calls`` (list of ``(src, dst)`` Path
+    tuples) to verify delivery went through ``publish`` and never via a
+    direct shared-mount write.
     """
-    return MagicMock()
+    task = MagicMock()
+    task.publish_calls = []
+
+    def _publish(src, dst=None, *, key=None):
+        assert dst is not None, "run_eval_task must publish with explicit dst="
+        src_p = pathlib.Path(src)
+        dst_p = pathlib.Path(dst)
+        task.publish_calls.append((src_p, dst_p))
+        dst_p.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src_p, dst_p)
+
+    task.publish.side_effect = _publish
+    return task
+
+
+def _setup_publish_env(
+    monkeypatch: pytest.MonkeyPatch, src_root: pathlib.Path,
+) -> None:
+    """Point the framework publish staging root at a per-test tmp dir.
+
+    ``eval_worker._staged_archive_path`` reads
+    ``DYNRUNNER_PUBLISH_SRC_ROOT`` (default ``/app/out-tmp``) — pin it to
+    a writable test dir so the worker stages there before publishing.
+    """
+    monkeypatch.setenv("DYNRUNNER_PUBLISH_SRC_ROOT", str(src_root))
+
+
+def _stub_toolchain_import(
+    monkeypatch: pytest.MonkeyPatch, out_dir: pathlib.Path,
+) -> list[pathlib.Path]:
+    """Stub the toolchain-archive import and place a non-empty archive.
+
+    On the dedup path ``run_eval_task`` IMPORTS
+    ``<out_dir>/toolchains.drv.archive`` (via
+    ``build_worker.ensure_toolchain_archive_imported`` →
+    ``dependency_graph_worker.archive.import_archive``) before computing
+    the per-binary diff subtract, and hard-fails if the archive is
+    missing/zero-byte. We:
+
+    * reset ``build_worker._toolchain_imported`` so the process-global
+      memo doesn't leak across tests,
+    * write a non-empty toolchain archive (the submitter's upload, here
+      faked), and
+    * monkeypatch ``import_archive`` to a no-op recorder (so no real
+      ``nix-store --import`` runs).
+
+    Returns the recorder list of archive paths the import helper saw.
+    """
+    _bw._toolchain_imported = False
+    tc_archive = out_dir / "toolchains.drv.archive"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tc_archive.write_bytes(b"NIX_EXPORT:toolchain-closure")
+    imported: list[pathlib.Path] = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        imported.append(pathlib.Path(archive))
+        return True, b"", ["/nix/store/x-toolchain"]
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.dependency_graph_worker"
+        ".archive.import_archive",
+        _fake_import,
+    )
+    return imported
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +592,7 @@ def test_sample_suffix_attrs_passthrough_unstructured_entries() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_toolchain_import
 def test_run_eval_task_happy_path(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -489,6 +614,8 @@ def test_run_eval_task_happy_path(
     """
     wrapper = _install_wrapper_stub(monkeypatch)
     task = _make_task_mock()
+    _setup_publish_env(monkeypatch, tmp_path / "_staging")
+    imported = _stub_toolchain_import(monkeypatch, tmp_path)
     payload = _make_payload(
         archs=["x86_64", "aarch64"],
         suffixes=["O0", "O2"],
@@ -580,22 +707,36 @@ def test_run_eval_task_happy_path(
     assert wrap_call["name"] == "matrix-hello"
     assert wrap_call["system"] == "x86_64-linux"
 
-    # nix-store --query --requisites --stdin called once seeded with
-    # ONLY the matrix aggregate (closure expansion follows inputDrvs to
-    # every leaf and the toolchain aggregate). The pre-refactor seeding
-    # with raw leaf drvs is gone — the aggregate is the single export
-    # root. The seed list now travels via stdin, not argv.
+    # The eval worker is now a CONSUMER of the shared toolchain archive,
+    # not a producer: it IMPORTS toolchains.drv.archive before the diff
+    # subtract. The import helper saw the submitter-placed archive once.
+    assert imported == [tmp_path / "toolchains.drv.archive"]
+
+    # nix-store --query --requisites --stdin is called TWICE with
+    # toolchain dedup ON (the default): once with the matrix aggregate
+    # (the per-binary diff export's closure root) and once with the
+    # toolchain aggregate as the diff export's ``exclude_seed``. There is
+    # NO LONGER a third requisites call for a toolchain-archive producer
+    # — that was removed; the submitter produces the toolchain archive.
     req_invocations = [
         inv for inv in runner.invocations
         if inv[0][:4] == ["nix-store", "--query", "--requisites", "--stdin"]
     ]
-    assert len(req_invocations) == 1
-    req_argv, req_input = req_invocations[0]
-    assert req_argv == ["nix-store", "--query", "--requisites", "--stdin"]
-    assert req_input is not None
-    assert req_input.decode("utf-8").splitlines() == [
-        "/nix/store/wrap-matrix-hello.drv",
+    req_seeds = [
+        inv[1].decode("utf-8").splitlines() for inv in req_invocations
     ]
+    # The matrix aggregate is the diff-export root.
+    assert ["/nix/store/wrap-matrix-hello.drv"] in req_seeds
+    # The toolchain aggregate is seeded ONCE, only as the diff-export
+    # exclude_seed (the producer call site is gone).
+    assert req_seeds.count(["/nix/store/aggr-toolchains.drv"]) == 1
+    assert len(req_invocations) == 2
+    for req_argv, req_input in req_invocations:
+        assert req_argv == ["nix-store", "--query", "--requisites", "--stdin"]
+        assert req_input is not None
+    # nix-store --export --stdin runs EXACTLY ONCE: only the per-binary
+    # diff archive (matrix closure − toolchain closure). The toolchain
+    # archive is produced submitter-side, not here.
     export_invocations = [
         inv for inv in runner.invocations
         if inv[0][:3] == ["nix-store", "--export", "--stdin"]
@@ -604,14 +745,25 @@ def test_run_eval_task_happy_path(
     export_argv, export_input = export_invocations[0]
     assert export_argv == ["nix-store", "--export", "--stdin"]
     assert export_input is not None
-    closure_paths = export_input.decode("utf-8").splitlines()
-    # Closure piped to --export is what the stub synthesised from the
-    # requisites stdin (seed + seed-input for the aggregate).
-    assert "/nix/store/wrap-matrix-hello.drv" in closure_paths
-    assert "/nix/store/wrap-matrix-hello.drv-input" in closure_paths
+    export_seed_set = set(export_input.decode("utf-8").splitlines())
+    # The single export carries the matrix aggregate (the per-binary
+    # diff). The stub synthesised the matrix closure as seed + seed-input;
+    # the toolchain agg + its -input are subtracted as the exclude_seed,
+    # so the diff export keeps the matrix-aggregate paths.
+    assert "/nix/store/wrap-matrix-hello.drv" in export_seed_set
+    assert "/nix/store/wrap-matrix-hello.drv-input" in export_seed_set
+    # The toolchain agg paths are subtracted out of the diff export.
+    assert "/nix/store/aggr-toolchains.drv" not in export_seed_set
 
-    # Archive written with the stub's synthetic export payload.
+    # The per-binary archive was delivered to the shared mount via the
+    # framework publish API (NOT a direct shared-mount write). The stub
+    # records (src, dst) and mirrors the real stage→destination move.
     archive = tmp_path / "matrix-hello.drv.archive"
+    assert task.publish_calls == [
+        (tmp_path / "_staging" / "_matrix_eval" / "matrix-hello.drv.archive",
+         archive),
+    ]
+    # Archive landed with the stub's synthetic export payload.
     assert archive.exists()
     assert archive.stat().st_size > 0
     assert archive.read_bytes().startswith(b"NIX_EXPORT:")
@@ -649,10 +801,18 @@ def test_run_eval_task_happy_path(
     assert not (tmp_path / "hello").exists()
     # The on-disk JSON sidecar is gone: the matrix_aggregate drv is now
     # threaded to the dependency_graph successor via the framework's
-    # keyed-outputs API (``Task.publish_string``). Only the archive
-    # remains as the per-binary artefact on the shared fs.
-    siblings = sorted(p.name for p in tmp_path.iterdir())
-    assert siblings == ["matrix-hello.drv.archive"], siblings
+    # keyed-outputs API (``Task.publish_string``). On the shared mount
+    # (out_dir) the worker now writes ONLY the per-binary diff archive
+    # (the toolchains.drv.archive present here was placed by the
+    # submitter-upload fake in setup, NOT written by the eval worker).
+    siblings = sorted(
+        p.name for p in tmp_path.iterdir()
+        if p.is_file()
+    )
+    assert siblings == [
+        "matrix-hello.drv.archive",
+        "toolchains.drv.archive",
+    ], siblings
     # Step 6b: publish_string was called exactly once with the wrapper
     # drv keyed under ``matrix_aggregate_drv``. This is the wire the
     # downstream dependency_graph task reads via predecessor_outputs.
@@ -907,24 +1067,28 @@ def test_run_eval_task_requisites_failure_raises(
 def test_run_eval_task_export_failure_raises_and_cleans_up(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``nix-store --export`` rc=1 surfaces as RuntimeError; the
-    temporary archive file is removed so re-execution sees a clean
-    out_dir.
+    """``nix-store --export`` rc=1 surfaces as RuntimeError BEFORE the
+    publish step, so nothing is delivered to the shared mount — the
+    archive never appears in out_dir and re-execution sees a clean dir.
+    The framework now owns delivery atomicity (stage→publish), so there
+    is no consumer-managed ``.tmp`` to leak.
     """
     _install_wrapper_stub(monkeypatch)
     payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
+    task = _make_task_mock()
     runner = _EvalJobsStub(
         drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
         export_fail=True,
     )
     with pytest.raises(RuntimeError, match="nix-store --export"):
         run_eval_task(
-            payload, tmp_path, task=_make_task_mock(),
+            payload, tmp_path, task=task,
             run_subprocess=runner,
         )
-    # No archive (export failed). No stale .tmp lingering either.
+    # Export failed before delivery: no archive on the shared mount and
+    # publish was never invoked.
     assert not (tmp_path / "matrix-hello.drv.archive").exists()
-    assert not (tmp_path / "matrix-hello.drv.archive.tmp").exists()
+    assert task.publish_calls == []
 
 
 def test_run_eval_task_wrapper_failure_leaves_no_archive(
@@ -935,9 +1099,8 @@ def test_run_eval_task_wrapper_failure_leaves_no_archive(
     as :class:`RuntimeError`-shaped exit (matching the framework's
     Errored/retry-pass mapping for nix subprocess failures) and the
     output archive must NOT exist — re-execution must re-run the whole
-    pipeline. Defensive: any ``.tmp`` partial archive must also be
-    absent, even though Step 6 hasn't run, so a future atomic-rename
-    refactor cannot regress this invariant silently.
+    pipeline. The wrapper builder raises before the export/publish step,
+    so nothing is staged or published either.
     """
     def _raise(*args, **kwargs):
         raise RuntimeError("synthetic nix-instantiate failure")
@@ -947,19 +1110,20 @@ def test_run_eval_task_wrapper_failure_leaves_no_archive(
         _raise,
     )
     payload = _make_payload(archs=["x86_64"], suffixes=["O0"])
+    task = _make_task_mock()
     runner = _EvalJobsStub(
         drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}},
     )
 
     with pytest.raises(RuntimeError, match="synthetic nix-instantiate failure"):
         run_eval_task(
-            payload, tmp_path, task=_make_task_mock(),
+            payload, tmp_path, task=task,
             run_subprocess=runner,
         )
 
     archive = tmp_path / "matrix-hello.drv.archive"
     assert not archive.exists()
-    assert not archive.with_suffix(archive.suffix + ".tmp").exists()
+    assert task.publish_calls == []
 
 
 def test_run_eval_task_empty_kept_drvs_writes_empty_archive(
@@ -1332,15 +1496,19 @@ def test_matrix_aggregate_is_export_seed_for_archive(
         inv for inv in runner.invocations
         if inv[0][:4] == ["nix-store", "--query", "--requisites", "--stdin"]
     ]
-    assert len(req_invocations) == 1
-    # Exactly one seed: the matrix aggregate, fed via stdin. The raw
-    # leaves are NOT passed directly — they would be redundant (the
-    # aggregate carries them transitively).
-    _, req_input = req_invocations[0]
-    assert req_input is not None
-    assert req_input.decode("utf-8").splitlines() == [
-        "/nix/store/wrap-matrix-hello.drv",
+    req_seeds = [
+        inv[1].decode("utf-8").splitlines() for inv in req_invocations
     ]
+    # The matrix aggregate is fed as a --requisites seed via stdin (the
+    # raw leaves are NOT passed directly — the aggregate carries them
+    # transitively). The toolchain aggregate is seeded ONCE with dedup
+    # ON, only as the diff export's ``exclude_seed`` (the toolchain-
+    # archive producer call site was removed — the submitter produces
+    # it).
+    assert ["/nix/store/wrap-matrix-hello.drv"] in req_seeds
+    assert req_seeds.count([_DEFAULT_TOOLCHAIN_AGG]) == 1
+    for _, req_input in req_invocations:
+        assert req_input is not None
 
 
 def test_export_closure_pipes_paths_via_stdin(
@@ -1362,32 +1530,194 @@ def test_export_closure_pipes_paths_via_stdin(
         payload, tmp_path, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
-    # --requisites: argv ends with --stdin; the kept-drv list (just the
-    # aggregate) travels via input.
+    # EVERY --requisites invocation pipes its seed list via --stdin so
+    # argv stays bounded at production scale (toolchain dedup ON adds the
+    # toolchain-archive producer + the diff exclude, so there are
+    # multiple such invocations — all must be --stdin form).
     req_invocations = [
         inv for inv in runner.invocations
         if inv[0][:3] == ["nix-store", "--query", "--requisites"]
     ]
-    assert len(req_invocations) == 1
-    req_argv, req_input = req_invocations[0]
-    assert req_argv[-1] == "--stdin"
-    assert req_input is not None
-    assert req_input.decode("utf-8").splitlines() == [
-        "/nix/store/wrap-matrix-hello.drv",
-    ]
-    # --export: argv ends with --stdin; the closure paths travel via input.
+    assert req_invocations
+    req_seeds = []
+    for req_argv, req_input in req_invocations:
+        assert req_argv[-1] == "--stdin"
+        assert req_input is not None
+        req_seeds.append(req_input.decode("utf-8").splitlines())
+    assert ["/nix/store/wrap-matrix-hello.drv"] in req_seeds
+    # EVERY --export invocation pipes its closure via --stdin too.
     export_invocations = [
         inv for inv in runner.invocations
         if inv[0][:2] == ["nix-store", "--export"]
     ]
+    assert export_invocations
+    export_seed_sets = []
+    for export_argv, export_input in export_invocations:
+        assert export_argv[-1] == "--stdin"
+        assert export_input is not None
+        export_seed_sets.append(set(export_input.decode("utf-8").splitlines()))
+    # The per-binary diff export carries the matrix-aggregate closure
+    # (stub synthesis: seed + seed-input for the aggregate).
+    assert any(
+        "/nix/store/wrap-matrix-hello.drv" in s
+        and "/nix/store/wrap-matrix-hello.drv-input" in s
+        for s in export_seed_sets
+    )
+
+
+# ---------------------------------------------------------------------------
+# Toolchain-archive consumption (eval worker is the CONSUMER — the
+# submitter produces + uploads it; the worker imports it before the diff
+# subtract, and NEVER produces it itself).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.real_toolchain_import
+def test_eval_worker_imports_toolchain_archive_when_dedup_on(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With toolchain dedup ON (default), the eval worker IMPORTS the
+    submitter-produced shared ``toolchains.drv.archive`` (via the
+    ``build_worker.ensure_toolchain_archive_imported`` →
+    ``dependency_graph_worker.archive.import_archive`` helper) BEFORE
+    computing the per-binary diff subtract — so the toolchain closure is
+    resident in the worker store and the ``exclude_seed`` requisites
+    resolve. The worker does NOT produce the archive.
+    """
+    _install_wrapper_stub(monkeypatch)
+    imported = _stub_toolchain_import(monkeypatch, tmp_path)
+    payload = _make_payload(
+        archs=["x86_64"], suffixes=["O0"],
+        toolchain_aggregate_drv="/nix/store/tc-agg.drv",
+    )
+    runner = _EvalJobsStub(drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}})
+    run_eval_task(
+        payload, tmp_path, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
+    )
+    # The import helper saw the submitter-placed toolchain archive once.
+    assert imported == [tmp_path / "toolchains.drv.archive"]
+    # The worker did NOT produce a toolchain archive — there is exactly
+    # ONE --export (the per-binary diff) and the toolchain agg appears
+    # only as the diff exclude_seed, never as an export seed.
+    export_invocations = [
+        inv for inv in runner.invocations
+        if inv[0][:3] == ["nix-store", "--export", "--stdin"]
+    ]
     assert len(export_invocations) == 1
-    export_argv, export_input = export_invocations[0]
-    assert export_argv[-1] == "--stdin"
-    assert export_input is not None
-    closure = export_input.decode("utf-8").splitlines()
-    # Stub-synthesised closure: seed + seed-input for the aggregate.
-    assert "/nix/store/wrap-matrix-hello.drv" in closure
-    assert "/nix/store/wrap-matrix-hello.drv-input" in closure
+    export_seed = set(export_invocations[0][1].decode("utf-8").splitlines())
+    assert "/nix/store/tc-agg.drv" not in export_seed
+
+
+@pytest.mark.real_toolchain_import
+def test_eval_worker_does_not_produce_toolchain_archive(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The eval worker is no longer the PRODUCER of the shared toolchain
+    archive (that moved to the submitter). Given the submitter-placed
+    archive as input, the worker imports it and leaves it byte-for-byte
+    untouched — it never re-exports / overwrites it, and the only
+    on-disk artefact it WRITES to out_dir is the per-binary diff archive.
+    """
+    _install_wrapper_stub(monkeypatch)
+    _stub_toolchain_import(monkeypatch, tmp_path)
+    tc_archive = tmp_path / "toolchains.drv.archive"
+    original = tc_archive.read_bytes()
+    payload = _make_payload(
+        archs=["x86_64"], suffixes=["O0"],
+        toolchain_aggregate_drv="/nix/store/tc-agg.drv",
+    )
+    runner = _EvalJobsStub(drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}})
+    run_eval_task(
+        payload, tmp_path, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
+    )
+    # Submitter archive untouched (the worker consumes, never produces).
+    assert tc_archive.read_bytes() == original
+    # The toolchain agg's closure is NEVER exported by the worker (no
+    # producer): the toolchain agg is seeded ONLY as the diff
+    # exclude_seed requisites query, and there is exactly ONE export.
+    req_seeds = [
+        inv[1].decode("utf-8").splitlines()
+        for inv in runner.invocations
+        if inv[0][:4] == ["nix-store", "--query", "--requisites", "--stdin"]
+    ]
+    assert req_seeds.count(["/nix/store/tc-agg.drv"]) == 1
+    export_invocations = [
+        inv for inv in runner.invocations
+        if inv[0][:3] == ["nix-store", "--export", "--stdin"]
+    ]
+    assert len(export_invocations) == 1
+
+
+@pytest.mark.real_toolchain_import
+def test_eval_worker_hard_fails_when_toolchain_archive_missing(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On the dedup path a MISSING (or zero-byte) toolchain archive is a
+    hard failure: the submitter upload didn't land, so the per-binary
+    diff subtract would be computed against an absent closure and the
+    archive would be un-importable downstream. The worker raises
+    ``RuntimeError`` (retry-pass eligible) rather than silently producing
+    a bad diff.
+    """
+    _install_wrapper_stub(monkeypatch)
+    # Reset the per-process memo but DELIBERATELY do NOT place the
+    # toolchain archive (simulate a stranded submitter upload).
+    _bw._toolchain_imported = False
+    payload = _make_payload(
+        archs=["x86_64"], suffixes=["O0"],
+        toolchain_aggregate_drv="/nix/store/tc-agg.drv",
+    )
+    runner = _EvalJobsStub(drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}})
+    with pytest.raises(RuntimeError, match="toolchain dedup is ON"):
+        run_eval_task(
+            payload, tmp_path, task=_make_task_mock(),
+            run_subprocess=runner, now=lambda: 1.0,
+        )
+
+
+def test_eval_worker_skips_toolchain_import_when_dedup_off(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With toolchain dedup OFF (rollback), no toolchain archive is
+    imported and the per-binary archive carries the FULL closure — the
+    toolchain agg is NOT subtracted as an exclude_seed, so the toolchain
+    agg's requisites are not queried as a subtraction. (The autouse
+    fixture no-ops the import; with dedup OFF it must not be invoked at
+    all, which we assert via the single requisites query.)
+    """
+    _install_wrapper_stub(monkeypatch)
+    payload = _make_payload(
+        archs=["x86_64"], suffixes=["O0"],
+        toolchain_aggregate_drv="/nix/store/tc-agg.drv",
+        toolchain_dedup=False,
+    )
+    runner = _EvalJobsStub(drv_map={"x86_64": {"O0": "/nix/store/aaa.drv"}})
+    run_eval_task(
+        payload, tmp_path, task=_make_task_mock(),
+        run_subprocess=runner, now=lambda: 1.0,
+    )
+    # The eval worker never produces a toolchain archive.
+    assert not (tmp_path / "toolchains.drv.archive").exists()
+    # The matrix diff archive still lands (published, then mirrored).
+    assert (tmp_path / "matrix-hello.drv.archive").exists()
+    # No exclude_seed → the toolchain agg's requisites are NOT queried as
+    # a subtraction, so there is exactly ONE --requisites invocation (the
+    # matrix aggregate) and ONE --export (the per-binary archive).
+    req_invocations = [
+        inv for inv in runner.invocations
+        if inv[0][:4] == ["nix-store", "--query", "--requisites", "--stdin"]
+    ]
+    assert len(req_invocations) == 1
+    assert req_invocations[0][1].decode("utf-8").splitlines() == [
+        "/nix/store/wrap-matrix-hello.drv",
+    ]
+    export_invocations = [
+        inv for inv in runner.invocations
+        if inv[0][:3] == ["nix-store", "--export", "--stdin"]
+    ]
+    assert len(export_invocations) == 1
 
 
 # ---------------------------------------------------------------------------

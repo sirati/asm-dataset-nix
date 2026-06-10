@@ -38,7 +38,7 @@ class DependencyGraphPickleError(RuntimeError):
 def load_phase4_descriptors(
     pkl_path: pathlib.Path,
 ) -> tuple[list[Phase4Descriptor], dict[str, Union[int, float, str]]]:
-    """Load and validate ``_dependency_graph.pkl``.
+    """Load and validate ``_dependency_graph.pkl`` off the filesystem.
 
     Returns a ``(descriptors, summary)`` pair. Hard-fails with
     :class:`DependencyGraphPickleError` on any shape mismatch (bad
@@ -52,41 +52,78 @@ def load_phase4_descriptors(
         raise DependencyGraphPickleError(
             f"failed to read {pkl_path}: {exc}",
         ) from exc
+    return _validate_phase4_payload(payload, str(pkl_path))
+
+
+def load_phase4_descriptors_from_bytes(
+    raw: bytes,
+) -> tuple[list[Phase4Descriptor], dict[str, Union[int, float, str]]]:
+    """Filesystem-agnostic twin of :func:`load_phase4_descriptors`.
+
+    Decodes a pickle payload from in-memory ``bytes`` (rather than a
+    path) and runs the identical shape validation. Used by
+    ``SuitTask.on_phase_end`` to load descriptors from the
+    dependency_graph task's published ``dependency_graph_pkl`` output,
+    so the spawn path no longer depends on the pickle being present on
+    the primary's local filesystem (topology-proof under the
+    submitter-is-primary layout).
+    """
+    try:
+        payload = pickle.loads(raw)
+    except (pickle.UnpicklingError, EOFError, ValueError) as exc:
+        raise DependencyGraphPickleError(
+            f"failed to unpickle published dependency_graph_pkl: {exc}",
+        ) from exc
+    return _validate_phase4_payload(payload, "<published dependency_graph_pkl>")
+
+
+def _validate_phase4_payload(
+    payload: object,
+    source: str,
+) -> tuple[list[Phase4Descriptor], dict[str, Union[int, float, str]]]:
+    """Validate a decoded phase-4 pickle ``payload`` dict.
+
+    Shared by :func:`load_phase4_descriptors` (file source) and
+    :func:`load_phase4_descriptors_from_bytes` (published-output
+    source). ``source`` is a human label (path or
+    ``"<published dependency_graph_pkl>"``) interpolated into every
+    error message so a hard-fail names which source was being read.
+    """
     if not isinstance(payload, dict):
         raise DependencyGraphPickleError(
-            f"{pkl_path}: expected dict payload, got "
+            f"{source}: expected dict payload, got "
             f"{type(payload).__name__}",
         )
     magic = payload.get("format")
     if magic != PHASE4_PICKLE_MAGIC:
         raise DependencyGraphPickleError(
-            f"{pkl_path}: unexpected format magic {magic!r}, "
+            f"{source}: unexpected format magic {magic!r}, "
             f"expected {PHASE4_PICKLE_MAGIC!r}",
         )
     version = payload.get("format_version")
     if version != PHASE4_PICKLE_FORMAT_VERSION:
         raise DependencyGraphPickleError(
-            f"{pkl_path}: unknown format_version {version!r}, "
+            f"{source}: unknown format_version {version!r}, "
             f"expected {PHASE4_PICKLE_FORMAT_VERSION!r}",
         )
     if "descriptors" not in payload:
         raise DependencyGraphPickleError(
-            f"{pkl_path}: missing required key 'descriptors'",
+            f"{source}: missing required key 'descriptors'",
         )
     if "summary" not in payload:
         raise DependencyGraphPickleError(
-            f"{pkl_path}: missing required key 'summary'",
+            f"{source}: missing required key 'summary'",
         )
     descriptors = payload["descriptors"]
     summary = payload["summary"]
     if not isinstance(descriptors, list):
         raise DependencyGraphPickleError(
-            f"{pkl_path}: 'descriptors' must be a list, got "
+            f"{source}: 'descriptors' must be a list, got "
             f"{type(descriptors).__name__}",
         )
     if not isinstance(summary, dict):
         raise DependencyGraphPickleError(
-            f"{pkl_path}: 'summary' must be a dict, got "
+            f"{source}: 'summary' must be a dict, got "
             f"{type(summary).__name__}",
         )
     return list(descriptors), dict(summary)

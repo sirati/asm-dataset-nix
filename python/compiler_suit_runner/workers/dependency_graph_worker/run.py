@@ -11,7 +11,9 @@ emitted to ``_dependency_graph.pkl`` (with a human-readable companion
 
 from __future__ import annotations
 
+import base64
 import collections
+import logging
 import pathlib
 import time
 from collections.abc import Callable, Sequence
@@ -22,6 +24,29 @@ from . import output as _output
 from . import summary as _summary
 from .errors import DependencyGraphResult, DependencyGraphWorkerError
 from .subproc import RunSubprocess, default_run_subprocess
+
+# ``Task`` is only used for type hints + its ``publish_string`` method.
+# Mirror eval_worker's ``from dynamic_runner.worker import Task`` import
+# but degrade to ``Any`` when the framework is absent (pure-logic unit
+# tests that never construct a real Task), matching the lazy /
+# framework-absent-fallback idioms elsewhere in this package.
+try:  # pragma: no cover - import-shape guard
+    from dynamic_runner.worker import Task  # type: ignore
+except Exception:  # noqa: BLE001 - framework absent in some test envs
+    Task = Any  # type: ignore[assignment,misc]
+
+
+_LOG = logging.getLogger(__name__)
+
+# Hard cap on the pickle size published via ``task.publish_string``.
+# The task-output channel is built for signal-sized values; a 42MB
+# full-matrix pickle (~55MB as base64) wedged the worker→secondary IPC
+# handoff on the 2026-06-10 LMU run (the secondary consumed the frame,
+# silently dropped it, and never ACKed — dynrunner #364). Larger
+# pickles rely solely on the filesystem copy, which ``on_phase_end``
+# already reads as its fallback and which is the matching path under
+# the relocated-primary topology.
+_PUBLISH_PICKLE_MAX_BYTES = 4 * 1024 * 1024
 
 
 __all__ = [
@@ -41,6 +66,7 @@ def run_dependency_graph_task(
     sys_name: str = "x86_64-linux",
     run_subprocess: Optional[RunSubprocess] = None,
     clock: Optional[Callable[[], float]] = None,
+    task: Optional[Task] = None,
 ) -> DependencyGraphResult:
     """Assemble one sum-drv spanning ALL binaries' pre-built aggregate
     drvs and produce a single ``_dependency_graph.pkl`` (plus the
@@ -144,14 +170,21 @@ def run_dependency_graph_task(
         return _empty_result(
             matrix_eval_out_dir=matrix_eval_out_dir,
             duration=max(0.0, clock_fn() - start),
+            task=task,
         )
 
     runner = run_subprocess or default_run_subprocess
     tc_ids: dict[str, str] = dict(toolchain_task_ids or {})
 
-    # Step 1: import archives so leaves are present locally; the
-    # aggregate drv references them but `nix-store --query --tree`
-    # cannot walk them until the closure exists in /nix/store.
+    # Step 1: import the shared toolchain archive FIRST (toolchain-first),
+    # then every per-binary archive. With toolchain dedup the per-binary
+    # archives are diffs against the toolchain closure, so the toolchain
+    # must be resident locally before they import. The leaves the
+    # aggregate drv references must all be present before the
+    # `nix-store --query --tree` walk further down.
+    _import_toolchain_archive_or_raise(
+        matrix_eval_out_dir=matrix_eval_out_dir, runner=runner,
+    )
     _import_all_archives(archives=archives, runner=runner)
 
     # Step 2: derive the variant lookup for every binary from its
@@ -166,6 +199,7 @@ def run_dependency_graph_task(
         return _empty_result(
             matrix_eval_out_dir=matrix_eval_out_dir,
             duration=max(0.0, clock_fn() - start),
+            task=task,
         )
 
     # Step 3: wrap each binary's aggregate drv in a length-1 list keyed
@@ -199,6 +233,7 @@ def run_dependency_graph_task(
         descriptors=descriptors,
         binaries=plannable_binaries,
         counters=counters,
+        task=task,
     )
     return DependencyGraphResult(
         output_path=out_path,
@@ -223,19 +258,23 @@ def _empty_result(
     *,
     matrix_eval_out_dir: pathlib.Path,
     duration: float,
+    task: Optional[Task] = None,
 ) -> DependencyGraphResult:
     """Write an empty descriptor pickle + return a zero-counter result.
 
     Used on the two short-circuit paths (no archives discovered and no
     plannable binaries after lookup derivation) so the watcher's
     consumer sees a well-formed ``_dependency_graph.pkl`` even when
-    there is nothing to plan.
+    there is nothing to plan. The empty pickle is ALSO published on the
+    task-output channel (via ``task``) so ``on_phase_end`` receives a
+    well-formed 0-descriptor payload rather than nothing.
     """
     out_path = _write_outputs(
         matrix_eval_out_dir=matrix_eval_out_dir,
         descriptors=[],
         binaries=[],
         counters={},
+        task=task,
     )
     return DependencyGraphResult(
         output_path=out_path,
@@ -243,6 +282,47 @@ def _empty_result(
         descriptor_count=0,
         duration_seconds=duration,
     )
+
+
+def _import_toolchain_archive_or_raise(
+    *,
+    matrix_eval_out_dir: pathlib.Path,
+    runner: RunSubprocess,
+) -> None:
+    """Import the shared ``toolchains.drv.archive`` (toolchain-first).
+
+    Toolchain-dedup pre-flight writes ONE ``toolchains.drv.archive``
+    carrying the whole compiler-toolchain closure; the per-binary
+    ``matrix-<binary>.drv.archive`` files are diffs against it. This
+    archive MUST import before any per-binary archive or those diffs
+    cannot resolve. Fatal (:class:`DependencyGraphWorkerError`, stage
+    ``"toolchain_import"``) if the archive is missing or zero-byte —
+    every diff archive would be un-importable otherwise.
+    """
+    archive = _archive.toolchain_archive_path(matrix_eval_out_dir)
+    try:
+        size = archive.stat().st_size
+    except OSError:
+        size = -1
+    if size <= 0:
+        raise DependencyGraphWorkerError(
+            binary="<toolchain>", stage="toolchain_import",
+            message=(
+                "toolchains.drv.archive missing or zero-byte at "
+                f"{archive} (size={size}); the per-binary diff archives "
+                "are un-importable without it — was the submit "
+                "pre-flight toolchain export skipped?"
+            ),
+        )
+    ok, err, _imported = _archive.import_archive(archive, run_subprocess=runner)
+    if not ok:
+        raise DependencyGraphWorkerError(
+            binary="<toolchain>", stage="toolchain_import",
+            message=(
+                "nix-store --import of toolchains.drv.archive failed: "
+                + err.decode("utf-8", errors="replace").strip()
+            ),
+        )
 
 
 def _import_all_archives(
@@ -263,6 +343,15 @@ def _import_all_archives(
     side effects (closure materialisation) and the success rc.
     """
     for archive in archives:
+        # A zero-byte per-binary archive means the binary was fully gated
+        # (all archs filtered out) — there is nothing to import. Skip it
+        # (not an error); ``nix-store --import`` on empty input would be a
+        # harmless no-op anyway, but skipping avoids the spurious call.
+        try:
+            if archive.stat().st_size == 0:
+                continue
+        except OSError:
+            pass
         _import_archive_or_raise(
             archive=archive, runner=runner,
             binary=_archive.binary_from_archive_name(archive),
@@ -444,10 +533,20 @@ def _write_outputs(
     descriptors: Sequence[Any],
     binaries: Sequence[str],
     counters: dict[str, int],
+    task: Optional[Task] = None,
 ) -> pathlib.Path:
     """Write the pickle + summary-text companion atomically and return
     the pickle path (the canonical ``output_path`` reported in
     :class:`DependencyGraphResult`).
+
+    When ``task`` is supplied, ALSO publish the just-written pickle
+    bytes (base64-encoded) on the framework task-output channel under
+    :data:`output.DEPENDENCY_GRAPH_PKL_OUTPUT_KEY`. ``on_phase_end``
+    reads that back instead of re-reading the on-disk pickle, which is
+    not local to the primary under the submitter-is-primary topology.
+    The filesystem write is kept (the dedup path + back-compat still
+    use it); publishing is purely additive and a publish failure is
+    non-fatal — it is logged at WARNING and the worker still succeeds.
     """
     summary = _build_summary(
         descriptors=descriptors, binaries=binaries, counters=counters,
@@ -460,4 +559,54 @@ def _write_outputs(
     _output.write_phase4_summary_text(
         summary=summary, out_path=summary_path,
     )
+    _publish_pickle(task=task, pickle_path=pickle_path)
     return pickle_path
+
+
+def _publish_pickle(
+    *,
+    task: Optional[Task],
+    pickle_path: pathlib.Path,
+) -> None:
+    """Publish the on-disk pickle bytes on the task-output channel.
+
+    No-op when ``task`` is ``None`` (ad-hoc / CLI invocation with no
+    framework task handle). The fs-write has already succeeded by the
+    time this is called, so any error here (read-back or
+    ``publish_string``) is swallowed with a WARNING — the topology-proof
+    publish is best-effort and must never fail the worker.
+
+    Pickles above :data:`_PUBLISH_PICKLE_MAX_BYTES` are NOT published:
+    the task-output channel is built for small values, and a full-matrix
+    multi-binary graph (e.g. 16 binaries / ~67k descriptors ≈ 42MB ≈
+    55MB base64) silently wedged the worker→secondary handoff on the
+    2026-06-10 LMU run, stranding the whole run at the dep_graph
+    barrier. Under the relocated-primary topology ``on_phase_end`` runs
+    in-container where ``matrix_eval_out_dir`` matches the worker's, so
+    the fs fallback it already implements is sufficient — skipping the
+    publish merely selects that proven path, loudly.
+    """
+    if task is None:
+        return
+    try:
+        raw = pickle_path.read_bytes()
+        if len(raw) > _PUBLISH_PICKLE_MAX_BYTES:
+            _LOG.warning(
+                "dependency_graph: pickle is %d bytes (> %d cap); NOT"
+                " publishing on the task-output channel (oversize values"
+                " can wedge the worker handoff) — on_phase_end will use"
+                " the fs pickle at %s",
+                len(raw), _PUBLISH_PICKLE_MAX_BYTES, pickle_path,
+            )
+            return
+        task.publish_string(
+            _output.DEPENDENCY_GRAPH_PKL_OUTPUT_KEY,
+            base64.b64encode(raw).decode(),
+        )
+    except Exception as exc:  # noqa: BLE001 - publish is best-effort
+        _LOG.warning(
+            "dependency_graph: failed to publish %s on task-output"
+            " channel (fs pickle at %s still written; on_phase_end will"
+            " fall back to the fs path): %s",
+            _output.DEPENDENCY_GRAPH_PKL_OUTPUT_KEY, pickle_path, exc,
+        )

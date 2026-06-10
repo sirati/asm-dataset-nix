@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import pathlib
 import re
 import shutil
 import subprocess
@@ -737,6 +738,71 @@ def enumerate_toolchains_only(
         system=sys_name,
     )
     return pairs, drv_paths, aggregate_drv
+
+
+# ---------------------------------------------------------------------------
+# Toolchain archive export (toolchain dedup pre-flight step)
+# ---------------------------------------------------------------------------
+
+
+TOOLCHAIN_ARCHIVE_NAME = "toolchains.drv.archive"
+
+
+def export_toolchain_archive(
+    toolchain_aggregate_drv: str,
+    out_dir: pathlib.Path,
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> pathlib.Path:
+    """Export the toolchain aggregate's closure into ``toolchains.drv.archive``.
+
+    The submit pre-flight produces ONE toolchain archive per dispatch so
+    the per-binary ``matrix-<binary>.drv.archive`` exports can subtract
+    the toolchain closure and ship only the binary-specific diff. The
+    landing file is ``<out_dir>/toolchains.drv.archive``; consumers
+    (dependency_graph_worker / build_worker) import it FIRST, then each
+    per-binary diff archive.
+
+    The seed is the toolchain aggregate ``.drv`` path itself — the same
+    closure space as the matrix aggregate (which carries the toolchain
+    aggregate as inputDrv #0), so ``requisites(seed)`` here is exactly
+    the set the matrix export subtracts on the worker.
+
+    Delegates to :func:`workers.build_compilers_worker.export_closure`
+    (requisites → ``nix-store --export`` → atomic ``.tmp`` + ``os.replace``).
+    The helper is imported lazily so the submit pre-flight only pays the
+    cross-worker import cost when toolchain dedup is actually exercised.
+
+    Returns the written archive path. Raises :class:`RuntimeError` on
+    any export failure (a missing toolchain archive makes every diff
+    archive un-importable, so the caller must fail fast).
+    """
+    if not toolchain_aggregate_drv:
+        raise RuntimeError(
+            "export_toolchain_archive: empty toolchain_aggregate_drv"
+        )
+    # Lazy import: the cross-worker dependency is only needed when the
+    # submitter actually exports the toolchain archive (mirrors the
+    # lazy ``make_sum_drv`` import in ``enumerate_toolchains_only``).
+    from compiler_suit_runner.workers.build_compilers_worker import (  # noqa: PLC0415
+        export_closure,
+    )
+
+    archive_path = out_dir / TOOLCHAIN_ARCHIVE_NAME
+    ok, req_stderr, exp_stderr = export_closure(
+        archive_path,
+        [toolchain_aggregate_drv],
+        run_subprocess=run_subprocess,
+    )
+    if not ok:
+        raise RuntimeError(
+            "export_toolchain_archive: nix-store export of "
+            f"{toolchain_aggregate_drv!r} failed: requisites_stderr="
+            + req_stderr.decode("utf-8", errors="replace").strip()
+            + " export_stderr="
+            + exp_stderr.decode("utf-8", errors="replace").strip()
+        )
+    return archive_path
 
 
 # ---------------------------------------------------------------------------

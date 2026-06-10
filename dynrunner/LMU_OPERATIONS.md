@@ -1,22 +1,24 @@
 # LMU CIP operations notes
 
-Companion to `SLURM_RUNBOOK.md`. The runbook explains **how to dispatch**; this document captures the **firm LMU-specific operational policy, shared-cap coordination state, and the running pin-lineage observation log** that the runbook intentionally keeps out of its flag table.
+Companion to `SLURM_RUNBOOK.md`. The runbook explains **how to dispatch**; this document captures the **firm LMU-specific operational policy, shared-cap constraint, and the running pin-lineage observation log** that the runbook intentionally keeps out of its flag table.
 
-If you are a fresh subagent or a future-me reading this after some weeks: read `SLURM_RUNBOOK.md` first for the canonical recipe, then read this file for the LMU-specific firm overrides and coordination state.
+Our dataset-generation operational root on LMU is `/home/k/kruppb/BIG/slurm/gen-binary-dataset/` (`~/BIG/slurm/gen-binary-dataset/`) — that is the `--slurm-root-folder`, under which `out/`, `log/`, and `image_bin/` live.
+
+If you are a fresh subagent or a future-me reading this after some weeks: read `SLURM_RUNBOOK.md` first for the canonical recipe, then read this file for the LMU-specific firm overrides and operational constraints.
 
 ## Firm LMU CLI overrides
 
 | Flag | LMU value | Why firm |
 |---|---|---|
-| `--slurm-partition Krater` | `Krater` (40-node partition) | Framework default is `All` (131 nodes, union of all rock-named nodes). `All` works — sbatch accepts it, jobs run — but is the wrong placement for asm-tokenizer and adjacent dispatches. User flagged this 2026-05-15 after a Tier-3 run landed on `All`. The 40-node `Krater` partition is comfortably more than our 15-job cap, so concurrency is not constrained. |
-| `--jobs 15` | `15` (kruppb cap) | kruppb has a 15-parallel-task quota across all kruppb SLURM jobs at LMU. This is shared with asm-dataset-nix (compiler_suit_runner). Pre-flight orphan-scan is mandatory or the next run won't get full quota. |
-| `--slurm-time-limit 60` | `60` minutes (typical) | sbatch `--time` in minutes. 60 is comfortable for ~1k binaries on Krater; bump for larger. Runaway jobs auto-terminate. |
+| `--slurm-partition Krater` | `Krater` (40-node partition) | Framework default is `All` (131 nodes, union of all rock-named nodes). `All` works — sbatch accepts it, jobs run — but is the wrong placement for our dispatches. User flagged this 2026-05-15 after a Tier-3 run landed on `All`. The 40-node `Krater` partition is comfortably more than our 15-job cap, so concurrency is not constrained. |
+| `--jobs 15` | `15` (kruppb cap) | kruppb has a 15-parallel-task quota across all kruppb SLURM jobs at LMU. Pre-flight orphan-scan is mandatory or the next run won't get full quota. |
+| `--slurm-time-limit 1440` | `1440` minutes = **24h** (firm) | sbatch `--time` in minutes. Set the runtime/timeout to **24h** for LMU dispatches: a full compiler × arch × opt matrix has long-tail per-variant builds (old-GCC cross-toolchains, heavy variants) that blow past a 60-minute cap and get SLURM-killed mid-run. 24h gives ample headroom; runaway jobs still auto-terminate at the limit. Pass `--slurm-time-limit 1440` (or `24:00:00`). |
 
-### Setup deadline auto-scales — do NOT pass `--slurm-setup-deadline-secs`
+### Setup deadline auto-scales — no manual override needed
 
 Since `ba889cd`, the framework auto-computes the per-secondary setup deadline as `max(60, num_secondaries * 15)` (`crates/dynrunner-slurm/src/pipeline.rs::compute_setup_deadline_secs`). The 15s/secondary slope was calibrated against LMU Krater empirical observation. For `--jobs 15` you get 225s automatically; for `--jobs 32` you get 480s. The 60s floor covers `--jobs 1..4`.
 
-Override with `--slurm-setup-deadline-secs N` ONLY if you're on a cluster slower than LMU (or running a probe that intentionally needs to wait longer). On LMU Krater the auto-scaled value is the validated default; do not pass the flag.
+The old `--slurm-setup-deadline-secs` override flag was removed; if a cluster genuinely slower than LMU ever needs more headroom, the current knob is `--unconfigured-deadline-secs N`. On LMU Krater the auto-scaled value is the validated default — don't override.
 
 ## Do NOT confuse with slurm-test-env mandates
 
@@ -68,7 +70,7 @@ On every wake:
 1. **Check local progress evidence**:
    - dispatch log file's line count / size grew since last tick (filtered `tail` is fine; do NOT pull raw lines into context)
    - primary's stdout shows new `|P|` state-transition lines or `Completed: N/M` counter advanced
-   - output dir (`--output` arg) entry count grew (Phase 1 emits per-binary CSVs; Phase 2 emits `unified_vocab.csv`; Phase 3 emits `memmap/<binary>/...`)
+   - output dir entry count grew under `<slurm-root>/out/dataset/<binary>/<variant-id>/` (new per-variant binaries + `.json` sidecars landing as the build workers complete)
 
    Useful filter for the dispatch log (do NOT tail raw into context):
 
@@ -96,51 +98,40 @@ ssh kruppb@remote.cip.ifi.lmu.de "scancel -u kruppb" # all (only if sure)
 #    "address in use" errors that look like framework bugs.
 pkill -f 'ssh.*-J kruppb.*-R'
 # 4. Kill local primary process if it did not exit cleanly
-pkill -f 'python.*-m dynrunner'
+pkill -f 'python.*-m compiler_suit_runner'
 ```
 
 Note: `scancel` does NOT propagate to nested podman containers on compute nodes — conmon double-forks to host systemd. Post-`a12f84a` the wrapper spawns a `setsid -f` watchdog that polls `squeue -j $SLURM_JOB_ID` and runs `podman kill` + `rm -f` when the job disappears, so this is now handled wrapper-side. If you see a leaked container on a compute node despite a cleared `squeue`, the watchdog failed — file with `dynrunner-owner`.
 
-## Shared `/home/k/kruppb/BIG/slurm/out/` convention — asm-dataset-nix is the divergent consumer
+## Our `out/dataset/` output convention
 
-The gateway-side `<slurm-root>/out/` directory is shared between dynrunner consumers.
-
-**Canonical (framework default, what asm-tokenizer uses)**: outputs land flat under `<slurm-root>/out/` mirroring the source layout of `--source-already-staged` (per dynamic_runner commit `8da909d`).
-
-**Divergent — asm-dataset-nix only**: `compiler_suit_runner` is the **only** consumer that writes into a `dataset/` subdirectory:
+We write to our own dedicated slurm-root, `~/BIG/slurm/gen-binary-dataset/` (`/home/k/kruppb/BIG/slurm/gen-binary-dataset/`). The build workers lay produced binaries out under the gateway-side `<slurm-root>/out/dataset/`:
 
 ```
-/home/k/kruppb/BIG/slurm/out/dataset/<binary-name>/<variant-id>/<binary>
-/home/k/kruppb/BIG/slurm/out/dataset/<binary-name>/<variant-id>.json   # sibling sidecar
+/home/k/kruppb/BIG/slurm/gen-binary-dataset/out/dataset/<binary-name>/<variant-id>/<binary>
+/home/k/kruppb/BIG/slurm/gen-binary-dataset/out/dataset/<binary-name>/<variant-id>.json   # sibling sidecar
 ```
 
-asm-tokenizer **reads from** `<slurm-root>/out/dataset/...` as its Phase-1 input when our binaries are prepared. Do NOT change this output-path layout without coordinating: their `--source-already-staged` paths point at `/home/k/kruppb/BIG/slurm/out/dataset/` (or a sub-tree of it).
+`compiler_suit_runner` is a producer: every artifact under this tree is generated by the matrix_eval and build workers; we never pass `--source-already-staged`.
 
-If we need to change the `./dataset/<binary>/<variant-id>/` layout (e.g. for new variant axes), ping `asm-tokenizer` on the claude-comm channel first so they can adapt their source-already-staged path + name-regex filters.
+The `<binary>/<variant-id>/` path shape is the dataset's stable output contract — treat it as load-bearing, since anything that indexes the produced dataset keys off this layout. Before changing it for a new variant axis, update both this section and `SLURM_RUNBOOK.md`'s "Output layout".
 
-Other dynrunner consumers (if any future ones land) should use the canonical flat layout unless explicitly negotiated.
+## 15-job cap
 
-## 15-job cap coordination with asm-dataset-nix
+kruppb has a 15-parallel-task SLURM quota at LMU. `--jobs 15` is our full-run ceiling (see the firm CLI overrides table). The quota may be shared with other kruppb jobs, so:
 
-kruppb's 15-parallel-task quota is shared. We coordinate slot ownership via the claude-comm channel between peers `asm-tokenizer` and `asm-dataset-nix`.
-
-Protocol:
-1. **Before a large dispatch**, ping the other peer with the planned `--jobs N`, partition, ETA wallclock.
-2. **Run `squeue -u kruppb`** before sending — if non-zero entries that are NOT yours, ask the other peer if they own them before scancelling.
-3. **On dispatch completion (or abort)**, signal slots-free so the other peer can pick up.
-4. **Never `scancel` jobs you don't own** without explicit ack from the other peer.
-
-asm-dataset-nix entry point: `python -m compiler_suit_runner submit` (thin wrapper around dynamic_runner with the same flag discipline as `python -m dynrunner --task <name>` — same `--gateway`, `--slurm-partition Krater`, `--jobs 15`, `--source-already-staged`, etc.).
+1. **Run a mandatory pre-flight orphan-scan** (`squeue -u kruppb`) before every dispatch — stale jobs from a prior session starve the next run of its full quota.
+2. **Never `scancel -u kruppb` blindly.** If `squeue` shows entries you don't recognise, scancel them by explicit job-ID after confirming they're orphans, not a legitimately-running kruppb job.
 
 ## dynamic_runner pin policy
 
-The asm-tokenizer flake input `dynamic-runner` is bare (`github:sirati/dynamic-runner`) — `flake.lock` tracks the actual rev. Upgrade with `nix flake update dynamic-runner` and rebuild the image with `nix build --no-link .#dockerImage`.
+Our flake input `dynamic-runner` is bare (`github:sirati/dynamic-runner`) — `flake.lock` tracks the actual rev. Upgrade with `nix flake update dynamic-runner` and rebuild the image with `nix build --no-link .#dockerImage`.
 
 ### Pin history (Tier-3 LMU green markers)
 
 - **`328a78e`** (2026-05-15) — first Tier-3 GREEN end-to-end on LMU Krater `--jobs 15`. Includes the 11-commit fix lineage: sync-walk-aware discovery (`be3e2e9`), args-forwarding through phase chain (`1670e7a`), scale-aware setup-deadline (`ba889cd`), SSH-tunnel stagger + retry on MaxStartups (`d4ad1b7`), chain-gate (`76fe930`), peer-bus ClusterMutation arm (`ad71e83`), peer-repoll on PromotePrimary (`cd729fe`), originator flush rendezvous (`328a78e`). See memory `tier3_green_at_328a78e.md`.
 - **`8ecd382`** (post-rebase) — upstream rebased/re-merged the DAG; `328a78e` is no longer a literal ancestor of main, but `8ecd382` is the equivalent merge (same merge title "Merge handoff/fix-runcomplete-writer-flush-race", same tree hash `834f643a036eec15dc315aa955c12e7fb362d345`). Functionally identical.
-- **`2552f7c`** (2026-05-15) — current main tip at last check. Beyond `8ecd382` it adds: PyO3 codec migration (`2a31304`), secondary subprocess lifecycle migration (`365b649`), PodmanExecWorkerFactory migration (`8315a13`), SLURM submit_job + preparation migration (`612cfe3`, `01849ca`), ErrorType::Unfulfillable wire variant (`a581939`). **Not yet validated on LMU end-to-end** (as of 2026-05-15) — asm-dataset-nix is the canary.
+- **`2552f7c`** (2026-05-15) — current main tip at last check. Beyond `8ecd382` it adds: PyO3 codec migration (`2a31304`), secondary subprocess lifecycle migration (`365b649`), PodmanExecWorkerFactory migration (`8315a13`), SLURM submit_job + preparation migration (`612cfe3`, `01849ca`), ErrorType::Unfulfillable wire variant (`a581939`). **Not yet validated on LMU end-to-end** (as of 2026-05-15) — we are the canary.
 
 ### Lineage check rule of thumb
 
@@ -160,14 +151,13 @@ Same tree hash on the same merge-title = same merge re-applied post-rebase = fun
 
 ## What you do NOT do
 
-- You do NOT hand-roll `sbatch` + `ssh kruppb@<rock-node>` + `podman run` for an LMU dispatch. The framework owns all of that. The user has flagged this multiple times across both asm-tokenizer and asm-dataset-nix sessions.
+- You do NOT hand-roll `sbatch` + `ssh kruppb@<rock-node>` + `podman run` for an LMU dispatch. The framework owns all of that. The user has flagged this multiple times.
 - You do NOT manually create gateway directories. The dispatcher creates `image_bin/`, `out/`, `log/`, `log/run_<ts>/`, `log/run_<ts>/connection_info/` itself.
 - You do NOT manually upload the image. It's layered-blob-uploaded from the local nix store; only changed layers re-upload.
-- You do NOT manually scp binaries to the gateway when using `--source-already-staged`. The data is already on cluster NFS; the wrapper bind-mounts at `/app/src-network` (RO).
 - You do NOT inspect the image with `python -c "import tarfile..."`. If you find yourself reaching for this, stop and re-read the runbook.
 - You do NOT substitute the gateway hostname with the load-balanced FQDN `hostname -f` returns on the remote.
-- You do NOT `scancel` jobs without first checking who owns the cap (15-job quota is shared).
-- You do NOT change the `<slurm-root>/out/dataset/<binary>/<variant-id>/` output layout without coordinating with `asm-tokenizer` first.
+- You do NOT `scancel` jobs without first checking who owns the cap (15-job quota may be shared with other kruppb jobs).
+- You do NOT change the `<slurm-root>/out/dataset/<binary>/<variant-id>/` output layout casually — it is our stable output contract; update both this file and the runbook if a new variant axis requires it.
 
 ## Reference paths
 

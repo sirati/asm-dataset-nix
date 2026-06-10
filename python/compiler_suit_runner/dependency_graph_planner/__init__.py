@@ -99,6 +99,7 @@ from .manifest_glue import (
     DependencyGraphPickleError,
     headers_from_descriptors,
     load_phase4_descriptors,
+    load_phase4_descriptors_from_bytes,
     variant_label_key,
 )
 from .plan_total import (
@@ -134,5 +135,6 @@ __all__ = [
     "plan_phase4_from_graph",
     "headers_from_descriptors",
     "load_phase4_descriptors",
+    "load_phase4_descriptors_from_bytes",
     "variant_label_key",
 ]

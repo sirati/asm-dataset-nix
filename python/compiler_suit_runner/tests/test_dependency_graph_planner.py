@@ -1839,3 +1839,76 @@ class TestPriorityHintOnMetaDescriptors:
         recovered, _summary = load_phase4_descriptors(out_path)
         assert len(recovered) == 1
         assert recovered[0].priority_hint == 10
+
+
+class TestLoadPhase4DescriptorsFromBytes:
+    """:func:`load_phase4_descriptors_from_bytes` is the filesystem-
+    agnostic twin used by ``on_phase_end`` to decode the published
+    ``dependency_graph_pkl`` task-output bytes. It shares the validator
+    with the path loader, so it round-trips a valid payload and
+    hard-fails (``DependencyGraphPickleError``) on bad bytes / bad
+    shape — mirroring the path-loader's contract.
+    """
+
+    @staticmethod
+    def _valid_pickle_bytes() -> bytes:
+        import pickle  # noqa: PLC0415
+
+        from compiler_suit_runner.dependency_graph_planner.manifest_glue import (  # noqa: PLC0415,E501
+            PHASE4_PICKLE_FORMAT_VERSION,
+            PHASE4_PICKLE_MAGIC,
+        )
+
+        descriptor = Phase4Descriptor(
+            kind="build_common_dep",
+            task_id="build_common_dep__h-libfoo.drv",
+            name="build_common_dep__hello__x86_64__libfoo.drv",
+            payload={"sys": "x86_64-linux", "arch": "x86_64"},
+            priority_hint=7,
+        )
+        payload = {
+            "format": PHASE4_PICKLE_MAGIC,
+            "format_version": PHASE4_PICKLE_FORMAT_VERSION,
+            "descriptors": [descriptor],
+            "summary": {"binary_count": 1},
+        }
+        return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def test_roundtrips_valid_payload(self):
+        from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
+            load_phase4_descriptors_from_bytes,
+        )
+
+        recovered, summary = load_phase4_descriptors_from_bytes(
+            self._valid_pickle_bytes(),
+        )
+        assert len(recovered) == 1
+        assert recovered[0].task_id == "build_common_dep__h-libfoo.drv"
+        assert recovered[0].priority_hint == 7
+        assert summary == {"binary_count": 1}
+
+    def test_bad_bytes_raises(self):
+        from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
+            DependencyGraphPickleError,
+            load_phase4_descriptors_from_bytes,
+        )
+
+        with pytest.raises(DependencyGraphPickleError):
+            load_phase4_descriptors_from_bytes(b"not a pickle at all")
+
+    def test_bad_shape_raises(self):
+        import pickle  # noqa: PLC0415
+
+        from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
+            DependencyGraphPickleError,
+            load_phase4_descriptors_from_bytes,
+        )
+
+        # Wrong magic — well-formed pickle, wrong payload shape.
+        bad = pickle.dumps(
+            {"format": "nope", "format_version": 1,
+             "descriptors": [], "summary": {}},
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        with pytest.raises(DependencyGraphPickleError, match="format magic"):
+            load_phase4_descriptors_from_bytes(bad)

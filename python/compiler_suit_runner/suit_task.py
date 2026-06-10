@@ -66,6 +66,7 @@ deployments go through the framework's worker protocol.
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import logging
 import os
@@ -666,7 +667,7 @@ def _header_depends_on(header: ManifestHeader) -> tuple:
     return tuple(header.task_depends_on) + toolchain_deps
 
 
-def _header_to_task_info(header: ManifestHeader):
+def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = False):
     """Convert one :class:`ManifestHeader` directly into a framework
     ``TaskInfo``. Mirrors the call shape used by
     :func:`_make_task_info` (the disk-round-trip path used by
@@ -681,7 +682,10 @@ def _header_to_task_info(header: ManifestHeader):
     Cross-phase toolchain deps (``build_compilers_depends_on``) are
     phase-tagged via :func:`_header_depends_on`; this is the live
     spawn path (``on_phase_end`` → ``headers_from_descriptors``) that
-    emits each ``build_variant``'s BUILD_COMPILERS toolchain edge.
+    emits each ``build_variant``'s BUILD_COMPILERS toolchain edge. When
+    ``disable_task_deps`` is set the dep tuple is dropped entirely —
+    parity with the disk loop and :meth:`SuitTask._task_info_from_header`
+    (the caller passes ``self.config.disable_task_deps``).
     """
     phase_id, type_id, affinity_id = _classify(header)
     header_dict = {
@@ -702,7 +706,7 @@ def _header_to_task_info(header: ManifestHeader):
         affinity_id=affinity_id,
         payload=header_dict,
         task_id=header.task_id or "",
-        task_depends_on=_header_depends_on(header),
+        task_depends_on=() if disable_task_deps else _header_depends_on(header),
     )
 
 
@@ -1109,6 +1113,9 @@ class SuitTask:
                 toolchain_aggregate_drv=tc_agg,
                 variant_sample=meta.get("variant_sample"),
                 variant_seed=meta.get("variant_seed"),
+                # Default ON when absent so legacy metadata (pre-dedup)
+                # behaves as full-dedup; the cli.py path always sets it.
+                toolchain_dedup=meta.get("toolchain_dedup", True),
             )
             matrix_eval_ids.append(header.task_id or matrix_eval_task_id(binary))
             yield self._task_info_from_header(header)
@@ -1268,10 +1275,16 @@ class SuitTask:
             # dep_graph worker (PH-A) imports it from the same location.
             # The matrix_aggregate drv is threaded out-of-band via
             # ``Task.publish_string`` / predecessor_outputs, not on
-            # disk. Other types (toolchain_validate / common_dep /
-            # variant) ignore the flag harmlessly.
+            # disk. Build types (variant / common_dep / toolchain_validate)
+            # also need it now: with toolchain dedup the build prelude
+            # imports ``toolchains.drv.archive`` from this dir before the
+            # per-binary diff archive (toolchain-first), so a build-only
+            # secondary that never ran eval/dep_graph still gets the path.
             if (
-                type_id in {"eval", "dep_graph"}
+                type_id in {
+                    "eval", "dep_graph",
+                    "variant", "common_dep", "toolchain_validate",
+                }
                 and self.config.matrix_eval_out_dir is not None
             ):
                 argv += [
@@ -1706,6 +1719,23 @@ class SuitTask:
             # 5. Harmonia (optional). Requires nix-daemon (harmonia 3.x
             # talks to the daemon over its socket for store queries).
             if self.config.enable_harmonia and self._signing_key is not None:
+                # Land the per-secondary aux-process logs (nix-daemon,
+                # harmonia) INSIDE this secondary's own subdir alongside
+                # the framework's per-role logs
+                # (<log-network>/<id>/{primary,secondary,worker_0}.log),
+                # instead of at the top level with the id baked into the
+                # filename. The per-id DIRECTORY keeps each node's path
+                # unique (no shared inode across concurrent writers)
+                # without an id-scoped filename.
+                sec_log_dir = (
+                    pathlib.Path("/app/log-network")
+                    / self.config.secondary_id
+                )
+                try:
+                    sec_log_dir.mkdir(parents=True, exist_ok=True)
+                except OSError:  # noqa: BLE001 — best-effort; the
+                    # framework already creates <id>/ for its own logs.
+                    pass
                 try:
                     # Start nix-daemon FIRST. Idempotent — no-op if a
                     # daemon socket already exists. Container's
@@ -1716,10 +1746,7 @@ class SuitTask:
                     # the host after the container exits and its
                     # /tmp gets nuked.
                     from .peer_cache import start_nix_daemon
-                    daemon_log = (
-                        pathlib.Path("/app/log-network")
-                        / f"nix-daemon-{self.config.secondary_id}.log"
-                    )
+                    daemon_log = sec_log_dir / "nix-daemon.log"
                     start_nix_daemon(daemon_log)
                 except Exception:  # noqa: BLE001 — log + continue
                     self._logger.exception(
@@ -1727,15 +1754,11 @@ class SuitTask:
                         " (harmonia will likely 500 on store queries)"
                     )
                 try:
-                    # Log goes on the gateway-readable mount under a
-                    # secondary-id-scoped filename (operators read it
-                    # from the gateway; other secondaries never write
-                    # it). TOML stays container-local under the
-                    # default runtime_dir.
-                    log_path = (
-                        pathlib.Path("/app/log-network")
-                        / f"harmonia-{self.config.secondary_id}.log"
-                    )
+                    # Log goes on the gateway-readable mount inside this
+                    # secondary's subdir (operators read it from the
+                    # gateway; other secondaries never write it). TOML
+                    # stays container-local under the default runtime_dir.
+                    log_path = sec_log_dir / "harmonia.log"
                     self._harmonia = HarmoniaProcess(
                         bind_addr=f"0.0.0.0:{self.config.harmonia_port}",
                         signing_key_path=self._signing_key.secret_path,
@@ -2240,7 +2263,12 @@ class SuitTask:
         self._logger.info("phase %s starting", phase_id)
 
     def on_phase_end(
-        self, phase_id: str, completed: int = 0, failed: int = 0
+        self,
+        phase_id: str,
+        completed: int = 0,
+        failed: int = 0,
+        *,
+        phase_outputs: Optional[dict] = None,
     ) -> None:
         self._logger.info(
             "phase %s ended: %d completed, %d failed",
@@ -2266,22 +2294,36 @@ class SuitTask:
         from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
             headers_from_descriptors,
             load_phase4_descriptors,
+            load_phase4_descriptors_from_bytes,
         )
         from compiler_suit_runner.workers.dependency_graph_worker.output import (  # noqa: PLC0415
             DEPENDENCY_GRAPH_PICKLE,
+            DEPENDENCY_GRAPH_PKL_OUTPUT_KEY,
         )
 
         # Container-view path: the dependency_graph worker writes
         # ``_dependency_graph.pkl`` under matrix_eval_out_dir
         # (the fa7b604 archive-root resolution rule). No manifest scan.
         pickle_path = self.config.matrix_eval_out_dir / DEPENDENCY_GRAPH_PICKLE
+        # ``source`` names which channel the descriptors came from so a
+        # future total=0 degradation log is unambiguously diagnosable.
+        source = "fs-path"
         try:
-            descriptors, _summary = load_phase4_descriptors(pickle_path)
+            descriptors, source = self._load_dependency_graph_descriptors(
+                phase_outputs=phase_outputs,
+                pickle_path=pickle_path,
+                output_key=DEPENDENCY_GRAPH_PKL_OUTPUT_KEY,
+                from_bytes=load_phase4_descriptors_from_bytes,
+                from_path=load_phase4_descriptors,
+            )
             headers = headers_from_descriptors(descriptors)
             task_infos: list = []
             for header in headers:
                 try:
-                    task_infos.append(_header_to_task_info(header))
+                    task_infos.append(_header_to_task_info(
+                        header,
+                        disable_task_deps=self.config.disable_task_deps,
+                    ))
                 except Exception:  # noqa: BLE001 — log + skip
                     self._logger.exception(
                         "on_phase_end: header→TaskInfo failed for %s"
@@ -2291,15 +2333,16 @@ class SuitTask:
                     )
             self._logger.info(
                 "on_phase_end(\"dependency_graph\"): loaded %d"
-                " descriptors; spawning %d task(s)",
-                len(descriptors), len(task_infos),
+                " descriptors from %s; spawning %d task(s)",
+                len(descriptors), source, len(task_infos),
             )
             errors = self._primary_handle.spawn_tasks(task_infos) or []
             self._log_spawn_errors(errors, headers)
         except Exception:  # noqa: BLE001 — log + degrade
             self._logger.exception(
-                "on_phase_end: dependency_graph spawn failed at %s",
-                pickle_path,
+                "on_phase_end: dependency_graph spawn failed"
+                " (descriptor source=%s; fs-path=%s)",
+                source, pickle_path,
             )
             # Surface a clearly-marked CRITICAL line so the
             # follow-on ``phase build ended: 0 completed, 0
@@ -2307,10 +2350,70 @@ class SuitTask:
             # degradation, not to "phase 4 found nothing to do".
             self._logger.critical(
                 "on_phase_end: dependency_graph descriptor load"
-                " failed at %s — phase build will spawn ZERO"
-                " tasks (degradation; see ERROR above)",
-                pickle_path,
+                " failed (source=%s; fs-path=%s) — phase build will"
+                " spawn ZERO tasks (degradation; see ERROR above)",
+                source, pickle_path,
             )
+
+    def _load_dependency_graph_descriptors(
+        self,
+        *,
+        phase_outputs: Optional[dict],
+        pickle_path: pathlib.Path,
+        output_key: str,
+        from_bytes: Callable[[bytes], tuple],
+        from_path: Callable[[pathlib.Path], tuple],
+    ) -> tuple[list, str]:
+        """Resolve the phase-4 descriptor list, preferring the published
+        task-output channel and falling back to the on-disk pickle.
+
+        Returns ``(descriptors, source_label)`` where ``source_label``
+        is ``"published-output"`` or ``"fs-path"`` for diagnostics.
+
+        Preferred path (new framework pin): the dependency_graph worker
+        published the pickle bytes (base64) under ``output_key`` on its
+        task output; ``phase_outputs`` is the just-completed phase's
+        ``{task_id: {output_key: {"kind", "value"}}}`` map. Decode +
+        load filesystem-agnostically — works under the
+        submitter-is-primary topology where the on-disk pickle is not
+        local to the primary.
+
+        Fallback (``phase_outputs`` is ``None`` / missing the key — old
+        framework pin, single-process, or relocated-primary topology
+        where the fs path still resolves): read the on-disk pickle.
+        """
+        value = self._published_pickle_value(phase_outputs, output_key)
+        if value is not None:
+            raw = base64.b64decode(value)
+            descriptors, _summary = from_bytes(raw)
+            self._logger.info(
+                "on_phase_end(\"dependency_graph\"): loaded descriptors"
+                " from the task-output channel (key=%s)",
+                output_key,
+            )
+            return descriptors, "published-output"
+        descriptors, _summary = from_path(pickle_path)
+        return descriptors, "fs-path"
+
+    @staticmethod
+    def _published_pickle_value(
+        phase_outputs: Optional[dict],
+        output_key: str,
+    ) -> Optional[str]:
+        """Extract the published pickle ``"value"`` string from
+        ``phase_outputs``, or ``None`` when absent/malformed."""
+        if not phase_outputs:
+            return None
+        dg_outputs = phase_outputs.get("dependency_graph")
+        if not isinstance(dg_outputs, dict):
+            return None
+        entry = dg_outputs.get(output_key)
+        if not isinstance(entry, dict):
+            return None
+        value = entry.get("value")
+        if not isinstance(value, str) or not value:
+            return None
+        return value
 
     def _log_spawn_errors(
         self, errors: Iterable, headers: list[ManifestHeader],

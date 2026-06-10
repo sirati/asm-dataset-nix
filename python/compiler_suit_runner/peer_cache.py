@@ -724,13 +724,13 @@ class HarmoniaProcess:
     harmonia occasionally parsed a half-written TOML and exited
     silently.
 
-    ``log_path`` can sit on NFS — but the filename MUST be unique
-    per node (e.g. ``/app/log-network/harmonia-<secondary_id>.log``)
-    so concurrent writers never share an inode. Default is
+    ``log_path`` can sit on NFS — but the PATH MUST be unique per node
+    (e.g. ``/app/log-network/<secondary_id>/harmonia.log``) so
+    concurrent writers never share an inode. Default is
     ``runtime_dir / "harmonia.log"`` (container-local) for callers
     that don't need the log shared off-node; the suit-task secondary
-    overrides it to land alongside the other per-secondary logs on
-    the gateway-readable mount.
+    overrides it to land inside the secondary's own subdir alongside
+    the framework's per-role logs on the gateway-readable mount.
 
     Tests typically monkeypatch :func:`subprocess.Popen` so no real
     server is spawned.

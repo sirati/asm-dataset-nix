@@ -41,11 +41,29 @@ __all__ = [
     "import_archive",
     "is_path_locally_present",
     "binary_from_archive_name",
+    "toolchain_archive_path",
 ]
 
 
 _ARCHIVE_PREFIX = "matrix-"
 _ARCHIVE_SUFFIX = ".drv.archive"
+
+# The shared toolchain archive (toolchain-dedup pre-flight artefact).
+# Named OUTSIDE the ``matrix-`` prefix so :func:`discover_archives`
+# never picks it up as a per-binary matrix archive; consumers import it
+# explicitly (toolchain-first) via :func:`toolchain_archive_path`.
+TOOLCHAIN_ARCHIVE_NAME = "toolchains.drv.archive"
+
+
+def toolchain_archive_path(out_dir: pathlib.Path) -> pathlib.Path:
+    """Return the shared ``toolchains.drv.archive`` path under ``out_dir``.
+
+    Fixed-name lookup mirroring the per-binary
+    ``matrix-<binary>.drv.archive`` convention. The toolchain-dedup
+    pre-flight writes this once per run; every consumer imports it
+    FIRST (before any ``matrix-*`` diff archive).
+    """
+    return out_dir / TOOLCHAIN_ARCHIVE_NAME
 
 
 def binary_from_archive_name(archive: pathlib.Path) -> str:
@@ -77,6 +95,10 @@ def discover_archives(matrix_eval_out_dir: pathlib.Path) -> list[pathlib.Path]:
     """
     if not matrix_eval_out_dir.is_dir():
         return []
+    # The ``matrix-`` prefix filter intentionally EXCLUDES the shared
+    # ``toolchains.drv.archive`` (toolchain-dedup artefact) — it is
+    # imported explicitly toolchain-first by the consumers, never as a
+    # per-binary matrix archive.
     return sorted(
         p for p in matrix_eval_out_dir.iterdir()
         if p.is_file()

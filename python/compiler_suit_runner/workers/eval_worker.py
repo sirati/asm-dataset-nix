@@ -48,9 +48,12 @@ Re-execution
 The worker always re-runs every step on every invocation; there is no
 resume fast-path. In-run "second attempts" are failure restarts
 where any cached on-disk archive cannot be trusted (the writer never
-fully completed). The atomic ``.tmp`` + ``os.replace`` archive writer
-guarantees readers never see a half-written file, so a fresh run
-simply overwrites the prior archive in place.
+fully completed). The per-binary archive is delivered via the
+framework publish API (stage under ``DYNRUNNER_PUBLISH_SRC_ROOT`` then
+``Task.publish(dst=...)``), whose concurrency-safe atomic cross-FS
+rename guarantees readers never see a half-written file and concurrent
+publishers of the same shared destination never collide — a fresh run
+simply re-publishes over the prior archive in place.
 
 Error-type contract (framework integration)
 -------------------------------------------
@@ -97,6 +100,7 @@ full rationale and the Phase 1 planner that consumes the marker.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import pathlib
 import random
@@ -108,6 +112,15 @@ from collections.abc import Callable
 from typing import Any, Optional
 
 from dynamic_runner.worker import Task
+
+
+# Module logger. The worker subprocess routes stdlib logging to a per-
+# worker file (build_worker.main configures the root handler), so INFO
+# step logging here surfaces in ``worker_N.log`` — making an eval's
+# progress (and any failure point) readable rather than a ~6-min silence
+# between "dispatching matrix_eval" and the result. Naming mirrors the
+# build_worker convention (``compiler_suit_runner.build_worker.handle``).
+_LOG = logging.getLogger("compiler_suit_runner.eval_worker")
 
 
 # ``run_subprocess`` accepts argv (list[str]) plus an optional
@@ -278,6 +291,17 @@ def parse_payload(payload: dict) -> dict[str, Any]:
             f" ({toolchain_aggregate_drv!r})"
         )
 
+    # Toolchain-dedup feature flag (default ON when absent so legacy
+    # headers behave as dedup). When True the export subtracts the
+    # toolchain closure from the per-binary archive; when False the
+    # full closure is exported (today's behaviour / rollback).
+    toolchain_dedup_raw = payload.get("toolchain_dedup", True)
+    if not isinstance(toolchain_dedup_raw, bool):
+        raise ValueError(
+            "matrix_eval payload: invalid 'toolchain_dedup'"
+            f" ({toolchain_dedup_raw!r})"
+        )
+
     return {
         "binary": binary,
         "sys": sys_name,
@@ -287,6 +311,7 @@ def parse_payload(payload: dict) -> dict[str, Any]:
         "variant_sample": variant_sample,
         "variant_seed": variant_seed,
         "toolchain_aggregate_drv": toolchain_aggregate_drv,
+        "toolchain_dedup": toolchain_dedup_raw,
     }
 
 
@@ -525,6 +550,10 @@ def _eval_meta_for_arch(
 # ---------------------------------------------------------------------------
 
 
+TOOLCHAIN_ARCHIVE_NAME = "toolchains.drv.archive"
+"""Shared toolchain-archive filename (mirrors preflight + dep-graph)."""
+
+
 def _archive_path(out_dir: pathlib.Path, binary: str) -> pathlib.Path:
     """Per-binary archive path under the matrix-eval output dir.
 
@@ -539,44 +568,172 @@ def _archive_path(out_dir: pathlib.Path, binary: str) -> pathlib.Path:
     return out_dir / f"matrix-{binary}.drv.archive"
 
 
+def _import_toolchain_archive(
+    out_dir: pathlib.Path,
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> None:
+    """Import the shared ``toolchains.drv.archive`` into the worker store.
+
+    Toolchain dedup makes the eval worker a CONSUMER of the shared
+    toolchain archive: the submitter produces + uploads ONE
+    ``toolchains.drv.archive`` (under ``out_dir`` =
+    ``matrix_eval_out_dir`` = the shared gateway mount) at setup, and
+    the per-binary diff export subtracts its closure. The toolchain
+    closure must therefore be RESIDENT in this worker's store before
+    the subtract recompute (``exclude_seed`` requisites) — so we import
+    it first.
+
+    Delegates to
+    :func:`workers.build_worker.ensure_toolchain_archive_imported` (the
+    same process-memoised, dep_graph-``import_archive``-backed helper
+    the build worker uses). Imported lazily so eval_worker pays the
+    cross-worker import cost only on the dedup path; the helper's own
+    dep_graph import is likewise lazy, so there is no import cycle.
+
+    Hard-fails (:class:`RuntimeError`) when the archive is MISSING or
+    ZERO-BYTE on the dedup path: a missing toolchain archive means the
+    submitter upload did not happen, so the per-binary diff subtract
+    would be computed against an absent closure and the resulting
+    archive would be un-importable downstream. (``ensure_toolchain_
+    archive_imported`` itself treats absent/empty as a no-op — the
+    operator-older-submit tolerance the build worker wants — so the
+    strict presence check lives HERE, gated on dedup by the caller,
+    before delegating.)
+    """
+    archive = out_dir / TOOLCHAIN_ARCHIVE_NAME
+    try:
+        size = archive.stat().st_size
+    except OSError:
+        size = -1
+    if size <= 0:
+        raise RuntimeError(
+            "toolchain dedup is ON but the shared toolchain archive is "
+            f"missing or zero-byte at {archive!s} (size={size}); the "
+            "submitter setup must produce + upload it before dispatch — "
+            "the per-binary diff subtract would otherwise be computed "
+            "against an absent toolchain closure"
+        )
+    # Lazy: the cross-worker import is only needed on the dedup path,
+    # and build_worker's own dep_graph import is lazy too (no cycle).
+    from compiler_suit_runner.workers.build_worker import (  # noqa: PLC0415
+        ensure_toolchain_archive_imported,
+    )
+
+    ensure_toolchain_archive_imported(out_dir, run_subprocess=run_subprocess)
+    _LOG.info(
+        "toolchain archive: imported %s (%d bytes) before dedup subtract",
+        archive.name, size,
+    )
+
+
+def _publish_src_root() -> pathlib.Path:
+    """Worker-local STAGING root for files headed to the shared mount.
+
+    The framework's publish API moves a file from a per-worker staging
+    tree (``DYNRUNNER_PUBLISH_SRC_ROOT``, default ``/app/out-tmp``)
+    onto the shared destination mount (``/app/out-network``) with a
+    concurrency-safe PID+nanos-unique sibling tmp → fsync → atomic
+    rename → fsync-parent. Workers stage under this root, then call
+    :meth:`Task.publish` (mirrors build_worker's ``copy_elf_folder``
+    → ``task.publish_all`` pattern).
+    """
+    return pathlib.Path(
+        os.environ.get("DYNRUNNER_PUBLISH_SRC_ROOT", "/app/out-tmp")
+    )
+
+
+def _staged_archive_path(archive: pathlib.Path) -> pathlib.Path:
+    """Worker-local staging path for the per-binary ``archive``.
+
+    Mirrors the archive's basename under ``<src_root>/_matrix_eval/``
+    so the staged file is unambiguous + co-located by binary. The
+    publish step delivers it to the explicit ``dst=archive`` on the
+    shared mount; the staging path itself is never read by consumers.
+    """
+    return _publish_src_root() / "_matrix_eval" / archive.name
+
+
+def _publish_archive(
+    task: Task,
+    staged: pathlib.Path,
+    archive: pathlib.Path,
+) -> None:
+    """Deliver ``staged`` to ``archive`` via the framework publish API.
+
+    ``task.publish(staged, dst=archive)`` performs the concurrency-safe
+    cross-FS delivery — concurrent publishers of the same ``dst`` never
+    collide (the native ``publish_one`` renames a PID+nanos-unique
+    sibling tmp). Replaces the prior hand-rolled fixed-``.tmp`` +
+    ``os.replace`` straight onto the shared mount, which raced when
+    multiple workers published the same shared archive. Wraps
+    :class:`PublishError` into :class:`RuntimeError` so the failure is
+    retry-pass eligible per the module's error contract.
+    """
+    from dynamic_runner.worker import PublishError  # noqa: PLC0415
+
+    try:
+        task.publish(staged, dst=archive)
+    except PublishError as exc:
+        raise RuntimeError(
+            f"publishing {staged!s} -> {archive!s} failed: {exc}"
+        ) from exc
+
+
 def _export_kept_closure(
     archive: pathlib.Path,
     kept_drvs: list[str],
     *,
+    task: Task,
     run_subprocess: RunSubprocess,
+    exclude_seed: Optional[str] = None,
 ) -> None:
     """Export the closure of ``kept_drvs`` into ``archive``.
 
-    Two subprocess invocations, each fed its store-path list as
-    newline-delimited bytes on stdin via ``--stdin`` so argv stays
-    bounded at production scale:
+    Two (or three, with ``exclude_seed``) subprocess invocations, each
+    fed its store-path list as newline-delimited bytes on stdin via
+    ``--stdin`` so argv stays bounded at production scale:
 
       1. ``nix-store --query --requisites --stdin`` to enumerate
-         every store path in the transitive closure.
-      2. ``nix-store --export --stdin`` whose stdout is the
-         self-contained archive byte stream we redirect to disk.
+         every store path in the transitive closure of ``kept_drvs``.
+      2. (toolchain dedup only) ``nix-store --query --requisites
+         --stdin`` over ``exclude_seed`` (the toolchain aggregate drv),
+         set-subtracted from the matrix closure so the exported archive
+         carries only ``requisites(matrix) − requisites(toolchain)`` —
+         the toolchain ships once via the pre-flight
+         ``toolchains.drv.archive``. The toolchain closure is already
+         local on the worker (it is inputDrv #0 of the matrix aggregate),
+         so this is recomputed here rather than shipping a manifest.
+      3. ``nix-store --export --stdin`` whose stdout is the
+         self-contained archive byte stream we stage to a worker-local
+         file then publish.
 
-    The archive is written atomically via ``.tmp`` + ``os.replace`` so a
-    crash mid-export never leaves a half-written file the primary would
-    mis-import.
+    When ``exclude_seed`` is ``None`` (toolchain dedup OFF / rollback)
+    the full matrix closure is exported, i.e. today's behaviour.
 
-    Mirrors :func:`workers.build_compilers_worker.export_closure` but
-    in-module so eval_worker stays free of cross-worker imports and the
-    injected ``run_subprocess`` seam mirrors the rest of this module.
-
-    Raises :class:`RuntimeError` on any subprocess failure (retry-pass
-    eligible per the worker's error-type contract).
+    The export bytes are written to a worker-local STAGING path (under
+    ``DYNRUNNER_PUBLISH_SRC_ROOT``) and then delivered to ``archive`` on
+    the shared mount via :meth:`Task.publish` — the framework owns the
+    concurrency-safe atomic cross-FS rename, so concurrent publishers of
+    the same shared ``archive`` never collide (the prior hand-rolled
+    fixed-``.tmp`` + ``os.replace`` raced and ENOENT'd). Mirrors
+    build_worker's stage→publish pattern; the injected ``run_subprocess``
+    seam mirrors the rest of this module. Raises :class:`RuntimeError`
+    on any subprocess or publish failure (retry-pass eligible).
     """
     if not kept_drvs:
-        # No kept drvs ⇒ no archive. Still produce an empty file so the
+        # No kept drvs ⇒ no archive. Still publish an empty file so the
         # primary's quiesce-watcher (archive-presence based) stays
         # consistent — zero variants is a valid outcome for a binary
-        # with all archs gated out by the support table.
-        archive.parent.mkdir(parents=True, exist_ok=True)
-        tmp = archive.with_suffix(archive.suffix + ".tmp")
-        with open(tmp, "wb") as fh:
+        # with all archs gated out by the support table. Downstream
+        # readers (build_worker.ensure_binary_archive_imported /
+        # dep_graph discover_archives) treat a zero-byte archive as "no
+        # variants".
+        staged = _staged_archive_path(archive)
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        with open(staged, "wb") as fh:
             fh.write(b"")
-        os.replace(tmp, archive)
+        _publish_archive(task, staged, archive)
         return
 
     req_argv: list[str] = [
@@ -603,39 +760,73 @@ def _export_kept_closure(
             "nix-store --query --requisites returned no paths for "
             f"kept_drvs={kept_drvs!r}"
         )
+    _LOG.info(
+        "closure of %d seed drv(s): %d paths", len(kept_drvs), len(closure),
+    )
 
-    archive.parent.mkdir(parents=True, exist_ok=True)
-    tmp_archive = archive.with_suffix(archive.suffix + ".tmp")
-    if tmp_archive.exists():
-        try:
-            tmp_archive.unlink()
-        except OSError:
-            pass
+    # Toolchain dedup: subtract the toolchain aggregate's requisites from
+    # the matrix closure so the per-binary archive carries only the
+    # binary-specific diff. Order-preserving filter (keeps the closure's
+    # deterministic ordering) over a set of excluded paths. The toolchain
+    # closure is recomputed locally — it is already resident as inputDrv
+    # #0 of the matrix aggregate, so no manifest needs shipping.
+    if exclude_seed:
+        excl_argv: list[str] = [
+            "nix-store", "--query", "--requisites", "--stdin",
+        ]
+        excl_stdout, excl_stderr, excl_rc = run_subprocess(
+            excl_argv, input=exclude_seed.encode("utf-8"),
+        )
+        if excl_rc != 0:
+            raise RuntimeError(
+                "nix-store --query --requisites (toolchain exclude) failed "
+                f"(rc={excl_rc}): "
+                + excl_stderr.decode("utf-8", errors="replace").strip()
+            )
+        excluded = {
+            line.strip()
+            for line in excl_stdout.decode(
+                "utf-8", errors="replace",
+            ).splitlines()
+            if line.strip()
+        }
+        before = len(closure)
+        closure = [p for p in closure if p not in excluded]
+        _LOG.info(
+            "toolchain-dedup: excluded %d paths, diff = %d paths",
+            before - len(closure), len(closure),
+        )
+        if not closure:
+            raise RuntimeError(
+                "toolchain-dedup closure subtraction left nothing to export "
+                f"for kept_drvs={kept_drvs!r} (exclude_seed={exclude_seed!r})"
+            )
+
+    staged = _staged_archive_path(archive)
+    staged.parent.mkdir(parents=True, exist_ok=True)
 
     export_argv: list[str] = [
         "nix-store",
         "--export",
         "--stdin",
     ]
+    _LOG.info("exporting %d paths -> %s", len(closure), archive.name)
     exp_stdin = "\n".join(closure).encode("utf-8")
     exp_stdout, exp_stderr, exp_rc = run_subprocess(export_argv, input=exp_stdin)
     if exp_rc != 0:
-        try:
-            tmp_archive.unlink()
-        except OSError:
-            pass
         raise RuntimeError(
             f"nix-store --export failed (rc={exp_rc}): "
             + exp_stderr.decode("utf-8", errors="replace").strip()
         )
     try:
-        with open(tmp_archive, "wb") as fh:
+        with open(staged, "wb") as fh:
             fh.write(exp_stdout)
-        os.replace(tmp_archive, archive)
     except OSError as exc:
         raise RuntimeError(
-            f"writing nix-store --export stdout to {archive!s} failed: {exc}"
+            f"writing nix-store --export stdout to {staged!s} failed: {exc}"
         ) from exc
+    _publish_archive(task, staged, archive)
+    _LOG.info("published %s (%d bytes)", archive.name, len(exp_stdout))
 
 
 # ---------------------------------------------------------------------------
@@ -810,7 +1001,9 @@ def _export_matrix_archive(
     matrix_aggregate_drv: Optional[str],
     archive: pathlib.Path,
     *,
+    task: Task,
     run_subprocess: RunSubprocess,
+    exclude_seed: Optional[str] = None,
 ) -> None:
     """Step 6: export the matrix-aggregate closure into the per-binary
     archive.
@@ -823,9 +1016,21 @@ def _export_matrix_archive(
     re-evaluating the flake. When ``matrix_aggregate_drv`` is ``None``
     (a binary with all archs gated out) we still write an empty archive
     so the primary's archive-presence quiesce signal stays consistent.
+
+    ``exclude_seed`` (the toolchain aggregate drv) enables toolchain
+    dedup: the exported closure is ``requisites(matrix) −
+    requisites(toolchain)`` and the toolchain ships once via the
+    pre-flight ``toolchains.drv.archive``. ``None`` exports the full
+    closure (rollback). The toolchain stays an inputDrv of the matrix
+    aggregate either way — only the exported BYTES are trimmed.
     """
     export_seeds = [matrix_aggregate_drv] if matrix_aggregate_drv else []
-    _export_kept_closure(archive, export_seeds, run_subprocess=run_subprocess)
+    _export_kept_closure(
+        archive, export_seeds,
+        task=task,
+        run_subprocess=run_subprocess,
+        exclude_seed=exclude_seed,
+    )
 
 
 def run_eval_task(
@@ -844,9 +1049,10 @@ def run_eval_task(
     ``out_dir/matrix-<binary>.drv.archive``; the returned dict is an
     in-process summary. Every invocation re-runs the full pipeline —
     there is no resume fast-path. An in-run second attempt is always a
-    failure restart (the cached on-disk archive cannot be trusted),
-    and the archive writer's atomic ``.tmp`` + ``os.replace`` overwrites
-    any prior file in place. Failure modes raise :class:`RuntimeError`
+    failure restart (the cached on-disk archive cannot be trusted), and
+    the framework publish step (stage → ``Task.publish(dst=...)``) re-
+    delivers over any prior file atomically. Failure modes raise
+    :class:`RuntimeError`
     so the harness surfaces ``ErrorType::Errored`` (retry-pass) — never
     ``Unfulfillable`` (that belongs to toolchain-validate).
     """
@@ -857,6 +1063,10 @@ def run_eval_task(
     binary = parsed["binary"]
     sys_name = parsed["sys"]
     archive = _archive_path(out_dir, binary)
+    _LOG.info(
+        "matrix_eval START binary=%s sys=%s archs=%d",
+        binary, sys_name, len(parsed["archs"]),
+    )
 
     # Step 1: sample per arch.
     sampled_by_arch = _sample_per_arch(
@@ -876,12 +1086,64 @@ def run_eval_task(
     variants = _variants_from_bulk(bulk_drvs, binary)
     # Step 4: build the per-binary matrix-aggregate drv.
     kept_drvs: list[str] = sorted({v["drv"] for v in variants})
+    _LOG.info(
+        "matrix_eval binary=%s: eval-jobs produced %d variant drvs"
+        " (kept %d unique)",
+        binary, len(variants), len(kept_drvs),
+    )
+    _LOG.info(
+        "matrix_eval binary=%s: building matrix aggregate over %d kept drvs"
+        " (+toolchain agg)",
+        binary, len(kept_drvs),
+    )
+    # Import the shared ``toolchains.drv.archive`` BEFORE building the
+    # matrix aggregate. The aggregate's ``nix-instantiate`` references the
+    # toolchain aggregate drv (``toolchain_aggregate_drv``, inputDrv #0),
+    # so ``toolchains.drv`` must be resident in this worker's store FIRST
+    # or the instantiate fails "path '…-toolchains.drv' is required, but
+    # there is no substituter that can build it". A warm store may already
+    # hold it (so this is idempotent), but a cold store needs the import
+    # here — importing after the aggregate build (as before) is too late.
+    # Skipped in dedup-OFF mode (no shared archive; the toolchain must be
+    # locally realised / substitutable).
+    if parsed["toolchain_dedup"] and parsed["toolchain_aggregate_drv"] is not None:
+        _LOG.info(
+            "matrix_eval binary=%s: importing shared toolchains.drv.archive",
+            binary,
+        )
+        _import_toolchain_archive(out_dir, run_subprocess=runner)
     matrix_aggregate_drv = _build_matrix_aggregate(
         parsed["toolchain_aggregate_drv"], kept_drvs, binary, sys_name,
     )
-    # Step 5: export the matrix-aggregate closure into the archive.
+    _LOG.info(
+        "matrix_eval binary=%s: matrix_aggregate=%s",
+        binary, matrix_aggregate_drv,
+    )
+    # Step 5: export the matrix-aggregate closure into the archive. With
+    # toolchain dedup ON (default) subtract the toolchain aggregate's
+    # closure so the per-binary archive carries only the binary-specific
+    # diff; the toolchain ships once via the pre-flight
+    # ``toolchains.drv.archive``. OFF (rollback) => full closure.
+    _LOG.info(
+        "matrix_eval binary=%s: toolchain_dedup=%s",
+        binary, parsed["toolchain_dedup"],
+    )
+    exclude_seed = (
+        parsed["toolchain_aggregate_drv"]
+        if parsed["toolchain_dedup"] else None
+    )
+    # The shared ``toolchains.drv.archive`` was already imported ABOVE,
+    # before the matrix-aggregate instantiate, so the toolchain closure is
+    # resident for BOTH the aggregate build and the ``exclude_seed``
+    # requisites subtract below (a stranded/missing upload hard-fails at
+    # that import point, before any per-binary work).
+    _LOG.info(
+        "matrix_eval binary=%s: exporting per-binary archive %s (dedup diff)",
+        binary, archive.name,
+    )
     _export_matrix_archive(
-        matrix_aggregate_drv, archive, run_subprocess=runner,
+        matrix_aggregate_drv, archive, task=task, run_subprocess=runner,
+        exclude_seed=exclude_seed,
     )
     # Step 5b: publish the matrix_aggregate drv path as a keyed task
     # output. The framework's keyed-outputs API (Task.publish_string,
@@ -890,6 +1152,10 @@ def run_eval_task(
     # task via predecessor_outputs[task_id]["matrix_aggregate_drv"],
     # replacing the prior per-binary JSON sidecar drop.
     task.publish_string("matrix_aggregate_drv", matrix_aggregate_drv)
+    _LOG.info(
+        "matrix_eval DONE binary=%s: %d variants, matrix_aggregate=%s",
+        binary, len(variants), matrix_aggregate_drv,
+    )
     # Step 6: in-process summary. ``variant_drvs`` is kept for
     # backwards compatibility with legacy consumers (retired by D.1b).
     return {

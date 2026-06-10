@@ -54,9 +54,28 @@ from compiler_suit_runner.preflight import (
     check_toolchains_locally,
     enumerate_toolchains_only,
     enumerate_variants,
+    export_toolchain_archive,
     preflight as run_preflight,
 )
 from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
+
+
+# Framework CLI composition surface. ``add_framework_arguments`` registers
+# every dynamic_runner flag onto our submit/secondary subparsers, and
+# ``validate_parsed_args`` runs the framework's cross-flag checks (the
+# ``args=`` path of ``run()`` does not call it — the consumer owns
+# validation). Imported at module load with a graceful fallback so the
+# hermetic test environment (no dynamic_runner) still constructs a parser
+# — there the framework flags are simply absent and only the SLURM /
+# secondary paths, which require the framework anyway, are affected.
+try:  # pragma: no cover - exercised in the dev shell, not the bare env
+    from dynamic_runner.cli import (  # type: ignore[import-not-found]
+        add_framework_arguments as _add_framework_arguments,
+        validate_parsed_args as _validate_parsed_args,
+    )
+except Exception:  # noqa: BLE001 — framework absent (hermetic tests)
+    _add_framework_arguments = None
+    _validate_parsed_args = None
 
 
 __all__ = [
@@ -68,10 +87,6 @@ __all__ = [
     "cmd_clear_cache",
     "run_single_process",
 ]
-
-
-_VALID_MULTI_COMPUTER = ("single-process", "slurm")
-_VALID_PACKAGING = ("podman", "none")
 
 
 def _non_negative_int(value: str) -> int:
@@ -147,18 +162,11 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         metavar="ARCH",
         help="Limit to these target architectures (default: all).",
     )
-    parser.add_argument(
-        "--multi-computer",
-        choices=_VALID_MULTI_COMPUTER,
-        default="single-process",
-        help="Distribution mode (default: single-process).",
-    )
-    parser.add_argument(
-        "--jobs",
-        type=int,
-        default=None,
-        help="Workers per secondary (default: cpu_count).",
-    )
+    # NOTE: --multi-computer, --jobs, --cores, --max-memory are now
+    # registered by add_framework_arguments() on the submit/secondary
+    # subparsers (see build_parser). Our custom defaults are restored
+    # post-registration via set_defaults() so the framework's choice set
+    # (which is a superset of ours) and parsing own these flags.
     parser.add_argument(
         "--build-max-concurrent",
         type=int,
@@ -170,40 +178,6 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "Each variant build itself spawns parallel compiler invocations,"
             " so a value around cpu_count/4 prevents oversubscription on "
             "small clusters."
-        ),
-    )
-    # Forwarded to dynamic_runner's own argparse (deliberately NOT in
-    # _CSR_FLAGS_WITH_VALUE, so the value stays in sys.argv after our
-    # strip-pass and the framework re-reads it). Without forwarding,
-    # the secondary's ``dynrunner_manager_local::pool`` auto-detects
-    # cores via ``available_parallelism``, which inside a podman
-    # container returns the HOST's full CPU count (cgroup CPU quota
-    # isn't reflected in /proc/cpuinfo). On a 32-core host with a
-    # 2-CPU cgroup that's 32 workers spawned per secondary, immediately
-    # fork-storming the per-job cgroup before any work starts.
-    parser.add_argument(
-        "--cores",
-        type=str,
-        default=None,
-        metavar="N",
-        help=(
-            "Forwarded to dynamic_runner --cores: int / +int / -int "
-            "controlling workers-per-secondary. Defaults to the "
-            "framework's own default (all detected cores). Set "
-            "explicitly to match the cgroup CPU envelope."
-        ),
-    )
-    parser.add_argument(
-        "--max-memory",
-        type=str,
-        default=None,
-        metavar="SPEC",
-        help=(
-            "Forwarded to dynamic_runner --max-memory: e.g. '3G', "
-            "'8192M', '+1G', '-2G'. Defaults to the framework's own "
-            "default (autodetected from /proc/meminfo). Set "
-            "explicitly to match the cgroup memory envelope; "
-            "autodetect doesn't see cgroup limits inside containers."
         ),
     )
     parser.add_argument(
@@ -290,19 +264,9 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "support in the running dynrunner version."
         ),
     )
-    parser.add_argument(
-        "--unfulfillable-reinject-max-per-task",
-        type=_non_negative_int,
-        default=None,
-        metavar="N",
-        help=(
-            "Cap how many times a permanently-Unfulfillable task may "
-            "auto-reinject when an observer broadcasts the missing "
-            "outpath. Default: unbounded. Useful for flap-tolerance "
-            "when a flaky peer keeps re-joining. Mirrors the framework "
-            "kwarg of the same name; 0 disables auto-reinject entirely."
-        ),
-    )
+    # --unfulfillable-reinject-max-per-task is framework-owned now
+    # (registered by add_framework_arguments). _config_from_args still
+    # reads args.unfulfillable_reinject_max_per_task → SuitTaskConfig.
     parser.add_argument(
         "--variant-sample",
         type=int,
@@ -340,71 +304,13 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "planner's size cap) in a future phase."
         ),
     )
-    parser.add_argument(
-        "--packaging",
-        choices=_VALID_PACKAGING,
-        default="none",
-        help="SLURM packaging method (default: none).",
-    )
-    parser.add_argument(
-        "--gateway",
-        default=None,
-        help="SLURM gateway URL (only used with --multi-computer slurm).",
-    )
-    parser.add_argument(
-        "--slurm-root-folder",
-        type=pathlib.Path,
-        default=None,
-        help="SLURM root folder on the gateway.",
-    )
-    parser.add_argument(
-        "--slurm-partition",
-        default=None,
-        help=(
-            "SLURM partition to submit jobs against (sbatch --partition). "
-            "Pass-through to the framework; defaults to the framework's "
-            "SlurmConfig.partition value when unset."
-        ),
-    )
-    parser.add_argument(
-        "--slurm-time-limit",
-        default=None,
-        help=(
-            "Per-secondary SLURM job wallclock limit (sbatch --time format, "
-            "e.g. '1:00:00'). Pass-through to the framework."
-        ),
-    )
-    parser.add_argument(
-        "--slurm-cpus-per-task",
-        type=int,
-        default=None,
-        help=(
-            "Per-secondary SLURM cpus-per-task (sbatch --cpus-per-task). "
-            "Pass-through to the framework; defaults to the framework's "
-            "SlurmConfig.cpus_per_task value (14) when unset. Must not "
-            "exceed the cluster's per-node CPU count."
-        ),
-    )
-    parser.add_argument(
-        "--ssh-identity-file",
-        default=None,
-        help=(
-            "Explicit private-key path for the gateway SSH connection. "
-            "Pass-through to the framework (dynamic_runner cli flag of "
-            "the same name); the value is forwarded verbatim. Use this "
-            "to bypass ssh-agent / IdentityFile defaults when the "
-            "gateway accepts only a specific key."
-        ),
-    )
-    parser.add_argument(
-        "--ssh-config",
-        default=None,
-        help=(
-            "Explicit ssh-config path for the gateway SSH connection. "
-            "Pass-through to the framework. Composes with "
-            "--ssh-identity-file."
-        ),
-    )
+    # --packaging, --gateway, --slurm-root-folder, --slurm-partition,
+    # --slurm-time-limit, --slurm-cpus-per-task, --ssh-identity-file,
+    # --ssh-config are all framework-owned now (registered by
+    # add_framework_arguments). cmd_submit / _config_from_args still read
+    # args.gateway / args.slurm_root_folder / args.ssh_identity_file /
+    # args.ssh_config off the namespace; the framework's str/None shapes
+    # are compatible with the str()-wrapping consumers.
     parser.add_argument(
         "--cachix-cache",
         default=None,
@@ -481,6 +387,49 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             "the operator hits on <compute-node>."
         ),
     )
+    # --important-stdio-only is framework-owned now (registered by
+    # add_framework_arguments via IMPORTANT_STDIO_ONLY_FLAG). The
+    # framework detects it (logging_setup) and drops it from the
+    # forwarded secondary argv so grid workers keep full logs.
+
+
+def _attach_framework_args(subparser: argparse.ArgumentParser) -> None:
+    """Register every dynamic_runner flag onto ``subparser``.
+
+    Thin wrapper over the framework's ``add_framework_arguments`` so the
+    one ``None`` guard (framework absent in the hermetic test env) lives
+    in a single place. When the framework can't be imported the wrapper
+    is a no-op — the submit / secondary paths require the framework to
+    run anyway, so a parser without its flags only ever surfaces in tests
+    that exercise consumer-only flags.
+    """
+    if _add_framework_arguments is not None:
+        _add_framework_arguments(subparser)
+
+
+def _restore_framework_flag_defaults(
+    subparser: argparse.ArgumentParser,
+) -> None:
+    """Re-apply this consumer's custom defaults for framework-owned flags.
+
+    ``add_framework_arguments`` ships the framework's own defaults; a few
+    of them differ from what this consumer historically used. We override
+    them post-registration via ``set_defaults`` (per the migration recipe;
+    ``set_defaults`` can't alter ``type``/``choices``, only defaults):
+
+    * ``--multi-computer``: framework default is ``None`` (choices are a
+      superset of ours); restore ``single-process`` so a bare ``submit``
+      runs in-process like before.
+    * ``--jobs``: framework default is ``1``; restore ``None`` so
+      ``_resolve_jobs`` falls back to ``cpu_count`` when unset.
+
+    ``--cores`` / ``--max-memory`` keep the framework defaults
+    (``"0"`` / ``"-2G"``) — the consumer never reads them directly, they
+    flow to the framework via the namespace, and the framework's parsers
+    require a non-None value. ``--packaging`` likewise keeps the framework
+    default (``None``); the consumer never reads it.
+    """
+    subparser.set_defaults(multi_computer="single-process", jobs=None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -500,18 +449,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # submit + secondary are the two subcommands that hand off to
+    # dynamic_runner.run(args=ns). They register the FULL framework flag
+    # set via add_framework_arguments (which also supplies --source /
+    # --output via add_selection_arguments, --important-stdio-only,
+    # --secondary-id, --cores/--max-memory/--jobs/--gateway/--packaging/
+    # --slurm-*/--ssh-config/--ssh-identity-file/--debug/etc.) alongside
+    # our consumer-only flags. _restore_framework_flag_defaults re-applies
+    # our custom defaults on the few framework flags whose defaults differ.
     p_submit = sub.add_parser("submit", help="Kick off a run from this host.")
+    _attach_framework_args(p_submit)
     _add_common_args(p_submit)
+    # CSR consumer flag (NOT a framework flag): disables toolchain dedup,
+    # i.e. each per-binary matrix archive exports its FULL closure
+    # (including the toolchain) instead of the binary-specific diff.
+    # Rollback switch — also honoured via env ``CSR_TOOLCHAIN_DEDUP=0``.
+    p_submit.add_argument(
+        "--no-toolchain-dedup",
+        dest="no_toolchain_dedup",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable toolchain dedup: per-binary matrix archives export "
+            "the full closure (including the compiler toolchain) instead "
+            "of the binary-specific diff. Rollback switch; also via env "
+            "CSR_TOOLCHAIN_DEDUP=0."
+        ),
+    )
+    _restore_framework_flag_defaults(p_submit)
 
     p_secondary = sub.add_parser(
         "secondary", help="Run as a per-node secondary worker."
     )
+    _attach_framework_args(p_secondary)
     _add_common_args(p_secondary)
-    p_secondary.add_argument(
-        "--secondary-id",
-        required=False,
-        help="Unique identifier for this secondary.",
-    )
+    _restore_framework_flag_defaults(p_secondary)
 
     p_preflight = sub.add_parser(
         "preflight",
@@ -568,90 +540,22 @@ def _resolve_jobs(args: argparse.Namespace) -> int:
     return max(1, os.cpu_count() or 1)
 
 
-# CSR-only flags that the framework's argparse doesn't know about.
-# The framework re-parses sys.argv when `dynamic_runner.run(task)` is
-# invoked, and chokes on any flag it can't resolve — so we strip these
-# before handing off. Flags taking a value (single or nargs="+") are
-# listed in `_CSR_FLAGS_WITH_VALUE`; boolean / store_true flags are in
-# `_CSR_BOOL_FLAGS`. Everything not in either set passes through
-# unchanged (e.g. --gateway, --multi-computer, --packaging,
-# --slurm-root-folder, --jobs — those the framework owns).
-_CSR_FLAGS_WITH_VALUE: frozenset[str] = frozenset({
-    "--flake",
-    "--shared-fs",
-    "--run-id",
-    "--sys",
-    "--system",
-    "--cachix-cache",
-    "--cachix-auth-token-file",
-    "--cache-root",
-    "--submitter-harmonia-port",
-    "--ssh-debug-port",
-    "--build-max-concurrent",
-    "--variant-sample",
-    "--variant-seed",
-    "--max-variants",
-    "--hash",
-    "--replication-k",
-    "--build-compiler-workers",
-    "--debug-testbuild",
-    # nargs="+" — may be followed by multiple values
-    "--packages",
-    "--archs",
-})
-_CSR_NARGS_PLUS: frozenset[str] = frozenset({
-    "--packages",
-    "--archs",
-})
-_CSR_BOOL_FLAGS: frozenset[str] = frozenset({
-    "--no-cache",
-    "--no-submitter-peer",
-    "--enable-ssh-debug",
-    "--no-task-depends",
-    "--build-compilers",
-    "--no-observer-as-holder",
-})
-_CSR_SUBCOMMANDS: frozenset[str] = frozenset({
-    "submit", "secondary", "preflight", "clear-cache",
-})
+def _resolve_toolchain_dedup(args: argparse.Namespace) -> bool:
+    """Resolve the toolchain-dedup feature flag (default ON).
 
-
-def _strip_csr_argv_for_framework(argv: list[str]) -> list[str]:
-    """Remove CSR-only verbs and flags from argv before the framework
-    re-parses it. Preserves order of the remaining tokens.
-
-    Handles three forms:
-      ``--flag value``        (consumes one trailing token)
-      ``--flag=value``        (single token)
-      ``--flag v1 v2 ...``    (nargs="+" — consumes all following non-flag tokens)
+    Precedence: the ``--no-toolchain-dedup`` submit flag wins (when the
+    operator explicitly passed it), then the ``CSR_TOOLCHAIN_DEDUP`` env
+    override (``0`` / ``false`` / ``no`` / ``off`` disable), then the
+    default (ON). When dedup is OFF the per-binary matrix archives export
+    the FULL closure (today's behaviour) and the submitter skips the
+    toolchain-archive export — rollback is this one flag.
     """
-    out: list[str] = []
-    i = 0
-    n = len(argv)
-    while i < n:
-        tok = argv[i]
-        if tok in _CSR_SUBCOMMANDS:
-            i += 1
-            continue
-        if tok in _CSR_BOOL_FLAGS:
-            i += 1
-            continue
-        if "=" in tok:
-            head = tok.split("=", 1)[0]
-            if head in _CSR_FLAGS_WITH_VALUE or head in _CSR_BOOL_FLAGS:
-                i += 1
-                continue
-        if tok in _CSR_FLAGS_WITH_VALUE:
-            i += 1
-            if tok in _CSR_NARGS_PLUS:
-                while i < n and not argv[i].startswith("-"):
-                    i += 1
-            elif i < n:
-                i += 1
-            continue
-        out.append(tok)
-        i += 1
-    return out
+    if getattr(args, "no_toolchain_dedup", False):
+        return False
+    env = os.environ.get("CSR_TOOLCHAIN_DEDUP")
+    if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    return True
 
 
 def _config_from_args(
@@ -940,18 +844,56 @@ def _compute_input_hash(repo_root: pathlib.Path) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _validate_framework_args(
+    args: argparse.Namespace, log: logging.Logger
+) -> None:
+    """Run the framework's cross-flag validation on a pre-parsed namespace.
+
+    ``run(task, args=ns)`` deliberately does NOT call
+    ``validate_parsed_args`` — that's the consumer's job on the args=
+    path (the framework only validates on the argv= path it parses
+    itself). We mirror it here so an invalid flag combination surfaces
+    with the framework's own usage/error shape (``parser.error`` → exit
+    2) rather than failing deep inside dispatch. A fresh framework parser
+    supplies the ``.error`` routing target; it parses nothing. No-op when
+    the framework is absent (hermetic tests).
+    """
+    if _validate_parsed_args is None:
+        return
+    try:
+        from dynamic_runner.cli import (  # type: ignore[import-not-found]
+            build_arg_parser,
+        )
+        fw_parser = build_arg_parser("compiler_suit_runner")
+        _validate_parsed_args(args, fw_parser)
+    except SystemExit:
+        # parser.error() exits 2 on a genuinely invalid combination —
+        # let it propagate so the operator sees the framework's message.
+        raise
+    except Exception:  # noqa: BLE001 — never block dispatch on a probe
+        log.debug(
+            "framework validate_parsed_args probe skipped", exc_info=True
+        )
+
+
 def run_single_process(
     config: SuitTaskConfig,
     *,
+    args: Optional[argparse.Namespace] = None,
     logger: Optional[logging.Logger] = None,
 ) -> int:
     """Drive the pipeline in this process via the framework's runner.
 
-    Constructs a :class:`SuitTask`, hands it to ``dynamic_runner.run``,
-    and lets the framework own setup / teardown via the
+    Constructs a :class:`SuitTask`, hands it to ``dynamic_runner.run``
+    via the ``args=`` namespace path (the framework no longer reads
+    ``sys.argv``), and lets the framework own setup / teardown via the
     ``on_run_start`` / ``on_run_end`` lifecycle hooks. Falls back to
     the legacy in-process dispatch loop when ``dynamic_runner`` is
     not importable (the consumer's hermetic test environment).
+
+    ``args`` is the namespace cmd_submit already parsed (framework flags
+    registered via add_framework_arguments) with ``source`` / ``output``
+    injected; there is no ``deployment`` for the in-process path.
 
     Returns 0 on success, 1 on any unhandled exception.
     """
@@ -969,9 +911,9 @@ def run_single_process(
         return _legacy_run_single_process(task, config, log)
 
     try:
-        # The framework's ``run`` consumes argparse via sys.argv; we
-        # let it do so and rely on lifecycle hooks for setup.
-        dynamic_runner_run(task)
+        # args= path: the framework parses nothing, using our pre-parsed
+        # namespace directly. No deployment for the in-process mode.
+        dynamic_runner_run(task, args=args)
         config.dataset_dir.mkdir(parents=True, exist_ok=True)
     except SystemExit as exc:
         return int(exc.code) if exc.code is not None else 0
@@ -1021,6 +963,93 @@ def _legacy_run_single_process(
 # ---------------------------------------------------------------------------
 
 
+def _produce_and_upload_toolchain_archive(
+    args: argparse.Namespace,
+    tc_aggregate_drv: str,
+    log: logging.Logger,
+) -> int:
+    """Produce + upload the shared ``toolchains.drv.archive`` to the gateway.
+
+    Toolchain dedup ships the compiler-toolchain closure ONCE per
+    dispatch: the SUBMITTER produces it locally then transfers it to
+    the gateway ``<slurm_root_folder>/out/_matrix_eval/`` — that ``out/``
+    is bind-mounted into every secondary as ``/app/out-network``, so the
+    archive lands where the eval workers import it
+    (``/app/out-network/_matrix_eval/toolchains.drv.archive``) and the
+    build workers consume it. The submitter is NOT a worker (no
+    ``/app/out-network`` mount), so it cannot use ``task.publish`` — it
+    uses the framework gateway primitive (``create_directory`` +
+    ``upload_file``) instead, mirroring ``packaging/job_manager.py``.
+
+    AUTH: ``parse_gateway_url`` parses only the URL (it returns a
+    ``GatewayConfig`` with ``ssh_identity_file``/``ssh_config_file``
+    left ``None``); the consumer's ``--ssh-identity-file`` /
+    ``--ssh-config`` are threaded onto the config AFTER parsing, the
+    same way the framework's own dispatch threads them — so this upload
+    authenticates identically (e.g. LMU 1Password / IdentityAgent
+    bypass).
+
+    Returns 0 on success, 1 on any produce/upload failure (a missing
+    toolchain archive strands every per-binary diff archive downstream,
+    so the caller must abort the dispatch).
+    """
+    from dynamic_runner.packaging.gateway import (  # noqa: PLC0415
+        create_gateway,
+        parse_gateway_url,
+    )
+
+    from compiler_suit_runner import preflight  # noqa: PLC0415
+
+    # 1. Produce the archive locally (submitter-side tmp dir). The
+    #    toolchain aggregate closure is already realised on this host
+    #    (the preflight built it), so the export is a cheap requisites +
+    #    nix-store --export.
+    local_dir = pathlib.Path(tempfile.mkdtemp(prefix="csr-toolchain-archive-"))
+    try:
+        local_archive = preflight.export_toolchain_archive(
+            tc_aggregate_drv, local_dir,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "toolchain-dedup: failed to export toolchains.drv.archive "
+            "from %r: %s",
+            tc_aggregate_drv, exc,
+        )
+        return 1
+
+    # 2. Transfer to the gateway. parse_gateway_url leaves auth fields
+    #    None; thread the consumer's identity/config onto the config so
+    #    the upload authenticates the same way the rest of the dispatch
+    #    does.
+    cfg = parse_gateway_url(args.gateway)
+    cfg.ssh_identity_file = getattr(args, "ssh_identity_file", None)
+    cfg.ssh_config_file = getattr(args, "ssh_config", None)
+    remote_dir = f"{args.slurm_root_folder}/out/_matrix_eval"
+    remote_archive = f"{remote_dir}/{preflight.TOOLCHAIN_ARCHIVE_NAME}"
+    gw = create_gateway(cfg)
+    try:
+        gw.connect()
+        gw.create_directory(remote_dir)
+        gw.upload_file(str(local_archive), remote_archive)
+        log.info(
+            "toolchain-dedup: uploaded %s -> %s",
+            local_archive.name, remote_archive,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "toolchain-dedup: failed to upload toolchains.drv.archive to "
+            "%s: %s",
+            remote_archive, exc,
+        )
+        return 1
+    finally:
+        try:
+            gw.disconnect()
+        except Exception:  # noqa: BLE001 — best-effort teardown
+            pass
+    return 0
+
+
 def cmd_submit(args: argparse.Namespace) -> int:
     """Primary host: pre-flight (or cache hit) -> manifests -> dispatch.
 
@@ -1068,6 +1097,19 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # ``allow_toolchain_build`` flag, so the placement-map plumbing isn't
     # needed there (workers find peers via gossip).
     tc_drvs: dict[tuple[str, str], str] = {}
+    # Toolchain aggregate drv path; populated on the preflight path
+    # (cache-hit re-emits no matrix_eval tasks, so it stays empty there
+    # and the toolchain-archive export below is skipped). Default-init
+    # so the export guard near the matrix_eval_out_dir mkdir doesn't hit
+    # UnboundLocalError on the cache-hit branch.
+    tc_aggregate_drv: str = ""
+    # Toolchain-dedup feature flag (rollback): when OFF the per-binary
+    # matrix archives export the FULL closure (today's behaviour) and the
+    # submitter skips the toolchain-archive export. Resolved from the
+    # ``--no-toolchain-dedup`` submit flag plus the ``CSR_TOOLCHAIN_DEDUP``
+    # env override (``0`` disables); the resolved bool rides each
+    # matrix_eval task payload via ``per_binary_metadata``.
+    toolchain_dedup = _resolve_toolchain_dedup(args)
     partition_drv_outpaths: Optional[dict[str, str]] = None
     # Per-binary metadata for the JSON-free phase-2 (matrix_eval) +
     # phase-3 (dependency_graph) TaskInfos. Populated on the preflight
@@ -1188,6 +1230,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 "variant_seed": meta.get("sample_seed"),
                 "tier": meta.get("tier"),
                 "toolchain_aggregate_drv": tc_aggregate_drv,
+                # Toolchain-dedup feature flag carried per-binary so each
+                # matrix_eval worker knows whether to subtract the
+                # toolchain closure from its exported diff archive. OFF =
+                # full closure (today's behaviour); the consumers still
+                # import the toolchain archive first (harmless no-op).
+                "toolchain_dedup": toolchain_dedup,
                 # ``matrix_eval_out_dir`` is deliberately NOT carried
                 # in per_binary_metadata or in the dep_graph payload:
                 # the submitter-host path is invalid inside the
@@ -1328,9 +1376,40 @@ def cmd_submit(args: argparse.Namespace) -> int:
         per_binary_metadata=per_binary_metadata,
     )
 
+    # Inject --source / --output onto the parsed namespace before handing
+    # it to the framework's run(args=ns). SuitTask has no real source tree
+    # (items come from the preflight-emitted manifests), so --source points
+    # at the run's shared FS root (which we created and the framework's
+    # process_selection_arguments validates exists). --output is the real
+    # destination for finished binary tars: SuitTask threads
+    # config.dataset_dir into every build worker via --dataset-output-dir,
+    # so mirror that onto args.output for the framework's stats / lifecycle
+    # surface. Same injection the old cmd_submit did via forwarded argv,
+    # now on the namespace. We do NOT set resolved_output_root (the
+    # framework derives it from --output) and do NOT inject --src-network.
+    config.dataset_dir.mkdir(parents=True, exist_ok=True)
+    if config.matrix_eval_out_dir is not None:
+        config.matrix_eval_out_dir.mkdir(parents=True, exist_ok=True)
+        # Toolchain-dedup ``toolchains.drv.archive`` is NOT produced
+        # here directly: this local matrix_eval_out_dir is a different
+        # physical location than the container/gateway mount the SLURM
+        # workers read (they resolve matrix_eval_out_dir to
+        # /app/out-network/_matrix_eval). The SUBMITTER produces it
+        # locally and TRANSFERS it to the gateway out/_matrix_eval (which
+        # bind-mounts into each secondary's matrix_eval_out_dir) via the
+        # gateway primitive — see ``_produce_and_upload_toolchain_archive``
+        # called on the SLURM-dispatch path below. The eval workers then
+        # CONSUME (import) it before computing their per-binary diff
+        # exports (``eval_worker._import_toolchain_archive``).
+    args.source = str(shared_fs)
+    args.output = str(config.dataset_dir)
+    # The args= path of run() skips validate_parsed_args (the consumer
+    # owns validation); mirror the framework's cross-flag checks here.
+    _validate_framework_args(args, log)
+
     rc = 0
     if args.multi_computer == "single-process":
-        rc = run_single_process(config, logger=log)
+        rc = run_single_process(config, args=args, logger=log)
     elif args.multi_computer == "slurm":
         # Defer to dynamic_runner's SLURM pipeline. Imported lazily so
         # the test environment does not require the native extension.
@@ -1346,40 +1425,24 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
             return 1
 
-        # Opt-in override for clusters where the framework's gateway-port
-        # probe is necessary-but-not-sufficient: brasilianit (LMU CIP)
-        # binds the SSH reverse-forward on 0.0.0.0 — so the framework's
-        # auto-detect sets ``gateway_ports_enabled=True`` and selects
-        # gateway-direct outbound mode — but the kraterNN compute nodes
-        # are on a different segment and can't actually reach the gateway
-        # port. Setting ``DYNRUNNER_FORCE_REVERSE_CONNECTION=1`` coerces
-        # ``gateway_ports_enabled=True → False`` so the framework picks
-        # the ProxyJump-into-secondaries path. Remove once the framework
-        # grows a reachability probe or a config-level override.
-        if os.environ.get("DYNRUNNER_FORCE_REVERSE_CONNECTION") == "1":
-            try:
-                from dynamic_runner.packaging.gateway import (  # type: ignore[import-not-found]
-                    ssh_gateway as _dr_ssh_gateway,
-                )
-                _gw_cls = _dr_ssh_gateway.SSHGateway
-                _orig_setattr = _gw_cls.__setattr__
-
-                def _coerce_gpe(self, name, value, _o=_orig_setattr):  # noqa: ANN001
-                    if name == "gateway_ports_enabled" and value is True:
-                        value = False
-                    return _o(self, name, value)
-
-                _gw_cls.__setattr__ = _coerce_gpe
-                log.info(
-                    "DYNRUNNER_FORCE_REVERSE_CONNECTION=1: coercing "
-                    "gateway_ports_enabled=True→False to force ProxyJump"
-                )
-            except Exception:  # noqa: BLE001 — opt-in workaround; never fatal
-                log.exception(
-                    "DYNRUNNER_FORCE_REVERSE_CONNECTION=1 set but "
-                    "SSHGateway patch failed; dispatch continues with "
-                    "the framework's native decision"
-                )
+        # Toolchain-dedup: produce + upload the shared
+        # ``toolchains.drv.archive`` to the gateway BEFORE dispatch so the
+        # eval workers can import it (their per-binary diff exports
+        # subtract its closure). Only on the gateway path — a local /
+        # single-process dispatch has no gateway mount and the eval
+        # worker's dedup import is a no-op there. A missing archive
+        # strands every diff archive, so abort the run on failure.
+        if (
+            toolchain_dedup
+            and tc_aggregate_drv
+            and args.gateway
+            and args.slurm_root_folder
+        ):
+            rc = _produce_and_upload_toolchain_archive(
+                args, tc_aggregate_drv, log,
+            )
+            if rc != 0:
+                return rc
 
         # Submitter-peer: makes the dispatching machine's local nix
         # store reachable from compute-node containers as a federated
@@ -1451,43 +1514,9 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 submitter = None
                 extra_pf = ()
 
-        # Strip CSR-only flags from sys.argv before handing off:
-        # `dynamic_runner.run` re-parses sys.argv with its OWN
-        # argparse, which doesn't know about --shared-fs / --packages /
-        # --archs / --enable-ssh-debug / etc. Without this, the
-        # framework dies with "unrecognized arguments" right after
-        # preflight. The remaining tokens (--gateway, --multi-computer,
-        # --packaging, --slurm-root-folder, --jobs, --debug) flow
-        # through untouched.
-        original_argv = sys.argv
-        forwarded = _strip_csr_argv_for_framework(original_argv[1:])
-        # SuitTask doesn't have a real "source dir" — items come from
-        # the preflight-emitted manifests, not from walking a binaries
-        # tree. The framework still validates that `--source` exists,
-        # so point it at the run's shared FS root (`--shared-fs`) which
-        # we already created. Not a placeholder: it's the actual root
-        # of every artifact this run produces (manifests/, partition/,
-        # peers/, dataset/).
-        if "--source" not in forwarded and not any(
-            t.startswith("--source=") for t in forwarded
-        ):
-            forwarded += ["--source", str(shared_fs)]
-        # `--output` is the real destination for finished binary tars:
-        # SuitTask threads `config.dataset_dir` into every build worker
-        # via `--dataset-output-dir` (suit_task.py:_command_for_type),
-        # so the workers write `.tar.zst` artifacts directly into this
-        # directory. Mirror that here so the framework's `args.output`
-        # surface (used by lifecycle / stats reporting) points at the
-        # same location.
-        config.dataset_dir.mkdir(parents=True, exist_ok=True)
-        if config.matrix_eval_out_dir is not None:
-            config.matrix_eval_out_dir.mkdir(parents=True, exist_ok=True)
-        if "--output" not in forwarded and not any(
-            t.startswith("--output=") for t in forwarded
-        ):
-            forwarded += ["--output", str(config.dataset_dir)]
-        sys.argv = [original_argv[0]] + forwarded
-        log.debug("forwarded argv to dynamic_runner: %s", sys.argv)
+        # --source / --output were injected onto ``args`` before the
+        # multi-computer branch (the args= path of run() reads them off
+        # the namespace; the framework no longer re-parses sys.argv).
         try:
             task = SuitTask(config)
             # Propagate --enable-ssh-debug to the secondary container
@@ -1566,12 +1595,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 # flight during peak fan-out).
                 extra_run_args=tuple(run_args),
             )
-            dynamic_runner_run(task, deployment=deployment)
+            dynamic_runner_run(task, deployment=deployment, args=args)
         except Exception:  # noqa: BLE001
             log.exception("SLURM dispatch failed")
             return 1
         finally:
-            sys.argv = original_argv
             if submitter is not None:
                 try:
                     submitter.stop()
@@ -1679,8 +1707,14 @@ def cmd_secondary(args: argparse.Namespace) -> int:
             "won't fetch from sibling secondaries)"
         )
 
-    # Same argv-strip as cmd_submit: framework re-parses sys.argv.
-    sys.argv = [sys.argv[0]] + _strip_csr_argv_for_framework(sys.argv[1:])
+    # The framework's run(args=ns) reads framework flags (--secondary
+    # URL, --secondary-id, --cores, --full-log-dir, …) straight off the
+    # namespace. For the framework-spawned path those were parsed from
+    # the REAL spawned argv in main() (so the framework-regenerated flags
+    # land in ns — no flag loss); for the operator-invoked `secondary`
+    # subcommand they came from build_parser. Mirror the framework's
+    # cross-flag validation that the args= path skips.
+    _validate_framework_args(args, log)
 
     # Opt-in kill-chasing instrumentation, paired with the
     # SYS_PTRACE / env-propagation block in cmd_submit. Enabled by
@@ -1723,7 +1757,7 @@ def cmd_secondary(args: argparse.Namespace) -> int:
             secondary_module="compiler_suit_runner",
             image_name="asm-dataset-nix-runner",
         )
-        dynamic_runner_run(task, deployment=deployment)
+        dynamic_runner_run(task, deployment=deployment, args=args)
     except SystemExit as exc:
         rc = int(exc.code) if exc.code is not None else 0
     except Exception:  # noqa: BLE001
@@ -1793,6 +1827,60 @@ _DISPATCH = {
 }
 
 
+def _parse_framework_spawned_secondary(
+    raw: list[str],
+) -> argparse.Namespace:
+    """Parse the framework-spawned secondary argv into a namespace.
+
+    The dynamic_runner pipeline invokes our image with
+    ``python -m compiler_suit_runner --secondary tcp://… --secondary-id …
+    --secondary-quic-port … --cores … --max-memory … --full-log-dir …`` —
+    framework flags only, NO subcommand verb. We parse that REAL argv
+    through a framework-enabled parser so every framework-regenerated
+    flag lands on the namespace (no flag loss when run(args=ns) reads
+    them back), then overlay the consumer-side container defaults the
+    spawn argv does not carry (shared-fs, dataset/matrix-eval mounts,
+    ssh-debug intent forwarded via env vars).
+    """
+    parser = argparse.ArgumentParser(
+        prog="compiler_suit_runner [secondary]",
+        add_help=False,
+    )
+    _attach_framework_args(parser)
+    _add_common_args(parser)
+    _restore_framework_flag_defaults(parser)
+    # parse_known_args: the spawn argv may carry framework flags newer
+    # than the pinned cli surface; ignore unknowns rather than crash the
+    # secondary at parse time (the framework's own run() will use the
+    # values it knows about off the namespace).
+    ns, _unknown = parser.parse_known_args(raw)
+
+    ns.command = "secondary"
+    ns.flake = "."
+    # log-network = per-run scratch (manifests, partition, peers)
+    # bind-mounted into every secondary container.
+    ns.shared_fs = pathlib.Path("/app/log-network")
+    # out-tmp = the framework's per-task staging root. Workers write
+    # tarballs/sidecars here, then task.publish_all atomically delivers
+    # them to the gateway-shared output mount (/app/out-network). The
+    # ``dataset`` subdir keeps our .tar.zst outputs separate from other
+    # consumers (e.g. asm-tokenizer) of the same shared output dir.
+    ns.dataset_dir = pathlib.Path("/app/out-tmp/dataset")
+    # matrix_eval archives land on the shared bind mount so the primary's
+    # watcher can read them. /app/out-network is the container view of
+    # <shared_fs>/dataset (host view).
+    ns.matrix_eval_out_dir = pathlib.Path("/app/out-network/_matrix_eval")
+    ns.sys_name = getattr(ns, "sys_name", None) or "x86_64-linux"
+    # The primary side propagates --enable-ssh-debug via the
+    # CSR_ENABLE_SSH_DEBUG env var (the framework rebuilds this argv
+    # synthetically and does not forward our CLI flags). Read it here so
+    # the secondary's SuitTask config picks up the operator's intent.
+    ns.enable_ssh_debug = os.environ.get("CSR_ENABLE_SSH_DEBUG", "0") == "1"
+    ns.ssh_debug_port = int(os.environ.get("CSR_SSH_DEBUG_PORT", "22222"))
+    ns.submitter_peer = False
+    return ns
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Top-level entry. Returns exit code (0 on success).
 
@@ -1813,65 +1901,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # (shared-fs = /app/log-network — the run-id-scoped gateway dir
     # bind-mounted into every secondary container).
     if "--secondary" in raw:
-        # Pull the framework-assigned secondary id out of the raw argv
-        # so SuitTaskConfig.secondary_id matches what the primary
-        # coordinator dispatched. Framework spawns us with
-        # ``--secondary-id <id>`` (next-token form, never =VALUE).
-        sec_id: Optional[str] = None
-        for j, tok in enumerate(raw):
-            if tok == "--secondary-id" and j + 1 < len(raw):
-                sec_id = raw[j + 1]
-                break
-            if tok.startswith("--secondary-id="):
-                sec_id = tok.split("=", 1)[1]
-                break
-        ns = argparse.Namespace(
-            debug="--debug" in raw,
-            command="secondary",
-            flake=".",
-            # log-network = per-run scratch (manifests, partition,
-            # peers) bind-mounted into every secondary container.
-            shared_fs=pathlib.Path("/app/log-network"),
-            # out-tmp = the framework's per-task staging root.
-            # Workers write tarballs/sidecars here, then call
-            # ``task.publish_all`` to atomically deliver them to the
-            # gateway-shared output mount (``/app/out-network``). The
-            # ``dataset`` subdir keeps our ``.tar.zst`` outputs separate
-            # from other consumers (e.g. asm-tokenizer) of the same
-            # shared output dir on the gateway.
-            dataset_dir=pathlib.Path("/app/out-tmp/dataset"),
-            # matrix_eval archives land on the shared bind mount so the
-            # primary's watcher can read them. /app/out-network is the
-            # container view of <shared_fs>/dataset (host view).
-            matrix_eval_out_dir=pathlib.Path("/app/out-network/_matrix_eval"),
-            run_id=None,
-            sys_name="x86_64-linux",
-            packages=None,
-            archs=None,
-            multi_computer="slurm",
-            jobs=None,
-            packaging="podman",
-            gateway=None,
-            slurm_root_folder=None,
-            cachix_cache=None,
-            cachix_auth_token_file=None,
-            no_cache=False,
-            cache_root=DEFAULT_CACHE_ROOT,
-            submitter_peer=False,
-            submitter_harmonia_port=5005,
-            # The primary side propagates --enable-ssh-debug via the
-            # ``CSR_ENABLE_SSH_DEBUG`` env var (the framework rebuilds
-            # this argv synthetically and does not forward our CLI
-            # flags). Read it here so the secondary's SuitTask config
-            # picks up the operator's intent.
-            enable_ssh_debug=os.environ.get(
-                "CSR_ENABLE_SSH_DEBUG", "0"
-            ) == "1",
-            ssh_debug_port=int(
-                os.environ.get("CSR_SSH_DEBUG_PORT", "22222")
-            ),
-            secondary_id=sec_id,
-        )
+        ns = _parse_framework_spawned_secondary(raw)
         return cmd_secondary(ns)
 
     parser = build_parser()

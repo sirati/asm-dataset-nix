@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import pathlib
 import shutil
@@ -34,6 +35,12 @@ import sys
 import time
 from collections.abc import Callable
 from typing import Optional
+
+# Module logger. The worker subprocess routes stdlib logging to a per-
+# worker file (see :func:`main`), so INFO step logging surfaces in
+# ``worker_N.log`` — making a build's progress (and any failure point)
+# readable rather than silence through the whole ``nix build``.
+_LOG = logging.getLogger("compiler_suit_runner.build_worker")
 
 __all__ = [
     "BuildWorkerResult",
@@ -48,6 +55,7 @@ __all__ = [
     "write_sidecar_metadata",
     "build_worker",
     "ensure_binary_archive_imported",
+    "ensure_toolchain_archive_imported",
 ]
 
 
@@ -62,6 +70,17 @@ __all__ = [
 # the archive content is per-binary-per-run and the local nix store is
 # also per-worker (containers don't share /nix/store).
 _imported_binaries: set[str] = set()
+
+# Companion guard for the per-process, once-only import of the shared
+# ``toolchains.drv.archive`` (the toolchain-dedup pre-flight artefact).
+# With toolchain dedup the per-binary ``matrix-<binary>.drv.archive``
+# carries only ``requisites(matrix) − requisites(toolchain)``; the
+# toolchain closure ships once via this archive and MUST be imported
+# FIRST so the per-binary diff is importable. Like _imported_binaries
+# this is per-worker (containers don't share /nix/store) and resets on
+# process exit. There is exactly one toolchain archive per run, so a
+# bare bool suffices.
+_toolchain_imported: bool = False
 
 # Item-class string tokens (matched against the manifest header). Kept as
 # module-level constants so callers (manifest_gen, suit_task) reference
@@ -848,6 +867,111 @@ def ensure_binary_archive_imported(
     )
 
 
+def ensure_toolchain_archive_imported(
+    matrix_eval_out_dir: Optional[pathlib.Path],
+    *,
+    run_subprocess: Optional[Callable[..., tuple[bytes, bytes, int]]] = None,
+) -> None:
+    """Import the shared ``toolchains.drv.archive`` once per worker process.
+
+    Toolchain-dedup pre-flight writes ONE ``toolchains.drv.archive``
+    under ``matrix_eval_out_dir`` carrying the whole compiler-toolchain
+    closure. Each per-binary ``matrix-<binary>.drv.archive`` then ships
+    only ``requisites(matrix) − requisites(toolchain)`` — so on a
+    build-only secondary the toolchain archive MUST be imported FIRST
+    (before :func:`ensure_binary_archive_imported`) or the per-binary
+    diff is un-importable. The first build task on this worker process
+    imports it; subsequent tasks short-circuit via
+    :data:`_toolchain_imported`.
+
+    The archive is located by fixed name under ``matrix_eval_out_dir``
+    (no new payload field), mirroring the per-binary lookup. Failure to
+    import is escalated to :class:`RuntimeError` (the framework wraps it
+    into ``ErrorType::Errored``, retry-pass eligible) — without the
+    toolchain closure the subsequent ``nix build`` fails with a missing
+    drv anyway, so failing fast here is the better surface.
+
+    ``matrix_eval_out_dir`` may be ``None`` (legacy fixtures that don't
+    thread it) — in that case the import is a no-op. A zero-byte archive
+    is treated as "nothing to import" (the toolchain export wrote an
+    empty file) and short-circuits without error.
+    """
+    global _toolchain_imported
+    if matrix_eval_out_dir is None:
+        return
+    if _toolchain_imported:
+        return
+    archive_path = matrix_eval_out_dir / "toolchains.drv.archive"
+    # A zero-byte (or absent) archive carries nothing to import. We do
+    # NOT hard-fail on absence here: the per-binary archive import that
+    # follows is the load-bearing fatal check, and an operator running
+    # an older submit (no toolchain archive) still gets the full closure
+    # from the per-binary archive. Mark imported so we don't re-stat.
+    try:
+        size = archive_path.stat().st_size
+    except OSError:
+        _toolchain_imported = True
+        return
+    if size == 0:
+        _toolchain_imported = True
+        return
+    # Late import to keep the module-load graph lean for tests that
+    # never touch dependency_graph_worker.
+    from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+        archive as _archive,
+    )
+
+    ok, err, imported = _archive.import_archive(
+        archive_path, run_subprocess=run_subprocess,
+    )
+    if not ok:
+        raise RuntimeError(
+            "build_worker: failed to import toolchains.drv.archive "
+            f"from {archive_path}: "
+            + err.decode("utf-8", errors="replace").strip()
+        )
+    _toolchain_imported = True
+    import logging  # noqa: PLC0415 — local import; cheap
+    logging.getLogger(
+        "compiler_suit_runner.build_worker.archive_import"
+    ).info(
+        "imported toolchains.drv.archive (%d paths)", len(imported),
+    )
+
+
+def _run_import_prelude(
+    item_class: str,
+    payload: dict,
+    env: BuildWorkerEnv,
+) -> None:
+    """Toolchain-first archive import prelude for build tasks.
+
+    Imports the shared ``toolchains.drv.archive`` FIRST (once per worker
+    process) then the per-binary ``matrix-<binary>.drv.archive`` so the
+    matrix-aggregate drv graph — every variant AND common-dep ``.drv`` —
+    is local before the ``nix build`` below. With toolchain dedup the
+    per-binary archive is a diff against the toolchain closure, so the
+    toolchain import MUST precede it. Both imports are fatal (the drvs
+    must exist locally before the build). Raises :class:`RuntimeError`
+    on any import failure; callers convert that into a failed result.
+    """
+    ensure_toolchain_archive_imported(
+        env.matrix_eval_out_dir,
+        run_subprocess=env.run_subprocess,
+    )
+    binary = (
+        payload.get("pkg") if isinstance(payload.get("pkg"), str)
+        else payload.get("binary") if isinstance(payload.get("binary"), str)
+        else ""
+    )
+    ensure_binary_archive_imported(
+        binary or "",
+        env.matrix_eval_out_dir,
+        run_subprocess=env.run_subprocess,
+    )
+    del item_class  # reserved for future per-class prelude branching
+
+
 def _prefetch_variant_inputs(
     payload: dict,
     env: BuildWorkerEnv,
@@ -1012,30 +1136,27 @@ def build_worker(
     ):
         attr = "/nix/store/" + attr
 
+    _LOG.info("build START item_class=%s name=%s attr=%s", item_class, name, attr)
+
     # No per-class nix flags: `nix build` is idempotent (an output already
     # in the local store is a no-op), so build_common_dep needs no skip
     # flag. Do NOT re-add `--skip-existing` here — nix rejects it.
 
-    # Build prelude: import the per-binary matrix-eval archive (once per
-    # binary per worker process) so the matrix-aggregate drv graph — every
-    # variant AND common-dep ``.drv`` — is local; then (variants only)
-    # pre-fetch input deps the placement map knows about from a single
-    # targeted peer. Pre-fetch is best-effort; archive import is fatal
-    # (the drv must exist locally before the nix build below). The
-    # common-dep ``.drv`` is part of the variants' drv closure the archive
-    # captures, so the same import makes it available.
+    # Build prelude: toolchain-first archive import. Import the shared
+    # ``toolchains.drv.archive`` (once per worker process) BEFORE the
+    # per-binary ``matrix-<binary>.drv.archive`` so the matrix-aggregate
+    # drv graph — every variant AND common-dep ``.drv`` — is local; with
+    # toolchain dedup the per-binary archive is a diff against the
+    # toolchain closure, so the toolchain import must come first. Then
+    # (variants only) pre-fetch input deps the placement map knows about
+    # from a single targeted peer. Pre-fetch is best-effort; archive
+    # imports are fatal (the drv must exist locally before the nix build
+    # below). The common-dep ``.drv`` is part of the variants' drv closure
+    # the archive captures, so the same import makes it available.
     if item_class in (ITEM_CLASS_BUILD_VARIANT, ITEM_CLASS_BUILD_COMMON_DEP):
-        binary = (
-            payload.get("pkg") if isinstance(payload.get("pkg"), str)
-            else payload.get("binary") if isinstance(payload.get("binary"), str)
-            else ""
-        )
+        _LOG.info("build name=%s: importing toolchain+binary archives", name)
         try:
-            ensure_binary_archive_imported(
-                binary or "",
-                env.matrix_eval_out_dir,
-                run_subprocess=env.run_subprocess,
-            )
+            _run_import_prelude(item_class, payload, env)
         except RuntimeError as exc:
             return BuildWorkerResult(
                 item_class=item_class,
@@ -1047,6 +1168,7 @@ def build_worker(
         if item_class == ITEM_CLASS_BUILD_VARIANT:
             _prefetch_variant_inputs(payload, env)
 
+    _LOG.info("build name=%s: nix build START attr=%s", name, attr)
     try:
         success, stdout, stderr = build_attr(attr, env)
     except Exception as exc:  # noqa: BLE001 - never raise out
@@ -1087,6 +1209,8 @@ def build_worker(
             nix_log_excerpt=excerpt,
             error="nix build returned non-zero",
         )
+
+    _LOG.info("build name=%s: nix build DONE (ok)", name)
 
     output_path: Optional[pathlib.Path] = None
     if item_class == ITEM_CLASS_BUILD_VARIANT:
@@ -1168,6 +1292,9 @@ def build_worker(
             except Exception:  # noqa: BLE001 - sidecar is best-effort
                 pass
 
+        _LOG.info(
+            "build DONE variant=%s (%d outputs staged)", name, len(staged),
+        )
         return BuildWorkerResult(
             item_class=item_class,
             name=name,
@@ -1191,6 +1318,7 @@ def build_worker(
             env, success_outpath, drv_str, "common_dep",
         )
 
+    _LOG.info("build DONE common_dep=%s outpath=%s", name, success_outpath)
     return BuildWorkerResult(
         item_class=item_class,
         name=name,
@@ -1597,6 +1725,7 @@ def main() -> int:
                     toolchain_aggregate_drv=tc_drv,
                     matrix_drvs=matrix_drvs,
                     sys_name=sys_name,
+                    task=task,
                 )
             except BaseException as exc:  # noqa: BLE001
                 _handle_log.exception(

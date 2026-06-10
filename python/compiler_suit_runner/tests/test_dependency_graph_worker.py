@@ -62,6 +62,12 @@ class _SubprocessStub:
         # per-archive responses in invocation order.
         self.import_stdout = b""
         self.import_stdout_queue: list[bytes] = []
+        # Per-call return-code queue for ``nix-store --import`` (consumed
+        # in invocation order). With toolchain-first import the first
+        # import is the shared ``toolchains.drv.archive``; a queue lets a
+        # test pass that import then fail the per-binary one. Falls back
+        # to the scalar ``import_rc`` when exhausted/empty.
+        self.import_rc_queue: list[int] = []
         self.tree_stdout = b""
         self.tree_rc = 0
 
@@ -78,7 +84,11 @@ class _SubprocessStub:
                 stdout = self.import_stdout_queue.pop(0)
             else:
                 stdout = self.import_stdout
-            return stdout, self.import_stderr, self.import_rc
+            rc = (
+                self.import_rc_queue.pop(0)
+                if self.import_rc_queue else self.import_rc
+            )
+            return stdout, self.import_stderr, rc
         if argv[:3] == ["nix-store", "--query", "--tree"]:
             return self.tree_stdout, b"", self.tree_rc
         raise AssertionError(f"unexpected argv to stub: {argv!r}")
@@ -651,10 +661,29 @@ class TestRunDependencyGraphTask:
         materialises in the local store for the tree walk), but the
         kept-drv list no longer comes from the import stdout — D.1a's
         ``derive_variant_lookup_from_aggregate`` owns it now.
+
+        Also seeds the shared ``toolchains.drv.archive`` (toolchain
+        dedup): the worker imports it FIRST (toolchain-first) and
+        fatally raises if it is missing/zero-byte. The eval worker is
+        its producer in production; here we drop a non-empty placeholder
+        so the toolchain-first import step succeeds.
         """
+        self._seed_toolchain_archive(matrix_dir)
         archive = matrix_dir / f"matrix-{binary}.drv.archive"
         archive.write_bytes(b"fake")
         return archive
+
+    @staticmethod
+    def _seed_toolchain_archive(matrix_dir: pathlib.Path) -> pathlib.Path:
+        """Drop a non-empty placeholder ``toolchains.drv.archive``.
+
+        Idempotent (overwrites): seeding it once per binary in a
+        multi-binary test re-writes the identical placeholder, mirroring
+        the production race where N eval workers write the same file.
+        """
+        tc_archive = matrix_dir / "toolchains.drv.archive"
+        tc_archive.write_bytes(b"fake-toolchain")
+        return tc_archive
 
     def _matrix_agg(self, binary: str, *, hash_prefix: str = "ma") -> str:
         """Synthetic aggregate drv path for ``binary``."""
@@ -915,11 +944,15 @@ class TestRunDependencyGraphTask:
             matrix_drv=matrix_agg,
             run_subprocess=stub,
         )
-        # --import runs once even though the aggregate is "present".
+        # --import runs twice even though the aggregate is "present":
+        # once for the toolchain-first ``toolchains.drv.archive`` and
+        # once for the per-binary ``matrix-hello.drv.archive``. The
+        # closure must be resident locally for the tree walk; we do not
+        # probe-and-skip.
         import_calls = [
             c for c in stub.calls if c[:2] == ["nix-store", "--import"]
         ]
-        assert len(import_calls) == 1
+        assert len(import_calls) == 2
 
     def test_import_failure_raises(
         self, tmp_path: pathlib.Path, monkeypatch,
@@ -933,7 +966,10 @@ class TestRunDependencyGraphTask:
         )
 
         stub = _SubprocessStub()
-        stub.import_rc = 1
+        # Toolchain-first import succeeds (rc=0); the per-binary import
+        # then fails (rc=1) — proves the per-binary import-failure path
+        # still surfaces under toolchain-first import ordering.
+        stub.import_rc_queue = [0, 1]
         stub.import_stderr = b"borked"
 
         monkeypatch.setattr(
@@ -955,6 +991,81 @@ class TestRunDependencyGraphTask:
         # (one per archive on disk), not the task's ``binary`` kwarg.
         assert excinfo.value.binary == "hello"
         assert excinfo.value.stage == "import"
+
+    def test_missing_toolchain_archive_raises(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        """A missing (or zero-byte) shared ``toolchains.drv.archive``
+        is fatal at the toolchain-first import step: the per-binary diff
+        archives are un-importable without the toolchain closure. The
+        error is tagged ``binary='<toolchain>'`` stage
+        ``'toolchain_import'`` so a producer/transport regression surfaces
+        loudly instead of crashing deep in the per-binary import.
+        """
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        # Per-binary archive present, but NO toolchains.drv.archive.
+        (matrix_dir / "matrix-hello.drv.archive").write_bytes(b"fake")
+        matrix_agg = self._matrix_agg("hello", hash_prefix="mt")
+        self._patch_derive(
+            monkeypatch, {matrix_agg: self._stub_lookup_for("hello")},
+        )
+        stub = _SubprocessStub()
+        monkeypatch.setattr(
+            dgw, "build_sum_drv_multi",
+            lambda **kw: pytest.fail(
+                "build_sum_drv_multi must not be reached without the "
+                "toolchain archive"
+            ),
+        )
+        with pytest.raises(dgw.DependencyGraphWorkerError) as excinfo:
+            dgw.run_dependency_graph_task(
+                matrix_eval_out_dir=matrix_dir,
+                bash_path="/nix/store/bash",
+                toolchain_aggregate_drv=self._TC_AGG,
+                binary="hello",
+                matrix_drv=matrix_agg,
+                run_subprocess=stub,
+            )
+        assert excinfo.value.binary == "<toolchain>"
+        assert excinfo.value.stage == "toolchain_import"
+
+    def test_toolchain_import_failure_raises(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        """A non-zero rc on the toolchain-first ``nix-store --import``
+        surfaces as ``DependencyGraphWorkerError(stage='toolchain_import')``
+        before any per-binary archive is imported.
+        """
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        self._seed_archive(matrix_dir, "hello")
+        matrix_agg = self._matrix_agg("hello", hash_prefix="tf")
+        self._patch_derive(
+            monkeypatch, {matrix_agg: self._stub_lookup_for("hello")},
+        )
+        stub = _SubprocessStub()
+        # First (toolchain) import fails.
+        stub.import_rc_queue = [1]
+        stub.import_stderr = b"toolchain-import-borked"
+        monkeypatch.setattr(
+            dgw, "build_sum_drv_multi",
+            lambda **kw: pytest.fail(
+                "build_sum_drv_multi must not be reached after toolchain "
+                "import failure"
+            ),
+        )
+        with pytest.raises(dgw.DependencyGraphWorkerError) as excinfo:
+            dgw.run_dependency_graph_task(
+                matrix_eval_out_dir=matrix_dir,
+                bash_path="/nix/store/bash",
+                toolchain_aggregate_drv=self._TC_AGG,
+                binary="hello",
+                matrix_drv=matrix_agg,
+                run_subprocess=stub,
+            )
+        assert excinfo.value.binary == "<toolchain>"
+        assert excinfo.value.stage == "toolchain_import"
 
     def test_query_tree_failure_raises(
         self, tmp_path: pathlib.Path, monkeypatch,
@@ -1740,6 +1851,9 @@ class TestDependencyGraphCounters:
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
         (matrix_dir / "matrix-hello.drv.archive").write_bytes(b"x")
+        # Toolchain-first import requires a non-empty toolchains.drv.archive
+        # (the eval worker produces it in production).
+        (matrix_dir / "toolchains.drv.archive").write_bytes(b"x")
         agg_hello = "/nix/store/" + "rh" + "a" * 30 + "-matrix-hello.drv"
         tc_agg = "/nix/store/zzzz-toolchains.drv"
 
@@ -1939,3 +2053,145 @@ class TestStreamDrvTree:
         ):
             with pytest.raises(RuntimeError, match="no such derivation"):
                 list(dgw.stream_drv_tree("/nix/store/zzzz-sum.drv"))
+
+
+# ---------------------------------------------------------------------------
+# task-output publish: the worker publishes the pickle bytes (base64) on
+# the framework task-output channel so on_phase_end can read them
+# filesystem-agnostically (topology-proof under submitter-is-primary).
+# ---------------------------------------------------------------------------
+
+
+class _FakeTask:
+    """Records ``publish_string`` calls; optionally raises to exercise
+    the non-fatal publish-failure path."""
+
+    def __init__(self, *, raise_on_publish: bool = False) -> None:
+        self.published: list[tuple[str, str]] = []
+        self._raise = raise_on_publish
+
+    def publish_string(self, key: str, value: str) -> None:
+        if self._raise:
+            raise RuntimeError("simulated publish failure")
+        self.published.append((key, value))
+
+
+class TestRunDependencyGraphTaskPublishes(TestRunDependencyGraphTask):
+    """Reuse the parent's archive/lookup/planner stubs; assert the
+    pickle is ALSO published on the task-output channel."""
+
+    @staticmethod
+    def _decode_published(value: str):
+        import base64  # noqa: PLC0415
+        import pickle  # noqa: PLC0415
+
+        return pickle.loads(base64.b64decode(value))
+
+    def test_publishes_pickle_on_success(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        from compiler_suit_runner.workers.dependency_graph_worker.output import (  # noqa: PLC0415,E501
+            DEPENDENCY_GRAPH_PKL_OUTPUT_KEY,
+        )
+
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        self._seed_archive(matrix_dir, "hello")
+        matrix_agg = self._matrix_agg("hello", hash_prefix="pb")
+        self._patch_derive(
+            monkeypatch, {matrix_agg: self._stub_lookup_for("hello")},
+        )
+        stub = _SubprocessStub()
+        stub.tree_stdout = b"/nix/store/sum.drv\n"
+        monkeypatch.setattr(
+            dgw, "build_sum_drv_multi", lambda **kw: "/nix/store/sum.drv",
+        )
+        monkeypatch.setattr(
+            dgw, "plan_total",
+            lambda **kw: [Phase4Descriptor(
+                kind="build_variant", task_id="bv_hello",
+                name="build_variant__hello", payload={"binary": "hello"},
+                depends_on=(),
+            )],
+        )
+
+        task = _FakeTask()
+        result = dgw.run_dependency_graph_task(
+            matrix_eval_out_dir=matrix_dir,
+            bash_path="/nix/store/aaaa-bash",
+            toolchain_aggregate_drv=self._TC_AGG,
+            binary="hello",
+            matrix_drv=matrix_agg,
+            run_subprocess=stub,
+            task=task,
+        )
+        assert result.descriptor_count == 1
+        # Exactly one publish, under the canonical key.
+        assert len(task.published) == 1
+        key, value = task.published[0]
+        assert key == DEPENDENCY_GRAPH_PKL_OUTPUT_KEY
+        # The published bytes decode → pickle.loads → the SAME payload
+        # the worker wrote to the on-disk pickle.
+        published_payload = self._decode_published(value)
+        on_disk = result.output_path.read_bytes()
+        import pickle  # noqa: PLC0415
+        assert published_payload == pickle.loads(on_disk)
+        assert len(published_payload["descriptors"]) == 1
+
+    def test_publishes_empty_pickle(
+        self, tmp_path: pathlib.Path,
+    ):
+        from compiler_suit_runner.workers.dependency_graph_worker.output import (  # noqa: PLC0415,E501
+            DEPENDENCY_GRAPH_PKL_OUTPUT_KEY,
+        )
+
+        # No archives discovered → the empty short-circuit path; it must
+        # STILL publish a well-formed 0-descriptor payload.
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        task = _FakeTask()
+        result = dgw.run_dependency_graph_task(
+            matrix_eval_out_dir=matrix_dir,
+            bash_path="/nix/store/aaaa-bash",
+            toolchain_aggregate_drv=self._TC_AGG,
+            binary="hello",
+            matrix_drv=self._matrix_agg("hello"),
+            task=task,
+        )
+        assert result.descriptor_count == 0
+        assert len(task.published) == 1
+        key, value = task.published[0]
+        assert key == DEPENDENCY_GRAPH_PKL_OUTPUT_KEY
+        published_payload = self._decode_published(value)
+        assert published_payload["descriptors"] == []
+
+    def test_publish_failure_is_non_fatal(
+        self, tmp_path: pathlib.Path, caplog,
+    ):
+        import logging  # noqa: PLC0415
+
+        # A raising publish_string must NOT fail the worker — the fs
+        # pickle write already succeeded; the publish is best-effort.
+        matrix_dir = tmp_path / "_matrix_eval"
+        matrix_dir.mkdir()
+        task = _FakeTask(raise_on_publish=True)
+        with caplog.at_level(logging.WARNING):
+            result = dgw.run_dependency_graph_task(
+                matrix_eval_out_dir=matrix_dir,
+                bash_path="/nix/store/aaaa-bash",
+                toolchain_aggregate_drv=self._TC_AGG,
+                binary="hello",
+                matrix_drv=self._matrix_agg("hello"),
+                task=task,
+            )
+        assert result.descriptor_count == 0
+        # The fs pickle still exists and loads.
+        from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
+            load_phase4_descriptors,
+        )
+        descriptors, _summary = load_phase4_descriptors(result.output_path)
+        assert descriptors == []
+        # The failure was logged at WARNING, not raised.
+        assert any(
+            "failed to publish" in rec.message for rec in caplog.records
+        )

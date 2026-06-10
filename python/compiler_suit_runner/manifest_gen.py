@@ -296,6 +296,7 @@ def make_matrix_eval_header(
     toolchain_aggregate_drv: str,
     variant_sample: Optional[int] = None,
     variant_seed: Optional[str] = None,
+    toolchain_dedup: bool = True,
 ) -> ManifestHeader:
     """Build a matrix_eval (distributed-eval) :class:`ManifestHeader`.
 
@@ -319,6 +320,12 @@ def make_matrix_eval_header(
     Manifests built before this field was wired are rejected by
     schema validation, forcing a clean fresh preflight.
 
+    ``toolchain_dedup`` (default True) is the rollback switch for
+    toolchain dedup: when True the eval worker subtracts the toolchain
+    closure from the exported per-binary archive (the toolchain is
+    shipped once via the pre-flight ``toolchains.drv.archive``); when
+    False the per-binary archive exports the full closure as before.
+
     ``task_depends_on`` is left empty for now — once the
     ``build_compilers`` stage is wired (gated by ``--build-compilers``),
     matrix_eval should depend on every build_compilers task whose
@@ -336,6 +343,12 @@ def make_matrix_eval_header(
         "archs": archs_list,
         "attr": f"dataset.{sys_name}.{binary}",
         "toolchain_aggregate_drv": toolchain_aggregate_drv,
+        # Toolchain-dedup feature flag (default ON). When True the eval
+        # worker exports only ``requisites(matrix) − requisites(toolchain)``
+        # into the per-binary archive; when False it exports the full
+        # closure (today's behaviour). The toolchain archive is imported
+        # first by every consumer regardless, so this is the sole rollback.
+        "toolchain_dedup": bool(toolchain_dedup),
     }
     if variant_sample is not None:
         payload["variant_sample"] = variant_sample

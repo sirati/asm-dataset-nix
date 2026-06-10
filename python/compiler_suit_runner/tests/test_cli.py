@@ -514,7 +514,7 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
         lambda drvs: {d: f"{d}.out" for d in drvs},
     )
 
-    def fake_single_process(config, *, logger=None):
+    def fake_single_process(config, *, args=None, logger=None):
         state["single_process_calls"].append(config)
         return 0
 
@@ -632,6 +632,194 @@ def test_cmd_submit_cache_miss_runs_preflight_and_stores(
     assert stub_submit_helpers["restore_calls"] == []
     # On success, cache.store is called.
     assert stub_submit_helpers["cache_store_calls"]
+
+
+# ---------------------------------------------------------------------------
+# Submitter-side toolchain-archive produce + gateway upload (dedup, SLURM)
+# ---------------------------------------------------------------------------
+
+
+class _FakeGateway:
+    """Records connect / create_directory / upload_file / disconnect.
+
+    Stands in for the framework's ``Gateway`` so the submitter-side
+    toolchain-archive upload can be asserted without a real SSH hop.
+    """
+
+    def __init__(self, config) -> None:
+        self.config = config
+        self.connected = False
+        self.created_dirs: list[str] = []
+        self.uploads: list[tuple[str, str]] = []
+        self.disconnected = False
+
+    def connect(self) -> None:
+        self.connected = True
+
+    def create_directory(self, remote_dir) -> None:
+        self.created_dirs.append(str(remote_dir))
+
+    def upload_file(self, local, remote) -> None:
+        self.uploads.append((str(local), str(remote)))
+
+    def disconnect(self) -> None:
+        self.disconnected = True
+
+
+def _patch_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict:
+    """Patch the lazily-imported gateway API + the toolchain export.
+
+    Returns a state dict capturing the created gateway, the parsed
+    GatewayConfig (so auth threading can be asserted), and the
+    export_toolchain_archive call args.
+    """
+    from dynamic_runner.packaging.gateway import GatewayConfig
+
+    state: dict = {"gateway": None, "config": None, "export_calls": []}
+
+    def fake_parse(url):
+        # Mirror the real parser's shape: auth fields start unset.
+        cfg = GatewayConfig(
+            mode="ssh", ssh_user="kruppb", ssh_host="localhost",
+            ssh_port=2222,
+        )
+        state["config"] = cfg
+        return cfg
+
+    def fake_create(cfg):
+        gw = _FakeGateway(cfg)
+        state["gateway"] = gw
+        return gw
+
+    monkeypatch.setattr(
+        "dynamic_runner.packaging.gateway.parse_gateway_url", fake_parse,
+    )
+    monkeypatch.setattr(
+        "dynamic_runner.packaging.gateway.create_gateway", fake_create,
+    )
+
+    def fake_export(tc_agg, out_dir, *, run_subprocess=None):
+        state["export_calls"].append((tc_agg, pathlib.Path(out_dir)))
+        archive = pathlib.Path(out_dir) / "toolchains.drv.archive"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        archive.write_bytes(b"NIX_EXPORT:toolchain")
+        return archive
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.preflight.export_toolchain_archive", fake_export,
+    )
+    return state
+
+
+def test_produce_and_upload_toolchain_archive_happy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+):
+    """The submitter produces the toolchain archive locally then
+    create_directory + upload_file it to the gateway out/_matrix_eval,
+    threading --ssh-identity-file / --ssh-config onto the GatewayConfig
+    (parse_gateway_url leaves them None) so the upload authenticates the
+    same way the rest of the dispatch does."""
+    import logging
+
+    state = _patch_gateway(monkeypatch)
+    args = _make_args(
+        tmp_path,
+        multi_computer="slurm",
+        gateway="ssh://kruppb@localhost:2222",
+        slurm_root_folder="/data/slurm/asm-dataset",
+        ssh_identity_file="/tmp/id_ed25519",
+        ssh_config="/tmp/ssh_config",
+    )
+    rc = cli_module._produce_and_upload_toolchain_archive(
+        args, "/nix/store/tc-agg.drv", logging.getLogger("t"),
+    )
+    assert rc == 0
+    # Produced locally (submitter tmp dir, NOT the gateway path).
+    assert state["export_calls"]
+    assert state["export_calls"][0][0] == "/nix/store/tc-agg.drv"
+    # Uploaded to the gateway out/_matrix_eval (bind-mounts into
+    # /app/out-network on secondaries).
+    gw = state["gateway"]
+    assert gw.connected and gw.disconnected
+    assert gw.created_dirs == ["/data/slurm/asm-dataset/out/_matrix_eval"]
+    assert len(gw.uploads) == 1
+    local, remote = gw.uploads[0]
+    assert local.endswith("/toolchains.drv.archive")
+    assert remote == (
+        "/data/slurm/asm-dataset/out/_matrix_eval/toolchains.drv.archive"
+    )
+    # AUTH (R4): identity/config threaded onto the parsed config.
+    assert state["config"].ssh_identity_file == "/tmp/id_ed25519"
+    assert state["config"].ssh_config_file == "/tmp/ssh_config"
+
+
+def test_produce_and_upload_toolchain_archive_export_failure_returns_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+):
+    """A failed local produce returns 1 (abort dispatch) and never
+    touches the gateway."""
+    import logging
+
+    state = _patch_gateway(monkeypatch)
+
+    def boom(tc_agg, out_dir, *, run_subprocess=None):
+        raise RuntimeError("nix-store export failed")
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.preflight.export_toolchain_archive", boom,
+    )
+    args = _make_args(
+        tmp_path,
+        multi_computer="slurm",
+        gateway="ssh://kruppb@localhost:2222",
+        slurm_root_folder="/data/slurm/asm-dataset",
+        ssh_identity_file=None,
+        ssh_config=None,
+    )
+    rc = cli_module._produce_and_upload_toolchain_archive(
+        args, "/nix/store/tc-agg.drv", logging.getLogger("t"),
+    )
+    assert rc == 1
+    # Gateway was never created (produce failed first).
+    assert state["gateway"] is None
+
+
+def test_produce_and_upload_toolchain_archive_upload_failure_returns_1(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+):
+    """A gateway upload failure returns 1 and still disconnects."""
+    import logging
+
+    state = _patch_gateway(monkeypatch)
+
+    def fake_create(cfg):
+        gw = _FakeGateway(cfg)
+
+        def _boom(local, remote):
+            raise RuntimeError("scp refused")
+
+        gw.upload_file = _boom  # type: ignore[method-assign]
+        state["gateway"] = gw
+        return gw
+
+    monkeypatch.setattr(
+        "dynamic_runner.packaging.gateway.create_gateway", fake_create,
+    )
+    args = _make_args(
+        tmp_path,
+        multi_computer="slurm",
+        gateway="ssh://kruppb@localhost:2222",
+        slurm_root_folder="/data/slurm/asm-dataset",
+        ssh_identity_file=None,
+        ssh_config=None,
+    )
+    rc = cli_module._produce_and_upload_toolchain_archive(
+        args, "/nix/store/tc-agg.drv", logging.getLogger("t"),
+    )
+    assert rc == 1
+    assert state["gateway"].disconnected
 
 
 def test_cmd_submit_no_cache_flag_skips_lookup_and_store(
@@ -793,11 +981,15 @@ def test_cmd_submit_populates_per_binary_toolchain_aggregate_drv(
     assert pbm is not None
     assert "hello" in pbm
     # New flatten shape: archs, variant_sample, variant_seed, tier,
-    # toolchain_aggregate_drv. Per-arch suffix selection now lives in
-    # eval_worker, not the submit-time flatten loop. The dep_graph
-    # archive root is NOT threaded via per_binary_metadata anymore —
-    # the worker reads it from BuildWorkerEnv (container view), so
-    # this dict carries no path field.
+    # toolchain_aggregate_drv, toolchain_dedup. Per-arch suffix selection
+    # now lives in eval_worker, not the submit-time flatten loop. The
+    # dep_graph archive root is NOT threaded via per_binary_metadata
+    # anymore — the worker reads it from BuildWorkerEnv (container view),
+    # so this dict carries no path field. ``toolchain_dedup`` IS carried
+    # per-binary so each matrix_eval worker knows whether to subtract the
+    # toolchain closure from its exported diff archive (it defaults ON;
+    # the eval worker produces the shared toolchains.drv.archive — the
+    # submitter no longer exports it).
     assert "suffixes" not in pbm["hello"]
     assert "matrix_eval_out_dir" not in pbm["hello"]
     assert set(pbm["hello"].keys()) == {
@@ -806,8 +998,10 @@ def test_cmd_submit_populates_per_binary_toolchain_aggregate_drv(
         "variant_seed",
         "tier",
         "toolchain_aggregate_drv",
+        "toolchain_dedup",
     }
     assert pbm["hello"]["toolchain_aggregate_drv"] == aggregate_drv
+    assert pbm["hello"]["toolchain_dedup"] is True
     assert pbm["hello"]["archs"] == ["x86_64"]
     assert pbm["hello"]["variant_sample"] == 2
     assert pbm["hello"]["variant_seed"] == 42
@@ -970,6 +1164,11 @@ def test_unfulfillable_reinject_flag_accepts_zero(
 def test_unfulfillable_reinject_flag_rejects_negative(
     tmp_path: pathlib.Path,
 ):
+    """The flag is framework-owned (add_framework_arguments). Since the
+    count-flag validation fix it rejects a negative at parse time via a
+    non_negative_int converter — a negative budget is meaningless and
+    would otherwise hit the PyO3 u32 boundary as an OverflowError. Zero
+    stays valid: it disables the budget the flag gates."""
     parser = build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(
@@ -982,6 +1181,17 @@ def test_unfulfillable_reinject_flag_rejects_negative(
                 "--unfulfillable-reinject-max-per-task=-1",
             ]
         )
+    ok = parser.parse_args(
+        [
+            "submit",
+            "--shared-fs",
+            str(tmp_path),
+            "--multi-computer",
+            "single-process",
+            "--unfulfillable-reinject-max-per-task=0",
+        ]
+    )
+    assert ok.unfulfillable_reinject_max_per_task == 0
 
 
 def test_unfulfillable_reinject_flag_rejects_non_int(
@@ -1048,13 +1258,17 @@ def test_unfulfillable_reinject_default_plumbs_none_into_config(
     assert config.unfulfillable_reinject_max_per_task is None
 
 
-def test_unfulfillable_reinject_not_stripped_from_framework_argv():
-    """The flag must NOT be in the CSR-only strip set: the framework's
-    own argparse parses ``--unfulfillable-reinject-max-per-task`` and
-    plumbs it into PrimaryCoordinator(__init__). If we strip it before
-    handing argv to the framework, the operator's value silently
-    reverts to the framework default."""
-    forwarded = cli_module._strip_csr_argv_for_framework(
+def test_unfulfillable_reinject_lands_on_framework_namespace():
+    """Post-migration there is no CSR-only strip pass: the consumer's
+    submit subparser registers the framework flags directly (via
+    add_framework_arguments) and passes the SAME parsed namespace to
+    run(args=ns). So ``--unfulfillable-reinject-max-per-task 5`` must
+    land on ``args.unfulfillable_reinject_max_per_task`` — that's the
+    value the framework reads off the namespace (it is no longer
+    re-parsed from argv, so a lost flag would silently revert to the
+    framework default)."""
+    parser = build_parser()
+    args = parser.parse_args(
         [
             "submit",
             "--shared-fs",
@@ -1065,10 +1279,7 @@ def test_unfulfillable_reinject_not_stripped_from_framework_argv():
             "5",
         ]
     )
-    assert "--unfulfillable-reinject-max-per-task" in forwarded
-    # Adjacent value must survive too (argparse consumes the next token).
-    idx = forwarded.index("--unfulfillable-reinject-max-per-task")
-    assert forwarded[idx + 1] == "5"
+    assert args.unfulfillable_reinject_max_per_task == 5
 
 
 def test_apply_unfulfillable_reinject_cap_calls_setter_when_set(

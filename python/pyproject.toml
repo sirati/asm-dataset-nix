@@ -81,4 +81,5 @@ filterwarnings = [
 markers = [
     "slurm_live: end-to-end tests that drive the live slurm-test-env (off by default; run via -m slurm_live or by file path)",
     "nix: tests requiring a real nix-instantiate against this repo's flake (off by default; run via -m nix)",
+    "real_toolchain_import: eval_worker tests that exercise the real toolchain-archive import (opt out of the autouse no-op stub)",
 ]

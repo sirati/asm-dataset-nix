@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEPENDENCY_GRAPH_PICKLE",
+    "DEPENDENCY_GRAPH_PKL_OUTPUT_KEY",
     "DEPENDENCY_GRAPH_SUMMARY",
     "PHASE4_PICKLE_MAGIC",
     "PHASE4_PICKLE_FORMAT_VERSION",
@@ -39,6 +40,15 @@ __all__ = [
 # Output filenames written under ``<matrix_eval_out_dir>``.
 DEPENDENCY_GRAPH_PICKLE = "_dependency_graph.pkl"
 DEPENDENCY_GRAPH_SUMMARY = "_dependency_graph_summary.txt"
+
+# Framework task-output key under which the dependency_graph worker
+# publishes the (base64-encoded) pickle bytes. Single source of truth:
+# the worker publishes under this key and ``SuitTask.on_phase_end``
+# reads it back from the just-completed phase's task outputs, so the
+# spawn path is filesystem-agnostic (topology-proof under the
+# submitter-is-primary layout where the on-disk pickle is not local to
+# the primary).
+DEPENDENCY_GRAPH_PKL_OUTPUT_KEY = "dependency_graph_pkl"
 
 
 # ``PHASE4_PICKLE_MAGIC`` / ``PHASE4_PICKLE_FORMAT_VERSION`` are sourced
