@@ -150,14 +150,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_cli_parser()
     args = parser.parse_args(argv)
 
+    from compiler_suit_runner.streamed_spawn import (  # noqa: PLC0415
+        LocalMessageSink,
+    )
+
     from .errors import DependencyGraphWorkerError  # noqa: PLC0415
     from .run import run_dependency_graph_task  # noqa: PLC0415
 
     matrix_eval_out_dir = pathlib.Path(args.matrix_eval_out_dir)
     toolchain_task_ids = parse_task_id_mappings(args.toolchain_task_id)
 
+    # Ad-hoc CLI run: no framework Task, so the worker's streamed-spawn
+    # messages go to a counting log-and-discard sink.
+    logger.info(
+        "local CLI run: no framework primary attached; streamed spawn "
+        "messages will be discarded (logged per message)"
+    )
+    sink = LocalMessageSink()
     try:
         result = run_dependency_graph_task(
+            task=sink,
             matrix_eval_out_dir=matrix_eval_out_dir,
             bash_path=args.bash_path,
             toolchain_aggregate_drv=args.toolchain_aggregate_drv,
@@ -175,8 +187,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     logger.info(
         "dependency_graph_worker ok: wrote %s (%d binaries, %d descriptors)"
-        " in %.2fs",
+        " in %.2fs; local run discarded %d streamed message(s)"
+        " (%d bytes)",
         result.output_path, result.binary_count,
         result.descriptor_count, result.duration_seconds,
+        sink.messages_discarded, sink.bytes_discarded,
     )
     return 0

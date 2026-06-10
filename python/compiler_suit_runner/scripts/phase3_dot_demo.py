@@ -14,13 +14,18 @@ Run via ``python -m compiler_suit_runner.scripts.phase3_dot_demo``.
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import sys
 import tempfile
 import time
 from typing import Optional
 
-from compiler_suit_runner.preflight import enumerate_toolchains_only
+from compiler_suit_runner.preflight import (
+    enumerate_toolchains_only,
+    export_toolchain_archive,
+)
+from compiler_suit_runner.streamed_spawn import LocalMessageSink
 from compiler_suit_runner.workers.dependency_graph_worker import (
     build_sum_drv_multi,
     run_dependency_graph_task,
@@ -102,6 +107,18 @@ def run_demo(
 
     with tempfile.TemporaryDirectory(prefix="phase3-dot-demo-") as tmp_str:
         archive_dir = pathlib.Path(tmp_str)
+        # Point the eval worker's publish staging root into the demo's
+        # tmp dir (the container default /app/out-tmp does not exist on
+        # a dev box); the _NullTask publish stand-in then moves staged
+        # archives onto ``archive_dir``.
+        os.environ["DYNRUNNER_PUBLISH_SRC_ROOT"] = str(
+            archive_dir / "_publish-stage"
+        )
+        # The submitter half of toolchain dedup: produce the shared
+        # ``toolchains.drv.archive`` BEFORE the evals (production
+        # uploads it to the gateway's out/_matrix_eval/); the eval
+        # workers CONSUME it and export only the per-binary diff.
+        export_toolchain_archive(toolchain_aggregate_drv, archive_dir)
         matrix_aggregates = eval_all_binaries(
             binaries=binaries, archs=archs, sys_name=sys_name,
             sample_size=sample_size, sample_seed=sample_seed,
@@ -111,11 +128,20 @@ def run_demo(
 
         # Phase 3: production code path (import archives, build sum-drv,
         # stream-plan, write descriptors) — per-binary dispatch mirrors
-        # the framework's dependency_graph task fan-out.
+        # the framework's dependency_graph task fan-out. The worker
+        # streams descriptors via ``task.send_message``; the demo runs
+        # with no framework primary, so a LocalMessageSink counts and
+        # discards them (the demo consumes the returned result instead).
+        print(
+            "phase3-dot-demo: local run, no framework primary — "
+            "streamed spawn messages are discarded"
+        )
+        sink = LocalMessageSink()
         total_descriptors = 0
         total_binaries = 0
         for binary, matrix_agg in matrix_aggregates.items():
             dep_result = run_dependency_graph_task(
+                task=sink,
                 matrix_eval_out_dir=archive_dir,
                 bash_path=bash_path,
                 toolchain_aggregate_drv=toolchain_aggregate_drv,

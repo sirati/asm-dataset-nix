@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import pathlib
+import shutil
 
 from compiler_suit_runner._nix_eval_utils import (
     nix_eval_json,
@@ -38,12 +39,26 @@ class _NullTask:
     keyed-outputs wire (consumed by dependency_graph via
     ``predecessor_outputs``). The demo runs out-of-band with no
     framework around it and no successor task to consume the value, so
-    the publish is a documented no-op here. We avoid duck-typing on a
+    that publish is a documented no-op here. We avoid duck-typing on a
     bare ``Mock`` to keep the call site grep-friendly.
+
+    ``publish`` (file delivery) is NOT a no-op: the eval worker stages
+    the per-binary archive under ``DYNRUNNER_PUBLISH_SRC_ROOT`` and
+    publishes it to the shared mount; the demo's phase 3 reads those
+    archives back, so this stand-in delivers with a plain move (single
+    host, per-run tmp dirs, no concurrent publishers of one dst).
     """
 
     def publish_string(self, key: str, value: str) -> None:
         del key, value
+
+    def publish(self, src, *, dst=None, key=None) -> None:
+        del key
+        if dst is None:
+            raise ValueError("_NullTask.publish requires dst=")
+        dst = pathlib.Path(dst)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
 
 
 def resolve_bash_path() -> str:
@@ -123,12 +138,19 @@ def run_eval_for_binary(
         )
     header = make_matrix_eval_header(
         binary=binary, sys_name=sys_name, archs=archs,
-        suffixes=suffixes,
         toolchain_aggregate_drv=toolchain_aggregate_drv,
         variant_sample=0, variant_seed=sample_seed,
     )
+    # ``make_matrix_eval_header`` no longer ships suffixes (production
+    # eval workers enumerate per-arch suffix lists themselves), but the
+    # eval worker still honours a payload-level ``suffixes`` list as a
+    # ceiling. The demo pre-samples the calibration family above and
+    # splices it in here (with ``variant_sample=0`` so the worker keeps
+    # the full ceiling-filtered set instead of re-sampling).
+    payload = dict(header.payload)
+    payload["suffixes"] = suffixes
     result = run_eval_task(
-        payload=dict(header.payload),
+        payload=payload,
         out_dir=archive_dir,
         task=_NullTask(),
         flake_ref=flake_ref,

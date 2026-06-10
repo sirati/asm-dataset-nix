@@ -43,16 +43,22 @@ byte.  At production scale (~67,000 descriptors of ~622 bytes each)
 this yields on the order of 340-700 messages.
 
 This module is deliberately dependency-free: pure stdlib plus the
-:class:`Phase4Descriptor` dataclass.  No dynamic_runner imports, no
-I/O, no logging -- it is a codec, nothing more.
+:class:`Phase4Descriptor` dataclass.  No dynamic_runner imports and no
+I/O -- it is the protocol module.  The sole non-codec resident is
+:class:`LocalMessageSink`, the log-and-discard ``send_message`` stand-in
+for local (framework-less) debug/demo entry points; it lives here so
+those entries can import it without dragging framework deps.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 
 from .dependency_graph_planner.descriptors import Phase4Descriptor
+
+logger = logging.getLogger(__name__)
 
 SPAWN_TOPIC = "dependency_graph_spawn"
 SUMMARY_TOPIC = "dependency_graph_summary"
@@ -74,6 +80,37 @@ _DESCRIPTOR_FIELDS = (
 
 _SPAWN_BATCH_FIELDS = ("v", "kind", "seq", "descriptors")
 _SUMMARY_FIELDS = ("v", "kind", "total", "batches", "counters")
+
+
+# ---------------------------------------------------------------------------
+# Local (framework-less) message sink
+# ---------------------------------------------------------------------------
+
+
+class LocalMessageSink:
+    """Log-and-discard ``send_message`` stand-in for local entry points.
+
+    The dependency_graph worker hard-requires a ``task`` with
+    ``send_message(topic, data)`` to stream descriptor batches to the
+    primary. Local debug/demo invocations (the package's ``python -m``
+    CLI, the phase-3 dot demo) run with no framework and no primary to
+    receive them, so this sink counts and logs every message and drops
+    it. It is NOT a transport: nothing downstream ever sees the
+    descriptors, which is fine for entries that only consume the
+    returned :class:`DependencyGraphResult` / on-disk summary.
+    """
+
+    def __init__(self) -> None:
+        self.messages_discarded = 0
+        self.bytes_discarded = 0
+
+    def send_message(self, topic: str, data: bytes) -> None:
+        self.messages_discarded += 1
+        self.bytes_discarded += len(data)
+        logger.info(
+            "local run: discarding streamed message (topic=%s, %d bytes)",
+            topic, len(data),
+        )
 
 
 # ---------------------------------------------------------------------------
