@@ -17,11 +17,11 @@ cleanly:
   is written, the dependency_graph_worker derives variant_lookup from
   the imported .drv paths).
 * The framework ``dependency_graph`` phase runs
-  ``workers.dependency_graph_worker``, which writes
-  ``_dependency_graph.pkl``. :meth:`SuitTask.on_phase_end` then loads
-  that pickle and translates the descriptors into ``build_variant`` /
-  ``build_common_dep`` headers spawned via
-  ``primary_handle.spawn_tasks``.
+  ``workers.dependency_graph_worker``, which plans the phase-4
+  descriptors. :meth:`SuitTask.on_phase_end` then translates the
+  descriptors into ``build_variant`` / ``build_common_dep`` headers
+  spawned via ``primary_handle.spawn_tasks`` (descriptor handoff
+  transport pending replacement).
 * Final ``<dataset_dir>/<pkg>/<variant_dir>/`` directories are
   populated for every variant the run produced.
 * The cluster's placement-map gossip files name at least one holder

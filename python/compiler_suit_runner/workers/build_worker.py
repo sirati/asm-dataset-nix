@@ -1725,7 +1725,6 @@ def main() -> int:
                     toolchain_aggregate_drv=tc_drv,
                     matrix_drvs=matrix_drvs,
                     sys_name=sys_name,
-                    task=task,
                 )
             except BaseException as exc:  # noqa: BLE001
                 _handle_log.exception(

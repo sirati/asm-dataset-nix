@@ -56,9 +56,10 @@ def _render_dot(
     out_path: pathlib.Path,
 ) -> int:
     """Stream-plan per-binary sum-drv tree, emit merged dot, return size.
-    A second ``plan_from_drv_tree`` pass (after the descriptor pickle)
+    A second ``plan_from_drv_tree`` pass (after the descriptor planning)
     is needed because the renderer wants ``meta_templates`` keys the
-    pickle does not carry; the cost is wall-negligible on a warm tree."""
+    descriptor list does not carry; the cost is wall-negligible on a
+    warm tree."""
     from template_graph.dot import save_binary_merged_dot
     from template_graph.streaming import plan_from_drv_tree
 

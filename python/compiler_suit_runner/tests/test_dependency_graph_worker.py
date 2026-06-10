@@ -11,8 +11,6 @@ Coverage:
     (filter, label compose, collision detection);
   * import_archive happy + missing-file + subprocess-failure paths,
     including stdout-path capture;
-  * write_phase4_descriptors roundtrip (descriptor + summary), including
-    the ``_dependency_graph_summary.txt`` companion file shape;
   * --toolchain-task-id parser;
   * end-to-end run_dependency_graph_task with stubbed planner +
     sum-drv builder + subprocess;
@@ -535,74 +533,6 @@ class TestImportArchive:
 
 
 # ---------------------------------------------------------------------------
-# write_phase4_descriptors / write_phase4_summary_text
-# ---------------------------------------------------------------------------
-
-
-class TestWritePhase4Descriptors:
-    """Phase 6 pickle migration: the worker writes typed
-    :class:`Phase4Descriptor` instances to ``_dependency_graph.pkl`` so
-    the watcher (via ``load_phase4_descriptors``) gets them back with
-    zero re-tupling. A human-readable
-    ``_dependency_graph_summary.txt`` companion is written alongside.
-    """
-
-    def test_dataclass_descriptors_roundtrip(
-        self, tmp_path: pathlib.Path,
-    ):
-        from compiler_suit_runner.dependency_graph_planner import (
-            load_phase4_descriptors,
-        )
-
-        descriptors = [
-            Phase4Descriptor(
-                kind="build_common_dep",
-                task_id="cd_1",
-                name="common_dep_1",
-                payload={"a": 1},
-                depends_on=(),
-            ),
-            Phase4Descriptor(
-                kind="build_variant",
-                task_id="v_1",
-                name="variant_1",
-                payload={"b": 2},
-                depends_on=("cd_1",),
-            ),
-        ]
-        out_path = tmp_path / dgw.DEPENDENCY_GRAPH_PICKLE
-        out = dgw.write_phase4_descriptors(
-            descriptors=descriptors,
-            summary={"binary_count": 1, "descriptor_count": 2},
-            out_path=out_path,
-        )
-        assert out == out_path
-        recovered, summary = load_phase4_descriptors(out_path)
-        assert len(recovered) == 2
-        # Typed dataclasses survive the pickle roundtrip — no list
-        # coercion, no string-keyed dicts.
-        assert recovered[0].kind == "build_common_dep"
-        assert recovered[0].task_id == "cd_1"
-        assert recovered[1].depends_on == ("cd_1",)
-        assert summary == {"binary_count": 1, "descriptor_count": 2}
-
-    def test_empty_list_writes_valid_file(self, tmp_path: pathlib.Path):
-        from compiler_suit_runner.dependency_graph_planner import (
-            load_phase4_descriptors,
-        )
-
-        out_path = tmp_path / dgw.DEPENDENCY_GRAPH_PICKLE
-        dgw.write_phase4_descriptors(
-            descriptors=[],
-            summary={},
-            out_path=out_path,
-        )
-        recovered, summary = load_phase4_descriptors(out_path)
-        assert recovered == []
-        assert summary == {}
-
-
-# ---------------------------------------------------------------------------
 # _parse_task_id_mappings (CLI helper)
 # ---------------------------------------------------------------------------
 
@@ -739,9 +669,6 @@ class TestRunDependencyGraphTask:
     def test_empty_matrix_dir_writes_empty_graph(
         self, tmp_path: pathlib.Path,
     ):
-        from compiler_suit_runner.dependency_graph_planner import (
-            load_phase4_descriptors,
-        )
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
         result = dgw.run_dependency_graph_task(
@@ -753,12 +680,11 @@ class TestRunDependencyGraphTask:
         )
         assert result.binary_count == 0
         assert result.descriptor_count == 0
-        # ``output_path`` is the pickle; the loader recovers the empty
-        # descriptor list and the descriptor-derived summary fields.
-        descriptors, summary = load_phase4_descriptors(result.output_path)
-        assert descriptors == []
-        assert summary["binary_count"] == 0
-        assert summary["descriptor_count"] == 0
+        # ``output_path`` is the human-readable summary; it carries the
+        # descriptor-derived summary fields.
+        summary_text = result.output_path.read_text()
+        assert "binary_count: 0" in summary_text
+        assert "descriptor_count: 0" in summary_text
 
     def test_empty_toolchain_aggregate_raises(
         self, tmp_path: pathlib.Path,
@@ -898,13 +824,8 @@ class TestRunDependencyGraphTask:
         # nix-store --import was invoked (leaves need to be local for
         # the tree walk inside build_sum_drv_multi / query_drv_tree).
         assert any(c[:2] == ["nix-store", "--import"] for c in stub.calls)
-        # _dependency_graph.pkl was written.
-        from compiler_suit_runner.dependency_graph_planner import (
-            load_phase4_descriptors,
-        )
-        descriptors, _summary = load_phase4_descriptors(result.output_path)
-        assert len(descriptors) == 1
-        assert descriptors[0].task_id == "bv_hello"
+        # The human-readable summary was written.
+        assert "descriptor_count: 1" in result.output_path.read_text()
 
     def test_import_runs_unconditionally(
         self, tmp_path: pathlib.Path, monkeypatch,
@@ -1239,11 +1160,7 @@ class TestRunDependencyGraphTask:
         # The sum-drv builder never ran: a zero-variant wrapper cannot
         # be passed to the path-form helper.
         assert sum_drv_calls == []
-        from compiler_suit_runner.dependency_graph_planner import (
-            load_phase4_descriptors,
-        )
-        descriptors, _summary = load_phase4_descriptors(result.output_path)
-        assert descriptors == []
+        assert "descriptor_count: 0" in result.output_path.read_text()
 
     def test_no_nix_instantiate_outside_make_sum_drv(
         self, tmp_path: pathlib.Path, monkeypatch,
@@ -1304,7 +1221,7 @@ class TestRunDependencyGraphTask:
         """Single all-binaries dispatch: passing ``matrix_drvs`` (a
         {binary: drv} mapping) assembles ONE sum-drv wrapping every
         binary's matrix aggregate and runs ONE plan_total pass over all
-        of them — one ``_dependency_graph.pkl`` covering the whole run.
+        of them — one descriptor list covering the whole run.
         """
         matrix_dir = tmp_path / "_matrix_eval"
         matrix_dir.mkdir()
@@ -2053,145 +1970,3 @@ class TestStreamDrvTree:
         ):
             with pytest.raises(RuntimeError, match="no such derivation"):
                 list(dgw.stream_drv_tree("/nix/store/zzzz-sum.drv"))
-
-
-# ---------------------------------------------------------------------------
-# task-output publish: the worker publishes the pickle bytes (base64) on
-# the framework task-output channel so on_phase_end can read them
-# filesystem-agnostically (topology-proof under submitter-is-primary).
-# ---------------------------------------------------------------------------
-
-
-class _FakeTask:
-    """Records ``publish_string`` calls; optionally raises to exercise
-    the non-fatal publish-failure path."""
-
-    def __init__(self, *, raise_on_publish: bool = False) -> None:
-        self.published: list[tuple[str, str]] = []
-        self._raise = raise_on_publish
-
-    def publish_string(self, key: str, value: str) -> None:
-        if self._raise:
-            raise RuntimeError("simulated publish failure")
-        self.published.append((key, value))
-
-
-class TestRunDependencyGraphTaskPublishes(TestRunDependencyGraphTask):
-    """Reuse the parent's archive/lookup/planner stubs; assert the
-    pickle is ALSO published on the task-output channel."""
-
-    @staticmethod
-    def _decode_published(value: str):
-        import base64  # noqa: PLC0415
-        import pickle  # noqa: PLC0415
-
-        return pickle.loads(base64.b64decode(value))
-
-    def test_publishes_pickle_on_success(
-        self, tmp_path: pathlib.Path, monkeypatch,
-    ):
-        from compiler_suit_runner.workers.dependency_graph_worker.output import (  # noqa: PLC0415,E501
-            DEPENDENCY_GRAPH_PKL_OUTPUT_KEY,
-        )
-
-        matrix_dir = tmp_path / "_matrix_eval"
-        matrix_dir.mkdir()
-        self._seed_archive(matrix_dir, "hello")
-        matrix_agg = self._matrix_agg("hello", hash_prefix="pb")
-        self._patch_derive(
-            monkeypatch, {matrix_agg: self._stub_lookup_for("hello")},
-        )
-        stub = _SubprocessStub()
-        stub.tree_stdout = b"/nix/store/sum.drv\n"
-        monkeypatch.setattr(
-            dgw, "build_sum_drv_multi", lambda **kw: "/nix/store/sum.drv",
-        )
-        monkeypatch.setattr(
-            dgw, "plan_total",
-            lambda **kw: [Phase4Descriptor(
-                kind="build_variant", task_id="bv_hello",
-                name="build_variant__hello", payload={"binary": "hello"},
-                depends_on=(),
-            )],
-        )
-
-        task = _FakeTask()
-        result = dgw.run_dependency_graph_task(
-            matrix_eval_out_dir=matrix_dir,
-            bash_path="/nix/store/aaaa-bash",
-            toolchain_aggregate_drv=self._TC_AGG,
-            binary="hello",
-            matrix_drv=matrix_agg,
-            run_subprocess=stub,
-            task=task,
-        )
-        assert result.descriptor_count == 1
-        # Exactly one publish, under the canonical key.
-        assert len(task.published) == 1
-        key, value = task.published[0]
-        assert key == DEPENDENCY_GRAPH_PKL_OUTPUT_KEY
-        # The published bytes decode → pickle.loads → the SAME payload
-        # the worker wrote to the on-disk pickle.
-        published_payload = self._decode_published(value)
-        on_disk = result.output_path.read_bytes()
-        import pickle  # noqa: PLC0415
-        assert published_payload == pickle.loads(on_disk)
-        assert len(published_payload["descriptors"]) == 1
-
-    def test_publishes_empty_pickle(
-        self, tmp_path: pathlib.Path,
-    ):
-        from compiler_suit_runner.workers.dependency_graph_worker.output import (  # noqa: PLC0415,E501
-            DEPENDENCY_GRAPH_PKL_OUTPUT_KEY,
-        )
-
-        # No archives discovered → the empty short-circuit path; it must
-        # STILL publish a well-formed 0-descriptor payload.
-        matrix_dir = tmp_path / "_matrix_eval"
-        matrix_dir.mkdir()
-        task = _FakeTask()
-        result = dgw.run_dependency_graph_task(
-            matrix_eval_out_dir=matrix_dir,
-            bash_path="/nix/store/aaaa-bash",
-            toolchain_aggregate_drv=self._TC_AGG,
-            binary="hello",
-            matrix_drv=self._matrix_agg("hello"),
-            task=task,
-        )
-        assert result.descriptor_count == 0
-        assert len(task.published) == 1
-        key, value = task.published[0]
-        assert key == DEPENDENCY_GRAPH_PKL_OUTPUT_KEY
-        published_payload = self._decode_published(value)
-        assert published_payload["descriptors"] == []
-
-    def test_publish_failure_is_non_fatal(
-        self, tmp_path: pathlib.Path, caplog,
-    ):
-        import logging  # noqa: PLC0415
-
-        # A raising publish_string must NOT fail the worker — the fs
-        # pickle write already succeeded; the publish is best-effort.
-        matrix_dir = tmp_path / "_matrix_eval"
-        matrix_dir.mkdir()
-        task = _FakeTask(raise_on_publish=True)
-        with caplog.at_level(logging.WARNING):
-            result = dgw.run_dependency_graph_task(
-                matrix_eval_out_dir=matrix_dir,
-                bash_path="/nix/store/aaaa-bash",
-                toolchain_aggregate_drv=self._TC_AGG,
-                binary="hello",
-                matrix_drv=self._matrix_agg("hello"),
-                task=task,
-            )
-        assert result.descriptor_count == 0
-        # The fs pickle still exists and loads.
-        from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
-            load_phase4_descriptors,
-        )
-        descriptors, _summary = load_phase4_descriptors(result.output_path)
-        assert descriptors == []
-        # The failure was logged at WARNING, not raised.
-        assert any(
-            "failed to publish" in rec.message for rec in caplog.records
-        )

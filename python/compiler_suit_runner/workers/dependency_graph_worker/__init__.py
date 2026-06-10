@@ -24,10 +24,9 @@ Worker flow:
   5. ``dependency_graph_planner.plan_phase4_from_graph`` adapts the
      streaming result into a flat list of
      :class:`Phase4Descriptor` records.
-  6. The descriptor list is pickled to
-     ``<matrix_eval_out_dir>/_dependency_graph.pkl`` (with a companion
-     ``_dependency_graph_summary.txt`` for operator inspection) for the
-     primary-side spawn-tasks step to pick up.
+  6. The descriptor list is produced for the primary-side spawn-tasks
+     step (a ``_dependency_graph_summary.txt`` is written under
+     ``<matrix_eval_out_dir>`` for operator inspection).
 
 Module layout
 -------------
@@ -45,8 +44,7 @@ and test monkeypatches keep working unmodified:
                          presence probe + import.
   * :mod:`.sum_drv`   — sum-drv assembly + tree-walk.
   * :mod:`.plan`      — streaming-planner driver (single + multi-binary).
-  * :mod:`.output`    — atomic ``_dependency_graph.pkl`` writer +
-                         ``_dependency_graph_summary.txt`` companion.
+  * :mod:`.output`    — atomic ``_dependency_graph_summary.txt`` writer.
   * :mod:`.run`       — top-level driver function.
   * :mod:`.cli`       — argparse + ``main``.
 """
@@ -67,11 +65,7 @@ from .cli import main
 from .cli import parse_task_id_mappings as _parse_task_id_mappings
 from .errors import DependencyGraphResult, DependencyGraphWorkerError
 from .output import (
-    DEPENDENCY_GRAPH_PICKLE,
     DEPENDENCY_GRAPH_SUMMARY,
-    PHASE4_PICKLE_FORMAT_VERSION,
-    PHASE4_PICKLE_MAGIC,
-    write_phase4_descriptors,
     write_phase4_summary_text,
 )
 from .plan import (
@@ -92,10 +86,7 @@ from .sum_drv import (
 __all__ = [
     "DependencyGraphResult",
     "DependencyGraphWorkerError",
-    "DEPENDENCY_GRAPH_PICKLE",
     "DEPENDENCY_GRAPH_SUMMARY",
-    "PHASE4_PICKLE_FORMAT_VERSION",
-    "PHASE4_PICKLE_MAGIC",
     "binary_from_archive_name",
     "build_sum_drv",
     "build_sum_drv_multi",
@@ -111,7 +102,6 @@ __all__ = [
     "query_drv_tree",
     "run_dependency_graph_task",
     "stream_drv_tree",
-    "write_phase4_descriptors",
     "write_phase4_summary_text",
 ]
 

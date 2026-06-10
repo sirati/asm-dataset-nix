@@ -53,8 +53,7 @@ imports keep working unmodified.
                               :func:`plan_phase4_from_graph` -- the
                               per-binary and multi-binary drivers.
   * :mod:`.manifest_glue`  -- descriptor -> ``ManifestHeader`` translation,
-                              ``_dependency_graph.pkl`` reader, drv-path
-                              label key.
+                              drv-path label key.
 
 Decoupling notes
 ----------------
@@ -75,9 +74,8 @@ caller passes the streaming result as a plain dict (the same shape
 ``plan_from_tree_streaming`` returns, but also tolerant of a
 list-coerced form -- e.g. tuples-as-lists, stringified integer keys --
 so callers that route the streaming result through a serialisation
-layer keep working). This keeps unit tests dependency-free and lets
-the worker pickle dataclasses to ``_dependency_graph.pkl`` without
-dragging the adapter into the choice of on-disk format.
+layer keep working). This keeps unit tests dependency-free and keeps
+the adapter out of the choice of any downstream transport format.
 """
 
 from __future__ import annotations
@@ -94,12 +92,7 @@ from .descriptors import (
     _variant_task_id,
 )
 from .manifest_glue import (
-    PHASE4_PICKLE_FORMAT_VERSION,
-    PHASE4_PICKLE_MAGIC,
-    DependencyGraphPickleError,
     headers_from_descriptors,
-    load_phase4_descriptors,
-    load_phase4_descriptors_from_bytes,
     variant_label_key,
 )
 from .plan_total import (
@@ -125,16 +118,11 @@ from .shapes import (
 
 __all__ = [
     "DependencyGraphCycleError",
-    "DependencyGraphPickleError",
-    "PHASE4_PICKLE_FORMAT_VERSION",
-    "PHASE4_PICKLE_MAGIC",
     "Phase4Descriptor",
     "BinaryPlanInput",
     "convert_toolchain_drvs",
     "plan_phase4_for_binary",
     "plan_phase4_from_graph",
     "headers_from_descriptors",
-    "load_phase4_descriptors",
-    "load_phase4_descriptors_from_bytes",
     "variant_label_key",
 ]
