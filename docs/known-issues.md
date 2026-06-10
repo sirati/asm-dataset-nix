@@ -130,7 +130,7 @@ pipeline; under the new dependency_graph + streaming planner pipeline
 the cap is supposed to be applied by the planner itself, but that
 plumbing has not landed yet.
 
-**Where**: `python/compiler_suit_runner/cli.py:325-337` (help text),
+**Where**: `python/compiler_suit_runner/cli.py:291-303` (help text),
 `python/compiler_suit_runner/tests/slurm/run_helpers.py:410`
 (SLURM `default_invocation_for_smoke` still forwards
 `max_variants={1, 10, 50}` for the small/medium/large tiers).
@@ -146,6 +146,42 @@ exposure surface.
 planner (`template_graph/streaming.py` + `dependency_graph_planner.py`).
 Once that lands, either reactivate the CLI flag's effect or drop it
 entirely.
+
+---
+
+## `DYNRUNNER_FORCE_REVERSE_CONNECTION` env var removed (obsolete, now a warned no-op)
+
+**Status**: Removed — the workaround the variable enabled no longer
+exists; setting it has no effect beyond a WARN log at SLURM dispatch.
+
+**History**: `cmd_submit` used to honour
+`DYNRUNNER_FORCE_REVERSE_CONNECTION=1` as an opt-in workaround for
+clusters where the framework's gateway-port probe was
+necessary-but-not-sufficient (LMU CIP: `remote.cip.ifi.lmu.de` binds
+the SSH reverse-forward on `0.0.0.0`, so auto-detect reported
+`gateway_ports_enabled=True` and selected gateway-direct outbound
+mode, but the kraterNN compute nodes sit on a different segment and
+cannot reach the gateway port). The workaround monkeypatched
+`SSHGateway.__setattr__` to coerce `gateway_ports_enabled=True →
+False`, forcing the ProxyJump-into-secondaries path.
+
+**Why it is obsolete**: on the current dynamic-runner pin the SLURM
+pipeline hardwires the reverse-connection topology — the Rust
+dispatcher sets `use_reverse_connection = true` unconditionally
+(`crates/dynrunner-pyo3/src/slurm/pipeline/run_pipeline.rs`, "SLURM
+dispatch unconditionally uses ProxyJump-into-secondaries"; the
+gateway-direct branch is documented as legacy/unreachable for SLURM
+in `python/dynamic_runner/deployment_spec.py`). There is no
+gateway-direct decision left to coerce, so the workaround has nothing
+to do. It also could no longer work mechanically: `gateway_ports_enabled`
+is now a read-only Python property mirroring state owned by the Rust
+`RustSshGateway`, so a Python-side `__setattr__` patch is never
+consulted.
+
+**What replaced it**: nothing is needed — the framework default IS
+the behaviour the variable used to force. Operators with old LMU
+runbooks exporting the variable get a one-line WARN from `cmd_submit`
+("obsolete and ignored") and otherwise identical behaviour.
 
 ---
 

@@ -984,7 +984,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
             len(tc_pairs), len(tc_drvs),
         )
     else:
-        log.info("enumerating toolchains (cache miss)")
+        log.info(
+            "enumerating toolchains (%s)",
+            "cache miss" if tc_key else "cache disabled",
+        )
         try:
             tc_pairs, tc_drvs, tc_aggregate_drv = enumerate_toolchains_only(
                 args.flake, args.sys_name, archs=args.archs,
@@ -1015,6 +1018,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
             len(per_binary_meta_raw),
         )
     else:
+        log.info(
+            "enumerating variants (%s)",
+            "cache miss" if var_key else "cache disabled",
+        )
         try:
             per_binary_meta_raw = enumerate_variants(
                 args.flake,
@@ -1256,6 +1263,18 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 exc,
             )
             return 1
+
+        # Obsolete env-var workaround (see docs/known-issues.md):
+        # the framework hardwires ProxyJump-into-secondaries for SLURM
+        # dispatch, so there is no gateway-direct decision left to
+        # coerce. Warn so an operator exporting it learns it's a no-op.
+        if os.environ.get("DYNRUNNER_FORCE_REVERSE_CONNECTION"):
+            log.warning(
+                "DYNRUNNER_FORCE_REVERSE_CONNECTION is set but obsolete"
+                " and ignored: the dynamic-runner framework now always"
+                " uses the SSH ProxyJump (reverse-connection) topology"
+                " for SLURM dispatch (see docs/known-issues.md)"
+            )
 
         # Toolchain-dedup: produce + upload the shared
         # ``toolchains.drv.archive`` to the gateway BEFORE dispatch so the

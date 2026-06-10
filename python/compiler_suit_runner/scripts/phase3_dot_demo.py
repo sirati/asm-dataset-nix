@@ -110,21 +110,30 @@ def run_demo(
         # Point the eval worker's publish staging root into the demo's
         # tmp dir (the container default /app/out-tmp does not exist on
         # a dev box); the _NullTask publish stand-in then moves staged
-        # archives onto ``archive_dir``.
+        # archives onto ``archive_dir``. Saved + restored so the demo
+        # doesn't leak a dangling tmp path into the calling process
+        # (e.g. an in-process test runner).
+        saved_publish_root = os.environ.get("DYNRUNNER_PUBLISH_SRC_ROOT")
         os.environ["DYNRUNNER_PUBLISH_SRC_ROOT"] = str(
             archive_dir / "_publish-stage"
         )
-        # The submitter half of toolchain dedup: produce the shared
-        # ``toolchains.drv.archive`` BEFORE the evals (production
-        # uploads it to the gateway's out/_matrix_eval/); the eval
-        # workers CONSUME it and export only the per-binary diff.
-        export_toolchain_archive(toolchain_aggregate_drv, archive_dir)
-        matrix_aggregates = eval_all_binaries(
-            binaries=binaries, archs=archs, sys_name=sys_name,
-            sample_size=sample_size, sample_seed=sample_seed,
-            toolchain_aggregate_drv=toolchain_aggregate_drv,
-            archive_dir=archive_dir, flake_ref=flake_ref, root=root,
-        )
+        try:
+            # The submitter half of toolchain dedup: produce the shared
+            # ``toolchains.drv.archive`` BEFORE the evals (production
+            # uploads it to the gateway's out/_matrix_eval/); the eval
+            # workers CONSUME it and export only the per-binary diff.
+            export_toolchain_archive(toolchain_aggregate_drv, archive_dir)
+            matrix_aggregates = eval_all_binaries(
+                binaries=binaries, archs=archs, sys_name=sys_name,
+                sample_size=sample_size, sample_seed=sample_seed,
+                toolchain_aggregate_drv=toolchain_aggregate_drv,
+                archive_dir=archive_dir, flake_ref=flake_ref, root=root,
+            )
+        finally:
+            if saved_publish_root is None:
+                os.environ.pop("DYNRUNNER_PUBLISH_SRC_ROOT", None)
+            else:
+                os.environ["DYNRUNNER_PUBLISH_SRC_ROOT"] = saved_publish_root
 
         # Phase 3: production code path (import archives, build sum-drv,
         # stream-plan, write descriptors) — per-binary dispatch mirrors

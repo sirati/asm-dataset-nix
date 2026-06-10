@@ -7,13 +7,17 @@ primary calls this worker to translate the per-binary
 
 Worker flow:
 
-  1. ``nix-store --import < <matrix_eval_out_dir>/matrix-<binary>.drv.archive``
-     loads the kept variant drvs + their transitive input closure into
-     the primary's local store. The store paths printed on stdout by
-     ``nix-store --import`` ARE the kept-drv source — no sidecar JSON,
-     no header lookup.
-  2. Filter that stdout to ``*-elf-folder.drv`` to recover the kept
-     variant-drv list + per-binary ``variant_lookup``.
+  1. ``nix-store --import`` the shared ``toolchains.drv.archive``
+     FIRST, then every per-binary
+     ``<matrix_eval_out_dir>/matrix-<binary>.drv.archive`` (a diff
+     against the toolchain closure), materialising the kept variant
+     drvs + their transitive input closure in the local store. Only
+     the side effect matters — the import stdout is discarded.
+  2. Derive each binary's kept variant-drv list + ``variant_lookup``
+     from its matrix aggregate drv via
+     :func:`archive.derive_variant_lookup_from_aggregate`
+     (``nix-store --query`` on the aggregate; no sidecar JSON, no
+     import-stdout filtering).
   3. ``template_graph.make_sum_drv.make_sum_drv_from_paths`` glues
      toolchains + per-binary kept-drvs into a single sum-root drv;
      :func:`stream_drv_tree` then spawns ``nix-store --query --tree``
@@ -24,9 +28,11 @@ Worker flow:
   5. ``dependency_graph_planner.plan_phase4_from_graph`` adapts the
      streaming result into a flat list of
      :class:`Phase4Descriptor` records.
-  6. The descriptor list is produced for the primary-side spawn-tasks
-     step (a ``_dependency_graph_summary.txt`` is written under
-     ``<matrix_eval_out_dir>`` for operator inspection).
+  6. The descriptor list is streamed to the primary as batched custom
+     messages (:mod:`compiler_suit_runner.streamed_spawn`) for the
+     incremental spawn-tasks step (a ``_dependency_graph_summary.txt``
+     is written under ``<matrix_eval_out_dir>`` for operator
+     inspection).
 
 Module layout
 -------------
@@ -44,6 +50,11 @@ and test monkeypatches keep working unmodified:
                          presence probe + import.
   * :mod:`.sum_drv`   — sum-drv assembly + tree-walk.
   * :mod:`.plan`      — streaming-planner driver (single + multi-binary).
+  * :mod:`.slice`     — per-binary slicing of the streaming result
+                         (private helpers consumed by :mod:`.plan`).
+  * :mod:`.counters`  — pure-function per-category counter aggregation.
+  * :mod:`.summary`   — summary / violation log emitters + planner
+                         invocation shim.
   * :mod:`.output`    — atomic ``_dependency_graph_summary.txt`` writer.
   * :mod:`.run`       — top-level driver function.
   * :mod:`.cli`       — argparse + ``main``.
