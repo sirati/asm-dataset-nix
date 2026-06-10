@@ -769,10 +769,15 @@ def test_cmd_submit_hit_with_missing_toolchains_fails_like_miss(
     store behaves exactly like a miss would (abort before emission when
     --build-compilers is off)."""
     state = stub_submit_helpers
+    # The aggregate drv must be a real file: lookup_toolchains verifies
+    # its existence (GC-staleness guard) before returning a hit, and
+    # this test exercises the per-toolchain-OUTPUT staleness path.
+    agg = tmp_path / "fake-toolchains.drv"
+    agg.write_text("")
     state["toolchain_return"] = (
         (("x86_64", "gcc15"),),
         {("x86_64", "gcc15"): "/nix/store/fake-gcc15.drv"},
-        "/nix/store/fake-toolchains.drv",
+        str(agg),
     )
     state["variants_return"] = {
         "hello": {
@@ -1145,24 +1150,30 @@ _EQ_TC_DRVS = {
     ("aarch64", "clang18"): "/nix/store/fake-clang18.drv",
     ("x86_64", "gcc15"): "/nix/store/fake-gcc15.drv",
 }
-_EQ_TC_AGG = "/nix/store/fake-toolchains.drv"
-
-
-def _equivalence_stubs(monkeypatch: pytest.MonkeyPatch) -> dict:
+def _equivalence_stubs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> dict:
     """Fake ONLY the nix/git-touching helpers; the cache, stage
     selection, manifest emission (REAL ``emit_all_manifests``) and
     config building all run for real, so the captured state reflects
-    the production state-building path."""
+    the production state-building path.
+
+    The toolchain aggregate drv is a real on-disk file (under
+    ``tmp_path``) because ``lookup_toolchains`` verifies its existence
+    (GC-staleness guard) before returning a hit."""
+    tc_agg = tmp_path / "fake-toolchains.drv"
+    tc_agg.write_text("")
     state: dict = {
         "preflight_calls": 0,
         "variant_calls": 0,
         "configs": [],
         "eval_calls": [],
+        "tc_agg": str(tc_agg),
     }
 
     def fake_tc(flake_ref, sys_name, *, archs=None, run_subprocess=None):
         state["preflight_calls"] += 1
-        return _EQ_TC_PAIRS, dict(_EQ_TC_DRVS), _EQ_TC_AGG
+        return _EQ_TC_PAIRS, dict(_EQ_TC_DRVS), state["tc_agg"]
 
     def fake_var(
         flake_ref, sys_name, *, packages=None, archs=None,
@@ -1233,7 +1244,7 @@ def _run_miss_then_hit(
 ) -> dict:
     """Run cmd_submit twice (miss, then hit) against one cache root and
     two separate shared-fs dirs; return the harness state."""
-    state = _equivalence_stubs(monkeypatch)
+    state = _equivalence_stubs(monkeypatch, tmp_path)
     common = dict(cache_root=tmp_path / "cache", **arg_overrides)
 
     args_miss = _make_args(tmp_path / "miss", **common)
@@ -1291,7 +1302,7 @@ def test_cmd_submit_hit_state_equals_miss_state(
         # slurm_root_folder``; args are shared between the runs, the
         # dedup flag derives from args, so gate equality reduces to the
         # aggregate drv riding the hit path too.
-        assert meta["toolchain_aggregate_drv"] == _EQ_TC_AGG
+        assert meta["toolchain_aggregate_drv"] == state["tc_agg"]
 
     # Manifest sets identical: same files, same classes, same payloads
     # (the stage gate applied on both paths).

@@ -621,12 +621,21 @@ class IncrementalCache:
 
         Any validation failure is loudly logged and degrades to a miss;
         this method never raises.
+
+        A shape-valid entry whose ``tc_aggregate_drv`` no longer exists
+        in the local nix store (garbage-collected since the entry was
+        written) is ALSO a miss: downstream consumers (e.g. the slurm
+        path's ``export_toolchain_archive``) hand the drv path straight
+        to nix and would fail where a miss self-heals — the forced
+        re-enumeration re-instantiates the aggregate drv and the
+        re-store replaces the entry. A plain existence check is correct
+        here: ``.drv`` paths are regular files in ``/nix/store``.
         """
         payload = self._load_subentry(self.TOOLCHAINS_NAMESPACE, key)
         if payload is None:
             return None
         try:
-            return _toolchains_from_payload(payload)
+            triple = _toolchains_from_payload(payload)
         except ValueError as exc:
             logger.warning(
                 "incremental cache: invalid toolchains entry %s (%s);"
@@ -635,6 +644,19 @@ class IncrementalCache:
             )
             self._discard_invalid_subentry(self.TOOLCHAINS_NAMESPACE, key)
             return None
+        tc_aggregate_drv = triple[2]
+        # The legit-empty triple ``((), {}, "")`` (no toolchain leaves
+        # resolved) carries no drv path to verify.
+        if tc_aggregate_drv and not os.path.exists(tc_aggregate_drv):
+            logger.warning(
+                "incremental cache: toolchains entry %s references"
+                " aggregate drv %s which is gone from the local store"
+                " (garbage-collected?); treating as miss",
+                key, tc_aggregate_drv,
+            )
+            self._discard_invalid_subentry(self.TOOLCHAINS_NAMESPACE, key)
+            return None
+        return triple
 
     def store_toolchains(
         self,

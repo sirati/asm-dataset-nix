@@ -69,7 +69,20 @@ _TC_DRVS = {
     ("aarch64", "clang18"): "/nix/store/clang18.drv",
     ("x86_64", "gcc15"): "/nix/store/gcc15.drv",
 }
-_TC_AGG = "/nix/store/toolchains.drv"
+
+
+def _tc_agg(tmp_path: pathlib.Path) -> str:
+    """An aggregate drv path that actually exists on disk.
+
+    ``lookup_toolchains`` verifies the aggregate drv still exists (the
+    GC-staleness guard) before returning a hit, so hit-asserting tests
+    must store a real file rather than a fake ``/nix/store/...`` path.
+    """
+    path = tmp_path / "toolchains.drv"
+    if not path.exists():
+        path.write_text("")
+    return str(path)
+
 
 _VARIANTS = {
     "hello": {
@@ -366,7 +379,8 @@ def test_lookup_missing_returns_none(tmp_path: pathlib.Path):
 
 def test_toolchains_round_trip_exact(tmp_path: pathlib.Path):
     cache = _cache(tmp_path)
-    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    agg = _tc_agg(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, agg)
 
     restored = cache.lookup_toolchains("k1")
     assert restored is not None
@@ -376,7 +390,7 @@ def test_toolchains_round_trip_exact(tmp_path: pathlib.Path):
     assert pairs == _TC_PAIRS
     assert drvs == _TC_DRVS
     assert list(drvs.items()) == list(_TC_DRVS.items())
-    assert aggregate == _TC_AGG
+    assert aggregate == agg
 
 
 def test_toolchains_round_trip_empty_shapes(tmp_path: pathlib.Path):
@@ -385,6 +399,34 @@ def test_toolchains_round_trip_empty_shapes(tmp_path: pathlib.Path):
     cache = _cache(tmp_path)
     cache.store_toolchains("k1", (), {}, "")
     assert cache.lookup_toolchains("k1") == ((), {}, "")
+
+
+def test_lookup_toolchains_gcd_aggregate_drv_is_miss(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+):
+    """A shape-valid entry whose aggregate drv was GC'd from the local
+    store since the entry was written is a loudly-logged miss, and the
+    entry dir is discarded so the re-store after the forced
+    re-enumeration self-heals it (the store path's keep-the-existing-
+    entry race guard would otherwise preserve the stale entry forever)."""
+    cache = _cache(tmp_path)
+    agg = _tc_agg(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, agg)
+    assert cache.lookup_toolchains("k1") == (_TC_PAIRS, _TC_DRVS, agg)
+
+    # GC the aggregate drv out from under the entry.
+    pathlib.Path(agg).unlink()
+    with caplog.at_level("WARNING"):
+        assert cache.lookup_toolchains("k1") is None
+    assert any(
+        "gone from the local store" in r.getMessage()
+        for r in caplog.records
+    )
+    # Entry discarded so a re-store self-heals.
+    assert not (tmp_path / "cache" / "toolchains" / "k1").exists()
+    agg2 = _tc_agg(tmp_path)  # re-enumeration re-instantiates the drv
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, agg2)
+    assert cache.lookup_toolchains("k1") == (_TC_PAIRS, _TC_DRVS, agg2)
 
 
 def test_variants_round_trip_exact(tmp_path: pathlib.Path):
@@ -401,7 +443,8 @@ def test_namespaces_are_independent(tmp_path: pathlib.Path):
     """Storing under one namespace never produces a hit in the other,
     even for the same key string."""
     cache = _cache(tmp_path)
-    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    agg = _tc_agg(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, agg)
     assert cache.lookup_variants("k1") is None
     cache.store_variants("k2", _VARIANTS)
     assert cache.lookup_toolchains("k2") is None
@@ -409,7 +452,8 @@ def test_namespaces_are_independent(tmp_path: pathlib.Path):
 
 def test_store_leaves_no_tmp_dirs(tmp_path: pathlib.Path):
     cache = _cache(tmp_path)
-    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    agg = _tc_agg(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, agg)
     cache.store_variants("k1", _VARIANTS)
     leftovers = [
         p
@@ -422,7 +466,8 @@ def test_store_leaves_no_tmp_dirs(tmp_path: pathlib.Path):
 
 def test_store_does_not_clobber_existing(tmp_path: pathlib.Path):
     cache = _cache(tmp_path)
-    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    agg = _tc_agg(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, agg)
     entry = tmp_path / "cache" / "toolchains" / "k1" / "entry.json"
     sentinel = entry.read_text()
 
@@ -430,7 +475,7 @@ def test_store_does_not_clobber_existing(tmp_path: pathlib.Path):
     # values for one key are identical by construction).
     cache.store_toolchains("k1", (), {}, "")
     assert entry.read_text() == sentinel
-    assert cache.lookup_toolchains("k1") == (_TC_PAIRS, _TC_DRVS, _TC_AGG)
+    assert cache.lookup_toolchains("k1") == (_TC_PAIRS, _TC_DRVS, agg)
 
 
 def test_lookup_rejects_legacy_entry_dir(
@@ -449,8 +494,9 @@ def test_lookup_rejects_legacy_entry_dir(
         assert cache.lookup_toolchains("k1") is None
     assert not legacy.exists()
     # Self-heal: a subsequent store repopulates the entry.
-    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
-    assert cache.lookup_toolchains("k1") == (_TC_PAIRS, _TC_DRVS, _TC_AGG)
+    agg = _tc_agg(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, agg)
+    assert cache.lookup_toolchains("k1") == (_TC_PAIRS, _TC_DRVS, agg)
 
 
 def test_lookup_rejects_corrupt_json(
@@ -568,7 +614,8 @@ def test_lookup_variants_rejects_malformed_metadata(
 
 def test_invalidate_removes_key_from_all_namespaces(tmp_path: pathlib.Path):
     cache = _cache(tmp_path)
-    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    agg = _tc_agg(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, agg)
     cache.store_variants("k1", _VARIANTS)
     # Plus a legacy top-level entry dir under the same key.
     legacy = tmp_path / "cache" / "k1"
@@ -594,14 +641,16 @@ def test_invalidate_namespace_name_does_not_drop_namespace(
     """``invalidate("toolchains")`` must not rmtree the whole toolchains
     namespace dir via the legacy-cleanup path."""
     cache = _cache(tmp_path)
-    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    agg = _tc_agg(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, agg)
     cache.invalidate("toolchains")
     assert cache.lookup_toolchains("k1") is not None
 
 
 def test_clear_counts_and_removes(tmp_path: pathlib.Path):
     cache = _cache(tmp_path)
-    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    agg = _tc_agg(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, agg)
     cache.store_variants("k1", _VARIANTS)
     cache.store_variants("k2", {})
 
