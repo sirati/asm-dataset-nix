@@ -5,14 +5,15 @@ This module wires :mod:`compiler_suit_runner.preflight`,
 and :mod:`compiler_suit_runner.incremental_cache` into a small argparse
 front-end. Subcommands:
 
-* ``submit`` — primary host's flow: pre-flight (or incremental cache
-  hit), emit manifests, dispatch the run via either the in-process
-  single-process loop or the dynamic_runner SLURM bridge.
+* ``submit`` — primary host's flow: pre-flight (its two enumeration
+  steps memoized via the incremental cache), emit manifests, dispatch
+  the run via either the in-process single-process loop or the
+  dynamic_runner SLURM bridge.
 * ``secondary`` — secondary container entry: bring up peer-cache state
   and live until told to stop. SLURM dispatch handles per-item work.
 * ``preflight`` — pre-flight only; print the manifest count by class.
 * ``clear-cache`` — invalidate the local incremental cache (or one
-  specific hash).
+  specific cache key).
 
 Single-process execution is implemented inline via
 :func:`run_single_process` because it is small enough to keep with the
@@ -22,35 +23,30 @@ CLI; SLURM execution defers to dynamic_runner's pipeline.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import pathlib
 import socket
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Optional
-
-if TYPE_CHECKING:
-    from compiler_suit_runner.partition import VariantSpec
+from typing import Optional
 
 from compiler_suit_runner.incremental_cache import (
-    CacheEntry,
     DEFAULT_CACHE_ROOT,
     IncrementalCache,
-    InvocationAxes,
+    InputHashInputs,
+    ToolchainAxes,
+    VariantAxes,
     collect_input_hash_inputs,
-    compute_input_hash,
+    compute_subentry_key,
 )
 from compiler_suit_runner.manifest_gen import emit_all_manifests
 from compiler_suit_runner.nix_drv_show import eval_drv_outpaths
 from compiler_suit_runner.preflight import (
     PreflightError,
-    PreflightResult,
     build_toolchains_locally,
     check_toolchains_locally,
     enumerate_toolchains_only,
@@ -506,8 +502,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--hash",
         default=None,
         help=(
-            "Specific input_hash to invalidate (default: clear the entire"
-            " cache root)."
+            "Specific cache key to invalidate across every sub-entry"
+            " namespace (default: clear the entire cache root)."
         ),
     )
 
@@ -642,229 +638,66 @@ def _config_from_args(
     )
 
 
-def _backfill_toolchain_validate_outpath(
-    manifest_dir: pathlib.Path,
-    drv_to_outpath: dict[str, str],
-    log: logging.Logger,
-) -> None:
-    """Rewrite ``toolchain_validate__*.json`` manifests in
-    ``manifest_dir`` with the current ``payload.outpath`` value.
+def _toolchain_axes_from_args(args: argparse.Namespace) -> ToolchainAxes:
+    """Build the toolchains sub-entry axes from the parsed namespace.
 
-    Used on the cache-hit path: cached manifests pre-date the
-    submitter's outpath-resolution step, so the validate worker
-    refuses them with "manifest missing 'payload.outpath'". Reads the
-    drv from each manifest, looks up the resolved outpath, and
-    atomically rewrites the file when the lookup succeeds. Tolerates
-    parse / IO errors silently — the caller's downstream warning is
-    loud enough.
+    Exactly the inputs ``enumerate_toolchains_only`` reads off the
+    namespace at its :func:`cmd_submit` call site (``sys_name`` +
+    ``archs``); see :class:`ToolchainAxes` for the rationale per field.
     """
-    if not drv_to_outpath:
-        return
-    patched = 0
-    for path in sorted(manifest_dir.glob("toolchain_validate__*.json")):
-        try:
-            body = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        payload = body.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        if isinstance(payload.get("outpath"), str) and payload["outpath"]:
-            continue
-        drv = payload.get("drv")
-        if not isinstance(drv, str):
-            continue
-        outpath = drv_to_outpath.get(drv)
-        if not outpath:
-            continue
-        payload["outpath"] = outpath
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        try:
-            tmp.write_text(json.dumps(body, indent=2, sort_keys=True))
-            tmp.replace(path)
-        except OSError:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            continue
-        patched += 1
-    if patched:
-        log.info(
-            "cache-hit: backfilled payload.outpath into %d"
-            " toolchain_validate manifests", patched,
-        )
+    return ToolchainAxes.from_values(
+        sys_name=getattr(args, "sys_name", "x86_64-linux"),
+        archs=getattr(args, "archs", None),
+    )
 
 
-def _restore_manifests_from_archive(
-    archive: pathlib.Path, target_dir: pathlib.Path
-) -> dict[tuple[str, str], str]:
-    """Extract a cache-stored ``manifests.tar`` into ``target_dir``.
+def _variant_axes_from_args(args: argparse.Namespace) -> VariantAxes:
+    """Build the variants sub-entry axes from the parsed namespace.
 
-    Returns the restored ``{(arch, compiler): drv_path}`` mapping so the
-    caller can use it for the submitter placement broadcast on a
-    cache hit (without it, the placement map has no submitter entry
-    for toolchain outpaths, and the validate-only worker path fails
-    with "no peer in the placement map could serve it" even though
-    the toolchain manifests were restored correctly).
-
-    The archive's root entry is ``manifests/`` (see
-    :class:`IncrementalCache`); we strip that prefix so files land
-    directly in ``target_dir``.
-
-    A special ``manifests/_preflight.json`` entry, when present, holds
-    the serialized :class:`PreflightResult` we wrote at cache-store
-    time. We use it to re-emit manifests via
-    :func:`compiler_suit_runner.manifest_gen.emit_all_manifests` rather
-    than extracting potentially-huge sparse manifest files from the
-    archive (the cache only carries the small JSON descriptor; the
-    sparse files are recreated locally).
+    Exactly the inputs ``enumerate_variants`` reads off the namespace
+    at its :func:`cmd_submit` call site. Values are normalized the same
+    way the call site normalizes them (the ``variant_sample`` ``or 0``
+    / ``variant_seed`` ``or "42"`` fallbacks), so the key reflects the
+    effective invocation, not the raw flag spelling.
     """
-    target_dir.mkdir(parents=True, exist_ok=True)
-    preflight_blob: Optional[bytes] = None
-    with tarfile.open(archive, mode="r") as tf:
-        for member in tf.getmembers():
-            relative = (
-                member.name.split("/", 1)[1]
-                if "/" in member.name
-                else member.name
-            )
-            if not relative or relative.startswith(".."):
-                continue
-            if relative == "_preflight.json":
-                f = tf.extractfile(member)
-                if f is not None:
-                    preflight_blob = f.read()
-                continue
-            # We deliberately do NOT extract other members: the live
-            # manifests are sparse multi-PiB files that we only want to
-            # materialize once via emit_all_manifests below.
-
-    if preflight_blob is None:
-        raise RuntimeError(
-            "cache archive missing _preflight.json; cannot restore manifests"
-        )
-
-    from compiler_suit_runner.partition import VariantSpec
-
-    pre_dict = json.loads(preflight_blob.decode("utf-8"))
-    sys_name = pre_dict.get("sys_name", "x86_64-linux")
-    variants: tuple[VariantSpec, ...] = tuple(
-        VariantSpec(
-            label=v["label"],
-            drv=v["drv"],
-            variant_dir=v["variant_dir"],
-            metadata_name=v["metadata_name"],
-            compiler_id=v["compiler_id"],
-            compiler_family=v["compiler_family"],
-            compiler_version=v["compiler_version"],
-            optimization=v["optimization"],
-            flag_set=v["flag_set"],
-            hardening=v["hardening"],
-            sanitizer=v["sanitizer"],
-            march=v["march"],
-            tier=int(v["tier"]),
-            pkg=v["pkg"],
-            arch=v["arch"],
-        )
-        for v in pre_dict.get("variants", [])
-    )
-    toolchain_specs = tuple(
-        (entry[0], entry[1]) for entry in pre_dict.get("toolchain_specs", [])
-    )
-    common_dep_drvs = tuple(
-        (entry[0], entry[1]) for entry in pre_dict.get("common_dep_drvs", [])
-    )
-    tc_drvs: dict[tuple[str, str], str] = {
-        (entry[0], entry[1]): entry[2]
-        for entry in pre_dict.get("toolchain_drvs_by_pair", [])
-        if isinstance(entry, list) and len(entry) == 3
-    }
-    num_workers = int(pre_dict.get("num_workers", 1))
-    allow_toolchain_build = bool(pre_dict.get("allow_toolchain_build", False))
-    emit_all_manifests(
-        target_dir=target_dir,
-        sys_name=sys_name,
-        variants=variants,
-        toolchain_specs=toolchain_specs,
-        common_deps=common_dep_drvs,
-        num_workers=num_workers,
-        toolchain_drvs=tc_drvs,
-        allow_toolchain_build=allow_toolchain_build,
-    )
-    return tc_drvs
-
-
-def _serialize_preflight_for_cache(
-    pre: PreflightResult,
-    num_workers: int,
-    target_path: pathlib.Path,
-    *,
-    toolchain_drvs_by_pair: Optional[dict[tuple[str, str], str]] = None,
-    allow_toolchain_build: bool = False,
-) -> None:
-    """Write the cacheable subset of a :class:`PreflightResult` as JSON.
-
-    We only persist what :func:`emit_all_manifests` needs to recreate the
-    manifest tree on a future cache hit: variants, toolchain_specs,
-    common_dep_drvs, sys_name, num_workers, and the realised toolchain
-    drv paths keyed by (arch, compiler). Storing the sparse manifest
-    files themselves would explode the cache (each is up to ~1.5 PiB
-    apparent-size).
-
-    Without ``toolchain_drvs_by_pair`` the restored toolchain manifests
-    fall back to ``flake_ref#_crossToolchainMap.<...>``, which fails on
-    SLURM secondaries (no flake.nix in /app).
-    """
-    tc_pairs = toolchain_drvs_by_pair or {}
-    payload = {
-        "sys_name": pre.sys_name,
-        "variants": [dict(v) for v in pre.variants],
-        "toolchain_specs": [list(p) for p in pre.toolchain_specs],
-        "common_dep_drvs": [list(p) for p in pre.common_dep_drvs],
-        "toolchain_drvs_by_pair": [
-            [arch, compiler, drv]
-            for (arch, compiler), drv in sorted(tc_pairs.items())
-        ],
-        "toolchain_aggregate_drv": pre.toolchain_aggregate_drv,
-        "num_workers": num_workers,
-        "allow_toolchain_build": bool(allow_toolchain_build),
-    }
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text(json.dumps(payload, sort_keys=True, indent=2))
-
-
-def _invocation_axes_from_args(args: argparse.Namespace) -> InvocationAxes:
-    """Build the cache-key invocation axes from the parsed namespace.
-
-    Covers every CLI axis that changes what the pre-flight / matrix
-    planning produces (see :class:`InvocationAxes` for the rationale
-    per field). Values are normalized exactly like the pre-flight call
-    sites in :func:`cmd_submit` normalize them (e.g. the
-    ``variant_sample`` ``or 0`` / ``variant_seed`` ``or "42"``
-    fallbacks), so the key reflects the effective invocation, not the
-    raw flag spelling.
-    """
-    return InvocationAxes.from_values(
+    return VariantAxes.from_values(
+        sys_name=getattr(args, "sys_name", "x86_64-linux"),
         packages=getattr(args, "packages", None),
         archs=getattr(args, "archs", None),
         variant_sample=getattr(args, "variant_sample", 0) or 0,
         variant_seed=getattr(args, "variant_seed", "42") or "42",
-        sys_name=getattr(args, "sys_name", "x86_64-linux"),
-        build_compilers=bool(getattr(args, "build_compilers", False)),
-        debug_testbuild=getattr(args, "debug_testbuild", None),
-        toolchain_dedup=_resolve_toolchain_dedup(args),
     )
 
 
-def _compute_input_hash(
-    repo_root: pathlib.Path, args: argparse.Namespace
-) -> str:
-    """Compute the cache key from the flake state + invocation axes."""
-    inputs = collect_input_hash_inputs(
-        repo_root, invocation=_invocation_axes_from_args(args)
+def _collect_repo_inputs_for_cache(
+    args: argparse.Namespace, log: logging.Logger
+) -> Optional[InputHashInputs]:
+    """Collect the repo-state half of the memoization keys, or ``None``.
+
+    ``args.flake`` is normally a local path (``"."`` or a checkout
+    path). For a NON-path flake ref (``github:...``, a registry alias)
+    ``pathlib.Path(args.flake).resolve()`` still produces *a*
+    filesystem path — it just points at a directory that has no
+    ``flake.lock`` / ``.git``, so :func:`collect_input_hash_inputs`
+    raises and we deliberately degrade to "no cache" (every enumeration
+    runs) rather than mis-keying the cache on an unrelated directory.
+    This used to be an accidental property of a broad exception guard;
+    it is now the documented contract of this helper.
+    """
+    repo_root = (
+        pathlib.Path(args.flake).resolve()
+        if args.flake != "."
+        else pathlib.Path.cwd()
     )
-    return compute_input_hash(inputs)
+    try:
+        return collect_input_hash_inputs(repo_root)
+    except Exception:  # noqa: BLE001
+        log.warning(
+            "failed to collect repo state for the incremental cache;"
+            " continuing without cache",
+            exc_info=True,
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1079,11 +912,27 @@ def _produce_and_upload_toolchain_archive(
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
-    """Primary host: pre-flight (or cache hit) -> manifests -> dispatch.
+    """Primary host: enumeration (memoized) -> manifests -> dispatch.
 
-    The cache-hit shortcut keys on the input_hash and copies
-    ``manifests.tar`` out of the cache into the shared FS manifest dir,
-    skipping the local pre-flight entirely.
+    The incremental cache memoizes ONLY the two pure enumeration
+    steps, each under its own key (repo state + the axis subset that
+    function actually reads):
+
+    * ``toolchains/<key>`` — :func:`enumerate_toolchains_only` (the
+      expensive ~5-min nix-eval-jobs pass + the aggregate instantiate),
+      keyed on ``(repo state, sys_name, archs)``.
+    * ``variants/<key>`` — :func:`enumerate_variants`, keyed on
+      ``(repo state, sys_name, packages, archs, variant_sample,
+      variant_seed)``.
+
+    EVERYTHING downstream of the enumerations — the per-binary
+    metadata flatten, the empty-aggregate fail-fast, the local
+    toolchain availability check, outpath resolution, stage selection,
+    manifest emission, SuitTaskConfig construction and the
+    toolchain-archive upload gate — runs unconditionally on every
+    invocation. A cache hit therefore reaches dispatch with exactly
+    the same state a miss builds: there is only one state-building
+    path.
     """
     log = _setup_logging(args.debug)
 
@@ -1098,39 +947,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
     run_id = _resolve_run_id(args)
     num_workers = _resolve_jobs(args)
-
-    cache = IncrementalCache(args.cache_root)
-
-    # Compute input hash; failure here is non-fatal — we still proceed
-    # without caching, mirroring the plan's "cache invalidation" notes.
-    input_hash = ""
-    repo_root = pathlib.Path(args.flake).resolve() if args.flake != "." else pathlib.Path.cwd()
-    try:
-        input_hash = _compute_input_hash(repo_root, args)
-    except Exception:  # noqa: BLE001
-        log.warning(
-            "failed to compute input hash; continuing without cache",
-            exc_info=True,
-        )
-
-    cache_hit: Optional[CacheEntry] = None
-    if input_hash and not args.no_cache:
-        cache_hit = cache.lookup(input_hash)
-
-    pre: Optional[PreflightResult] = None
-    # Default-init these so the cache-hit path (which skips preflight)
-    # doesn't hit UnboundLocalError when downstream code references them:
-    # submitter placement broadcast, cache.store payload, etc. Cache
-    # restore re-emits manifests with the persisted
-    # ``allow_toolchain_build`` flag, so the placement-map plumbing isn't
-    # needed there (workers find peers via gossip).
-    tc_drvs: dict[tuple[str, str], str] = {}
-    # Toolchain aggregate drv path; populated on the preflight path
-    # (cache-hit re-emits no matrix_eval tasks, so it stays empty there
-    # and the toolchain-archive export below is skipped). Default-init
-    # so the export guard near the matrix_eval_out_dir mkdir doesn't hit
-    # UnboundLocalError on the cache-hit branch.
-    tc_aggregate_drv: str = ""
     # Toolchain-dedup feature flag (rollback): when OFF the per-binary
     # matrix archives export the FULL closure (today's behaviour) and the
     # submitter skips the toolchain-archive export. Resolved from the
@@ -1138,65 +954,37 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # env override (``0`` disables); the resolved bool rides each
     # matrix_eval task payload via ``per_binary_metadata``.
     toolchain_dedup = _resolve_toolchain_dedup(args)
-    partition_drv_outpaths: Optional[dict[str, str]] = None
-    # Per-binary metadata for the JSON-free phase-2 (matrix_eval) +
-    # phase-3 (dependency_graph) TaskInfos. Populated on the preflight
-    # path; threaded onto the SuitTaskConfig so discover_items builds
-    # those tasks in-memory. The cache-hit path leaves it empty (the
-    # cache persists only the build-phase PreflightResult subset, not
-    # per-binary matrix_eval metadata), matching the prior behaviour
-    # where restore never re-emitted matrix_eval manifests.
-    per_binary_metadata: dict[str, dict] = {}
 
-    if cache_hit is not None:
-        log.info("cache hit: %s", input_hash)
-        try:
-            tc_drvs = _restore_manifests_from_archive(
-                cache_hit.manifests_archive, manifest_dir
-            )
-            # Re-resolve toolchain outpaths from the local store so the
-            # submitter placement block populates the gossip file even
-            # on cache hit. ``eval_drv_outpaths`` is cheap (single
-            # batched ``nix derivation show``) and idempotent.
-            if tc_drvs:
-                try:
-                    tc_outpaths = eval_drv_outpaths(
-                        [d for d in tc_drvs.values() if d]
-                    )
-                    if tc_outpaths:
-                        partition_drv_outpaths = dict(tc_outpaths)
-                        # Cached toolchain_validate manifests pre-date
-                        # the cli.py change that started emitting
-                        # ``payload.outpath`` — restore-from-cache can't
-                        # back-fill in place because the archive is
-                        # immutable. Rewrite the on-disk files now so
-                        # the framework's validate worker (which
-                        # rejects ``payload.outpath`` missing) sees the
-                        # current shape.
-                        _backfill_toolchain_validate_outpath(
-                            manifest_dir, tc_outpaths, log,
-                        )
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "cache-hit toolchain outpath eval failed;"
-                        " submitter placement may be incomplete"
-                    )
-        except Exception:  # noqa: BLE001
-            log.exception("failed to restore manifests from cache; will pre-flight")
-            cache_hit = None
-            tc_drvs = {}
+    cache = IncrementalCache(args.cache_root)
+    # Repo-state half of the memoization keys; ``None`` (collection
+    # failed, or --no-cache) disables both lookups AND stores, so every
+    # enumeration runs.
+    repo_inputs = (
+        None if args.no_cache else _collect_repo_inputs_for_cache(args, log)
+    )
 
-    if cache_hit is None:
-        # Submit path: only enumerate toolchains locally and emit
-        # build_compilers (when --build-compilers) + matrix_eval
-        # manifests. The slow per-binary drv-instantiation is deferred
-        # to matrix_eval workers on secondaries (see
-        # ``workers/eval_worker.py``). The dependency_graph phase runs
-        # as a framework PhaseSpec; the build phase is spawned at
-        # runtime by the primary from
-        # ``SuitTask.on_phase_end("dependency_graph")`` via
-        # ``primary_handle.spawn_tasks`` (in suit_task.py).
-        log.info("running pre-flight (toolchains + per-binary metadata only)")
+    # ------------------------------------------------------------------
+    # Toolchain enumeration (memoized — the ~5-min nix-eval-jobs pass).
+    # The slow per-binary drv-instantiation is deferred to matrix_eval
+    # workers on secondaries (see ``workers/eval_worker.py``); the
+    # dependency_graph phase runs as a framework PhaseSpec and the build
+    # phase is spawned at runtime by the primary from
+    # ``SuitTask.on_phase_end("dependency_graph")``.
+    # ------------------------------------------------------------------
+    tc_key = ""
+    if repo_inputs is not None:
+        tc_key = compute_subentry_key(
+            repo_inputs, _toolchain_axes_from_args(args)
+        )
+    tc_cached = cache.lookup_toolchains(tc_key) if tc_key else None
+    if tc_cached is not None:
+        tc_pairs, tc_drvs, tc_aggregate_drv = tc_cached
+        log.info(
+            "toolchain enumeration: cache hit (%d pairs, %d drvs)",
+            len(tc_pairs), len(tc_drvs),
+        )
+    else:
+        log.info("enumerating toolchains (cache miss)")
         try:
             tc_pairs, tc_drvs, tc_aggregate_drv = enumerate_toolchains_only(
                 args.flake, args.sys_name, archs=args.archs,
@@ -1204,6 +992,29 @@ def cmd_submit(args: argparse.Namespace) -> int:
         except Exception:  # noqa: BLE001
             log.exception("toolchain enumeration failed")
             return 1
+        if tc_key:
+            try:
+                cache.store_toolchains(
+                    tc_key, tc_pairs, tc_drvs, tc_aggregate_drv,
+                )
+            except Exception:  # noqa: BLE001
+                log.warning("toolchains cache store failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Variant enumeration (memoized — cheap, 1-2 nix evals).
+    # ------------------------------------------------------------------
+    var_key = ""
+    if repo_inputs is not None:
+        var_key = compute_subentry_key(
+            repo_inputs, _variant_axes_from_args(args)
+        )
+    per_binary_meta_raw = cache.lookup_variants(var_key) if var_key else None
+    if per_binary_meta_raw is not None:
+        log.info(
+            "variant enumeration: cache hit (%d binaries)",
+            len(per_binary_meta_raw),
+        )
+    else:
         try:
             per_binary_meta_raw = enumerate_variants(
                 args.flake,
@@ -1222,178 +1033,171 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 type(per_binary_meta_raw).__name__,
             )
             return 1
+        if var_key:
+            try:
+                cache.store_variants(var_key, per_binary_meta_raw)
+            except Exception:  # noqa: BLE001
+                log.warning("variants cache store failed", exc_info=True)
 
-        # Fail fast when toolchain enumeration produced no aggregate but
-        # binaries are queued for matrix_eval: emit_matrix_eval_manifests
-        # would otherwise raise ``ValueError("toolchain_aggregate_drv
-        # must be a non-empty string")`` deep inside the manifest-emit
-        # step, masking the real preflight failure.
-        if per_binary_meta_raw and not tc_aggregate_drv:
-            log.error(
-                "submit pre-flight: toolchain aggregate is empty (no toolchain "
-                "leaves resolved) but %d binaries queued for matrix_eval — "
-                "refusing to emit manifests that will fail downstream",
-                len(per_binary_meta_raw),
-            )
-            return 1
-
-        # Flatten the {pkg: {"archs": [...], "sample_size": ...,
-        # "sample_seed": ..., "tier": ...}} shape returned by
-        # enumerate_variants into the {binary: {"archs": [...],
-        # "variant_sample": ..., "variant_seed": ..., "tier": ...,
-        # "toolchain_aggregate_drv": ...}} shape that
-        # emit_matrix_eval_manifests / eval_worker.parse_payload expect.
-        # Per-arch suffix selection now happens inside the matrix_eval
-        # worker (eval_worker._sample_per_arch) with the same seed.
-        per_binary_metadata = {}
-        for pkg, meta in per_binary_meta_raw.items():
-            if not isinstance(meta, dict):
-                continue
-            archs_list = list(meta.get("archs", ()))
-            if not archs_list:
-                continue
-            per_binary_metadata[pkg] = {
-                "archs": archs_list,
-                "variant_sample": meta.get("sample_size"),
-                "variant_seed": meta.get("sample_seed"),
-                "tier": meta.get("tier"),
-                "toolchain_aggregate_drv": tc_aggregate_drv,
-                # Toolchain-dedup feature flag carried per-binary so each
-                # matrix_eval worker knows whether to subtract the
-                # toolchain closure from its exported diff archive. OFF =
-                # full closure (today's behaviour); the consumers still
-                # import the toolchain archive first (harmless no-op).
-                "toolchain_dedup": toolchain_dedup,
-                # ``matrix_eval_out_dir`` is deliberately NOT carried
-                # in per_binary_metadata or in the dep_graph payload:
-                # the submitter-host path is invalid inside the
-                # secondary container. The dep_graph worker reads its
-                # archive root from the BuildWorkerEnv (synthesised
-                # from ``--matrix-eval-out-dir`` at the container's
-                # call site, cli.py ``container_namespace``), so the
-                # container view is the single source of truth.
-            }
-        log.info(
-            "submit pre-flight: %d toolchains, %d binaries queued for matrix_eval",
-            len(tc_drvs), len(per_binary_metadata),
+    # ------------------------------------------------------------------
+    # Unified state-building: everything below runs on EVERY invocation
+    # (cache hit or miss) — hit-state == miss-state by construction.
+    # ------------------------------------------------------------------
+    # Fail fast when toolchain enumeration produced no aggregate but
+    # binaries are queued for matrix_eval: emit_matrix_eval_manifests
+    # would otherwise raise ``ValueError("toolchain_aggregate_drv
+    # must be a non-empty string")`` deep inside the manifest-emit
+    # step, masking the real preflight failure.
+    if per_binary_meta_raw and not tc_aggregate_drv:
+        log.error(
+            "submit pre-flight: toolchain aggregate is empty (no toolchain "
+            "leaves resolved) but %d binaries queued for matrix_eval — "
+            "refusing to emit manifests that will fail downstream",
+            len(per_binary_meta_raw),
         )
+        return 1
 
-        # Local toolchain availability check. Without ``--build-compilers``
-        # secondaries only validate; the primary must have every
-        # toolchain output realised before dispatch. With it on, the
-        # primary builds any missing toolchain locally as a fallback
-        # and the in-cluster ``build_compilers`` worker re-realises
-        # them on each secondary that wins a dispatched task.
-        build_compilers_on = bool(getattr(args, "build_compilers", False))
-        debug_testbuild = getattr(args, "debug_testbuild", None)
-        tc_drv_set = frozenset(d for d in tc_drvs.values() if d)
-        if tc_drv_set:
-            try:
-                missing_tcs = check_toolchains_locally(tc_drv_set)
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "toolchain local-validity check failed"
-                )
-                missing_tcs = tc_drv_set
-            if missing_tcs:
-                if not build_compilers_on:
-                    log.error(
-                        "submit pre-flight: %d/%d toolchains missing locally "
-                        "and --build-compilers is off",
-                        len(missing_tcs), len(tc_drv_set),
-                    )
-                    for drv in sorted(missing_tcs):
-                        log.error("  %s", drv)
-                    return 1
-                log.warning(
-                    "submit pre-flight: building %d missing toolchains locally",
-                    len(missing_tcs),
-                )
-                try:
-                    build_toolchains_locally(missing_tcs)
-                except PreflightError as exc:
-                    log.error("local toolchain build aborted: %s", exc)
-                    return 1
-                except Exception:  # noqa: BLE001
-                    log.exception("local toolchain build failed")
-                    return 1
+    # Flatten the {pkg: {"archs": [...], "sample_size": ...,
+    # "sample_seed": ..., "tier": ...}} shape returned by
+    # enumerate_variants into the {binary: {"archs": [...],
+    # "variant_sample": ..., "variant_seed": ..., "tier": ...,
+    # "toolchain_aggregate_drv": ...}} shape that
+    # emit_matrix_eval_manifests / eval_worker.parse_payload expect.
+    # Per-arch suffix selection now happens inside the matrix_eval
+    # worker (eval_worker._sample_per_arch) with the same seed.
+    per_binary_metadata = {}
+    for pkg, meta in per_binary_meta_raw.items():
+        if not isinstance(meta, dict):
+            continue
+        archs_list = list(meta.get("archs", ()))
+        if not archs_list:
+            continue
+        per_binary_metadata[pkg] = {
+            "archs": archs_list,
+            "variant_sample": meta.get("sample_size"),
+            "variant_seed": meta.get("sample_seed"),
+            "tier": meta.get("tier"),
+            "toolchain_aggregate_drv": tc_aggregate_drv,
+            # Toolchain-dedup feature flag carried per-binary so each
+            # matrix_eval worker knows whether to subtract the
+            # toolchain closure from its exported diff archive. OFF =
+            # full closure (today's behaviour); the consumers still
+            # import the toolchain archive first (harmless no-op).
+            "toolchain_dedup": toolchain_dedup,
+            # ``matrix_eval_out_dir`` is deliberately NOT carried
+            # in per_binary_metadata or in the dep_graph payload:
+            # the submitter-host path is invalid inside the
+            # secondary container. The dep_graph worker reads its
+            # archive root from the BuildWorkerEnv (synthesised
+            # from ``--matrix-eval-out-dir`` at the container's
+            # call site, cli.py ``container_namespace``), so the
+            # container view is the single source of truth.
+        }
+    log.info(
+        "submit pre-flight: %d toolchains, %d binaries queued for matrix_eval",
+        len(tc_drvs), len(per_binary_metadata),
+    )
 
-        # Resolve toolchain outpaths so toolchain_validate manifests
-        # carry ``payload.outpath``. Without this the build_worker's
-        # validate path fails immediately with "manifest missing
-        # 'payload.outpath'".
-        dist_eval_drv_outpaths: Optional[dict[str, str]] = None
-        if tc_drvs:
-            try:
-                tc_outpaths = eval_drv_outpaths(
-                    [d for d in tc_drvs.values() if d]
-                )
-                dist_eval_drv_outpaths = dict(tc_outpaths) if tc_outpaths else {}
-                log.info(
-                    "submit pre-flight: toolchain outpath eval: %d/%d resolved",
-                    len(dist_eval_drv_outpaths), len(tc_drvs),
-                )
-            except Exception:  # noqa: BLE001
-                log.exception(
-                    "submit pre-flight: toolchain outpath eval failed;"
-                    " validate manifests will be missing payload.outpath"
-                )
-                dist_eval_drv_outpaths = {}
-
-        # Stages literal: matrix_eval (phase 2) + dependency_graph
-        # (phase 3) are JSON-free and built in-memory by
-        # ``SuitTask.discover_items`` from ``per_binary_metadata`` — they
-        # are NOT emitted here. The only JSON-backed stage at submit
-        # time is build_compilers (gated by --build-compilers or
-        # --debug-testbuild); the build stage's tasks are spawned at
-        # runtime by the primary via ``primary.spawn_tasks``.
-        stages: list[str] = []
-        if build_compilers_on:
-            stages = ["build_compilers"]
-        if debug_testbuild and "build_compilers" not in stages:
-            stages.insert(0, "build_compilers")
-
+    # Local toolchain availability check. Without ``--build-compilers``
+    # secondaries only validate; the primary must have every
+    # toolchain output realised before dispatch. With it on, the
+    # primary builds any missing toolchain locally as a fallback
+    # and the in-cluster ``build_compilers`` worker re-realises
+    # them on each secondary that wins a dispatched task.
+    build_compilers_on = bool(getattr(args, "build_compilers", False))
+    debug_testbuild = getattr(args, "debug_testbuild", None)
+    tc_drv_set = frozenset(d for d in tc_drvs.values() if d)
+    if tc_drv_set:
         try:
-            emit_all_manifests(
-                target_dir=manifest_dir,
-                sys_name=args.sys_name,
-                variants=(),
-                toolchain_specs=tc_pairs,
-                common_deps=(),
-                num_workers=num_workers,
-                toolchain_drvs=tc_drvs,
-                allow_toolchain_build=build_compilers_on,
-                per_binary_metadata=per_binary_metadata,
-                drv_outpaths=dist_eval_drv_outpaths,
-                stages=stages,
+            missing_tcs = check_toolchains_locally(tc_drv_set)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "toolchain local-validity check failed"
+            )
+            missing_tcs = tc_drv_set
+        if missing_tcs:
+            if not build_compilers_on:
+                log.error(
+                    "submit pre-flight: %d/%d toolchains missing locally "
+                    "and --build-compilers is off",
+                    len(missing_tcs), len(tc_drv_set),
+                )
+                for drv in sorted(missing_tcs):
+                    log.error("  %s", drv)
+                return 1
+            log.warning(
+                "submit pre-flight: building %d missing toolchains locally",
+                len(missing_tcs),
+            )
+            try:
+                build_toolchains_locally(missing_tcs)
+            except PreflightError as exc:
+                log.error("local toolchain build aborted: %s", exc)
+                return 1
+            except Exception:  # noqa: BLE001
+                log.exception("local toolchain build failed")
+                return 1
+
+    # Resolve toolchain outpaths so toolchain_validate manifests
+    # carry ``payload.outpath``. Without this the build_worker's
+    # validate path fails immediately with "manifest missing
+    # 'payload.outpath'".
+    dist_eval_drv_outpaths: Optional[dict[str, str]] = None
+    if tc_drvs:
+        try:
+            tc_outpaths = eval_drv_outpaths(
+                [d for d in tc_drvs.values() if d]
+            )
+            dist_eval_drv_outpaths = dict(tc_outpaths) if tc_outpaths else {}
+            log.info(
+                "submit pre-flight: toolchain outpath eval: %d/%d resolved",
+                len(dist_eval_drv_outpaths), len(tc_drvs),
             )
         except Exception:  # noqa: BLE001
-            log.exception("submit pre-flight: manifest emission failed")
-            return 1
+            log.exception(
+                "submit pre-flight: toolchain outpath eval failed;"
+                " validate manifests will be missing payload.outpath"
+            )
+            dist_eval_drv_outpaths = {}
 
-        # Expose the toolchain outpaths to the submitter-peer placement
-        # block below. Without this, ``partition_drv_outpaths`` stays
-        # None and the submitter never populates the gossip file, so
-        # secondaries see no peer for ``toolchain_validate`` fetches.
-        partition_drv_outpaths = dist_eval_drv_outpaths
+    # Stages literal: matrix_eval (phase 2) + dependency_graph
+    # (phase 3) are JSON-free and built in-memory by
+    # ``SuitTask.discover_items`` from ``per_binary_metadata`` — they
+    # are NOT emitted here. The only JSON-backed stage at submit
+    # time is build_compilers (gated by --build-compilers or
+    # --debug-testbuild); the build stage's tasks are spawned at
+    # runtime by the primary via ``primary.spawn_tasks``.
+    stages: list[str] = []
+    if build_compilers_on:
+        stages = ["build_compilers"]
+    if debug_testbuild and "build_compilers" not in stages:
+        stages.insert(0, "build_compilers")
 
-        # Build a synthetic PreflightResult so the rest of cmd_submit
-        # (SuitTaskConfig construction, submitter placement block,
-        # cache.store) operates on a non-None ``pre``. Variants are
-        # empty by design — phase 1+ variant headers are spawned at
-        # runtime by the primary, not at submit time.
-        pre = PreflightResult(
+    try:
+        emit_all_manifests(
+            target_dir=manifest_dir,
             sys_name=args.sys_name,
             variants=(),
             toolchain_specs=tc_pairs,
-            common_dep_drvs=(),
-            toolchain_drvs=frozenset(tc_drv_set),
-            toolchain_aggregate_drv=tc_aggregate_drv,
+            common_deps=(),
+            num_workers=num_workers,
+            toolchain_drvs=tc_drvs,
+            allow_toolchain_build=build_compilers_on,
+            per_binary_metadata=per_binary_metadata,
+            drv_outpaths=dist_eval_drv_outpaths,
+            stages=stages,
         )
+    except Exception:  # noqa: BLE001
+        log.exception("submit pre-flight: manifest emission failed")
+        return 1
 
-    # Build SuitTaskConfig. ``pre`` still carries the toolchain set
-    # (for the submitter placement block below + the cache.store
-    # roundtrip), but the SuitTaskConfig itself no longer holds
+    # Expose the toolchain outpaths to the submitter-peer placement
+    # block below. Without this, ``partition_drv_outpaths`` stays
+    # None and the submitter never populates the gossip file, so
+    # secondaries see no peer for ``toolchain_validate`` fetches.
+    partition_drv_outpaths = dist_eval_drv_outpaths
+
+    # Build SuitTaskConfig. The SuitTaskConfig no longer holds
     # ``input_hash`` / ``toolchain_drvs`` / ``variants`` — those moved
     # to runtime-derived state on the SuitTask / dependency_graph
     # planner after the phase-taxonomy refactor.
@@ -1636,48 +1440,6 @@ def cmd_submit(args: argparse.Namespace) -> int:
     else:
         log.error("unknown --multi-computer mode %r", args.multi_computer)
         return 2
-
-    if rc == 0 and input_hash and pre is not None and not args.no_cache:
-        # On success, write the cache so future runs short-circuit.
-        try:
-            # The IncrementalCache schema still wants a ``partition_path``
-            # slot; the partition/merge phases are gone, so we just plant
-            # a placeholder under the shared-fs root to keep the cache
-            # entry shape stable. Same for ``_meta.json`` — manifest_gen
-            # no longer writes a meta sidecar.
-            partition_path = shared_fs / "_partition_placeholder.json"
-            meta_path = manifest_dir / "_meta.json"
-            if not partition_path.exists():
-                partition_path.write_text("{}")
-            if not meta_path.exists():
-                meta_path.write_text("{}")
-
-            # Stage a tiny dir with just the preflight descriptor to
-            # avoid tarring up multi-PiB sparse manifest files.
-            staging = tempfile.mkdtemp(prefix="suit-runner-cache-")
-            try:
-                staging_path = pathlib.Path(staging)
-                _serialize_preflight_for_cache(
-                    pre,
-                    num_workers,
-                    staging_path / "_preflight.json",
-                    toolchain_drvs_by_pair=tc_drvs,
-                    allow_toolchain_build=getattr(
-                        config, "allow_toolchain_build", False
-                    ),
-                )
-                cache.store(
-                    input_hash=input_hash,
-                    partition_path=partition_path,
-                    manifests_dir=staging_path,
-                    meta_path=meta_path,
-                )
-                log.info("cache stored: %s", input_hash)
-            finally:
-                import shutil as _shutil
-                _shutil.rmtree(staging, ignore_errors=True)
-        except Exception:  # noqa: BLE001
-            log.warning("cache store failed", exc_info=True)
 
     return rc
 

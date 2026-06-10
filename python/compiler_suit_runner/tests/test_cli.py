@@ -1,14 +1,16 @@
 """Unit tests for ``compiler_suit_runner.cli``.
 
 The CLI surface is exercised through ``main(argv_list)`` with the
-preflight, IncrementalCache, and SuitTask side-effects monkeypatched
-out — no real nix, no real cache writes against the user's home dir.
+nix/git-touching helpers and the SuitTask side-effects monkeypatched
+out. The IncrementalCache runs for REAL against a per-test
+``cache_root`` under tmp_path (no real nix, no cache writes against
+the user's home dir) so the enumeration memoization is exercised
+end-to-end.
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import pathlib
 
@@ -23,10 +25,11 @@ from compiler_suit_runner.cli import (
     main,
 )
 from compiler_suit_runner.incremental_cache import (
-    CacheEntry,
     IncrementalCache,
     InputHashInputs,
-    InvocationAxes,
+    ToolchainAxes,
+    VariantAxes,
+    compute_subentry_key,
 )
 from compiler_suit_runner.preflight import PreflightResult
 
@@ -250,20 +253,6 @@ def test_cmd_submit_system_propagates_to_manifest_emit(
     """``cmd_submit`` must thread the parsed ``--system`` value into the
     matrix-eval manifest emission (so the manifest header's ``sys_name``
     field matches the submitter's CLI choice)."""
-
-    class _MissCache(IncrementalCache):
-        def lookup(self, input_hash: str):  # type: ignore[override]
-            return None
-
-        def store(self, input_hash, partition_path, manifests_dir, meta_path):  # type: ignore[override]
-            return CacheEntry(
-                input_hash=input_hash,
-                partition_path=partition_path,
-                manifests_archive=manifests_dir.parent / "manifests.tar",
-                meta_path=meta_path,
-            )
-
-    monkeypatch.setattr(cli_module, "IncrementalCache", _MissCache)
     args = _make_args(tmp_path, sys_name="aarch64-linux")
     rc = cmd_submit(args)
     assert rc == 0
@@ -432,30 +421,36 @@ def test_main_clear_cache_without_hash_calls_clear(
 
 @pytest.fixture
 def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path):
-    """Wire up stubs so cmd_submit can run without real nix or the
-    SuitTask side-effects.
+    """Wire up stubs so cmd_submit can run without real nix, git, or
+    the SuitTask side-effects.
 
     cmd_submit drives the submit-time pre-flight:
     ``enumerate_toolchains_only`` + ``enumerate_variants`` (per-binary
-    metadata) + ``emit_all_manifests``. The legacy composite preflight
-    is no longer wired into cmd_submit; ``preflight_calls`` here counts
-    the toolchain enumeration as a proxy for "pre-flight ran" so the
-    existing test contracts remain meaningful.
+    metadata, both memoized via the REAL :class:`IncrementalCache`
+    rooted at the per-test ``cache_root``) + ``emit_all_manifests``.
+    ``preflight_calls`` counts the toolchain enumeration as a proxy for
+    "pre-flight ran"; ``variant_calls`` counts the variant enumeration.
+    Only the repo-state collection is faked (``state["repo_inputs"]``;
+    mutate it to simulate a repo-state change between invocations).
     """
 
     state: dict = {
         "preflight_calls": [],
+        "variant_calls": [],
         "emit_calls": [],
         "emit_per_binary_metadata": [],
         "single_process_calls": [],
-        "cache_lookup_calls": [],
-        "cache_store_calls": [],
-        "restore_calls": [],
+        "collect_calls": [],
         # Mutable so individual tests can override what the stubbed
         # enumerate_* helpers return without rewriting the whole
         # fixture.
         "toolchain_return": ((), {}, ""),
         "variants_return": {},
+        # Repo-state half of the memoization keys; swap for a different
+        # InputHashInputs to simulate a flake.lock / git change.
+        "repo_inputs": InputHashInputs(
+            flake_lock=b"lock", git_rev="a" * 40, git_diff=b"",
+        ),
     }
 
     def fake_enumerate_toolchains_only(
@@ -475,7 +470,7 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
         flake_ref, sys_name, *, packages=None, archs=None,
         sample_size=0, sample_seed="42", run_subprocess=None,
     ):
-        del flake_ref, sys_name, packages, archs, sample_size, sample_seed
+        state["variant_calls"].append((flake_ref, sys_name, packages, archs))
         return state["variants_return"]
 
     monkeypatch.setattr(
@@ -495,7 +490,7 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
         state["emit_calls"].append((target_dir, sys_name, num_workers))
         state["emit_per_binary_metadata"].append(per_binary_metadata)
 
-        # Simulate manifest_dir population so cache.store can pack it.
+        # Simulate manifest_dir population.
         target_dir = pathlib.Path(target_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         (target_dir / "stub.json").write_text("{}")
@@ -522,18 +517,15 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
 
     monkeypatch.setattr(cli_module, "run_single_process", fake_single_process)
 
-    def fake_compute_input_hash(repo_root, args):
-        return "test-hash"
+    def fake_collect_input_hash_inputs(repo_root, **_kw):
+        state["collect_calls"].append(repo_root)
+        return state["repo_inputs"]
 
-    monkeypatch.setattr(cli_module, "_compute_input_hash", fake_compute_input_hash)
-
-    def fake_restore(archive, target_dir):
-        state["restore_calls"].append((archive, target_dir))
-        target_dir.mkdir(parents=True, exist_ok=True)
-        (target_dir / "from-cache.json").write_text("{}")
-        return {}
-
-    monkeypatch.setattr(cli_module, "_restore_manifests_from_archive", fake_restore)
+    monkeypatch.setattr(
+        cli_module,
+        "collect_input_hash_inputs",
+        fake_collect_input_hash_inputs,
+    )
 
     return state
 
@@ -563,13 +555,27 @@ def _make_args(tmp_path: pathlib.Path, **overrides) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
-def test_invocation_axes_from_args_normalizes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-):
-    """The axes derived from the namespace are canonical: package/arch
-    ordering and duplicates don't matter; defaults resolve like the
-    pre-flight call sites resolve them."""
-    monkeypatch.delenv("CSR_TOOLCHAIN_DEDUP", raising=False)
+def test_toolchain_axes_from_args_normalizes(tmp_path: pathlib.Path):
+    """The toolchains sub-entry axes derived from the namespace are
+    canonical: arch ordering and duplicates don't matter; defaults
+    resolve like the enumeration call site resolves them."""
+    args_a = _make_args(tmp_path, archs=["x86_64", "aarch64", "x86_64"])
+    args_b = _make_args(tmp_path, archs=["aarch64", "x86_64"])
+    axes_a = cli_module._toolchain_axes_from_args(args_a)
+    axes_b = cli_module._toolchain_axes_from_args(args_b)
+    assert isinstance(axes_a, ToolchainAxes)
+    assert axes_a == axes_b
+    assert axes_a.archs == ("aarch64", "x86_64")
+    assert axes_a.sys_name == "x86_64-linux"
+    # packages are NOT a toolchains axis.
+    assert not hasattr(axes_a, "packages")
+
+
+def test_variant_axes_from_args_normalizes(tmp_path: pathlib.Path):
+    """The variants sub-entry axes derived from the namespace are
+    canonical: package/arch ordering and duplicates don't matter;
+    defaults resolve like the enumeration call site resolves them
+    (``variant_sample or 0`` / ``variant_seed or "42"``)."""
     args_a = _make_args(
         tmp_path,
         packages=["zlib", "lz4", "zlib"],
@@ -582,141 +588,217 @@ def test_invocation_axes_from_args_normalizes(
         archs=["aarch64", "x86_64"],
         variant_sample=2,
     )
-    axes_a = cli_module._invocation_axes_from_args(args_a)
-    axes_b = cli_module._invocation_axes_from_args(args_b)
-    assert isinstance(axes_a, InvocationAxes)
+    axes_a = cli_module._variant_axes_from_args(args_a)
+    axes_b = cli_module._variant_axes_from_args(args_b)
+    assert isinstance(axes_a, VariantAxes)
     assert axes_a == axes_b
     assert axes_a.packages == ("lz4", "zlib")
     assert axes_a.archs == ("aarch64", "x86_64")
     assert axes_a.variant_sample == 2
     # Namespace fields absent from _make_args fall back to the same
-    # defaults cmd_submit's pre-flight path uses.
+    # defaults cmd_submit's enumeration call site uses.
     assert axes_a.variant_seed == "42"
-    assert axes_a.build_compilers is False
-    assert axes_a.debug_testbuild is None
-    assert axes_a.toolchain_dedup is True
+    assert axes_a.sys_name == "x86_64-linux"
 
 
-def test_compute_input_hash_varies_with_invocation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-):
-    """Same repo state, different invocation axes => different cache
-    key (the nano-vs-16-binary contamination); identical invocation =>
-    identical key."""
-    monkeypatch.delenv("CSR_TOOLCHAIN_DEDUP", raising=False)
+def test_subentry_keys_vary_with_their_own_axes(tmp_path: pathlib.Path):
+    """Same repo state, different invocation => the RIGHT sub-entry key
+    changes: ``--packages`` splits only the variants key (the
+    nano-vs-16-binary contamination), ``--archs`` splits both."""
+    repo = InputHashInputs(flake_lock=b"lock", git_rev="a" * 40, git_diff=b"")
 
-    def fake_collect(repo_root, *, invocation=None, **_kw):
-        return InputHashInputs(
-            flake_lock=b"lock",
-            git_rev="a" * 40,
-            git_diff=b"",
-            invocation=(
-                invocation.canonical_bytes()
-                if invocation is not None
-                else b""
+    def keys(args):
+        return (
+            compute_subentry_key(
+                repo, cli_module._toolchain_axes_from_args(args)
+            ),
+            compute_subentry_key(
+                repo, cli_module._variant_axes_from_args(args)
             ),
         )
 
-    monkeypatch.setattr(cli_module, "collect_input_hash_inputs", fake_collect)
-
-    nano = _make_args(tmp_path, packages=["zlib"])
-    full = _make_args(
-        tmp_path,
-        packages=[
-            "bzip2", "lz4", "xz", "zlib", "cjson", "expat", "libyaml",
-            "xxhash", "libb2", "mujs", "duktape", "m4", "bc", "dash",
-            "ed", "mawk",
-        ],
+    tc_nano, var_nano = keys(_make_args(tmp_path, packages=["zlib"]))
+    tc_full, var_full = keys(
+        _make_args(
+            tmp_path,
+            packages=[
+                "bzip2", "lz4", "xz", "zlib", "cjson", "expat", "libyaml",
+                "xxhash", "libb2", "mujs", "duktape", "m4", "bc", "dash",
+                "ed", "mawk",
+            ],
+        )
     )
-    h_nano = cli_module._compute_input_hash(tmp_path, nano)
-    h_full = cli_module._compute_input_hash(tmp_path, full)
-    assert h_nano != h_full
+    # --packages: toolchains key unchanged, variants key split.
+    assert tc_nano == tc_full
+    assert var_nano != var_full
 
-    # Other axes split the key too.
-    h_archs = cli_module._compute_input_hash(
-        tmp_path, _make_args(tmp_path, packages=["zlib"], archs=["x86_64"])
+    # --archs: both keys split.
+    tc_archs, var_archs = keys(
+        _make_args(tmp_path, packages=["zlib"], archs=["x86_64"])
     )
-    h_sample = cli_module._compute_input_hash(
-        tmp_path, _make_args(tmp_path, packages=["zlib"], variant_sample=5)
+    assert tc_archs != tc_nano
+    assert var_archs != var_nano
+
+    # --variant-sample: variants key only.
+    tc_sample, var_sample = keys(
+        _make_args(tmp_path, packages=["zlib"], variant_sample=5)
     )
-    assert len({h_nano, h_archs, h_sample}) == 3
+    assert tc_sample == tc_nano
+    assert var_sample != var_nano
 
-    # Identical invocation (re-parsed, different object) is stable.
-    nano_again = _make_args(tmp_path, packages=["zlib"])
-    assert cli_module._compute_input_hash(tmp_path, nano_again) == h_nano
+    # Identical invocation (re-parsed, different objects) is stable.
+    assert keys(_make_args(tmp_path, packages=["zlib"])) == (
+        tc_nano, var_nano,
+    )
 
 
-def test_cmd_submit_cache_hit_skips_preflight(
-    monkeypatch: pytest.MonkeyPatch,
+def test_cmd_submit_second_invocation_hits_memoized_enumerations(
     tmp_path: pathlib.Path,
     stub_submit_helpers: dict,
 ):
-    """When IncrementalCache.lookup returns a populated entry, the
-    pre-flight is skipped and the manifests get restored from the cache
-    archive."""
-    archive = tmp_path / "manifests.tar"
-    archive.write_text("not a real tar")
-    fake_entry = CacheEntry(
-        input_hash="test-hash",
-        partition_path=tmp_path / "p.json",
-        manifests_archive=archive,
-        meta_path=tmp_path / "m.json",
-    )
+    """A second identical invocation hits both sub-entries (no
+    enumeration re-runs) but still runs the WHOLE downstream
+    state-building path — manifest emission and dispatch fire again."""
+    assert cmd_submit(_make_args(tmp_path)) == 0
+    assert len(stub_submit_helpers["preflight_calls"]) == 1
+    assert len(stub_submit_helpers["variant_calls"]) == 1
 
-    class _HitCache(IncrementalCache):
-        def lookup(self, input_hash: str):  # type: ignore[override]
-            stub_submit_helpers["cache_lookup_calls"].append(input_hash)
-            return fake_entry
-
-        def store(self, input_hash, partition_path, manifests_dir, meta_path):  # type: ignore[override]
-            stub_submit_helpers["cache_store_calls"].append(input_hash)
-            return fake_entry
-
-    monkeypatch.setattr(cli_module, "IncrementalCache", _HitCache)
-
-    args = _make_args(tmp_path)
-    rc = cmd_submit(args)
-    assert rc == 0
-    # Pre-flight NOT called.
-    assert stub_submit_helpers["preflight_calls"] == []
-    # Manifest restoration was triggered.
-    assert stub_submit_helpers["restore_calls"]
-    # The single-process dispatch did fire.
-    assert stub_submit_helpers["single_process_calls"]
+    assert cmd_submit(_make_args(tmp_path)) == 0
+    # Enumerations memoized: not called again.
+    assert len(stub_submit_helpers["preflight_calls"]) == 1
+    assert len(stub_submit_helpers["variant_calls"]) == 1
+    # The unified path ran both times.
+    assert len(stub_submit_helpers["emit_calls"]) == 2
+    assert len(stub_submit_helpers["single_process_calls"]) == 2
 
 
-def test_cmd_submit_cache_miss_runs_preflight_and_stores(
-    monkeypatch: pytest.MonkeyPatch,
+def test_cmd_submit_miss_stores_both_subentries(
     tmp_path: pathlib.Path,
     stub_submit_helpers: dict,
 ):
-    class _MissCache(IncrementalCache):
-        def lookup(self, input_hash: str):  # type: ignore[override]
-            stub_submit_helpers["cache_lookup_calls"].append(input_hash)
-            return None
-
-        def store(self, input_hash, partition_path, manifests_dir, meta_path):  # type: ignore[override]
-            stub_submit_helpers["cache_store_calls"].append(
-                (input_hash, manifests_dir)
-            )
-            return CacheEntry(
-                input_hash=input_hash,
-                partition_path=partition_path,
-                manifests_archive=manifests_dir.parent / "manifests.tar",
-                meta_path=meta_path,
-            )
-
-    monkeypatch.setattr(cli_module, "IncrementalCache", _MissCache)
-
-    args = _make_args(tmp_path)
-    rc = cmd_submit(args)
-    assert rc == 0
+    assert cmd_submit(_make_args(tmp_path)) == 0
     # Pre-flight ran.
     assert stub_submit_helpers["preflight_calls"]
-    # No cache hit -> no restore.
-    assert stub_submit_helpers["restore_calls"] == []
-    # On success, cache.store is called.
-    assert stub_submit_helpers["cache_store_calls"]
+    assert stub_submit_helpers["variant_calls"]
+    # Both sub-entries persisted (memoized at enumeration time).
+    cache_root = tmp_path / "cache"
+    tc_entries = list((cache_root / "toolchains").iterdir())
+    var_entries = list((cache_root / "variants").iterdir())
+    assert len(tc_entries) == 1
+    assert len(var_entries) == 1
+    assert (tc_entries[0] / "entry.json").is_file()
+    assert (var_entries[0] / "entry.json").is_file()
+
+
+def test_cmd_submit_subentry_keying(
+    tmp_path: pathlib.Path,
+    stub_submit_helpers: dict,
+):
+    """Per-sub-entry keying through the full cmd_submit flow: a
+    --packages change re-enumerates only variants; an --archs change
+    re-enumerates both; a repo-state change re-enumerates both."""
+    state = stub_submit_helpers
+
+    assert cmd_submit(_make_args(tmp_path, packages=["zlib"])) == 0
+    assert len(state["preflight_calls"]) == 1
+    assert len(state["variant_calls"]) == 1
+
+    # --packages change: toolchains HIT, variants MISS.
+    assert cmd_submit(
+        _make_args(tmp_path, packages=["zlib", "lz4"])
+    ) == 0
+    assert len(state["preflight_calls"]) == 1
+    assert len(state["variant_calls"]) == 2
+
+    # --archs change: BOTH miss.
+    assert cmd_submit(
+        _make_args(tmp_path, packages=["zlib"], archs=["x86_64"])
+    ) == 0
+    assert len(state["preflight_calls"]) == 2
+    assert len(state["variant_calls"]) == 3
+
+    # Repo-state change (same invocation as run 1): BOTH miss.
+    state["repo_inputs"] = InputHashInputs(
+        flake_lock=b"lock", git_rev="b" * 40, git_diff=b"",
+    )
+    assert cmd_submit(_make_args(tmp_path, packages=["zlib"])) == 0
+    assert len(state["preflight_calls"]) == 3
+    assert len(state["variant_calls"]) == 4
+
+
+def test_cmd_submit_treats_corrupt_entry_as_miss_and_reheals(
+    tmp_path: pathlib.Path,
+    stub_submit_helpers: dict,
+):
+    """A legacy/corrupt entry under the new key is never replayed: the
+    enumeration re-runs and the entry is re-stored, after which the
+    next invocation hits again."""
+    state = stub_submit_helpers
+    assert cmd_submit(_make_args(tmp_path)) == 0
+    assert len(state["preflight_calls"]) == 1
+
+    # Corrupt both sub-entries in place: legacy-shaped toolchains dir
+    # (no entry.json) + wrong-version variants entry.
+    cache_root = tmp_path / "cache"
+    (tc_entry,) = (cache_root / "toolchains").iterdir()
+    (tc_entry / "entry.json").unlink()
+    (tc_entry / "manifests.tar").write_bytes(b"legacy")
+    (var_entry,) = (cache_root / "variants").iterdir()
+    body = json.loads((var_entry / "entry.json").read_text())
+    body["version"] = 0
+    (var_entry / "entry.json").write_text(json.dumps(body))
+
+    # Run 2: both treated as a miss; entries re-stored.
+    assert cmd_submit(_make_args(tmp_path)) == 0
+    assert len(state["preflight_calls"]) == 2
+    assert len(state["variant_calls"]) == 2
+
+    # Run 3: healed — both hit again.
+    assert cmd_submit(_make_args(tmp_path)) == 0
+    assert len(state["preflight_calls"]) == 2
+    assert len(state["variant_calls"]) == 2
+
+
+def test_cmd_submit_hit_with_missing_toolchains_fails_like_miss(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    stub_submit_helpers: dict,
+):
+    """Stale-store safety: the local toolchain availability check runs
+    on the UNIFIED path, so a cache hit whose drvs were GC'd since the
+    store behaves exactly like a miss would (abort before emission when
+    --build-compilers is off)."""
+    state = stub_submit_helpers
+    state["toolchain_return"] = (
+        (("x86_64", "gcc15"),),
+        {("x86_64", "gcc15"): "/nix/store/fake-gcc15.drv"},
+        "/nix/store/fake-toolchains.drv",
+    )
+    state["variants_return"] = {
+        "hello": {
+            "archs": ["x86_64"],
+            "sample_size": 2,
+            "sample_seed": "42",
+            "tier": 1,
+        },
+    }
+    assert cmd_submit(_make_args(tmp_path)) == 0
+    assert len(state["emit_calls"]) == 1
+
+    # The local store "loses" the toolchain outputs.
+    monkeypatch.setattr(
+        cli_module, "check_toolchains_locally", lambda drvs: frozenset(drvs),
+    )
+
+    # Cache-hit invocation: aborts before emission/dispatch...
+    rc_hit = cmd_submit(_make_args(tmp_path))
+    assert len(state["preflight_calls"]) == 1  # enumeration was a hit
+    # ...exactly like the forced-miss invocation does.
+    rc_miss = cmd_submit(_make_args(tmp_path, no_cache=True))
+    assert len(state["preflight_calls"]) == 2  # forced miss re-enumerated
+    assert rc_hit == rc_miss == 1
+    assert len(state["emit_calls"]) == 1
+    assert len(state["single_process_calls"]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -907,33 +989,19 @@ def test_produce_and_upload_toolchain_archive_upload_failure_returns_1(
     assert state["gateway"].disconnected
 
 
-def test_cmd_submit_no_cache_flag_skips_lookup_and_store(
-    monkeypatch: pytest.MonkeyPatch,
+def test_cmd_submit_no_cache_flag_disables_memoization(
     tmp_path: pathlib.Path,
     stub_submit_helpers: dict,
 ):
-    class _RecordingCache(IncrementalCache):
-        def lookup(self, input_hash: str):  # type: ignore[override]
-            stub_submit_helpers["cache_lookup_calls"].append(input_hash)
-            return None
-
-        def store(self, input_hash, partition_path, manifests_dir, meta_path):  # type: ignore[override]
-            stub_submit_helpers["cache_store_calls"].append(input_hash)
-            return CacheEntry(
-                input_hash=input_hash,
-                partition_path=partition_path,
-                manifests_archive=manifests_dir.parent / "manifests.tar",
-                meta_path=meta_path,
-            )
-
-    monkeypatch.setattr(cli_module, "IncrementalCache", _RecordingCache)
-
-    args = _make_args(tmp_path, no_cache=True)
-    rc = cmd_submit(args)
-    assert rc == 0
-    # No lookup, no store when --no-cache.
-    assert stub_submit_helpers["cache_lookup_calls"] == []
-    assert stub_submit_helpers["cache_store_calls"] == []
+    """--no-cache: the repo state is never collected, nothing is stored
+    and every invocation re-enumerates."""
+    state = stub_submit_helpers
+    assert cmd_submit(_make_args(tmp_path, no_cache=True)) == 0
+    assert cmd_submit(_make_args(tmp_path, no_cache=True)) == 0
+    assert len(state["preflight_calls"]) == 2
+    assert len(state["variant_calls"]) == 2
+    assert state["collect_calls"] == []
+    assert not (tmp_path / "cache").exists()
 
 
 def test_cmd_submit_propagates_failure(
@@ -941,27 +1009,21 @@ def test_cmd_submit_propagates_failure(
     tmp_path: pathlib.Path,
     stub_submit_helpers: dict,
 ):
-    """If run_single_process returns 1, cmd_submit returns 1 and the
-    cache is NOT updated (preserving the previous good state, if any)."""
+    """If run_single_process returns 1, cmd_submit returns 1. The
+    enumeration memoization is dispatch-independent (the memoized
+    values are pure functions of the repo state), so a follow-up
+    invocation still hits the cache."""
 
     monkeypatch.setattr(
         cli_module, "run_single_process", lambda *a, **kw: 1
     )
 
-    class _NoCache(IncrementalCache):
-        def lookup(self, input_hash: str):  # type: ignore[override]
-            return None
-
-        def store(self, *a, **kw):  # type: ignore[override]
-            stub_submit_helpers["cache_store_calls"].append("ouch")
-            return None
-
-    monkeypatch.setattr(cli_module, "IncrementalCache", _NoCache)
-
-    args = _make_args(tmp_path)
-    rc = cmd_submit(args)
-    assert rc == 1
-    assert stub_submit_helpers["cache_store_calls"] == []
+    assert cmd_submit(_make_args(tmp_path)) == 1
+    assert cmd_submit(_make_args(tmp_path)) == 1
+    # Second run hit the memoized enumerations despite the failed
+    # dispatch of the first.
+    assert len(stub_submit_helpers["preflight_calls"]) == 1
+    assert len(stub_submit_helpers["variant_calls"]) == 1
 
 
 def test_cmd_submit_fails_fast_on_empty_toolchain_aggregate(
@@ -976,16 +1038,6 @@ def test_cmd_submit_fails_fast_on_empty_toolchain_aggregate(
     ``emit_matrix_eval_manifests`` raises ``ValueError`` deep inside
     the emit step and the user-visible failure hides the real root
     cause (toolchain enumeration produced no aggregate)."""
-
-    class _MissCache(IncrementalCache):
-        def lookup(self, input_hash: str):  # type: ignore[override]
-            return None
-
-        def store(self, *a, **kw):  # type: ignore[override]
-            stub_submit_helpers["cache_store_calls"].append("stored")
-            return None
-
-    monkeypatch.setattr(cli_module, "IncrementalCache", _MissCache)
 
     # Preflight returns an empty aggregate (third element of tuple).
     stub_submit_helpers["toolchain_return"] = ((), {}, "")
@@ -1006,13 +1058,17 @@ def test_cmd_submit_fails_fast_on_empty_toolchain_aggregate(
     assert rc == 1
     # The guard short-circuits BEFORE emit_all_manifests runs.
     assert stub_submit_helpers["emit_calls"] == []
-    # And BEFORE cache.store fires.
-    assert stub_submit_helpers["cache_store_calls"] == []
     # The error log explicitly names the empty aggregate as the cause.
     assert any(
         "toolchain aggregate is empty" in rec.getMessage()
         for rec in caplog.records
     )
+    # The fail-fast guard runs on the UNIFIED path: a memoized re-run
+    # (cache hit on both sub-entries) aborts identically.
+    with caplog.at_level("ERROR"):
+        assert cmd_submit(_make_args(tmp_path)) == 1
+    assert len(stub_submit_helpers["preflight_calls"]) == 1  # hit
+    assert stub_submit_helpers["emit_calls"] == []
 
 
 def test_cmd_submit_populates_per_binary_toolchain_aggregate_drv(
@@ -1025,20 +1081,6 @@ def test_cmd_submit_populates_per_binary_toolchain_aggregate_drv(
     construction loop must thread the aggregate drv path into every
     per-binary metadata entry — and the fail-fast guard must NOT
     fire."""
-
-    class _MissCache(IncrementalCache):
-        def lookup(self, input_hash: str):  # type: ignore[override]
-            return None
-
-        def store(self, input_hash, partition_path, manifests_dir, meta_path):  # type: ignore[override]
-            return CacheEntry(
-                input_hash=input_hash,
-                partition_path=partition_path,
-                manifests_archive=manifests_dir.parent / "manifests.tar",
-                meta_path=meta_path,
-            )
-
-    monkeypatch.setattr(cli_module, "IncrementalCache", _MissCache)
 
     aggregate_drv = "/nix/store/fake-toolchains.drv"
     stub_submit_helpers["toolchain_return"] = (
@@ -1093,97 +1135,232 @@ def test_cmd_submit_populates_per_binary_toolchain_aggregate_drv(
     assert pbm["hello"]["tier"] == 1
 
 
-def test_serialize_then_restore_preflight_roundtrip(tmp_path: pathlib.Path):
-    """Cached preflight must round-trip every VariantSpec field.
+# ---------------------------------------------------------------------------
+# Hit-state == miss-state (the unified state-building path)
+# ---------------------------------------------------------------------------
 
-    Regression: previously the restore path constructed VariantSpec with
-    only 7 of its 15 TypedDict fields, so make_variant_header crashed
-    with KeyError('metadata_name') on a cache hit.
-    """
-    import tarfile
 
-    from compiler_suit_runner.cli import (
-        _restore_manifests_from_archive,
-        _serialize_preflight_for_cache,
-    )
-    from compiler_suit_runner.partition import VariantSpec
+_EQ_TC_PAIRS = (("aarch64", "clang18"), ("x86_64", "gcc15"))
+_EQ_TC_DRVS = {
+    ("aarch64", "clang18"): "/nix/store/fake-clang18.drv",
+    ("x86_64", "gcc15"): "/nix/store/fake-gcc15.drv",
+}
+_EQ_TC_AGG = "/nix/store/fake-toolchains.drv"
 
-    variant: VariantSpec = {
-        "label": "hello-x86_64-gcc15-O2",
-        "drv": "/nix/store/abc.drv",
-        "variant_dir": "gcc15_x86_64_O2_deadbeef",
-        "metadata_name": "gcc15_x86_64_O2_deadbeef.json",
-        "compiler_id": "gcc15",
-        "compiler_family": "gcc",
-        "compiler_version": "15.2.0",
-        "optimization": "O2",
-        "flag_set": "baseline",
-        "hardening": "default",
-        "sanitizer": "san-off",
-        "march": "march-default",
-        "tier": 1,
-        "pkg": "hello",
-        "arch": "x86_64",
+
+def _equivalence_stubs(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Fake ONLY the nix/git-touching helpers; the cache, stage
+    selection, manifest emission (REAL ``emit_all_manifests``) and
+    config building all run for real, so the captured state reflects
+    the production state-building path."""
+    state: dict = {
+        "preflight_calls": 0,
+        "variant_calls": 0,
+        "configs": [],
+        "eval_calls": [],
     }
-    pre = PreflightResult(
-        sys_name="x86_64-linux",
-        variants=(variant,),
-        toolchain_specs=(("x86_64", "gcc15"),),
-        common_dep_drvs=(),
-        toolchain_drvs=frozenset({"/nix/store/tc.drv"}),
-        toolchain_aggregate_drv="/nix/store/aaaa-toolchains.drv",
+
+    def fake_tc(flake_ref, sys_name, *, archs=None, run_subprocess=None):
+        state["preflight_calls"] += 1
+        return _EQ_TC_PAIRS, dict(_EQ_TC_DRVS), _EQ_TC_AGG
+
+    def fake_var(
+        flake_ref, sys_name, *, packages=None, archs=None,
+        sample_size=0, sample_seed="42", run_subprocess=None,
+    ):
+        state["variant_calls"] += 1
+        pkgs = sorted(packages) if packages else ["hello", "zlib"]
+        return {
+            p: {
+                "archs": ["aarch64", "x86_64"],
+                "sample_size": int(sample_size or 0),
+                "sample_seed": sample_seed,
+                "tier": 1,
+            }
+            for p in pkgs
+        }
+
+    def fake_eval(drvs):
+        call = {d: f"{d}.out" for d in drvs}
+        state["eval_calls"].append(tuple(sorted(call.items())))
+        return call
+
+    def fake_single_process(config, *, args=None, logger=None):
+        state["configs"].append(config)
+        return 0
+
+    monkeypatch.setattr(cli_module, "enumerate_toolchains_only", fake_tc)
+    monkeypatch.setattr(cli_module, "enumerate_variants", fake_var)
+    monkeypatch.setattr(
+        cli_module, "check_toolchains_locally", lambda drvs: frozenset(),
     )
-
-    preflight_path = tmp_path / "_preflight.json"
-    _serialize_preflight_for_cache(
-        pre,
-        num_workers=1,
-        target_path=preflight_path,
-        toolchain_drvs_by_pair={("x86_64", "gcc15"): "/nix/store/tc.drv"},
+    monkeypatch.setattr(
+        cli_module, "build_toolchains_locally", lambda drvs: None,
     )
-
-    # The aggregate drv path round-trips through the cache JSON
-    # verbatim: same handle written → same handle readable. Read it
-    # off-disk before the archive packs it, so we cover the
-    # write-side contract (the read side is exercised by
-    # _restore_manifests_from_archive below not crashing on the
-    # new field).
-    cached_payload = json.loads(preflight_path.read_text())
-    assert cached_payload["toolchain_aggregate_drv"] == (
-        "/nix/store/aaaa-toolchains.drv"
+    monkeypatch.setattr(cli_module, "eval_drv_outpaths", fake_eval)
+    monkeypatch.setattr(cli_module, "run_single_process", fake_single_process)
+    monkeypatch.setattr(
+        cli_module,
+        "collect_input_hash_inputs",
+        lambda repo_root, **_kw: InputHashInputs(
+            flake_lock=b"lock", git_rev="a" * 40, git_diff=b"",
+        ),
     )
+    return state
 
-    archive = tmp_path / "manifests.tar"
-    with tarfile.open(archive, mode="w") as tf:
-        tf.add(preflight_path, arcname="manifests/_preflight.json")
 
-    target_dir = tmp_path / "out"
-    _restore_manifests_from_archive(archive, target_dir)
+def _manifest_snapshot(manifest_dir: pathlib.Path) -> set:
+    """The audit's manifest-set shape: (filename, item_class, payload)."""
+    snap = set()
+    for path in manifest_dir.glob("*.json"):
+        if path.name.startswith(("_", ".")):
+            continue
+        body = json.loads(path.read_text())
+        snap.add(
+            (
+                path.name,
+                body["item_class"],
+                json.dumps(body["payload"], sort_keys=True),
+            )
+        )
+    return snap
 
-    # The variant header is written as <label>.json — load it and prove
-    # every VariantSpec field survived the round-trip.
-    body = json.loads((target_dir / f"{variant['label']}.json").read_text())
-    payload = body["payload"]
-    assert payload["pkg"] == "hello"
-    assert payload["arch"] == "x86_64"
-    assert payload["compiler_id"] == "gcc15"
-    assert payload["metadata_name"] == "gcc15_x86_64_O2_deadbeef.json"
-    assert payload["compiler_family"] == "gcc"
-    assert payload["optimization"] == "O2"
 
-    # The toolchain manifest must carry the realised drv path so the
-    # SLURM-side build worker doesn't fall back to flake-attr lookup
-    # (which fails — secondaries have no flake.nix in /app). The
-    # default (--build-compilers off) emits
-    # ``toolchain_validate__*.json``; opting in to in-cluster builds
-    # emits ``build_compilers__*.json``. Both carry the drv path,
-    # which is what this regression test guards.
-    tc_files = list(target_dir.glob("build_compilers__*.json")) + list(
-        target_dir.glob("toolchain_validate__*.json")
+def _run_miss_then_hit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    **arg_overrides,
+) -> dict:
+    """Run cmd_submit twice (miss, then hit) against one cache root and
+    two separate shared-fs dirs; return the harness state."""
+    state = _equivalence_stubs(monkeypatch)
+    common = dict(cache_root=tmp_path / "cache", **arg_overrides)
+
+    args_miss = _make_args(tmp_path / "miss", **common)
+    assert cmd_submit(args_miss) == 0
+    assert state["preflight_calls"] == 1
+    assert state["variant_calls"] == 1
+
+    args_hit = _make_args(tmp_path / "hit", **common)
+    assert cmd_submit(args_hit) == 0
+    # The second invocation hit BOTH sub-entries.
+    assert state["preflight_calls"] == 1
+    assert state["variant_calls"] == 1
+
+    state["manifest_dirs"] = (
+        pathlib.Path(args_miss.shared_fs) / "manifests",
+        pathlib.Path(args_hit.shared_fs) / "manifests",
     )
-    assert len(tc_files) == 1
-    tc = json.loads(tc_files[0].read_text())
-    assert tc["payload"].get("drv") == "/nix/store/tc.drv"
+    return state
+
+
+@pytest.mark.parametrize("packages", [None, ["hello"]])
+@pytest.mark.parametrize("debug_testbuild", [None, "hello"])
+@pytest.mark.parametrize("build_compilers", [False, True])
+def test_cmd_submit_hit_state_equals_miss_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    packages,
+    debug_testbuild,
+    build_compilers,
+):
+    """State-equivalence: a cache hit reaches dispatch with EXACTLY the
+    state the miss built (one unified state-building path).
+
+    Production consequences of the old divergence this guards against:
+    a hit planned ZERO matrix_eval/dependency_graph tasks
+    (per_binary_metadata stayed empty), dropped the toolchain
+    aggregate (skipping the dedup-archive upload), and re-emitted
+    manifest classes the original invocation's stage gate suppressed.
+    """
+    state = _run_miss_then_hit(
+        monkeypatch,
+        tmp_path,
+        packages=packages,
+        debug_testbuild=debug_testbuild,
+        build_compilers=build_compilers,
+    )
+    cfg_miss, cfg_hit = state["configs"]
+
+    # In-memory planning state identical and NON-empty on the hit.
+    assert cfg_hit.per_binary_metadata == cfg_miss.per_binary_metadata
+    assert cfg_hit.per_binary_metadata
+    for meta in cfg_hit.per_binary_metadata.values():
+        # Upload-gate input: the slurm-path gate is
+        # ``toolchain_dedup and tc_aggregate_drv and gateway and
+        # slurm_root_folder``; args are shared between the runs, the
+        # dedup flag derives from args, so gate equality reduces to the
+        # aggregate drv riding the hit path too.
+        assert meta["toolchain_aggregate_drv"] == _EQ_TC_AGG
+
+    # Manifest sets identical: same files, same classes, same payloads
+    # (the stage gate applied on both paths).
+    snap_miss, snap_hit = (
+        _manifest_snapshot(d) for d in state["manifest_dirs"]
+    )
+    assert snap_hit == snap_miss
+    if build_compilers or debug_testbuild:
+        assert snap_miss  # toolchain stage emitted on both paths
+    else:
+        assert snap_miss == set()  # stage gate suppressed JSON classes
+
+    # Placement inputs identical: outpath resolution ran on both paths
+    # over the same drv set (placements derive 1:1 from these).
+    assert state["eval_calls"][0] == state["eval_calls"][1]
+
+
+def test_cmd_submit_hit_task_plan_equals_miss_task_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+):
+    """TaskInfo-plan equivalence: discover_items over the hit-built
+    config yields the same multiset of (task_id, phase_id, type_id,
+    depends_on) as over the miss-built config."""
+    from compiler_suit_runner.suit_task import SuitTask
+
+    state = _run_miss_then_hit(
+        monkeypatch,
+        tmp_path,
+        build_compilers=True,
+        debug_testbuild="hello",
+    )
+    cfg_miss, cfg_hit = state["configs"]
+
+    def dep_key(dep):
+        if isinstance(dep, str):
+            return ("", dep)
+        return (
+            str(getattr(dep, "phase_id", "")),
+            str(getattr(dep, "task_id", "")),
+        )
+
+    def plan(config):
+        infos = list(SuitTask(config).discover_items())
+        return sorted(
+            (
+                str(getattr(ti, "task_id", "")),
+                str(getattr(ti, "phase_id", "")),
+                str(getattr(ti, "type_id", "")),
+                tuple(
+                    sorted(
+                        dep_key(d)
+                        for d in tuple(
+                            getattr(ti, "task_depends_on", ()) or ()
+                        )
+                    )
+                ),
+            )
+            for ti in infos
+        )
+
+    plan_miss = plan(cfg_miss)
+    plan_hit = plan(cfg_hit)
+    assert plan_hit == plan_miss
+    # Sanity: the equal plans actually contain the phase-2/3 tasks the
+    # old hit path silently dropped.
+    task_ids = [t[0] for t in plan_miss]
+    assert "dependency_graph" in task_ids
+    assert len(task_ids) > 3  # matrix_evals + dep_graph + toolchain tasks
 
 
 # ---------------------------------------------------------------------------

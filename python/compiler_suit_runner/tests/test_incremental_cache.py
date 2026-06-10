@@ -1,21 +1,20 @@
-"""Tests for the local incremental partition cache."""
+"""Tests for the local enumeration-memoization cache."""
 from __future__ import annotations
 
 import dataclasses
 import json
 import pathlib
-import subprocess
-import tarfile
 
 import pytest
 
 from compiler_suit_runner.incremental_cache import (
-    CacheEntry,
     IncrementalCache,
     InputHashInputs,
-    InvocationAxes,
+    ToolchainAxes,
+    VariantAxes,
     collect_input_hash_inputs,
     compute_input_hash,
+    compute_subentry_key,
 )
 
 
@@ -61,22 +60,31 @@ def _make_run_subprocess(
     return run_subprocess, calls
 
 
-def _populate_pre_flight_inputs(tmp_path: pathlib.Path) -> tuple[
-    pathlib.Path, pathlib.Path, pathlib.Path
-]:
-    """Create the three sources for ``IncrementalCache.store`` and return
-    the partition path, the manifests directory, and the meta path."""
-    partition_path = tmp_path / "partition.json"
-    partition_path.write_text(json.dumps({"version": 1, "variants": ["x"]}))
+_REPO = InputHashInputs(
+    flake_lock=b"lock", git_rev="a" * 40, git_diff=b""
+)
 
-    manifests_dir = tmp_path / "manifests"
-    manifests_dir.mkdir()
-    (manifests_dir / "a.json").write_text(json.dumps({"a": 1}))
-    (manifests_dir / "b.json").write_text(json.dumps({"b": 2}))
+_TC_PAIRS = (("aarch64", "clang18"), ("x86_64", "gcc15"))
+_TC_DRVS = {
+    ("aarch64", "clang18"): "/nix/store/clang18.drv",
+    ("x86_64", "gcc15"): "/nix/store/gcc15.drv",
+}
+_TC_AGG = "/nix/store/toolchains.drv"
 
-    meta_path = tmp_path / "meta.json"
-    meta_path.write_text(json.dumps({"meta": "info"}))
-    return partition_path, manifests_dir, meta_path
+_VARIANTS = {
+    "hello": {
+        "archs": ["aarch64", "x86_64"],
+        "sample_size": 2,
+        "sample_seed": "42",
+        "tier": 1,
+    },
+    "zlib": {
+        "archs": ["x86_64"],
+        "sample_size": 0,
+        "sample_seed": "7",
+        "tier": 2,
+    },
+}
 
 
 # ---------------------------------------------------------- compute_input_hash
@@ -120,100 +128,122 @@ def test_compute_input_hash_boundary_swap_distinct():
     assert compute_input_hash(c) != compute_input_hash(d)
 
 
-# --------------------------------------------------------- InvocationAxes
+# ------------------------------------------------- ToolchainAxes / VariantAxes
 
 
-def _axes(**overrides) -> InvocationAxes:
-    base = dict(
-        packages=["zlib", "lz4"],
-        archs=["x86_64", "aarch64"],
-        variant_sample=2,
-        variant_seed="42",
-        sys_name="x86_64-linux",
-        build_compilers=False,
-        debug_testbuild=None,
-        toolchain_dedup=True,
-    )
-    base.update(overrides)
-    return InvocationAxes.from_values(**base)
+def test_toolchain_axes_canonicalize_order_and_duplicates():
+    a = ToolchainAxes.from_values(archs=["x86_64", "aarch64", "x86_64"])
+    b = ToolchainAxes.from_values(archs=["aarch64", "x86_64"])
+    assert a == b
+    assert a.canonical_bytes() == b.canonical_bytes()
+    assert a.archs == ("aarch64", "x86_64")
 
 
-def _hash_with_axes(axes: InvocationAxes) -> str:
-    return compute_input_hash(
-        InputHashInputs(
-            flake_lock=b"lock",
-            git_rev="a" * 40,
-            git_diff=b"",
-            invocation=axes.canonical_bytes(),
-        )
-    )
-
-
-def test_invocation_axes_canonicalize_order_and_duplicates():
-    a = InvocationAxes.from_values(
+def test_variant_axes_canonicalize_order_and_duplicates():
+    a = VariantAxes.from_values(
         packages=["zlib", "lz4", "zlib"], archs=["x86_64", "aarch64"]
     )
-    b = InvocationAxes.from_values(
+    b = VariantAxes.from_values(
         packages=["lz4", "zlib"], archs=["aarch64", "x86_64"]
     )
     assert a == b
     assert a.canonical_bytes() == b.canonical_bytes()
+    assert a.packages == ("lz4", "zlib")
+    assert a.archs == ("aarch64", "x86_64")
 
 
-def test_invocation_axes_none_distinct_from_explicit_list():
-    all_pkgs = _axes(packages=None)
-    some_pkgs = _axes(packages=["zlib"])
-    assert all_pkgs.canonical_bytes() != some_pkgs.canonical_bytes()
-    assert _hash_with_axes(all_pkgs) != _hash_with_axes(some_pkgs)
-
-
-def test_input_hash_identical_invocation_is_stable():
-    h1 = _hash_with_axes(_axes(packages=["zlib", "lz4"]))
-    h2 = _hash_with_axes(_axes(packages=["lz4", "zlib"]))
-    assert h1 == h2
-
-
-def test_input_hash_changes_with_packages():
-    nano = _hash_with_axes(_axes(packages=["zlib"]))
-    full = _hash_with_axes(
-        _axes(packages=["zlib", "lz4", "xz", "bzip2"])
+def test_axes_none_distinct_from_explicit_list():
+    assert (
+        ToolchainAxes.from_values(archs=None).canonical_bytes()
+        != ToolchainAxes.from_values(archs=["x86_64"]).canonical_bytes()
     )
-    assert nano != full
-
-
-def test_input_hash_changes_with_archs():
-    h_two = _hash_with_axes(_axes(archs=["x86_64", "aarch64"]))
-    h_all = _hash_with_axes(_axes(archs=None))
-    h_one = _hash_with_axes(_axes(archs=["x86_64"]))
-    assert len({h_two, h_all, h_one}) == 3
-
-
-def test_input_hash_changes_with_variant_sample():
-    assert _hash_with_axes(_axes(variant_sample=2)) != _hash_with_axes(
-        _axes(variant_sample=0)
+    assert (
+        VariantAxes.from_values(packages=None).canonical_bytes()
+        != VariantAxes.from_values(packages=["zlib"]).canonical_bytes()
     )
 
 
-def test_input_hash_changes_with_each_remaining_axis():
-    base = _hash_with_axes(_axes())
-    variations = {
-        "variant_seed": _hash_with_axes(_axes(variant_seed="43")),
-        "sys_name": _hash_with_axes(_axes(sys_name="aarch64-linux")),
-        "build_compilers": _hash_with_axes(_axes(build_compilers=True)),
-        "debug_testbuild": _hash_with_axes(_axes(debug_testbuild="hello")),
-        "toolchain_dedup": _hash_with_axes(_axes(toolchain_dedup=False)),
-    }
-    hashes = {base, *variations.values()}
-    assert len(hashes) == 1 + len(variations)
+def test_axes_kind_discriminator_separates_namespaces():
+    """A toolchains key can never collide with a variants key, even when
+    the shared fields coincide — the canonical bytes embed a kind tag
+    (and the field sets differ anyway)."""
+    tc = ToolchainAxes.from_values(sys_name="x86_64-linux", archs=["x86_64"])
+    var = VariantAxes.from_values(sys_name="x86_64-linux", archs=["x86_64"])
+    assert tc.canonical_bytes() != var.canonical_bytes()
+    assert compute_subentry_key(_REPO, tc) != compute_subentry_key(_REPO, var)
 
 
-def test_input_hash_invocation_distinct_from_repo_only():
-    """A keyed-with-axes hash never collides with the axes-free hash of
-    the same repo state (the contamination scenario)."""
-    repo_only = compute_input_hash(
-        InputHashInputs(flake_lock=b"lock", git_rev="a" * 40, git_diff=b"")
+def test_subentry_key_stable_for_identical_invocation():
+    k1 = compute_subentry_key(
+        _REPO, VariantAxes.from_values(packages=["zlib", "lz4"])
     )
-    assert repo_only != _hash_with_axes(_axes())
+    k2 = compute_subentry_key(
+        _REPO, VariantAxes.from_values(packages=["lz4", "zlib"])
+    )
+    assert k1 == k2
+
+
+def test_packages_change_misses_variants_but_not_toolchains():
+    """``--packages`` is a variants-only axis: the toolchains key is
+    unchanged while the variants key splits."""
+    tc_a = compute_subentry_key(_REPO, ToolchainAxes.from_values())
+    tc_b = compute_subentry_key(_REPO, ToolchainAxes.from_values())
+    var_a = compute_subentry_key(
+        _REPO, VariantAxes.from_values(packages=["zlib"])
+    )
+    var_b = compute_subentry_key(
+        _REPO, VariantAxes.from_values(packages=["zlib", "lz4"])
+    )
+    assert tc_a == tc_b
+    assert var_a != var_b
+
+
+def test_archs_change_misses_both_subentries():
+    tc_a = compute_subentry_key(
+        _REPO, ToolchainAxes.from_values(archs=["x86_64"])
+    )
+    tc_b = compute_subentry_key(_REPO, ToolchainAxes.from_values(archs=None))
+    var_a = compute_subentry_key(
+        _REPO, VariantAxes.from_values(archs=["x86_64"])
+    )
+    var_b = compute_subentry_key(_REPO, VariantAxes.from_values(archs=None))
+    assert tc_a != tc_b
+    assert var_a != var_b
+
+
+def test_repo_state_change_misses_both_subentries():
+    other_repo = dataclasses.replace(_REPO, git_rev="b" * 40)
+    for axes in (ToolchainAxes.from_values(), VariantAxes.from_values()):
+        assert compute_subentry_key(_REPO, axes) != compute_subentry_key(
+            other_repo, axes
+        )
+
+
+def test_variant_axes_sample_and_seed_split_the_key():
+    base = compute_subentry_key(
+        _REPO, VariantAxes.from_values(variant_sample=2, variant_seed="42")
+    )
+    sample = compute_subentry_key(
+        _REPO, VariantAxes.from_values(variant_sample=0, variant_seed="42")
+    )
+    seed = compute_subentry_key(
+        _REPO, VariantAxes.from_values(variant_sample=2, variant_seed="43")
+    )
+    sys = compute_subentry_key(
+        _REPO,
+        VariantAxes.from_values(
+            variant_sample=2, variant_seed="42", sys_name="aarch64-linux"
+        ),
+    )
+    assert len({base, sample, seed, sys}) == 4
+
+
+def test_toolchain_axes_sys_name_splits_the_key():
+    assert compute_subentry_key(
+        _REPO, ToolchainAxes.from_values(sys_name="x86_64-linux")
+    ) != compute_subentry_key(
+        _REPO, ToolchainAxes.from_values(sys_name="aarch64-linux")
+    )
 
 
 # ---------------------------------------------------- collect_input_hash_inputs
@@ -241,6 +271,9 @@ def test_collect_input_hash_inputs_happy_path(tmp_path: pathlib.Path):
     assert result.flake_lock == flake_lock_bytes
     assert result.git_rev == "1234567890abcdef1234567890abcdef12345678"
     assert result.git_diff == b"diff --git a/x b/x\n"
+    # The repo-state collection carries no axes; sub-entry keys are
+    # derived later via compute_subentry_key.
+    assert result.invocation == b""
 
     # flake.lock was read from the right path
     assert read_calls == [tmp_path / "flake.lock"]
@@ -249,32 +282,6 @@ def test_collect_input_hash_inputs_happy_path(tmp_path: pathlib.Path):
     cmds = [cmd for cmd, _ in calls]
     assert ("git", "rev-parse", "HEAD") in cmds
     assert ("git", "diff") in cmds
-
-
-def test_collect_input_hash_inputs_carries_invocation(tmp_path: pathlib.Path):
-    """``invocation=`` lands as canonical bytes; omitted -> empty."""
-
-    def read_bytes(path: pathlib.Path) -> bytes:
-        return b"lock"
-
-    run_subprocess, _ = _make_run_subprocess()
-    axes = _axes()
-
-    with_axes = collect_input_hash_inputs(
-        tmp_path,
-        invocation=axes,
-        run_subprocess=run_subprocess,
-        read_bytes=read_bytes,
-    )
-    assert with_axes.invocation == axes.canonical_bytes()
-
-    without_axes = collect_input_hash_inputs(
-        tmp_path,
-        run_subprocess=run_subprocess,
-        read_bytes=read_bytes,
-    )
-    assert without_axes.invocation == b""
-    assert compute_input_hash(with_axes) != compute_input_hash(without_axes)
 
 
 def test_collect_input_hash_inputs_subprocess_failure(tmp_path: pathlib.Path):
@@ -347,178 +354,272 @@ def test_collect_input_hash_inputs_missing_flake_lock(tmp_path: pathlib.Path):
 # --------------------------------------------------------- IncrementalCache
 
 
-def test_lookup_missing_dir_returns_none(tmp_path: pathlib.Path):
-    cache = IncrementalCache(tmp_path / "cache")
-    assert cache.lookup("deadbeef") is None
+def _cache(tmp_path: pathlib.Path) -> IncrementalCache:
+    return IncrementalCache(tmp_path / "cache")
 
 
-def test_lookup_partial_entry_returns_none(tmp_path: pathlib.Path):
-    cache_root = tmp_path / "cache"
-    cache_root.mkdir()
-    entry_dir = cache_root / "abc123"
-    entry_dir.mkdir()
-    # Only 2 of 3 files
-    (entry_dir / "partition.json").write_text("{}")
-    (entry_dir / "meta.json").write_text("{}")
-
-    cache = IncrementalCache(cache_root)
-    assert cache.lookup("abc123") is None
+def test_lookup_missing_returns_none(tmp_path: pathlib.Path):
+    cache = _cache(tmp_path)
+    assert cache.lookup_toolchains("deadbeef") is None
+    assert cache.lookup_variants("deadbeef") is None
 
 
-def test_lookup_complete_returns_entry(tmp_path: pathlib.Path):
-    cache_root = tmp_path / "cache"
-    cache_root.mkdir()
-    entry_dir = cache_root / "abc123"
-    entry_dir.mkdir()
-    (entry_dir / "partition.json").write_text(json.dumps({"v": 1}))
-    (entry_dir / "manifests.tar").write_bytes(b"")
-    (entry_dir / "meta.json").write_text("{}")
+def test_toolchains_round_trip_exact(tmp_path: pathlib.Path):
+    cache = _cache(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
 
-    cache = IncrementalCache(cache_root)
-    entry = cache.lookup("abc123")
-    assert entry is not None
-    assert entry.input_hash == "abc123"
-    assert entry.partition_path == entry_dir / "partition.json"
-    assert entry.manifests_archive == entry_dir / "manifests.tar"
-    assert entry.meta_path == entry_dir / "meta.json"
-    assert entry.is_complete is True
+    restored = cache.lookup_toolchains("k1")
+    assert restored is not None
+    pairs, drvs, aggregate = restored
+    # Exact round-trip: tuple-of-tuples, dict keyed by (arch, compiler)
+    # tuples in original order, aggregate string verbatim.
+    assert pairs == _TC_PAIRS
+    assert drvs == _TC_DRVS
+    assert list(drvs.items()) == list(_TC_DRVS.items())
+    assert aggregate == _TC_AGG
 
 
-def test_is_complete_reflects_files(tmp_path: pathlib.Path):
-    entry = CacheEntry(
-        input_hash="x",
-        partition_path=tmp_path / "p.json",
-        manifests_archive=tmp_path / "m.tar",
-        meta_path=tmp_path / "meta.json",
-    )
-    assert entry.is_complete is False
-    entry.partition_path.write_text("{}")
-    assert entry.is_complete is False
-    entry.manifests_archive.write_bytes(b"")
-    assert entry.is_complete is False
-    entry.meta_path.write_text("{}")
-    assert entry.is_complete is True
+def test_toolchains_round_trip_empty_shapes(tmp_path: pathlib.Path):
+    """The legit-empty return of ``enumerate_toolchains_only`` (no
+    leaves resolved -> ``((), {}, "")``) round-trips as-is."""
+    cache = _cache(tmp_path)
+    cache.store_toolchains("k1", (), {}, "")
+    assert cache.lookup_toolchains("k1") == ((), {}, "")
 
 
-def test_store_round_trip(tmp_path: pathlib.Path):
-    partition_path, manifests_dir, meta_path = _populate_pre_flight_inputs(
-        tmp_path
-    )
-
-    cache = IncrementalCache(tmp_path / "cache")
-    stored = cache.store("h1", partition_path, manifests_dir, meta_path)
-
-    # Lookup returns a populated entry
-    looked_up = cache.lookup("h1")
-    assert looked_up is not None
-    assert looked_up.is_complete
-    assert looked_up.partition_path == stored.partition_path
-
-    # Partition contents readable
-    data = json.loads(looked_up.partition_path.read_text())
-    assert data == {"version": 1, "variants": ["x"]}
-
-    # meta.json contents readable
-    meta = json.loads(looked_up.meta_path.read_text())
-    assert meta == {"meta": "info"}
-
-    # manifests.tar extractable and contains the manifest files
-    extract_dir = tmp_path / "extracted"
-    extract_dir.mkdir()
-    with tarfile.open(looked_up.manifests_archive) as tf:
-        tf.extractall(extract_dir, filter="data")
-
-    extracted_files = sorted(p.name for p in (extract_dir / "manifests").iterdir())
-    assert extracted_files == ["a.json", "b.json"]
-    assert json.loads(
-        (extract_dir / "manifests" / "a.json").read_text()
-    ) == {"a": 1}
+def test_variants_round_trip_exact(tmp_path: pathlib.Path):
+    cache = _cache(tmp_path)
+    cache.store_variants("k1", _VARIANTS)
+    restored = cache.lookup_variants("k1")
+    assert restored == _VARIANTS
+    # Empty dict (no plannable binaries) round-trips too.
+    cache.store_variants("k2", {})
+    assert cache.lookup_variants("k2") == {}
 
 
-def test_store_does_not_clobber_existing(tmp_path: pathlib.Path):
-    partition_path, manifests_dir, meta_path = _populate_pre_flight_inputs(
-        tmp_path
-    )
+def test_namespaces_are_independent(tmp_path: pathlib.Path):
+    """Storing under one namespace never produces a hit in the other,
+    even for the same key string."""
+    cache = _cache(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    assert cache.lookup_variants("k1") is None
+    cache.store_variants("k2", _VARIANTS)
+    assert cache.lookup_toolchains("k2") is None
 
-    cache_root = tmp_path / "cache"
-    cache = IncrementalCache(cache_root)
 
-    # Pre-create the target dir with sentinel content (simulates a race).
-    target = cache_root / "h1"
-    target.mkdir(parents=True)
-    sentinel_partition = target / "partition.json"
-    sentinel_partition.write_text(json.dumps({"sentinel": True}))
-    (target / "manifests.tar").write_bytes(b"sentinel-tar")
-    (target / "meta.json").write_text(json.dumps({"sentinel": True}))
-
-    cache.store("h1", partition_path, manifests_dir, meta_path)
-
-    # Existing content is preserved, NOT overwritten.
-    assert json.loads(sentinel_partition.read_text()) == {"sentinel": True}
-    assert (target / "manifests.tar").read_bytes() == b"sentinel-tar"
-
-    # The tmp dir is cleaned up — no .tmp.* siblings left behind.
+def test_store_leaves_no_tmp_dirs(tmp_path: pathlib.Path):
+    cache = _cache(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    cache.store_variants("k1", _VARIANTS)
     leftovers = [
-        p for p in cache_root.iterdir() if ".tmp" in p.name
+        p
+        for ns in ("toolchains", "variants")
+        for p in (tmp_path / "cache" / ns).iterdir()
+        if ".tmp" in p.name
     ]
     assert leftovers == []
 
 
-def test_invalidate_removes_entry(tmp_path: pathlib.Path):
-    partition_path, manifests_dir, meta_path = _populate_pre_flight_inputs(
-        tmp_path
-    )
-    cache = IncrementalCache(tmp_path / "cache")
-    cache.store("h1", partition_path, manifests_dir, meta_path)
-    assert cache.lookup("h1") is not None
+def test_store_does_not_clobber_existing(tmp_path: pathlib.Path):
+    cache = _cache(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    entry = tmp_path / "cache" / "toolchains" / "k1" / "entry.json"
+    sentinel = entry.read_text()
 
-    cache.invalidate("h1")
-    assert cache.lookup("h1") is None
-    assert not (tmp_path / "cache" / "h1").exists()
+    # A second store for the same key keeps the first entry (memoized
+    # values for one key are identical by construction).
+    cache.store_toolchains("k1", (), {}, "")
+    assert entry.read_text() == sentinel
+    assert cache.lookup_toolchains("k1") == (_TC_PAIRS, _TC_DRVS, _TC_AGG)
+
+
+def test_lookup_rejects_legacy_entry_dir(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+):
+    """An entry dir in the old ``manifests.tar`` format (no entry.json)
+    is a miss — legacy entries are never replayed — and the dir is
+    discarded so the re-store after the forced miss can replace it."""
+    cache = _cache(tmp_path)
+    legacy = tmp_path / "cache" / "toolchains" / "k1"
+    legacy.mkdir(parents=True)
+    (legacy / "partition.json").write_text("{}")
+    (legacy / "manifests.tar").write_bytes(b"")
+    (legacy / "meta.json").write_text("{}")
+    with caplog.at_level("WARNING"):
+        assert cache.lookup_toolchains("k1") is None
+    assert not legacy.exists()
+    # Self-heal: a subsequent store repopulates the entry.
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    assert cache.lookup_toolchains("k1") == (_TC_PAIRS, _TC_DRVS, _TC_AGG)
+
+
+def test_lookup_rejects_corrupt_json(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+):
+    cache = _cache(tmp_path)
+    entry_dir = tmp_path / "cache" / "variants" / "k1"
+    entry_dir.mkdir(parents=True)
+    (entry_dir / "entry.json").write_text("{not json")
+    with caplog.at_level("WARNING"):
+        assert cache.lookup_variants("k1") is None
+    assert any("treating as miss" in r.getMessage() for r in caplog.records)
+    # The corrupt entry was discarded so a store can self-heal it.
+    assert not entry_dir.exists()
+    cache.store_variants("k1", _VARIANTS)
+    assert cache.lookup_variants("k1") == _VARIANTS
+
+
+def test_lookup_rejects_wrong_version(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+):
+    cache = _cache(tmp_path)
+    entry_dir = tmp_path / "cache" / "toolchains" / "k1"
+    for bad_version in (0, 2, "1", None):
+        entry_dir.mkdir(parents=True, exist_ok=True)
+        body = {
+            "version": bad_version,
+            "tc_pairs": [],
+            "tc_drvs": [],
+            "tc_aggregate_drv": "",
+        }
+        (entry_dir / "entry.json").write_text(json.dumps(body))
+        with caplog.at_level("WARNING"):
+            assert cache.lookup_toolchains("k1") is None
+        # Discarded for self-heal.
+        assert not entry_dir.exists()
+
+
+def test_lookup_rejects_missing_or_malformed_keys(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+):
+    cache = _cache(tmp_path)
+    entry_dir = tmp_path / "cache" / "toolchains" / "k1"
+
+    bad_payloads = [
+        # required keys absent entirely
+        {"version": 1},
+        # tc_pairs entries malformed (wrong arity / non-strings)
+        {
+            "version": 1,
+            "tc_pairs": [["x86_64"]],
+            "tc_drvs": [],
+            "tc_aggregate_drv": "",
+        },
+        {
+            "version": 1,
+            "tc_pairs": [["x86_64", 7]],
+            "tc_drvs": [],
+            "tc_aggregate_drv": "",
+        },
+        # tc_drvs entries malformed
+        {
+            "version": 1,
+            "tc_pairs": [],
+            "tc_drvs": [["x86_64", "gcc15"]],
+            "tc_aggregate_drv": "",
+        },
+        # aggregate not a string
+        {
+            "version": 1,
+            "tc_pairs": [],
+            "tc_drvs": [],
+            "tc_aggregate_drv": None,
+        },
+    ]
+    for payload in bad_payloads:
+        entry_dir.mkdir(parents=True, exist_ok=True)
+        (entry_dir / "entry.json").write_text(json.dumps(payload))
+        with caplog.at_level("WARNING"):
+            assert cache.lookup_toolchains("k1") is None, payload
+
+
+def test_lookup_variants_rejects_malformed_metadata(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture
+):
+    cache = _cache(tmp_path)
+    entry_dir = tmp_path / "cache" / "variants" / "k1"
+
+    bad_payloads = [
+        {"version": 1},  # per_binary_meta_raw absent
+        {"version": 1, "per_binary_meta_raw": []},  # not a dict
+        # metadata value not a dict
+        {"version": 1, "per_binary_meta_raw": {"hello": "x"}},
+        # required metadata keys missing
+        {"version": 1, "per_binary_meta_raw": {"hello": {"archs": ["x"]}}},
+        # archs not a list of strings
+        {
+            "version": 1,
+            "per_binary_meta_raw": {
+                "hello": {
+                    "archs": "x86_64",
+                    "sample_size": 0,
+                    "sample_seed": "42",
+                    "tier": 1,
+                }
+            },
+        },
+    ]
+    for payload in bad_payloads:
+        entry_dir.mkdir(parents=True, exist_ok=True)
+        (entry_dir / "entry.json").write_text(json.dumps(payload))
+        with caplog.at_level("WARNING"):
+            assert cache.lookup_variants("k1") is None, payload
+
+
+def test_invalidate_removes_key_from_all_namespaces(tmp_path: pathlib.Path):
+    cache = _cache(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    cache.store_variants("k1", _VARIANTS)
+    # Plus a legacy top-level entry dir under the same key.
+    legacy = tmp_path / "cache" / "k1"
+    legacy.mkdir()
+    (legacy / "manifests.tar").write_bytes(b"")
+
+    cache.invalidate("k1")
+    assert cache.lookup_toolchains("k1") is None
+    assert cache.lookup_variants("k1") is None
+    assert not legacy.exists()
 
 
 def test_invalidate_idempotent(tmp_path: pathlib.Path):
-    cache = IncrementalCache(tmp_path / "cache")
+    cache = _cache(tmp_path)
     # Calling on a missing entry must not raise.
     cache.invalidate("never-existed")
     cache.invalidate("never-existed")  # twice for good measure
 
 
-def test_clear_counts_and_removes(tmp_path: pathlib.Path):
-    partition_path, manifests_dir, meta_path = _populate_pre_flight_inputs(
-        tmp_path
-    )
-    cache_root = tmp_path / "cache"
-    cache = IncrementalCache(cache_root)
-    cache.store("h1", partition_path, manifests_dir, meta_path)
-    cache.store("h2", partition_path, manifests_dir, meta_path)
+def test_invalidate_namespace_name_does_not_drop_namespace(
+    tmp_path: pathlib.Path,
+):
+    """``invalidate("toolchains")`` must not rmtree the whole toolchains
+    namespace dir via the legacy-cleanup path."""
+    cache = _cache(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    cache.invalidate("toolchains")
+    assert cache.lookup_toolchains("k1") is not None
 
-    # Drop a non-entry file at the root; it must NOT be counted.
-    cache_root.mkdir(exist_ok=True)
+
+def test_clear_counts_and_removes(tmp_path: pathlib.Path):
+    cache = _cache(tmp_path)
+    cache.store_toolchains("k1", _TC_PAIRS, _TC_DRVS, _TC_AGG)
+    cache.store_variants("k1", _VARIANTS)
+    cache.store_variants("k2", {})
+
+    cache_root = tmp_path / "cache"
+    # Legacy top-level entry dir: counted (so the operator sees it
+    # cleared) but never consulted by lookups.
+    legacy = cache_root / ("f" * 64)
+    legacy.mkdir()
+    (legacy / "manifests.tar").write_bytes(b"")
+    # Strays: not counted.
     (cache_root / "stray.txt").write_text("not an entry")
-    # And a leftover tmp dir from a hypothetical aborted run.
-    (cache_root / "abc.tmp.999").mkdir()
+    (cache_root / "toolchains" / "abc.tmp.999").mkdir()
 
     n = cache.clear()
-    assert n == 2
+    assert n == 4  # 1 toolchains + 2 variants + 1 legacy
     assert not cache_root.exists()
 
 
 def test_clear_on_empty_cache(tmp_path: pathlib.Path):
     cache = IncrementalCache(tmp_path / "never-created")
     assert cache.clear() == 0
-
-
-def test_clear_ignores_non_entry_files(tmp_path: pathlib.Path):
-    cache_root = tmp_path / "cache"
-    cache_root.mkdir()
-    (cache_root / "junk.txt").write_text("hi")
-    (cache_root / "h1").mkdir()
-    (cache_root / "h1" / "partition.json").write_text("{}")
-    (cache_root / "h1" / "manifests.tar").write_bytes(b"")
-    (cache_root / "h1" / "meta.json").write_text("{}")
-
-    cache = IncrementalCache(cache_root)
-    n = cache.clear()
-    assert n == 1
-    assert not cache_root.exists()
