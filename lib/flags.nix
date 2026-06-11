@@ -11,6 +11,21 @@
 #
 # matrix.nix filters (compiler, target, entry) tuples by these constraints
 # at eval time so unsupported combos never get instantiated.
+#
+# Link-time flags come in TWO distinct kinds, routed through different
+# channels by mkVariant.nix — confusing them breaks every link:
+#
+#   ldflags / extraLdflags    — RAW ld flags (``-z relro``). Routed to
+#       ``NIX_LDFLAGS``, which the ld-wrapper feeds straight to ``ld``.
+#       Driver-only flags must NEVER go here: ld parses ``-fsanitize=x``
+#       as ``-f sanitize=x`` (``--auxiliary``) and fails every
+#       executable link with "-f may not be used without -shared".
+#
+#   linkFlags / extraLinkFlags — COMPILER-DRIVER link flags
+#       (``-fsanitize=x``, ``-flto``, ``-static-pie``). Routed to
+#       ``NIX_CFLAGS_LINK``, which the cc-wrapper appends to driver
+#       invocations that link; the driver then expands them into the
+#       proper ld arguments (and runtime libs, e.g. libasan).
 
 { }:
 
@@ -162,7 +177,18 @@ let
       label = "staticpie";
       cflags = "-fPIE";
       cxxflags = "-fPIE";
-      ldflags = "-static-pie";
+      # Driver flag (gcc expands it to ``-static -pie --no-dynamic-linker``
+      # plus rcrt1.o startfiles) — raw ld doesn't know ``-static-pie``.
+      # Appended at link via NIX_CFLAGS_LINK; on a ``-shared`` link the
+      # later -static-pie wins (gcc) or conflicts (clang), so configure's
+      # shared-library probe fails cleanly and packages fall back to
+      # static-only builds — exactly what a static-pie variant wants.
+      linkFlags = "-static-pie";
+      # Static linking needs the target libc's static archives (libc.a
+      # in glibc.static) — without them every configure link-test fails
+      # ("cannot find -lc") and feature detection collapses just like
+      # the sanitizer case. mkVariant adds them to buildInputs.
+      needsStaticLibc = true;
       minGccVersion = {
         major = 8;
         minor = 0;
@@ -257,11 +283,28 @@ let
     {
       # PIE — produces a position-independent executable. Affects
       # call/jump instruction encoding and main entry-point shape.
+      #
+      # ``-pie`` must NOT apply to ``-shared`` links: gcc treats
+      # pie/shared as a last-wins Negative pair, so an APPENDED -pie
+      # overrides -shared and the "shared library" links as a PIE
+      # executable (entry _start; downstream "cannot use executable
+      # file libfoo.so as input"). Routed through
+      # ``extraCflagsBefore`` → NIX_CFLAGS_COMPILE_BEFORE, which the
+      # cc-wrapper PREPENDS: executables still get -pie, while a
+      # package's own later ``-shared`` wins on gcc and clang ignores
+      # -pie whenever -shared/-static is present. (The 18.03-era
+      # native wrappers — gcc5, clang 3.7-4 — don't read the BEFORE
+      # var; they simply drop -pie, which builds correctly but
+      # without the explicit pie link flag.)
+      # ``-fPIE`` is prepended too: appended it would override a
+      # package's own ``-fPIC`` (also last-wins) on shared-object
+      # compiles, producing PIE-grade relocations that break the
+      # ``-shared`` link (R_X86_64_PC32 "can not be used when making
+      # a shared object", e.g. against asan globals).
       label = "pie";
       hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
-      extraCflags = "-fPIE";
-      extraLdflags = "-pie";
+      extraCflagsBefore = "-fPIE -pie";
     }
     {
       # ``extraLdflags`` is appended to ``NIX_LDFLAGS`` which the
@@ -381,12 +424,12 @@ let
     {
       label = "san-off";
       cflags = "";
-      ldflags = "";
+      linkFlags = "";
     }
     {
       label = "san-address";
       cflags = "-fsanitize=address";
-      ldflags = "-fsanitize=address";
+      linkFlags = "-fsanitize=address";
       minGccVersion = {
         major = 4;
         minor = 8;
@@ -403,7 +446,7 @@ let
     {
       label = "san-undefined";
       cflags = "-fsanitize=undefined";
-      ldflags = "-fsanitize=undefined";
+      linkFlags = "-fsanitize=undefined";
       minGccVersion = {
         major = 4;
         minor = 9;
@@ -416,7 +459,7 @@ let
     {
       label = "san-memory";
       cflags = "-fsanitize=memory";
-      ldflags = "-fsanitize=memory";
+      linkFlags = "-fsanitize=memory";
       clangOnly = true;
       minClangVersion = {
         major = 3;
@@ -430,7 +473,7 @@ let
     {
       label = "san-thread";
       cflags = "-fsanitize=thread";
-      ldflags = "-fsanitize=thread";
+      linkFlags = "-fsanitize=thread";
       minGccVersion = {
         major = 4;
         minor = 8;

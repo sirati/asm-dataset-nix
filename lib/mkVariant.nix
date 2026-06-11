@@ -15,8 +15,8 @@
   sanitizer ? {
     label = "san-off";
     cflags = "";
-    ldflags = "";
-  }, # { label, cflags, ldflags } from flags.nix
+    linkFlags = "";
+  }, # { label, cflags, linkFlags } from flags.nix
   march ? {
     label = "march-default";
     cflags = "";
@@ -94,20 +94,46 @@ let
     else
       flagSet.cxxflags;
 
-  # Extra linker flags — flag set + sanitizer + hardening. Sanitizers
-  # need -fsanitize=X on both compile and link; hardening profiles may
-  # inject ldflags (relro, bindnow, pie's -pie) directly.
+  # Link-time flags, split by channel (see the header of flags.nix):
+  #
+  #  - ldflags/extraLdflags        → NIX_LDFLAGS        (raw ld flags,
+  #    e.g. ``-z relro``; the ld-wrapper feeds them straight to ld)
+  #  - linkFlags/extraLinkFlags    → NIX_CFLAGS_LINK    (compiler-driver
+  #    flags applied only on linking invocations, e.g. ``-fsanitize=x``,
+  #    ``-flto``, ``-static-pie``; the driver expands them into proper
+  #    ld args + runtime libs)
+  #  - extraCflagsBefore           → NIX_CFLAGS_COMPILE_BEFORE (driver
+  #    flags PREPENDED before the package's own args — needed for
+  #    ``-pie``, where a later ``-shared`` must win on gcc's last-wins
+  #    pie/shared Negative pair so shared objects don't get linked as
+  #    PIE executables)
+  #
+  # Sanitizers need -fsanitize=X on both compile and link; the compile
+  # side rides NIX_CFLAGS_COMPILE, the link side NIX_CFLAGS_LINK.
   sanitizerCflags = sanitizer.cflags or "";
-  sanitizerLdflags = sanitizer.ldflags or "";
+  sanitizerLinkFlags = sanitizer.linkFlags or "";
   marchCflags = march.cflags or "";
 
-  flagSetLdflags = flagSet.ldflags or "";
-  hardeningExtraLdflags = hardening.extraLdflags or "";
   extraLdflags = lib.concatStringsSep " " (
     builtins.filter (s: s != "") [
-      flagSetLdflags
-      sanitizerLdflags
-      hardeningExtraLdflags
+      (flagSet.ldflags or "")
+      (sanitizer.ldflags or "")
+      (hardening.extraLdflags or "")
+    ]
+  );
+
+  extraLinkFlags = lib.concatStringsSep " " (
+    builtins.filter (s: s != "") [
+      (flagSet.linkFlags or "")
+      sanitizerLinkFlags
+      (hardening.extraLinkFlags or "")
+    ]
+  );
+
+  extraCflagsBefore = lib.concatStringsSep " " (
+    builtins.filter (s: s != "") [
+      (flagSet.extraCflagsBefore or "")
+      (hardening.extraCflagsBefore or "")
     ]
   );
 
@@ -142,6 +168,12 @@ let
       hardeningExtraCflags
     ]
   );
+
+  # Static-linking variants (-static-pie) need the target libc's static
+  # archives on the link path; the default stdenv only carries the
+  # shared glibc. ``glibc.static`` is the lib output with libc.a/libm.a.
+  staticLibc =
+    if flagSet.needsStaticLibc or false then targetPkgs.glibc.static or null else null;
 
   # Variant label encodes the full combination
   variantLabel = lib.concatStringsSep "-" [
@@ -193,6 +225,18 @@ let
           extraLdflags
         ]
       );
+      mergedLinkFlags = lib.concatStringsSep " " (
+        builtins.filter (s: s != "") [
+          (getOld "NIX_CFLAGS_LINK")
+          extraLinkFlags
+        ]
+      );
+      mergedCflagsBefore = lib.concatStringsSep " " (
+        builtins.filter (s: s != "") [
+          (getOld "NIX_CFLAGS_COMPILE_BEFORE")
+          extraCflagsBefore
+        ]
+      );
 
       # Build the flag attrs — either in env or at top level
       newFlags = {
@@ -201,12 +245,21 @@ let
       }
       // lib.optionalAttrs (mergedLdflags != "") {
         NIX_LDFLAGS = mergedLdflags;
+      }
+      // lib.optionalAttrs (mergedLinkFlags != "") {
+        NIX_CFLAGS_LINK = mergedLinkFlags;
+      }
+      // lib.optionalAttrs (mergedCflagsBefore != "") {
+        NIX_CFLAGS_COMPILE_BEFORE = mergedCflagsBefore;
       };
 
       flagAttrs = if inEnv then { env = (old.env or { }) // newFlags; } else newFlags;
 
     in
     flagAttrs
+    // lib.optionalAttrs (staticLibc != null) {
+      buildInputs = (old.buildInputs or [ ]) ++ [ staticLibc ];
+    }
     // {
       pname = "${old.pname or pkg.attr}-variant";
       hardeningDisable = allHardeningDisable;
