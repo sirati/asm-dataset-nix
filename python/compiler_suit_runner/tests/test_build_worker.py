@@ -1743,3 +1743,60 @@ def test_build_worker_build_variant_archive_import_failure_is_failure_result(
     assert result.success is False
     assert "matrix-hello.drv.archive" in (result.error or "")
     _reset_imported_binaries()
+
+
+# ---------------------------------------------------------------------------
+# Torn-PATH hardening (respawn-env): the default runner resolves argv[0]
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultRunnerResolvesTool:
+
+    def test_default_run_subprocess_resolves_argv0(self):
+        from unittest.mock import patch
+
+        calls: list[list[str]] = []
+
+        def _fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+
+            class _Proc:
+                stdout = b""
+                stderr = b""
+                returncode = 0
+
+            return _Proc()
+
+        with patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.shutil.which",
+            return_value=None,
+        ), patch.object(bw.subprocess, "run", _fake_run):
+            bw._default_run_subprocess(["nix-store", "--import"])
+        assert calls == [["/bin/nix-store", "--import"]]
+
+    def test_resolve_bash_store_path_default_resolves_nix(self):
+        from unittest.mock import patch
+
+        calls: list[list[str]] = []
+
+        def _fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+
+            class _Proc:
+                stdout = b"/nix/store/bbb-bash\n"
+                stderr = b""
+                returncode = 0
+
+            return _Proc()
+
+        with patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.shutil.which",
+            return_value=None,
+        ), patch.object(bw.subprocess, "run", _fake_run):
+            out = bw._resolve_bash_store_path_default()
+        assert out == "/nix/store/bbb-bash"
+        assert calls == [[
+            "/bin/nix", "eval", "--raw", "nixpkgs#bash.outPath",
+        ]]

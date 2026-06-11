@@ -36,6 +36,10 @@ import time
 from collections.abc import Callable
 from typing import Optional
 
+from compiler_suit_runner.workers.dependency_graph_worker.subproc import (
+    resolve_tool,
+)
+
 # Module logger. The worker subprocess routes stdlib logging to a per-
 # worker file (see :func:`main`), so INFO step logging surfaces in
 # ``worker_N.log`` — making a build's progress (and any failure point)
@@ -274,9 +278,12 @@ def _default_run_subprocess(argv: list[str]) -> tuple[bytes, bytes, int]:
 
     Raw bytes are returned so callers can decide on a decoding strategy
     (the worker uses ``errors="replace"`` for log excerpting).
+
+    ``argv[0]`` is resolved via :func:`resolve_tool` so a bare tool
+    name still execs when the respawn environment lost PATH.
     """
     proc = subprocess.run(  # noqa: S603 - argv is constructed in-module
-        argv,
+        [resolve_tool(argv[0]), *argv[1:]],
         check=False,
         capture_output=True,
         shell=False,
@@ -294,7 +301,7 @@ def _resolve_bash_store_path_default() -> Optional[str]:
     """
     try:
         proc = subprocess.run(  # noqa: S603 - argv is fixed
-            ["nix", "eval", "--raw", "nixpkgs#bash.outPath"],
+            [resolve_tool("nix"), "eval", "--raw", "nixpkgs#bash.outPath"],
             check=False,
             capture_output=True,
             shell=False,

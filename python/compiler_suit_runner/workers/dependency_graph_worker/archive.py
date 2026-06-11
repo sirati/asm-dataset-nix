@@ -32,7 +32,7 @@ from template_graph.tree_walker import VARIANT_SUFFIX, parse_variant_path
 
 from compiler_suit_runner.preflight import _short_dataset_name
 
-from .subproc import RunSubprocess, default_run_subprocess
+from .subproc import RunSubprocess, default_run_subprocess, resolve_tool
 
 
 __all__ = [
@@ -172,7 +172,7 @@ def import_archive(
     try:
         with open(archive, "rb") as fh:
             proc = subprocess.run(  # noqa: S603
-                ["nix-store", "--import"],
+                [resolve_tool("nix-store"), "--import"],
                 stdin=fh,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

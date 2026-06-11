@@ -89,6 +89,10 @@ import time
 from collections.abc import Callable
 from typing import Optional
 
+from compiler_suit_runner.workers.dependency_graph_worker.subproc import (
+    resolve_tool,
+)
+
 
 __all__ = [
     "ITEM_CLASS_BUILD_COMPILERS",
@@ -183,9 +187,13 @@ class BuildCompilersEnv:
 
 
 def _default_run_subprocess(argv: list[str]) -> tuple[bytes, bytes, int]:
-    """Real ``subprocess.run`` invocation; never goes through a shell."""
+    """Real ``subprocess.run`` invocation; never goes through a shell.
+
+    ``argv[0]`` is resolved via :func:`resolve_tool` so a bare tool
+    name still execs when the respawn environment lost PATH.
+    """
     proc = subprocess.run(  # noqa: S603 - argv constructed in-module
-        argv,
+        [resolve_tool(argv[0]), *argv[1:]],
         check=False,
         capture_output=True,
         shell=False,
@@ -416,7 +424,7 @@ def export_closure(
         try:
             with open(tmp_archive, "wb") as fh:
                 proc = subprocess.run(  # noqa: S603
-                    export_argv,
+                    [resolve_tool(export_argv[0]), *export_argv[1:]],
                     stdout=fh,
                     stderr=subprocess.PIPE,
                     check=False,
