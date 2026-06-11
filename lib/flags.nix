@@ -108,8 +108,23 @@ let
     }
     {
       label = "nopic";
-      cflags = "-fno-PIC";
-      cxxflags = "-fno-PIC";
+      cflags = "";
+      cxxflags = "";
+      # ``-fno-PIC`` must NOT ride NIX_CFLAGS_COMPILE (plain cflags):
+      # the cc-wrapper APPENDS it after a package's own args, so
+      # libtool's explicit ``-fPIC -DPIC`` on shared-object compiles
+      # loses the last-wins race and the objects come out non-PIC.
+      # The subsequent ``-shared`` link then fails on arches whose
+      # relocations can't tolerate non-PIC code (aarch64:
+      # ``relocation R_AARCH64_ADR_PREL_PG_HI21 ... can not be used
+      # when making a shared object; recompile with -fPIC``; also
+      # mips/mips64el — x86_64 happens to link). Route it through
+      # ``extraCflagsBefore`` → NIX_CFLAGS_COMPILE_BEFORE (same fix
+      # as the ``pie`` hardening profile): ordinary objects (no later
+      # -fPIC) still compile non-PIC, while a package's own later
+      # ``-fPIC`` wins for shared objects. The main executable stays
+      # non-PIC/non-PIE.
+      extraCflagsBefore = "-fno-PIC";
       # Don't push ``-no-pie`` into NIX_LDFLAGS: it gets applied
       # to every ld invocation including partial relinks (``ld -r``),
       # where it overrides ``-r`` and forces the linker to emit
