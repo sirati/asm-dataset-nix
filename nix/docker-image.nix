@@ -254,6 +254,14 @@ let
     substituters = https://cache.nixos.org
     trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
     extra-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+    # The submitter's harmonia rides an ssh reverse tunnel that can drop
+    # and rebuild mid-run. Nix's default 3600s NEGATIVE narinfo caching
+    # turns a minutes-long tunnel outage into an hour of "substituter
+    # has no such path" failures AFTER the tunnel heals (observed
+    # run_20260611_175319: secondary-0 kept failing toolchain
+    # substitution long after the 18:16 rebuild). TTL 0 = re-query on
+    # every miss; the narinfo is tiny and the harmonia is LAN-fast.
+    narinfo-cache-negative-ttl = 0
 
     !include /etc/nix/peer.conf
   '';
