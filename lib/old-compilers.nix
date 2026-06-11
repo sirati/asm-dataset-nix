@@ -579,6 +579,12 @@ let
         family = "clang";
         label = "clang${label}";
         inherit version;
+        # Plugin-aware archiver tools (llvm-ar/llvm-ranlib/llvm-nm) from
+        # the same old LLVM release — used by mkVariant for LTO variants
+        # (lto needs clang >= 3.7). The old nixpkgs' NATIVE llvm package
+        # works for cross targets too: llvm-ar runs on the build platform
+        # and LLVM bitcode is a host-agnostic container.
+        mkLlvmTools = _targetPkgs: _target: oldPkgs.${attr}.llvm or null;
         mkStdenv =
           targetPkgs: target:
           if target.crossAttr == null && !(target ? crossSystem) then

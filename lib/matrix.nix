@@ -44,9 +44,6 @@ let
   mkVariant = import ./mkVariant.nix { inherit pkgs lib; };
   mkBinaryFolder = import ./mkBinaryFolder.nix { inherit pkgs lib; };
 
-  # Skip -Oz for GCC (clang-only flag)
-  isValidCombo = compiler: optLevel: !(optLevel.clangOnly && compiler.family == "gcc");
-
   # Skip compiler/target combos below the minimum supported version (from support_matrix.md).
   parseVersion =
     version:
@@ -118,11 +115,14 @@ let
     && meetsMaxVersion cv maxV
     && !(isVersionInBrokenList cv brokenList);
 
-  # All valid (compiler, optLevel) pairs
+  # All valid (compiler, optLevel) pairs. Optimization levels carry the
+  # same constraint fields as the other axes (clangOnly for -Oz,
+  # minGccVersion for -Ofast), so reuse the generic per-axis filter
+  # (defined below; Nix lets-bindings are order-independent).
   compilerOptPairs = lib.concatMap (
     compiler:
     map (opt: { inherit compiler opt; }) (
-      builtins.filter (isValidCombo compiler) flagDefs.optimizationLevels
+      builtins.filter (e: entryAcceptsCompiler e compiler) flagDefs.optimizationLevels
     )
   ) compilers.all;
 

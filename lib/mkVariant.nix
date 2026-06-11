@@ -15,8 +15,8 @@
   sanitizer ? {
     label = "san-off";
     cflags = "";
-    ldflags = "";
-  }, # { label, cflags, ldflags } from flags.nix
+    linkFlags = "";
+  }, # { label, cflags, linkFlags } from flags.nix
   march ? {
     label = "march-default";
     cflags = "";
@@ -94,20 +94,46 @@ let
     else
       flagSet.cxxflags;
 
-  # Extra linker flags — flag set + sanitizer + hardening. Sanitizers
-  # need -fsanitize=X on both compile and link; hardening profiles may
-  # inject ldflags (relro, bindnow, pie's -pie) directly.
+  # Link-time flags, split by channel (see the header of flags.nix):
+  #
+  #  - ldflags/extraLdflags        → NIX_LDFLAGS        (raw ld flags,
+  #    e.g. ``-z relro``; the ld-wrapper feeds them straight to ld)
+  #  - linkFlags/extraLinkFlags    → NIX_CFLAGS_LINK    (compiler-driver
+  #    flags applied only on linking invocations, e.g. ``-fsanitize=x``,
+  #    ``-flto``, ``-static-pie``; the driver expands them into proper
+  #    ld args + runtime libs)
+  #  - extraCflagsBefore           → NIX_CFLAGS_COMPILE_BEFORE (driver
+  #    flags PREPENDED before the package's own args — needed for
+  #    ``-pie``, where a later ``-shared`` must win on gcc's last-wins
+  #    pie/shared Negative pair so shared objects don't get linked as
+  #    PIE executables)
+  #
+  # Sanitizers need -fsanitize=X on both compile and link; the compile
+  # side rides NIX_CFLAGS_COMPILE, the link side NIX_CFLAGS_LINK.
   sanitizerCflags = sanitizer.cflags or "";
-  sanitizerLdflags = sanitizer.ldflags or "";
+  sanitizerLinkFlags = sanitizer.linkFlags or "";
   marchCflags = march.cflags or "";
 
-  flagSetLdflags = flagSet.ldflags or "";
-  hardeningExtraLdflags = hardening.extraLdflags or "";
   extraLdflags = lib.concatStringsSep " " (
     builtins.filter (s: s != "") [
-      flagSetLdflags
-      sanitizerLdflags
-      hardeningExtraLdflags
+      (flagSet.ldflags or "")
+      (sanitizer.ldflags or "")
+      (hardening.extraLdflags or "")
+    ]
+  );
+
+  extraLinkFlags = lib.concatStringsSep " " (
+    builtins.filter (s: s != "") [
+      (flagSet.linkFlags or "")
+      sanitizerLinkFlags
+      (hardening.extraLinkFlags or "")
+    ]
+  );
+
+  extraCflagsBefore = lib.concatStringsSep " " (
+    builtins.filter (s: s != "") [
+      (flagSet.extraCflagsBefore or "")
+      (hardening.extraCflagsBefore or "")
     ]
   );
 
@@ -142,6 +168,71 @@ let
       hardeningExtraCflags
     ]
   );
+
+  # Plugin-aware archiver tools for LTO variants. Slim LTO objects are
+  # bitcode — plain binutils ``ar rc`` writes an EMPTY symbol index over
+  # them and the final link dies with "archive has no index; run ranlib
+  # to add one". Build systems take AR/RANLIB/NM from the environment
+  # (autoconf/zlib-style ``AR=''${AR-"ar"}``), so export the
+  # plugin-aware tools:
+  #   gcc:   gcc-ar/gcc-ranlib/gcc-nm from the unwrapped compiler
+  #          (exist since gcc 4.7; gcc 4.6 emits FAT objects by default
+  #          — real code alongside bitcode — so plain ar works there)
+  #   clang: llvm-ar/llvm-ranlib/llvm-nm from the matching LLVM package
+  #          (resolved by the compiler entry's ``mkLlvmTools``; bitcode
+  #          is a host-agnostic container, so the build-platform tools
+  #          handle cross-target objects too)
+  gccVersionParts = builtins.match "([0-9]+)\\.([0-9]+).*" (compiler.version or "0");
+  gccMajor = if gccVersionParts != null then lib.toInt (builtins.elemAt gccVersionParts 0) else 0;
+  gccMinor = if gccVersionParts != null then lib.toInt (builtins.elemAt gccVersionParts 1) else 0;
+  gccHasPluginAr = gccMajor > 4 || (gccMajor == 4 && gccMinor >= 7);
+
+  ltoTools =
+    if !(flagSet.needsLtoTools or false) then
+      null
+    else if compiler.family == "gcc" then
+      if gccHasPluginAr then
+        let
+          cc = customStdenv.cc;
+          prefix = cc.targetPrefix or "";
+        in
+        {
+          ar = "${cc.cc}/bin/${prefix}gcc-ar";
+          ranlib = "${cc.cc}/bin/${prefix}gcc-ranlib";
+          nm = "${cc.cc}/bin/${prefix}gcc-nm";
+        }
+      else
+        null
+    else
+      let
+        llvm = if compiler ? mkLlvmTools then compiler.mkLlvmTools targetPkgs target else null;
+      in
+      if llvm != null then
+        {
+          ar = "${llvm}/bin/llvm-ar";
+          ranlib = "${llvm}/bin/llvm-ranlib";
+          nm = "${llvm}/bin/llvm-nm";
+        }
+      else
+        null;
+
+  # Plain env attrs (AR = ...) get CLOBBERED during stdenv setup — the
+  # bintools-wrapper setup hook re-exports AR/RANLIB/NM pointing at
+  # binutils after derivation env vars are loaded. Export from
+  # preConfigure instead: it runs after all setup hooks and the exports
+  # persist into the configure/build phases (one shell).
+  ltoToolsPreConfigure =
+    lib.optionalString (ltoTools != null) ''
+      export AR=${ltoTools.ar}
+      export RANLIB=${ltoTools.ranlib}
+      export NM=${ltoTools.nm}
+    '';
+
+  # Static-linking variants (-static-pie) need the target libc's static
+  # archives on the link path; the default stdenv only carries the
+  # shared glibc. ``glibc.static`` is the lib output with libc.a/libm.a.
+  staticLibc =
+    if flagSet.needsStaticLibc or false then targetPkgs.glibc.static or null else null;
 
   # Variant label encodes the full combination
   variantLabel = lib.concatStringsSep "-" [
@@ -193,6 +284,18 @@ let
           extraLdflags
         ]
       );
+      mergedLinkFlags = lib.concatStringsSep " " (
+        builtins.filter (s: s != "") [
+          (getOld "NIX_CFLAGS_LINK")
+          extraLinkFlags
+        ]
+      );
+      mergedCflagsBefore = lib.concatStringsSep " " (
+        builtins.filter (s: s != "") [
+          (getOld "NIX_CFLAGS_COMPILE_BEFORE")
+          extraCflagsBefore
+        ]
+      );
 
       # Build the flag attrs — either in env or at top level
       newFlags = {
@@ -201,12 +304,24 @@ let
       }
       // lib.optionalAttrs (mergedLdflags != "") {
         NIX_LDFLAGS = mergedLdflags;
+      }
+      // lib.optionalAttrs (mergedLinkFlags != "") {
+        NIX_CFLAGS_LINK = mergedLinkFlags;
+      }
+      // lib.optionalAttrs (mergedCflagsBefore != "") {
+        NIX_CFLAGS_COMPILE_BEFORE = mergedCflagsBefore;
       };
 
       flagAttrs = if inEnv then { env = (old.env or { }) // newFlags; } else newFlags;
 
     in
     flagAttrs
+    // lib.optionalAttrs (ltoToolsPreConfigure != "") {
+      preConfigure = toString (old.preConfigure or "") + "\n" + ltoToolsPreConfigure;
+    }
+    // lib.optionalAttrs (staticLibc != null) {
+      buildInputs = (old.buildInputs or [ ]) ++ [ staticLibc ];
+    }
     // {
       pname = "${old.pname or pkg.attr}-variant";
       hardeningDisable = allHardeningDisable;
