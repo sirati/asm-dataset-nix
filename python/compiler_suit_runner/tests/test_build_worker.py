@@ -223,6 +223,105 @@ def test_build_attr_returns_failure_on_nonzero(tmp_path):
     assert stderr == b"boom"
 
 
+_TUNNEL_BLIP_STDERR = (
+    b"error: unable to download 'http://localhost:5005/nar/1abc.nar.zst':"
+    b" Could not connect to server (7) Failed to connect to localhost"
+    b" port 5005 after 0 ms\n"
+    b"error: path '/nix/store/aaa-compiler-rt-libc-12.0.1' is required,"
+    b" but there is no substituter that can build it\n"
+    b"error: some references of path"
+    b" '/nix/store/bbb-clang-wrapper-12.0.1' could not be realised\n"
+)
+
+
+def test_build_attr_retries_substituter_connect_failure_then_succeeds(
+    monkeypatch, tmp_path,
+):
+    """A peer-substituter connect failure (dropped SSH forward) is
+    TRANSIENT: build_attr retries on the backoff ladder and returns
+    success once the forward is back, instead of surfacing the failure
+    to the caller."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(bw, "_retry_sleep", sleeps.append)
+
+    outcomes = [
+        (b"", _TUNNEL_BLIP_STDERR, 1),
+        (b"", _TUNNEL_BLIP_STDERR, 1),
+        (b"/nix/store/xxx-out\n", b"", 0),
+    ]
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        return outcomes.pop(0)
+
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path,
+        run_subprocess=runner,
+    )
+    success, stdout, _ = build_attr("hello", env)
+    assert success is True
+    assert stdout == b"/nix/store/xxx-out\n"
+    assert len(calls) == 3
+    # Backoff schedule 2/4s, each plus up to 25% jitter.
+    assert len(sleeps) == 2
+    assert 2.0 <= sleeps[0] <= 2.5
+    assert 4.0 <= sleeps[1] <= 5.0
+
+
+def test_build_attr_missing_path_without_connect_error_is_permanent(
+    monkeypatch, tmp_path,
+):
+    """A genuine "no substituter that can build it" (no connect-failure
+    marker in stderr) fails fast — no retries, no sleeps."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(bw, "_retry_sleep", sleeps.append)
+
+    stderr = (
+        b"error: path '/nix/store/aaa-compiler-rt-libc-12.0.1' is"
+        b" required, but there is no substituter that can build it\n"
+        b"error: some references of path"
+        b" '/nix/store/bbb-clang-wrapper-12.0.1' could not be realised\n"
+    )
+    runner = RecordingRunner(returncode=1, stderr=stderr)
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path,
+        run_subprocess=runner,
+    )
+    success, _, out_stderr = build_attr("hello", env)
+    assert success is False
+    assert out_stderr == stderr
+    assert len(runner.calls) == 1
+    assert sleeps == []
+
+
+def test_build_attr_substituter_retries_exhausted_fails(
+    monkeypatch, tmp_path,
+):
+    """A connect failure that never heals exhausts the ladder and the
+    failure is surfaced with the original stderr."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(bw, "_retry_sleep", sleeps.append)
+
+    runner = RecordingRunner(returncode=1, stderr=_TUNNEL_BLIP_STDERR)
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path,
+        run_subprocess=runner,
+    )
+    success, _, out_stderr = build_attr("hello", env)
+    assert success is False
+    assert out_stderr == _TUNNEL_BLIP_STDERR
+    assert len(runner.calls) == bw._SUBSTITUTER_MAX_ATTEMPTS
+    assert len(sleeps) == bw._SUBSTITUTER_MAX_ATTEMPTS - 1
+    # Full ladder 2/4/8/16/32/32s, each plus up to 25% jitter — sized
+    # to outlast a forward rebuild.
+    for slept, base in zip(sleeps, bw._SUBSTITUTER_BACKOFF_SECONDS):
+        assert base <= slept <= base * 1.25
+
+
 def test_build_attr_uses_custom_flake_ref(tmp_path):
     runner = RecordingRunner()
     env = BuildWorkerEnv(
