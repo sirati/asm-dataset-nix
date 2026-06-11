@@ -55,6 +55,13 @@ let
       flag = "-Ofast";
       label = "Ofast";
       clangOnly = false;
+      # -Ofast was introduced in GCC 4.6; gcc 4.4/4.5 reject it outright
+      # and every configure compile-test dies ("Missing or broken C
+      # compiler"). All matrix clangs (>= 3.4) accept it.
+      minGccVersion = {
+        major = 4;
+        minor = 6;
+      };
     }
   ];
 
@@ -205,6 +212,18 @@ let
       hardeningEnable = [ ];
       hardeningDisable = [ "all" ];
       extraCflags = "-fstack-protector-strong --param=ssp-buffer-size=4";
+      # -fstack-protector-strong: GCC 4.9+, Clang 3.5+. Older compilers
+      # reject the flag and configure aborts ("Missing or broken C
+      # compiler"). -fstack-protector-all (ssp-all) is ancient and
+      # stays ungated.
+      minGccVersion = {
+        major = 4;
+        minor = 9;
+      };
+      minClangVersion = {
+        major = 3;
+        minor = 5;
+      };
     }
     {
       label = "ssp-all";
