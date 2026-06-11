@@ -113,6 +113,10 @@ from typing import Any, Optional
 
 from dynamic_runner.worker import Task
 
+from compiler_suit_runner.workers.dependency_graph_worker.subproc import (
+    resolve_tool,
+)
+
 
 # Module logger. The worker subprocess routes stdlib logging to a per-
 # worker file (build_worker.main configures the root handler), so INFO
@@ -156,9 +160,12 @@ def _default_run_subprocess(
     can stream large filter payloads / store-path lists via stdin
     instead of stuffing them into argv (which trips MAX_ARG_STRLEN at
     full LMU scale).
+
+    ``argv[0]`` is resolved via :func:`resolve_tool` so a bare tool
+    name still execs when the respawn environment lost PATH.
     """
     proc = subprocess.run(  # noqa: S603 - argv constructed in-module
-        argv,
+        [resolve_tool(argv[0]), *argv[1:]],
         check=False,
         capture_output=True,
         shell=False,

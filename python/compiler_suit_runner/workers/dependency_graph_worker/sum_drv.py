@@ -10,7 +10,7 @@ from __future__ import annotations
 import subprocess
 from typing import Iterator, Optional
 
-from .subproc import RunSubprocess, default_run_subprocess
+from .subproc import RunSubprocess, default_run_subprocess, resolve_tool
 
 
 __all__ = [
@@ -106,7 +106,7 @@ def stream_drv_tree(sum_drv: str) -> Iterator[tuple[int, bytes, str, bool]]:
     from template_graph.tree_walker import drv_tree_stream  # noqa: PLC0415
 
     proc = subprocess.Popen(
-        ["nix-store", "--query", "--tree", sum_drv],
+        [resolve_tool("nix-store"), "--query", "--tree", sum_drv],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=-1,

@@ -554,6 +554,105 @@ class TestImportArchive:
 
 
 # ---------------------------------------------------------------------------
+# resolve_tool / default_run_subprocess (torn-PATH hardening)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveTool:
+    """Workers can be respawned with a torn-down PATH (respawn-env);
+    bare nix tool names must still resolve to an executable path."""
+
+    def test_returns_which_result_when_on_path(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        with patch.object(
+            subproc.shutil, "which",
+            return_value="/nix/store/abc-nix/bin/nix-store",
+        ):
+            assert subproc.resolve_tool("nix-store") == (
+                "/nix/store/abc-nix/bin/nix-store"
+            )
+
+    def test_falls_back_to_bin_when_not_on_path(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        with patch.object(subproc.shutil, "which", return_value=None):
+            assert subproc.resolve_tool("nix-store") == "/bin/nix-store"
+            assert subproc.resolve_tool("nix") == "/bin/nix"
+
+    def test_paths_with_slash_pass_through(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        with patch.object(subproc.shutil, "which", return_value=None):
+            assert subproc.resolve_tool("/usr/bin/nix") == "/usr/bin/nix"
+            assert subproc.resolve_tool("./nix-store") == "./nix-store"
+
+    def test_default_run_subprocess_execs_resolved_argv0(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        calls: list[list[str]] = []
+
+        def _fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+
+            class _Proc:
+                stdout = b"out"
+                stderr = b"err"
+                returncode = 0
+
+            return _Proc()
+
+        with patch.object(subproc.shutil, "which", return_value=None), \
+                patch.object(subproc.subprocess, "run", _fake_run):
+            stdout, stderr, rc = subproc.default_run_subprocess(
+                ["nix-store", "--query", "--tree", "/nix/store/x.drv"],
+            )
+        assert (stdout, stderr, rc) == (b"out", b"err", 0)
+        assert calls == [[
+            "/bin/nix-store", "--query", "--tree", "/nix/store/x.drv",
+        ]]
+
+    def test_import_archive_direct_branch_resolves_nix_store(
+        self, tmp_path: pathlib.Path,
+    ):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            archive as archive_mod,
+        )
+        archive = tmp_path / "toolchains.drv.archive"
+        archive.write_bytes(b"fake")
+        calls: list[list[str]] = []
+
+        def _fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+
+            class _Proc:
+                stdout = b"/nix/store/aaa-x.drv\n"
+                stderr = b""
+                returncode = 0
+
+            return _Proc()
+
+        with patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.shutil.which",
+            return_value=None,
+        ), patch.object(archive_mod.subprocess, "run", _fake_run):
+            ok, _err, imported = archive_mod.import_archive(archive)
+        assert ok is True
+        assert imported == ["/nix/store/aaa-x.drv"]
+        assert calls == [["/bin/nix-store", "--import"]]
+
+
+# ---------------------------------------------------------------------------
 # _parse_task_id_mappings (CLI helper)
 # ---------------------------------------------------------------------------
 
@@ -1985,11 +2084,16 @@ class TestStreamDrvTree:
             "compiler_suit_runner.workers.dependency_graph_worker"
             ".sum_drv.subprocess.Popen",
             side_effect=factory,
+        ), patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.shutil.which",
+            return_value=None,
         ):
             got = list(dgw.stream_drv_tree("/nix/store/zzzz-sum.drv"))
         assert got == expected
+        # argv[0] is resolved (torn-PATH fallback → /bin/nix-store).
         assert calls == [[
-            "nix-store", "--query", "--tree",
+            "/bin/nix-store", "--query", "--tree",
             "/nix/store/zzzz-sum.drv",
         ]]
 

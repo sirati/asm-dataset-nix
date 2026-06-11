@@ -505,3 +505,71 @@ class TestParseArchiveSidecar:
         sidecar = archive.with_suffix(".nix-archive.json")
         sidecar.write_text('["a", "b"]', encoding="utf-8")
         assert bcw.parse_archive_sidecar(archive) == {}
+
+
+# ---------------------------------------------------------------------------
+# Torn-PATH hardening (respawn-env): bare nix argv[0] gets resolved
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultRunnerResolvesTool:
+
+    def test_default_run_subprocess_resolves_argv0(self):
+        from unittest.mock import patch
+
+        calls: list[list[str]] = []
+
+        def _fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+
+            class _Proc:
+                stdout = b""
+                stderr = b""
+                returncode = 0
+
+            return _Proc()
+
+        with patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.shutil.which",
+            return_value=None,
+        ), patch.object(bcw.subprocess, "run", _fake_run):
+            bcw._default_run_subprocess(["nix", "build", "--no-link"])
+        assert calls == [["/bin/nix", "build", "--no-link"]]
+
+    def test_export_closure_direct_branch_resolves_nix_store(
+        self, tmp_path: pathlib.Path,
+    ):
+        """The streaming export path (run_subprocess=None) execs the
+        resolved nix-store, not the bare name."""
+        from unittest.mock import patch
+
+        calls: list[list[str]] = []
+
+        def _fake_run(argv, **kwargs):
+            calls.append(list(argv))
+
+            class _Proc:
+                stdout = (
+                    b"/nix/store/aaa-x.drv\n"
+                    if argv[1] == "--query" else b""
+                )
+                stderr = b""
+                returncode = 0
+
+            return _Proc()
+
+        archive = tmp_path / "toolchain.nix-archive"
+        with patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.shutil.which",
+            return_value=None,
+        ), patch.object(bcw.subprocess, "run", _fake_run):
+            ok, _req_err, _exp_err = bcw.export_closure(
+                archive, ["/nix/store/aaa-x.drv"],
+            )
+        assert ok is True
+        # Both the requisites query (via the default runner) and the
+        # direct streaming export resolved argv[0].
+        assert [c[0] for c in calls] == ["/bin/nix-store", "/bin/nix-store"]
+        assert calls[1][:2] == ["/bin/nix-store", "--export"]

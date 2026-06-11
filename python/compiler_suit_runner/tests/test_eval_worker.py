@@ -2402,3 +2402,37 @@ class TestEvalMetaForArch:
                 flake_ref=".",
                 run_subprocess=_run,
             )
+
+
+# ---------------------------------------------------------------------------
+# Torn-PATH hardening (respawn-env): the default runner resolves argv[0]
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultRunnerResolvesTool:
+
+    def test_default_run_subprocess_resolves_argv0(self):
+        from unittest.mock import patch
+
+        calls: list[list[str]] = []
+
+        def _fake_run(argv, **_kwargs):
+            calls.append(list(argv))
+
+            class _Proc:
+                stdout = b""
+                stderr = b""
+                returncode = 0
+
+            return _Proc()
+
+        with patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.shutil.which",
+            return_value=None,
+        ), patch.object(eval_worker.subprocess, "run", _fake_run):
+            eval_worker._default_run_subprocess(
+                ["nix-store", "--export", "/nix/store/x"],
+                input=b"payload",
+            )
+        assert calls == [["/bin/nix-store", "--export", "/nix/store/x"]]
