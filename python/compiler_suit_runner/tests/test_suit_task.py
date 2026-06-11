@@ -1083,6 +1083,89 @@ def test_custom_message_handler_spawn_batch_spawns_task_infos(
     assert task._streamed_spawned_count == 2
 
 
+def test_spawn_batch_same_display_name_distinct_wire_identity(
+    tmp_path,
+) -> None:
+    """Two descriptors with the SAME display name but distinct task_ids
+    must spawn with DISTINCT wire identities.
+
+    Regression for the LMU run_20260611_112116 run-killer: the
+    framework's wire-canonical task hash is computed over (phase_id,
+    path, identifier) — NOT task_id — and the consumer derived both
+    path and identifier from ``header.name``. The planner's
+    ``build_common_dep`` names role-collapse the drv ident, so
+    bc/aarch64's native flex-2.6.4 and cross
+    flex-aarch64-unknown-linux-gnu-2.6.4 both spawned as
+    ``build_common_dep__bc__aarch64__flex.drv`` → identical hash
+    366c070376d4ef85 → DuplicateInBatch → run-wide invalidation.
+    Fixture below is that real pair, reduced.
+    """
+    flex_pair = [
+        Phase4Descriptor(
+            kind="build_common_dep",
+            task_id=(
+                "build_common_dep__"
+                "20gpcnk5a9lqjgwqjyacwcv4rricjdwm-flex-2.6.4.drv"
+            ),
+            name="build_common_dep__bc__aarch64__flex.drv",
+            payload={
+                "sys": _SYS,
+                "binary": "bc",
+                "arch": "aarch64",
+                "node_name": "flex.drv",
+                "node_id": 8,
+                "ident": "20gpcnk5a9lqjgwqjyacwcv4rricjdwm-flex-2.6.4.drv",
+                "attr": "20gpcnk5a9lqjgwqjyacwcv4rricjdwm-flex-2.6.4.drv",
+            },
+        ),
+        Phase4Descriptor(
+            kind="build_common_dep",
+            task_id=(
+                "build_common_dep__5l8vd9v2mxqnggawvzc2vzlcrn216bwj-"
+                "flex-aarch64-unknown-linux-gnu-2.6.4.drv"
+            ),
+            name="build_common_dep__bc__aarch64__flex.drv",
+            payload={
+                "sys": _SYS,
+                "binary": "bc",
+                "arch": "aarch64",
+                "node_name": "flex.drv",
+                "node_id": 9,
+                "ident": (
+                    "5l8vd9v2mxqnggawvzc2vzlcrn216bwj-"
+                    "flex-aarch64-unknown-linux-gnu-2.6.4.drv"
+                ),
+                "attr": (
+                    "5l8vd9v2mxqnggawvzc2vzlcrn216bwj-"
+                    "flex-aarch64-unknown-linux-gnu-2.6.4.drv"
+                ),
+            },
+        ),
+    ]
+    task = _streamed_task(tmp_path)
+    handle = task._primary_handle
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC, _batch_bytes(flex_pair), True, handle,
+    )
+    (infos,) = handle.calls
+    assert len(infos) == 2
+    # task_ids were always distinct — the bug was the wire identity.
+    assert infos[0].task_id != infos[1].task_id
+    # The hash recipe inputs: phase_id equal (both BUILD), so path —
+    # and the path-derived identifier — must differ.
+    assert str(infos[0].path) != str(infos[1].path), (
+        "synthetic TaskInfo paths collide; the framework task hash "
+        "(phase_id, path, identifier) would mark these DuplicateInBatch"
+    )
+    # When the real framework is importable, assert on the actual
+    # wire-canonical hash the primary's validator uses.
+    try:
+        from dynamic_runner import compute_task_hash  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — framework absent in unit env
+        return
+    assert compute_task_hash(infos[0]) != compute_task_hash(infos[1])
+
+
 def test_custom_message_handler_count_accumulates_across_batches(
     tmp_path,
 ) -> None:
