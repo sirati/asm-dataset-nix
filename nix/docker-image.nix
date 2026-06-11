@@ -324,6 +324,33 @@ let
     ++ lib.optional (cachixPkg != null) cachixPkg
     ++ contents;
 
+  # ── store-DB registration ────────────────────────────────────
+  # buildLayeredImage ships every store path of the image closure in
+  # the rootfs but bakes NO nix database — in a fresh container all
+  # of those paths are present-on-disk yet INVALID in the DB. Nix's
+  # LocalStore::addToStore (used by both `nix-store --import` and
+  # substitution) deletePath()s an existing-but-invalid destination
+  # before re-unpacking it, so the build phase's first concurrent
+  # import storm transiently DELETES live rootfs paths (glibc, the
+  # python interpreter, nix itself); processes exec/dlopen-ing inside
+  # that window die with ENOENT. Fix: bake closureInfo's
+  # `registration` file (nix-store --load-db format, covers the whole
+  # image closure) into the image; start_nix_daemon load-db's it
+  # before the daemon serves anything (CSR_NIX_DB_REGISTRATION below).
+  #
+  # The registration stage's own store path is the one path NOT
+  # covered by the registration (chicken-and-egg); that's inert —
+  # nothing ever imports, substitutes or builds it, so it's never a
+  # deletePath() target.
+  storeDbRegistration = pkgs.runCommand "${name}-store-db-registration"
+    {
+      closure = pkgs.closureInfo { rootPaths = imageContents; };
+    } ''
+    mkdir -p $out/nix-support
+    cp $closure/registration $out/nix-support/registration
+    chmod 444 $out/nix-support/registration
+  '';
+
   # Previous-build layer assignment for partial-build cache
   # stability. Reads NIX_DOCKER_LAYER_CACHE on `--impure` builds;
   # null on regular builds (full popularity-contest fallback for
@@ -386,6 +413,15 @@ let
         roots = [ nssFiles nixConfDir ];
         isolate = true;
       }
+      {
+        # The registration text references every other image path, so
+        # this layer changes whenever ANY image content changes —
+        # isolate it so that churn never reshuffles other layers'
+        # blob cache.
+        name = "store-db-registration";
+        roots = [ storeDbRegistration ];
+        isolate = true;
+      }
     ];
 
   layeringPipeline = semanticLayering.buildPipeline {
@@ -397,7 +433,11 @@ in
 pkgs.dockerTools.buildLayeredImage {
   inherit name tag;
 
-  contents = imageContents;
+  # storeDbRegistration is appended here (not in imageContents) so the
+  # closureInfo above isn't self-referential; its top-level nix-support/
+  # dir is symlinked into the image root, giving the stable path
+  # /nix-support/registration.
+  contents = imageContents ++ [ storeDbRegistration ];
 
   layeringPipeline = pkgs.writeText "${name}-pipeline.json" (
     builtins.toJSON layeringPipeline
@@ -443,6 +483,13 @@ pkgs.dockerTools.buildLayeredImage {
       # builds run as the daemon's nixbld_N user (giving us the
       # non-root euid that fixes tar's ``--same-owner`` default).
       "NIX_REMOTE=daemon"
+      # nix-store --load-db source registering every baked rootfs
+      # store path as VALID before anything imports/substitutes
+      # (see storeDbRegistration above and
+      # peer_cache.load_store_db_registration for the consumer).
+      # Points at the store path directly (not the /nix-support root
+      # symlink) so the consumer reads exactly the baked file.
+      "CSR_NIX_DB_REGISTRATION=${storeDbRegistration}/nix-support/registration"
       # cacert is in basePkgs but its bundle path needs to be exposed
       # explicitly for nix / curl / openssl to find it. Without these,
       # `nix build` over HTTPS fails to verify substituter TLS certs.

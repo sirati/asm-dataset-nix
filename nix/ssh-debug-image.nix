@@ -292,6 +292,20 @@ let
     ++ lib.optional (cachixPkg != null) cachixPkg
     ++ contents;
 
+  # Baked store-DB registration (see docker-image.nix for the full
+  # delete-then-restore tear rationale): buildLayeredImage bakes no
+  # nix DB, so every rootfs store path starts INVALID and is a
+  # deletePath() target for the first import/substitution. The
+  # bootstrap's start_nix_daemon load-db's this file before serving.
+  storeDbRegistration = pkgs.runCommand "${name}-store-db-registration"
+    {
+      closure = pkgs.closureInfo { rootPaths = imageContents; };
+    } ''
+    mkdir -p $out/nix-support
+    cp $closure/registration $out/nix-support/registration
+    chmod 444 $out/nix-support/registration
+  '';
+
   previousAssignment =
     semanticLayering.readAssignmentFromEnv "NIX_DOCKER_LAYER_CACHE";
 
@@ -343,6 +357,13 @@ let
         ];
         isolate = true;
       }
+      {
+        # Changes whenever ANY image content changes (it references
+        # every path) — isolate so it never reshuffles other layers.
+        name = "store-db-registration";
+        roots = [ storeDbRegistration ];
+        isolate = true;
+      }
     ];
 
   layeringPipeline = semanticLayering.buildPipeline {
@@ -354,7 +375,9 @@ in
 pkgs.dockerTools.buildLayeredImage {
   inherit name tag;
 
-  contents = imageContents;
+  # storeDbRegistration appended here (not in imageContents) so the
+  # closureInfo above isn't self-referential.
+  contents = imageContents ++ [ storeDbRegistration ];
 
   layeringPipeline = pkgs.writeText "${name}-pipeline.json" (
     builtins.toJSON layeringPipeline
@@ -371,6 +394,11 @@ pkgs.dockerTools.buildLayeredImage {
       # contend on the SQLite write lock instead of serializing through
       # the running nix-daemon socket.
       "NIX_REMOTE=daemon"
+      # nix-store --load-db source registering every baked rootfs
+      # store path as VALID before anything imports/substitutes
+      # (consumed by peer_cache.load_store_db_registration via the
+      # bootstrap's start_nix_daemon call).
+      "CSR_NIX_DB_REGISTRATION=${storeDbRegistration}/nix-support/registration"
       # TEMPORARY — gathering trace-level transport logs for the
       # primary-timeout diagnosis the dynamic_runner peer asked for.
       # Drop once the LMU CIP reverse-connection mode bug is fixed.

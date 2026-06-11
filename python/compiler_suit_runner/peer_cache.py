@@ -59,6 +59,9 @@ __all__ = [
     "prune_stale",
     "HarmoniaProcess",
     "start_nix_daemon",
+    "load_store_db_registration",
+    "NixStoreRegistrationError",
+    "NIX_DB_REGISTRATION_ENV",
     "NIX_DAEMON_SOCKET",
     "PEER_CONF_PATH",
     "SubmitterPeer",
@@ -887,6 +890,97 @@ class HarmoniaProcess:
 
 NIX_DAEMON_SOCKET = "/nix/var/nix/daemon-socket/socket"
 
+# Env var baked into the runner image (see nix/docker-image.nix) that
+# points at the ``nix-store --load-db``-format registration file
+# covering every store path shipped in the image rootfs. When set, the
+# registration MUST be loaded before the store serves any traffic;
+# unset means we're running outside the image (e.g. the submitter
+# host) where the local nix DB is managed by the host install.
+NIX_DB_REGISTRATION_ENV = "CSR_NIX_DB_REGISTRATION"
+
+
+class NixStoreRegistrationError(RuntimeError):
+    """The image's baked store-DB registration could not be loaded.
+
+    Raised LOUDLY (never swallowed) because continuing with an
+    unloaded DB leaves every rootfs store path present-on-disk but
+    INVALID in the nix database. Nix's ``LocalStore::addToStore``
+    (used by both ``nix-store --import`` and substitution)
+    ``deletePath()``s an existing-but-invalid destination before
+    re-unpacking it — so the first concurrent import storm deletes
+    live rootfs paths (glibc, python, nix itself) out from under
+    running processes, which then die with ENOENT mid-exec/dlopen.
+    """
+
+
+def load_store_db_registration(
+    nix_store: str,
+    env: dict[str, str] | None = None,
+    registration: str | None = None,
+) -> bool:
+    """Register the image's baked store paths as VALID in the nix DB.
+
+    ``dockerTools.buildLayeredImage`` ships the store *paths* but no
+    nix *database*; the image bakes a ``closureInfo`` registration
+    file and points :data:`NIX_DB_REGISTRATION_ENV` at it. This runs
+    ``nix-store --load-db < registration`` against the LOCAL store
+    (caller must pass an env with ``NIX_REMOTE`` stripped). load-db
+    is idempotent: re-loading an already-registered DB is a no-op.
+
+    Returns ``True`` if the registration was loaded, ``False`` when
+    no registration is configured (host context — nothing to do).
+
+    Raises :class:`NixStoreRegistrationError` if a registration is
+    configured but missing/unloadable. A silent skip here reproduces
+    the delete-then-restore tear class described on the exception.
+    """
+    if registration is None:
+        registration = os.environ.get(NIX_DB_REGISTRATION_ENV)
+    if not registration:
+        logger.debug(
+            "no %s in environment; skipping store-DB registration "
+            "(host-managed nix DB)",
+            NIX_DB_REGISTRATION_ENV,
+        )
+        return False
+    if not os.path.exists(registration):
+        raise NixStoreRegistrationError(
+            f"store-DB registration file {registration!r} (from "
+            f"${NIX_DB_REGISTRATION_ENV}) does not exist; refusing to "
+            "serve a store whose baked rootfs paths are unregistered"
+        )
+    if not os.path.exists(nix_store):
+        raise NixStoreRegistrationError(
+            f"nix-store binary {nix_store!r} not found; cannot load "
+            f"store-DB registration {registration!r}"
+        )
+    try:
+        with open(registration, "rb") as reg_fh:
+            proc = subprocess.run(  # noqa: S603 - argv built in-module
+                [nix_store, "--load-db"],
+                check=False,
+                stdin=reg_fh,
+                capture_output=True,
+                shell=False,
+                timeout=600,
+                env=env,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise NixStoreRegistrationError(
+            f"nix-store --load-db < {registration} failed to run: {exc}"
+        ) from exc
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise NixStoreRegistrationError(
+            f"nix-store --load-db < {registration} exited "
+            f"{proc.returncode}: {stderr}"
+        )
+    logger.info(
+        "registered baked image store paths in the nix DB from %s",
+        registration,
+    )
+    return True
+
 
 def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
     """Start ``nix-daemon`` detached. No-op if its socket already exists.
@@ -909,6 +1003,15 @@ def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
     corrupt``. ``nix-store --init`` is idempotent and forces the
     init synchronously in this single process before any other
     nix invocation can race it.
+
+    After the init, loads the image's baked store-DB registration
+    (``nix-store --load-db``, see :func:`load_store_db_registration`)
+    so every store path shipped in the rootfs is VALID in the DB
+    before the daemon serves a single request. Raises
+    :class:`NixStoreRegistrationError` if the image declares a
+    registration (via :data:`NIX_DB_REGISTRATION_ENV`) that can't be
+    loaded — continuing would let the first import/substitution storm
+    delete live rootfs paths out from under running processes.
 
     Returns the PID, or None if the daemon was already running.
     """
@@ -941,6 +1044,14 @@ def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
         except (OSError, subprocess.TimeoutExpired):
             # fall through to daemon spawn; daemon will retry init
             pass
+    # Load the image's baked store-DB registration BEFORE the daemon
+    # starts serving (and before harmonia / any worker import or
+    # substitution can run). The image rootfs carries thousands of
+    # store paths that buildLayeredImage does NOT register in the DB;
+    # until they're registered, any import/substitution touching them
+    # deletePath()s live rootfs paths mid-flight (#delete-then-restore
+    # tear, see NixStoreRegistrationError). Loud on failure by design.
+    load_store_db_registration(nix_store, env=local_store_env)
     binary = shutil.which("nix-daemon") or "/bin/nix-daemon"
     if not os.path.exists(binary):
         raise FileNotFoundError("nix-daemon not found on PATH or /bin")
