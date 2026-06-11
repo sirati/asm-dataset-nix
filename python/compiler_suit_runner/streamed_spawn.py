@@ -63,13 +63,6 @@ logger = logging.getLogger(__name__)
 
 SPAWN_TOPIC = "dependency_graph_spawn"
 SUMMARY_TOPIC = "dependency_graph_summary"
-# Task-output key carrying a copy of the terminal summary. The message
-# channel can lose an ordering race against the worker's completion
-# report (observed in production: the completion was processed ahead of
-# the final in-flight batch + summary, and the phase-end barrier fired
-# early); task outputs are delivered atomically WITH the completion, so
-# the barrier can always recover the authoritative total from here.
-SUMMARY_OUTPUT_KEY = "streamed_spawn_summary"
 WIRE_VERSION = 1
 DEFAULT_MAX_MESSAGE_BYTES = 100 * 1024  # mirrors framework CUSTOM_MESSAGE_MAX_BYTES
 MAX_BATCH_DESCRIPTORS = 200

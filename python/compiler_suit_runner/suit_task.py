@@ -2321,11 +2321,9 @@ class SuitTask:
         completed: int = 0,
         failed: int = 0,
         *,
-        # Supplied by the framework's call shape. Used as the FALLBACK
-        # channel for the streamed-spawn terminal summary: task outputs
-        # are delivered atomically with the worker's completion report,
-        # so the authoritative total survives even when the message
-        # channel loses the completion-overtakes-sends ordering race.
+        # Still supplied by the framework's call shape; retained for
+        # compatibility and intentionally unused since the published-
+        # pickle handoff was replaced by the streamed-spawn messages.
         phase_outputs: Optional[dict] = None,
     ) -> None:
         self._logger.info(
@@ -2360,42 +2358,17 @@ class SuitTask:
         # reconciliation can false-alarm after failover. Accepted for
         # now — loud beats silent.
         if self._streamed_expected_total is None:
-            # The message-channel summary can lose an ordering race
-            # against the worker's completion report (the completion is
-            # processed first, the phase ends, and the summary is still
-            # in flight). The worker also publishes the summary as a
-            # task output, which arrives atomically WITH the completion
-            # — recover the authoritative totals from there.
-            recovered = self._summary_from_phase_outputs(phase_outputs)
-            if recovered is not None:
-                self._streamed_expected_total = recovered.get("total")
-                self._streamed_summary_counters = recovered.get("counters")
-                self._streamed_summary_batches = recovered.get("batches")
-                self._logger.warning(
-                    "dependency_graph summary recovered from the task"
-                    " output (the message-channel summary lost the"
-                    " completion ordering race): total=%s batches=%s",
-                    self._streamed_expected_total,
-                    self._streamed_summary_batches,
-                )
-        if self._streamed_expected_total is None:
             raise RuntimeError(
                 "dependency_graph handoff incomplete: no summary"
-                " received on either channel (message or task output)"
+                " message received"
                 f" (spawned={self._streamed_spawned_count})"
             )
         if self._streamed_spawned_count != self._streamed_expected_total:
-            outstanding = (
-                self._streamed_expected_total - self._streamed_spawned_count
-            )
             raise RuntimeError(
                 "dependency_graph handoff mismatch:"
                 f" spawned={self._streamed_spawned_count}"
                 f" != total={self._streamed_expected_total}"
-                f" ({outstanding} spawn message(s) outstanding at"
-                " barrier time — the completion report overtook the"
-                " message channel"
-                f"; counters={self._streamed_summary_counters})"
+                f" (counters={self._streamed_summary_counters})"
             )
         self._logger.info(
             "dependency_graph handoff reconciled:"
@@ -2404,61 +2377,6 @@ class SuitTask:
             self._streamed_summary_batches,
             self._streamed_summary_counters,
         )
-
-    def _summary_from_phase_outputs(
-        self,
-        phase_outputs: Optional[dict],
-    ) -> Optional[dict]:
-        """Extract the streamed-spawn summary from published task outputs.
-
-        ``phase_outputs`` (as supplied by the framework to
-        :meth:`on_phase_end`) maps task identifiers to their published
-        key/value outputs; entries may be plain strings or
-        ``{"value": str}`` wrappers depending on the framework's
-        delivery shape, so both are accepted. Returns the decoded
-        summary dict (``total`` / ``batches`` / ``counters``) or None
-        when no parseable summary output exists. Never raises: a
-        malformed fallback summary just leaves the barrier to fail with
-        the no-summary diagnosis.
-        """
-        from compiler_suit_runner.streamed_spawn import (  # noqa: PLC0415
-            SUMMARY_OUTPUT_KEY,
-        )
-        import json  # noqa: PLC0415 — local import; cheap
-
-        if not phase_outputs:
-            return None
-
-        def _entry_text(entry: Any) -> Optional[str]:
-            if isinstance(entry, str):
-                return entry
-            if isinstance(entry, dict):
-                value = entry.get("value")
-                if isinstance(value, str):
-                    return value
-            return None
-
-        candidates: list[str] = []
-        direct = phase_outputs.get(SUMMARY_OUTPUT_KEY)
-        text = _entry_text(direct)
-        if text is not None:
-            candidates.append(text)
-        for task_outputs in phase_outputs.values():
-            if not isinstance(task_outputs, dict):
-                continue
-            text = _entry_text(task_outputs.get(SUMMARY_OUTPUT_KEY))
-            if text is not None:
-                candidates.append(text)
-        for candidate in candidates:
-            try:
-                payload = json.loads(candidate)
-            except (TypeError, ValueError):
-                continue
-            if isinstance(payload, dict) and isinstance(
-                payload.get("total"), int,
-            ):
-                return payload
-        return None
 
     # ── Streamed dependency_graph → build spawn transport ──────────────
 
