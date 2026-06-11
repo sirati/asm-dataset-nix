@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import pathlib
+import random
 import shutil
 import subprocess
 import sys
@@ -114,6 +115,39 @@ _LOG_EXCERPT_BYTE_LIMIT = 8 * 1024
 # real build but long enough for typical contention windows to clear.
 _SQLITE_BUSY_MAX_RETRIES = 6
 _SQLITE_BUSY_BACKOFF_SECONDS = 0.5
+
+# Retry policy for transient peer-substituter connectivity failures.
+# Secondaries reach peer nix caches through per-node SSH forwards
+# (e.g. the submitter's harmonia on localhost:5005); when a forward
+# drops, ``nix build`` fails with a curl connect error plus the
+# downstream "no substituter that can build it" cascade. The forward
+# is rebuilt automatically, so back off long enough to ride out a
+# rebuild: 2+4+8+16+32+32 = 94 s worst case (plus up to 25% jitter
+# per step).
+_SUBSTITUTER_MAX_ATTEMPTS = 7
+_SUBSTITUTER_BACKOFF_SECONDS = (2.0, 4.0, 8.0, 16.0, 32.0, 32.0)
+_SUBSTITUTER_JITTER_FRACTION = 0.25
+
+# stderr substrings (lower-cased match) marking a failed CONNECTION to
+# a substituter. Deliberately narrow: a bare "no substituter that can
+# build it" / "could not be realised" without one of these connect
+# markers is a genuinely missing path and stays a permanent failure.
+_SUBSTITUTER_CONNECT_MARKERS = (
+    b"could not connect to server",
+    b"couldn't connect to server",
+    b"failed to connect to",
+    b"connection refused",
+)
+
+# Injectable sleep hook so tests can assert the backoff schedule without
+# actually sleeping. Production never overrides it.
+_retry_sleep = time.sleep
+
+
+def _is_substituter_connect_failure(stderr: bytes) -> bool:
+    """True iff nix stderr indicates a substituter connect failure."""
+    low = stderr.lower()
+    return any(marker in low for marker in _SUBSTITUTER_CONNECT_MARKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +390,14 @@ def build_attr(
     Returns ``(success, stdout, stderr)`` where ``success`` is True iff
     the subprocess returned 0. The subprocess inherits the parent
     environment and never goes through a shell.
+
+    TRANSIENT failures are retried in-place before the failure is
+    surfaced: local nix-store SQLite contention (brief linear backoff)
+    and peer-substituter connect failures (exponential backoff +
+    jitter on the :data:`_SUBSTITUTER_BACKOFF_SECONDS` ladder, sized
+    to outlast an SSH-forward rebuild). A "no substituter that can
+    build it" / "could not be realised" error WITHOUT an accompanying
+    connect marker is a genuinely missing path and fails immediately.
     """
     runner = env.run_subprocess or _default_run_subprocess
 
@@ -381,29 +423,65 @@ def build_attr(
     else:
         argv.append(f"{env.flake_ref}#{attr}")
 
-    # Retry on transient nix-store init / contention errors. Multiple
-    # concurrent workers in the same secondary container all hit the
-    # same local nix store; the first invocation has to create the
-    # SQLite DB and schema file, and subsequent invocations can race
-    # on either the lock (``SQLite database is busy``) or the not-
-    # yet-fully-written schema file (``schema is corrupt``). The
-    # contention window is short — back off briefly and retry.
-    for attempt in range(_SQLITE_BUSY_MAX_RETRIES):
+    # Retry on transient errors. Two independent budgets:
+    #
+    # * nix-store init / contention: multiple concurrent workers in the
+    #   same secondary container all hit the same local nix store; the
+    #   first invocation has to create the SQLite DB and schema file,
+    #   and subsequent invocations can race on either the lock
+    #   (``SQLite database is busy``) or the not-yet-fully-written
+    #   schema file (``schema is corrupt``). The contention window is
+    #   short — back off briefly and retry.
+    # * peer-substituter connectivity: a dropped SSH forward makes nix
+    #   fail with a connect error (and a misleading "no substituter
+    #   that can build it" cascade). The forward self-heals — back off
+    #   on the :data:`_SUBSTITUTER_BACKOFF_SECONDS` ladder and retry.
+    #
+    # Anything else is permanent and returned to the caller unchanged.
+    sqlite_failures = 0
+    substituter_failures = 0
+    while True:
         stdout, stderr, rc = runner(argv)
         if rc == 0:
             return True, stdout, stderr
-        is_transient = (
+        if (
             b"is busy" in stderr
             or b"SQLite" in stderr
             or b"schema" in stderr and b"corrupt" in stderr
-        )
-        if not is_transient:
-            return False, stdout, stderr
-        # Last attempt — give up and return the error to the caller.
-        if attempt == _SQLITE_BUSY_MAX_RETRIES - 1:
-            return False, stdout, stderr
-        time.sleep(_SQLITE_BUSY_BACKOFF_SECONDS * (1 + attempt))
-    return False, stdout, stderr
+        ):
+            sqlite_failures += 1
+            if sqlite_failures >= _SQLITE_BUSY_MAX_RETRIES:
+                return False, stdout, stderr
+            time.sleep(_SQLITE_BUSY_BACKOFF_SECONDS * sqlite_failures)
+            continue
+        if _is_substituter_connect_failure(stderr):
+            substituter_failures += 1
+            if substituter_failures >= _SUBSTITUTER_MAX_ATTEMPTS:
+                _LOG.warning(
+                    "nix build of %s still failing on substituter "
+                    "connectivity after %d attempts — giving up: %s",
+                    attr, substituter_failures,
+                    stderr.decode("utf-8", errors="replace").strip(),
+                )
+                return False, stdout, stderr
+            base = _SUBSTITUTER_BACKOFF_SECONDS[
+                min(
+                    substituter_failures - 1,
+                    len(_SUBSTITUTER_BACKOFF_SECONDS) - 1,
+                )
+            ]
+            delay = base + random.uniform(
+                0, base * _SUBSTITUTER_JITTER_FRACTION
+            )
+            _LOG.warning(
+                "transient substituter connect failure building %s "
+                "(attempt %d/%d) — retrying in %.1fs",
+                attr, substituter_failures, _SUBSTITUTER_MAX_ATTEMPTS,
+                delay,
+            )
+            _retry_sleep(delay)
+            continue
+        return False, stdout, stderr
 
 
 # ---------------------------------------------------------------------------
