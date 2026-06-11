@@ -1374,3 +1374,206 @@ def test_peer_nix_conf_watcher_writes_when_target_writable(
     # Empty peers → empty body, but the file IS created.
     assert target.exists()
     assert target.read_text() == ""
+
+
+# ---------------------------------------------------------------------------
+# Store-DB registration (baked-image load-db)
+# ---------------------------------------------------------------------------
+
+
+def _write_fake_nix_store(
+    tmp_path: pathlib.Path,
+    *,
+    exit_code: int = 0,
+    stderr: str = "",
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    """A fake ``nix-store`` recording argv + stdin to files."""
+    script = tmp_path / "nix-store"
+    calls = tmp_path / "calls.log"
+    stdin_copy = tmp_path / "stdin.bin"
+    script.write_text(
+        "#!/bin/sh\n"
+        f'echo "$@" >> {calls}\n'
+        # Only consume stdin on --load-db; --init runs with the
+        # parent's inherited stdin, which `cat` could block on.
+        f'if [ "$1" = "--load-db" ]; then cat > {stdin_copy}; fi\n'
+        + (f'echo "{stderr}" >&2\n' if stderr else "")
+        + f"exit {exit_code}\n"
+    )
+    script.chmod(0o755)
+    return script, calls, stdin_copy
+
+
+def test_load_db_registration_skipped_when_env_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host context (no CSR_NIX_DB_REGISTRATION) → no-op, False."""
+    monkeypatch.delenv(peer_cache.NIX_DB_REGISTRATION_ENV, raising=False)
+    # nix_store path deliberately bogus: must not even be looked at.
+    assert (
+        peer_cache.load_store_db_registration("/nonexistent/nix-store")
+        is False
+    )
+
+
+def test_load_db_registration_invokes_load_db_with_file(
+    tmp_path: pathlib.Path,
+) -> None:
+    """load-db runs with the registration file streamed on stdin."""
+    script, calls, stdin_copy = _write_fake_nix_store(tmp_path)
+    reg = tmp_path / "registration"
+    reg.write_text("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc\n")
+
+    ran = peer_cache.load_store_db_registration(
+        str(script),
+        env=dict(os.environ),
+        registration=str(reg),
+    )
+
+    assert ran is True
+    assert "--load-db" in calls.read_text()
+    assert stdin_copy.read_text() == reg.read_text()
+
+
+def test_load_db_registration_missing_file_fails_loudly(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A configured-but-absent registration file must raise, not skip —
+    a silent skip leaves the rootfs paths invalid and reproduces the
+    import-storm delete-then-restore tear."""
+    script, _, _ = _write_fake_nix_store(tmp_path)
+    with pytest.raises(peer_cache.NixStoreRegistrationError) as excinfo:
+        peer_cache.load_store_db_registration(
+            str(script),
+            env=dict(os.environ),
+            registration=str(tmp_path / "does-not-exist"),
+        )
+    assert "does-not-exist" in str(excinfo.value)
+
+
+def test_load_db_registration_nonzero_exit_fails_loudly(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A failing ``nix-store --load-db`` must raise with its stderr."""
+    script, _, _ = _write_fake_nix_store(
+        tmp_path, exit_code=7, stderr="boom: db locked"
+    )
+    reg = tmp_path / "registration"
+    reg.write_text("x\n")
+    with pytest.raises(peer_cache.NixStoreRegistrationError) as excinfo:
+        peer_cache.load_store_db_registration(
+            str(script),
+            env=dict(os.environ),
+            registration=str(reg),
+        )
+    msg = str(excinfo.value)
+    assert "exited 7" in msg
+    assert "boom: db locked" in msg
+
+
+def test_load_db_registration_missing_nix_store_fails_loudly(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Registration configured but no nix-store binary → loud failure."""
+    reg = tmp_path / "registration"
+    reg.write_text("x\n")
+    with pytest.raises(peer_cache.NixStoreRegistrationError):
+        peer_cache.load_store_db_registration(
+            str(tmp_path / "no-such-nix-store"),
+            env=dict(os.environ),
+            registration=str(reg),
+        )
+
+
+def test_start_nix_daemon_loads_registration_before_daemon_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """start_nix_daemon must load-db AFTER --init and BEFORE spawning
+    the daemon (i.e. before the store can serve any import), and must
+    strip NIX_REMOTE so load-db talks to the local store directly."""
+    script, calls, stdin_copy = _write_fake_nix_store(tmp_path)
+    reg = tmp_path / "registration"
+    reg.write_text("/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-nix\n")
+
+    monkeypatch.setattr(
+        peer_cache, "NIX_DAEMON_SOCKET", str(tmp_path / "daemon.sock")
+    )
+    monkeypatch.setenv(peer_cache.NIX_DB_REGISTRATION_ENV, str(reg))
+    monkeypatch.setenv("NIX_REMOTE", "daemon")
+    monkeypatch.setattr(
+        peer_cache.shutil, "which", lambda _name: str(script)
+    )
+
+    events: list[str] = []
+    load_envs: list[Optional[dict]] = []
+    orig_load = peer_cache.load_store_db_registration
+
+    def recording_load(nix_store, env=None, registration=None):
+        events.append("load_db")
+        load_envs.append(env)
+        return orig_load(nix_store, env=env, registration=registration)
+
+    monkeypatch.setattr(
+        peer_cache, "load_store_db_registration", recording_load
+    )
+
+    class _FakeDaemon:
+        pid = 4242
+
+    # subprocess.run delegates to subprocess.Popen internally, so only
+    # intercept the daemon spawn (the sole start_new_session=True call
+    # here) and pass --init / --load-db through to the real Popen.
+    real_popen = subprocess.Popen
+
+    def fake_popen(argv, **kwargs):
+        if kwargs.get("start_new_session"):
+            events.append("daemon_spawn")
+            return _FakeDaemon()
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(peer_cache.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        peer_cache, "_nix_daemon_accepts_connections", lambda: True
+    )
+
+    pid = peer_cache.start_nix_daemon(tmp_path / "nix-daemon.log")
+
+    assert pid == 4242
+    assert events == ["load_db", "daemon_spawn"]
+    assert stdin_copy.read_text() == reg.read_text()
+    assert load_envs == [
+        {k: v for k, v in os.environ.items() if k != "NIX_REMOTE"}
+    ]
+
+
+def test_start_nix_daemon_fails_loudly_on_missing_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """If the image declares a registration that's absent, bring-up
+    must abort before any daemon is spawned."""
+    script, _, _ = _write_fake_nix_store(tmp_path)
+    monkeypatch.setattr(
+        peer_cache, "NIX_DAEMON_SOCKET", str(tmp_path / "daemon.sock")
+    )
+    monkeypatch.setenv(
+        peer_cache.NIX_DB_REGISTRATION_ENV,
+        str(tmp_path / "missing-registration"),
+    )
+    monkeypatch.setattr(
+        peer_cache.shutil, "which", lambda _name: str(script)
+    )
+
+    real_popen = subprocess.Popen
+
+    def forbidden_popen(argv, **kwargs):
+        if kwargs.get("start_new_session"):  # pragma: no cover
+            raise AssertionError("daemon must not spawn without load-db")
+        # subprocess.run's internal Popen (--init) passes through.
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(peer_cache.subprocess, "Popen", forbidden_popen)
+
+    with pytest.raises(peer_cache.NixStoreRegistrationError):
+        peer_cache.start_nix_daemon(tmp_path / "nix-daemon.log")

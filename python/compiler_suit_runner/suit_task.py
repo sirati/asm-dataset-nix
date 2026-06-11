@@ -1784,9 +1784,21 @@ class SuitTask:
                     # diagnose worker connection-reset issues from
                     # the host after the container exits and its
                     # /tmp gets nuked.
-                    from .peer_cache import start_nix_daemon
+                    from .peer_cache import (
+                        NixStoreRegistrationError,
+                        start_nix_daemon,
+                    )
                     daemon_log = sec_log_dir / "nix-daemon.log"
                     start_nix_daemon(daemon_log)
+                except NixStoreRegistrationError:
+                    # LOUD by design: the image declares a baked
+                    # store-DB registration that failed to load.
+                    # Continuing would leave every rootfs store path
+                    # invalid in the nix DB, and the build phase's
+                    # first concurrent import storm would then
+                    # deletePath() live rootfs paths (glibc, nix,
+                    # python) out from under running processes.
+                    raise
                 except Exception:  # noqa: BLE001 — log + continue
                     self._logger.exception(
                         "on_run_start: nix-daemon start failed"
