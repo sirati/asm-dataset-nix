@@ -169,6 +169,65 @@ let
     ]
   );
 
+  # Plugin-aware archiver tools for LTO variants. Slim LTO objects are
+  # bitcode — plain binutils ``ar rc`` writes an EMPTY symbol index over
+  # them and the final link dies with "archive has no index; run ranlib
+  # to add one". Build systems take AR/RANLIB/NM from the environment
+  # (autoconf/zlib-style ``AR=''${AR-"ar"}``), so export the
+  # plugin-aware tools:
+  #   gcc:   gcc-ar/gcc-ranlib/gcc-nm from the unwrapped compiler
+  #          (exist since gcc 4.7; gcc 4.6 emits FAT objects by default
+  #          — real code alongside bitcode — so plain ar works there)
+  #   clang: llvm-ar/llvm-ranlib/llvm-nm from the matching LLVM package
+  #          (resolved by the compiler entry's ``mkLlvmTools``; bitcode
+  #          is a host-agnostic container, so the build-platform tools
+  #          handle cross-target objects too)
+  gccVersionParts = builtins.match "([0-9]+)\\.([0-9]+).*" (compiler.version or "0");
+  gccMajor = if gccVersionParts != null then lib.toInt (builtins.elemAt gccVersionParts 0) else 0;
+  gccMinor = if gccVersionParts != null then lib.toInt (builtins.elemAt gccVersionParts 1) else 0;
+  gccHasPluginAr = gccMajor > 4 || (gccMajor == 4 && gccMinor >= 7);
+
+  ltoTools =
+    if !(flagSet.needsLtoTools or false) then
+      null
+    else if compiler.family == "gcc" then
+      if gccHasPluginAr then
+        let
+          cc = customStdenv.cc;
+          prefix = cc.targetPrefix or "";
+        in
+        {
+          ar = "${cc.cc}/bin/${prefix}gcc-ar";
+          ranlib = "${cc.cc}/bin/${prefix}gcc-ranlib";
+          nm = "${cc.cc}/bin/${prefix}gcc-nm";
+        }
+      else
+        null
+    else
+      let
+        llvm = if compiler ? mkLlvmTools then compiler.mkLlvmTools targetPkgs target else null;
+      in
+      if llvm != null then
+        {
+          ar = "${llvm}/bin/llvm-ar";
+          ranlib = "${llvm}/bin/llvm-ranlib";
+          nm = "${llvm}/bin/llvm-nm";
+        }
+      else
+        null;
+
+  # Plain env attrs (AR = ...) get CLOBBERED during stdenv setup — the
+  # bintools-wrapper setup hook re-exports AR/RANLIB/NM pointing at
+  # binutils after derivation env vars are loaded. Export from
+  # preConfigure instead: it runs after all setup hooks and the exports
+  # persist into the configure/build phases (one shell).
+  ltoToolsPreConfigure =
+    lib.optionalString (ltoTools != null) ''
+      export AR=${ltoTools.ar}
+      export RANLIB=${ltoTools.ranlib}
+      export NM=${ltoTools.nm}
+    '';
+
   # Static-linking variants (-static-pie) need the target libc's static
   # archives on the link path; the default stdenv only carries the
   # shared glibc. ``glibc.static`` is the lib output with libc.a/libm.a.
@@ -257,6 +316,9 @@ let
 
     in
     flagAttrs
+    // lib.optionalAttrs (ltoToolsPreConfigure != "") {
+      preConfigure = toString (old.preConfigure or "") + "\n" + ltoToolsPreConfigure;
+    }
     // lib.optionalAttrs (staticLibc != null) {
       buildInputs = (old.buildInputs or [ ]) ++ [ staticLibc ];
     }

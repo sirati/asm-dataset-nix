@@ -142,7 +142,13 @@ let
       label = "lto";
       cflags = "-flto";
       cxxflags = "-flto";
-      ldflags = "-flto";
+      linkFlags = "-flto";
+      # Slim LTO objects are bitcode; plain binutils ``ar``/``ranlib``
+      # can't index them ("archive has no index; run ranlib"), so
+      # mkVariant points AR/RANLIB/NM at the plugin-aware tools
+      # (gcc-ar / llvm-ar). gcc < 4.9 emits fat objects by default and
+      # gcc < 4.7 has no gcc-ar at all — mkVariant handles that gate.
+      needsLtoTools = true;
       minGccVersion = {
         major = 4;
         minor = 6;
@@ -157,7 +163,8 @@ let
       label = "ltothin";
       cflags = "-flto=thin";
       cxxflags = "-flto=thin";
-      ldflags = "-flto=thin";
+      linkFlags = "-flto=thin";
+      needsLtoTools = true;
       clangOnly = true;
       minClangVersion = {
         major = 3;

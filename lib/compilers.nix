@@ -87,6 +87,16 @@ let
           targetPkgs.overrideCC targetPkgs.stdenv targetPkgs.buildPackages.${name}.clang
         else
           targetPkgs.${name}.stdenv;
+      # Plugin-aware archiver tools (llvm-ar/llvm-ranlib/llvm-nm) from
+      # the same LLVM release as this clang — used by mkVariant for LTO
+      # variants, where plain binutils ar can't index bitcode objects.
+      # Always build-platform binaries (bitcode is host-agnostic).
+      mkLlvmTools =
+        targetPkgs: target:
+        if target.crossAttr != null || target ? crossSystem then
+          targetPkgs.buildPackages.${name}.llvm or null
+        else
+          targetPkgs.${name}.llvm or null;
     };
 
 in
