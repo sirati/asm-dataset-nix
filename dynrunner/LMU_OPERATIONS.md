@@ -125,7 +125,7 @@ kruppb has a 15-parallel-task SLURM quota at LMU. `--jobs 15` is our full-run ce
 
 ## dynamic_runner pin policy
 
-Our flake input `dynamic-runner` is bare (`github:sirati/dynamic-runner`) — `flake.lock` tracks the actual rev. Upgrade with `nix flake update dynamic-runner` and rebuild the image with `nix build --no-link .#dockerImage`.
+Our flake input `dynamic-runner` is bare (`github:sirati/dynamic-runner`) — `flake.lock` tracks the actual rev. Upgrade with `nix flake update dynamic-runner`. Do NOT manually `nix build .#dockerImage` afterwards — the dispatch builds and layered-blob-uploads the image itself; a manual pre-build is redundant process.
 
 ### Pin history (Tier-3 LMU green markers)
 

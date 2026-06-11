@@ -13,8 +13,8 @@ For the slurm-root layout (where `out/`, `log/`, `image_bin/` live on the gatewa
 - Working `nix develop` shell from `/home/sirati/devel/nix/asm-dataset-nix`. All commands run inside `nix develop --no-write-lock-file --command bash -c "..."` unless explicitly stated otherwise.
 - For LMU dispatches: `~/.ssh/config` reachable for `kruppb@remote.cip.ifi.lmu.de`. 1Password SSH agent must be unlocked — if the gateway returns `signing failed for ED25519 "LMU CIP SSH Key" from agent: communication with agent failed`, the agent is locked and only the user can unlock it.
 - For `slurm-test-env` dispatches: bring the env up via `cd ~/devel/python/dynamic_runner/slurm-test-env && nix run .#up`; obtain the per-instance keypair path and SSH port (see `LMU_OPERATIONS.md` "Do NOT confuse with slurm-test-env mandates" table for the test-env-only flags).
-- `flake.lock` pinned to a current `dynamic-runner` revision (see `LMU_OPERATIONS.md` pin-history for the validated tip). Bump with `nix flake update dynamic-runner` and rebuild with `nix build --no-link .#dockerImage`.
-- Image is rebuilt locally (`nix path-info .#dockerImage` → store path of the tar.gz). The runner uploads it via layered-blob transfer; only changed layers re-upload, so this is fast on iteration.
+- `flake.lock` pinned to a current `dynamic-runner` revision (see `LMU_OPERATIONS.md` pin-history for the validated tip). Bump with `nix flake update dynamic-runner`.
+- The image is built and uploaded BY THE DISPATCH itself (layered-blob transfer; only changed layers re-upload). Do NOT manually `nix build .#dockerImage` before dispatching — redundant process.
 
 ## The dispatch command
 
