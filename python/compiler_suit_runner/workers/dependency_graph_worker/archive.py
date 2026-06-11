@@ -23,9 +23,12 @@ been retired, along with the legacy stdout-walking
 
 from __future__ import annotations
 
+import errno
 import logging
 import pathlib
+import random
 import subprocess
+import time
 from typing import Optional
 
 from template_graph.tree_walker import VARIANT_SUFFIX, parse_variant_path
@@ -82,6 +85,66 @@ def binary_from_archive_name(archive: pathlib.Path) -> str:
 
 
 logger = logging.getLogger("compiler_suit_runner.dependency_graph_worker")
+
+
+# ---------------------------------------------------------------------------
+# Transient-failure retry policy for ``import_archive``
+#
+# Production evidence (run_20260611_123632): under fork/pids pressure or
+# network-mount backpressure, spawning ``nix-store --import`` raises
+# ``[Errno 11] Resource temporarily unavailable``. EAGAIN is TRANSIENT,
+# but a single failed import used to kill the worker NonRecoverable; the
+# respawned worker re-ran the import (the memo flags are per-process),
+# hit EAGAIN again, and died again — a respawn loop that took out whole
+# secondaries. Retrying INSIDE import_archive lets every caller
+# (toolchain import, per-binary import, eval path, dep_graph run) ride
+# out a transient blip, while a 30s-persistent condition still fails
+# loud exactly as before.
+# ---------------------------------------------------------------------------
+
+# 1 initial attempt + 5 retries; sleeps between attempts follow the
+# schedule below (plus up to 25% jitter), ~31s total worst case.
+_IMPORT_MAX_ATTEMPTS = 6
+_IMPORT_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0)
+_IMPORT_JITTER_FRACTION = 0.25
+
+# OSError errnos that indicate a transient spawn/read condition (fork
+# pressure, signal interruption, momentary memory pressure) rather than
+# a permanent error like a missing or unreadable archive.
+_TRANSIENT_ERRNOS = frozenset({
+    errno.EAGAIN,
+    errno.EWOULDBLOCK,  # == EAGAIN on Linux; kept for portability
+    errno.EINTR,
+    errno.ENOMEM,
+})
+
+# stderr substrings (lower-cased match) from a non-zero ``nix-store
+# --import`` that indicate the SAME transient conditions surfacing
+# inside the child instead of at spawn time. Deliberately narrow:
+# "does not exist" / corrupt-archive / any other nix error stays
+# permanent and fails fast.
+_TRANSIENT_STDERR_MARKERS = (
+    b"resource temporarily unavailable",
+    b"cannot fork",
+    b"unable to fork",
+    b"cannot allocate memory",
+    b"interrupted system call",
+)
+
+# Injectable sleep hook so tests can assert the backoff schedule without
+# actually sleeping. Production never overrides it.
+_retry_sleep = time.sleep
+
+
+def _is_transient_oserror(exc: OSError) -> bool:
+    """True iff the OSError errno marks a retryable transient condition."""
+    return exc.errno in _TRANSIENT_ERRNOS
+
+
+def _is_transient_stderr(stderr: bytes) -> bool:
+    """True iff a non-zero rc's stderr indicates a transient condition."""
+    low = stderr.lower()
+    return any(marker in low for marker in _TRANSIENT_STDERR_MARKERS)
 
 
 def discover_archives(matrix_eval_out_dir: pathlib.Path) -> list[pathlib.Path]:
@@ -151,23 +214,76 @@ def import_archive(
     a real subprocess wrapper would take the argv-stub path, handing
     nix-store a literal ``<<N bytes>>`` positional that triggers
     ``error: no arguments expected``.
+
+    TRANSIENT failures (EAGAIN/EWOULDBLOCK/EINTR/ENOMEM from spawning
+    or reading, or a non-zero rc whose stderr indicates fork/memory
+    pressure — see :data:`_TRANSIENT_STDERR_MARKERS`) are retried with
+    exponential backoff + jitter (up to :data:`_IMPORT_MAX_ATTEMPTS`
+    attempts, ~31s total) before the failure is surfaced. Permanent
+    errors (archive missing, corrupt archive, nix "does not exist")
+    fail fast on the first attempt. The retry lives HERE so every
+    caller (toolchain import, per-binary import, eval path, dep_graph
+    run) inherits it.
     """
     if not archive.is_file():
         return False, f"archive not found: {archive}".encode("utf-8"), []
 
+    for attempt in range(1, _IMPORT_MAX_ATTEMPTS + 1):
+        success, stderr, imported, transient = _import_archive_once(
+            archive, run_subprocess,
+        )
+        if success or not transient:
+            return success, stderr, imported
+        if attempt == _IMPORT_MAX_ATTEMPTS:
+            logger.warning(
+                "import of %s still failing transiently after %d "
+                "attempts — giving up: %s",
+                archive, attempt,
+                stderr.decode("utf-8", errors="replace").strip(),
+            )
+            return success, stderr, imported
+        base = _IMPORT_BACKOFF_SECONDS[
+            min(attempt - 1, len(_IMPORT_BACKOFF_SECONDS) - 1)
+        ]
+        delay = base + random.uniform(0, base * _IMPORT_JITTER_FRACTION)
+        logger.warning(
+            "transient failure importing %s (attempt %d/%d): %s — "
+            "retrying in %.1fs",
+            archive, attempt, _IMPORT_MAX_ATTEMPTS,
+            stderr.decode("utf-8", errors="replace").strip(), delay,
+        )
+        _retry_sleep(delay)
+    raise AssertionError("unreachable: retry loop must return")
+
+
+def _import_archive_once(
+    archive: pathlib.Path,
+    run_subprocess: Optional[RunSubprocess],
+) -> tuple[bool, bytes, list[str], bool]:
+    """One ``nix-store --import`` attempt.
+
+    Returns ``(success, stderr_bytes, imported_paths, transient)``
+    where ``transient`` marks a retryable failure (always ``False`` on
+    success). Shared by both the ``_stdin_aware`` test-stub branch and
+    the production direct-subprocess branch so the retry classification
+    is identical for unit tests and real workers.
+    """
     if run_subprocess is not None and getattr(
         run_subprocess, "_stdin_aware", False,
     ):
         try:
             contents = archive.read_bytes()
         except OSError as exc:
-            return False, str(exc).encode("utf-8"), []
+            return (
+                False, str(exc).encode("utf-8"), [],
+                _is_transient_oserror(exc),
+            )
         stdout, stderr, rc = run_subprocess([
             "nix-store", "--import", f"<<{len(contents)}bytes>>",
         ])
         if rc != 0:
-            return False, stderr, []
-        return True, stderr, _split_import_stdout(stdout)
+            return False, stderr, [], _is_transient_stderr(stderr or b"")
+        return True, stderr, _split_import_stdout(stdout), False
 
     try:
         with open(archive, "rb") as fh:
@@ -178,11 +294,18 @@ def import_archive(
                 stderr=subprocess.PIPE,
                 check=False,
             )
-        if proc.returncode != 0:
-            return False, proc.stderr or b"", []
-        return True, proc.stderr or b"", _split_import_stdout(proc.stdout or b"")
     except OSError as exc:
-        return False, str(exc).encode("utf-8"), []
+        return (
+            False, str(exc).encode("utf-8"), [],
+            _is_transient_oserror(exc),
+        )
+    if proc.returncode != 0:
+        stderr = proc.stderr or b""
+        return False, stderr, [], _is_transient_stderr(stderr)
+    return (
+        True, proc.stderr or b"",
+        _split_import_stdout(proc.stdout or b""), False,
+    )
 
 
 def _split_import_stdout(stdout: bytes) -> list[str]:

@@ -1539,6 +1539,79 @@ def test_ensure_binary_archive_imported_raises_on_import_failure(
     _reset_imported_binaries()
 
 
+def test_ensure_toolchain_archive_imported_rides_out_transient_failure(
+    monkeypatch, tmp_path,
+):
+    """A transient EAGAIN-style import failure (production respawn-loop
+    signature) is retried INSIDE ``import_archive`` — the prelude
+    succeeds on the second attempt instead of raising RuntimeError and
+    killing the worker. Goes through the REAL ``import_archive`` (only
+    the sleep hook + subprocess stub are injected)."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+
+    monkeypatch.setattr(bw, "_toolchain_imported", False)
+    sleeps: list[float] = []
+    monkeypatch.setattr(archive_mod, "_retry_sleep", sleeps.append)
+
+    out_dir = tmp_path / "phase0"
+    out_dir.mkdir()
+    (out_dir / "toolchains.drv.archive").write_bytes(b"fake-archive")
+
+    rcs = [1, 0]
+    calls: list[list[str]] = []
+
+    def _stub(argv):
+        calls.append(list(argv))
+        rc = rcs.pop(0)
+        if rc != 0:
+            return b"", b"error: Resource temporarily unavailable", rc
+        return b"/nix/store/aaa-toolchain.drv\n", b"", rc
+
+    _stub._stdin_aware = True
+
+    bw.ensure_toolchain_archive_imported(out_dir, run_subprocess=_stub)
+
+    assert bw._toolchain_imported is True
+    assert len(calls) == 2
+    assert len(sleeps) == 1
+
+
+def test_ensure_toolchain_archive_imported_permanent_failure_still_raises(
+    monkeypatch, tmp_path,
+):
+    """A permanent import failure (corrupt archive) fails fast — no
+    retry sleeps — and still escalates to RuntimeError as before."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+
+    monkeypatch.setattr(bw, "_toolchain_imported", False)
+    sleeps: list[float] = []
+    monkeypatch.setattr(archive_mod, "_retry_sleep", sleeps.append)
+
+    out_dir = tmp_path / "phase0"
+    out_dir.mkdir()
+    (out_dir / "toolchains.drv.archive").write_bytes(b"junk")
+
+    calls: list[list[str]] = []
+
+    def _stub(argv):
+        calls.append(list(argv))
+        return b"", b"error: corrupt archive", 1
+
+    _stub._stdin_aware = True
+
+    with pytest.raises(RuntimeError) as exc_info:
+        bw.ensure_toolchain_archive_imported(out_dir, run_subprocess=_stub)
+    assert "toolchains.drv.archive" in str(exc_info.value)
+    assert "corrupt archive" in str(exc_info.value)
+    assert len(calls) == 1
+    assert sleeps == []
+    assert bw._toolchain_imported is False
+
+
 def test_build_worker_build_variant_imports_archive_first_time(
     monkeypatch, tmp_path,
 ):

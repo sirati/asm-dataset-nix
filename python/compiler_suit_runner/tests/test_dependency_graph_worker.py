@@ -554,6 +554,193 @@ class TestImportArchive:
 
 
 # ---------------------------------------------------------------------------
+# import_archive transient-failure retry (EAGAIN respawn-loop fix)
+#
+# Production evidence: under fork/pids pressure spawning
+# ``nix-store --import`` raises ``[Errno 11] Resource temporarily
+# unavailable``; treating that as permanent killed workers in a respawn
+# loop. import_archive now retries transient failures with backoff;
+# permanent failures still fail fast. The sleep hook is patched so no
+# test ever actually sleeps.
+# ---------------------------------------------------------------------------
+
+
+class TestImportArchiveRetry:
+
+    @pytest.fixture(autouse=True)
+    def _no_real_sleep(self, monkeypatch):
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            archive as archive_mod,
+        )
+        self.archive_mod = archive_mod
+        self.sleeps: list[float] = []
+        monkeypatch.setattr(archive_mod, "_retry_sleep", self.sleeps.append)
+
+    def test_transient_stderr_rc_retries_then_succeeds(
+        self, tmp_path: pathlib.Path,
+    ):
+        archive = tmp_path / "toolchains.drv.archive"
+        archive.write_bytes(b"x")
+        stub = _SubprocessStub()
+        stub.import_rc_queue = [1, 0]
+        stub.import_stderr = (
+            b"error: unable to fork: Resource temporarily unavailable"
+        )
+        stub.import_stdout = b"/nix/store/aaa-x.drv\n"
+        ok, _err, imported = dgw.import_archive(
+            archive, run_subprocess=stub,
+        )
+        assert ok is True
+        assert imported == ["/nix/store/aaa-x.drv"]
+        import_calls = [
+            c for c in stub.calls if c[:2] == ["nix-store", "--import"]
+        ]
+        assert len(import_calls) == 2
+        # One backoff sleep: base 1s plus up to 25% jitter.
+        assert len(self.sleeps) == 1
+        assert 1.0 <= self.sleeps[0] <= 1.25
+
+    def test_cannot_fork_stderr_retries(self, tmp_path: pathlib.Path):
+        archive = tmp_path / "matrix-x.drv.archive"
+        archive.write_bytes(b"x")
+        stub = _SubprocessStub()
+        stub.import_rc_queue = [1, 0]
+        stub.import_stderr = b"nix-store: cannot fork"
+        ok, _err, _imported = dgw.import_archive(
+            archive, run_subprocess=stub,
+        )
+        assert ok is True
+        assert len(self.sleeps) == 1
+
+    def test_permanent_rc_failure_does_not_retry(
+        self, tmp_path: pathlib.Path,
+    ):
+        archive = tmp_path / "matrix-x.drv.archive"
+        archive.write_bytes(b"x")
+        stub = _SubprocessStub()
+        stub.import_rc = 1
+        stub.import_stderr = b"error: corrupt archive"
+        ok, err, imported = dgw.import_archive(
+            archive, run_subprocess=stub,
+        )
+        assert ok is False
+        assert b"corrupt" in err
+        assert imported == []
+        import_calls = [
+            c for c in stub.calls if c[:2] == ["nix-store", "--import"]
+        ]
+        assert len(import_calls) == 1
+        assert self.sleeps == []
+
+    def test_nix_does_not_exist_does_not_retry(
+        self, tmp_path: pathlib.Path,
+    ):
+        archive = tmp_path / "matrix-x.drv.archive"
+        archive.write_bytes(b"x")
+        stub = _SubprocessStub()
+        stub.import_rc = 1
+        stub.import_stderr = (
+            b"error: path '/nix/store/aaa-x.drv' does not exist"
+        )
+        ok, _err, _imported = dgw.import_archive(
+            archive, run_subprocess=stub,
+        )
+        assert ok is False
+        assert self.sleeps == []
+
+    def test_missing_archive_does_not_retry(self, tmp_path: pathlib.Path):
+        archive = tmp_path / "matrix-missing.drv.archive"
+        stub = _SubprocessStub()
+        ok, err, _imported = dgw.import_archive(
+            archive, run_subprocess=stub,
+        )
+        assert ok is False
+        assert b"archive not found" in err
+        assert stub.calls == []
+        assert self.sleeps == []
+
+    def test_retries_exhausted_returns_failure(
+        self, tmp_path: pathlib.Path,
+    ):
+        archive = tmp_path / "toolchains.drv.archive"
+        archive.write_bytes(b"x")
+        stub = _SubprocessStub()
+        stub.import_rc = 1
+        stub.import_stderr = b"Resource temporarily unavailable"
+        ok, err, imported = dgw.import_archive(
+            archive, run_subprocess=stub,
+        )
+        assert ok is False
+        assert b"Resource temporarily unavailable" in err
+        assert imported == []
+        import_calls = [
+            c for c in stub.calls if c[:2] == ["nix-store", "--import"]
+        ]
+        # 1 initial attempt + 5 retries.
+        assert len(import_calls) == 6
+        # Backoff schedule 1/2/4/8/16s, each plus up to 25% jitter.
+        assert len(self.sleeps) == 5
+        for base, actual in zip((1.0, 2.0, 4.0, 8.0, 16.0), self.sleeps):
+            assert base <= actual <= base * 1.25
+
+    def test_transient_oserror_direct_branch_retries_then_succeeds(
+        self, tmp_path: pathlib.Path,
+    ):
+        """EAGAIN from spawning ``nix-store --import`` (the production
+        respawn-loop signature) is retried; the third attempt succeeds."""
+        import errno  # noqa: PLC0415
+        from unittest.mock import patch  # noqa: PLC0415
+
+        archive = tmp_path / "toolchains.drv.archive"
+        archive.write_bytes(b"fake")
+        attempts: list[int] = []
+
+        def _fake_run(argv, **_kwargs):
+            attempts.append(1)
+            if len(attempts) <= 2:
+                raise OSError(
+                    errno.EAGAIN, "Resource temporarily unavailable",
+                )
+
+            class _Proc:
+                stdout = b"/nix/store/aaa-x.drv\n"
+                stderr = b""
+                returncode = 0
+
+            return _Proc()
+
+        with patch.object(self.archive_mod.subprocess, "run", _fake_run):
+            ok, _err, imported = self.archive_mod.import_archive(archive)
+        assert ok is True
+        assert imported == ["/nix/store/aaa-x.drv"]
+        assert len(attempts) == 3
+        assert len(self.sleeps) == 2
+        assert 1.0 <= self.sleeps[0] <= 1.25
+        assert 2.0 <= self.sleeps[1] <= 2.5
+
+    def test_permanent_oserror_direct_branch_does_not_retry(
+        self, tmp_path: pathlib.Path,
+    ):
+        import errno  # noqa: PLC0415
+        from unittest.mock import patch  # noqa: PLC0415
+
+        archive = tmp_path / "toolchains.drv.archive"
+        archive.write_bytes(b"fake")
+        attempts: list[int] = []
+
+        def _fake_run(argv, **_kwargs):
+            attempts.append(1)
+            raise OSError(errno.EACCES, "Permission denied")
+
+        with patch.object(self.archive_mod.subprocess, "run", _fake_run):
+            ok, err, _imported = self.archive_mod.import_archive(archive)
+        assert ok is False
+        assert b"Permission denied" in err
+        assert len(attempts) == 1
+        assert self.sleeps == []
+
+
+# ---------------------------------------------------------------------------
 # resolve_tool / default_run_subprocess (torn-PATH hardening)
 # ---------------------------------------------------------------------------
 
