@@ -706,10 +706,21 @@ def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = Fa
     }
     # ManifestHeader carries a synthetic "path" only by name; the
     # framework treats path as an opaque tag for non-file-based
-    # tasks (SuitTask.uses_file_based_items = False), so we just
-    # use the header name as the path component.
+    # tasks (SuitTask.uses_file_based_items = False). The framework's
+    # wire-canonical task hash is computed over (phase_id, path,
+    # identifier) — NOT task_id — and both path and identifier are
+    # derived from this synthetic component, so it MUST be unique per
+    # task. ``header.name`` is a human-facing display label with no
+    # uniqueness guarantee (two distinct common_dep drvs can role-
+    # collapse to the same node name: bc/aarch64 carried both a native
+    # flex-2.6.4 and a cross flex-aarch64-…-2.6.4, both named
+    # ``build_common_dep__bc__aarch64__flex.drv`` — same wire hash →
+    # framework DuplicateInBatch → run-wide invalidation). ``task_id``
+    # is unique by construction (it encodes the drv ident / variant
+    # label), so it is the path component; ``name`` stays in the
+    # payload for logs.
     return _make_task_info(
-        pathlib.Path(f"{header.name}.json"),
+        pathlib.Path(f"{header.task_id or header.name}.json"),
         header.size,
         phase_id=phase_id,
         type_id=type_id,
@@ -1195,8 +1206,12 @@ class SuitTask:
             "payload": dict(header.payload),
         }
         task_depends_on = self._header_task_depends_on(header)
+        # Synthetic path keyed on task_id, not the display name — the
+        # framework's wire-canonical task hash is (phase_id, path,
+        # identifier) and names are not unique. See
+        # :func:`_header_to_task_info` for the full rationale.
         return _make_task_info(
-            pathlib.Path(f"{header.name}.json"),
+            pathlib.Path(f"{header.task_id or header.name}.json"),
             header.size,
             phase_id=phase_id,
             type_id=type_id,
