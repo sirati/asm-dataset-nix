@@ -533,6 +533,10 @@ class TestDefaultRunnerResolvesTool:
             "compiler_suit_runner.workers.dependency_graph_worker"
             ".subproc.shutil.which",
             return_value=None,
+        ), patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.os.path.exists",
+            lambda path: str(path).startswith("/bin/"),
         ), patch.object(bcw.subprocess, "run", _fake_run):
             bcw._default_run_subprocess(["nix", "build", "--no-link"])
         assert calls == [["/bin/nix", "build", "--no-link"]]
@@ -564,6 +568,10 @@ class TestDefaultRunnerResolvesTool:
             "compiler_suit_runner.workers.dependency_graph_worker"
             ".subproc.shutil.which",
             return_value=None,
+        ), patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.os.path.exists",
+            lambda path: str(path).startswith("/bin/"),
         ), patch.object(bcw.subprocess, "run", _fake_run):
             ok, _req_err, _exp_err = bcw.export_closure(
                 archive, ["/nix/store/aaa-x.drv"],

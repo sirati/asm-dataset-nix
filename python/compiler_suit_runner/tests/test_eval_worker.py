@@ -2430,6 +2430,10 @@ class TestDefaultRunnerResolvesTool:
             "compiler_suit_runner.workers.dependency_graph_worker"
             ".subproc.shutil.which",
             return_value=None,
+        ), patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.os.path.exists",
+            lambda path: str(path).startswith("/bin/"),
         ), patch.object(eval_worker.subprocess, "run", _fake_run):
             eval_worker._default_run_subprocess(
                 ["nix-store", "--export", "/nix/store/x"],

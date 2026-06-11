@@ -1844,6 +1844,10 @@ class TestDefaultRunnerResolvesTool:
             "compiler_suit_runner.workers.dependency_graph_worker"
             ".subproc.shutil.which",
             return_value=None,
+        ), patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.os.path.exists",
+            lambda path: str(path).startswith("/bin/"),
         ), patch.object(bw.subprocess, "run", _fake_run):
             bw._default_run_subprocess(["nix-store", "--import"])
         assert calls == [["/bin/nix-store", "--import"]]
@@ -1867,6 +1871,10 @@ class TestDefaultRunnerResolvesTool:
             "compiler_suit_runner.workers.dependency_graph_worker"
             ".subproc.shutil.which",
             return_value=None,
+        ), patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.os.path.exists",
+            lambda path: str(path).startswith("/bin/"),
         ), patch.object(bw.subprocess, "run", _fake_run):
             out = bw._resolve_bash_store_path_default()
         assert out == "/nix/store/bbb-bash"
