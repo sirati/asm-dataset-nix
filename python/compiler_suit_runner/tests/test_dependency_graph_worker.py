@@ -747,7 +747,32 @@ class TestImportArchiveRetry:
 
 class TestResolveTool:
     """Workers can be respawned with a torn-down PATH (respawn-env);
-    bare nix tool names must still resolve to an executable path."""
+    bare nix tool names must still resolve to an executable path.
+
+    The worker container is a nix-built layered image with no
+    ``/bin/nix-store``, so when which AND /bin both miss the resolver
+    must glob ``/nix/store/*/bin/<name>`` (once per process per name,
+    cached) and prefer the nix package's own store path.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_tool_cache(self):
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        saved = dict(subproc._TOOL_CACHE)
+        subproc._TOOL_CACHE.clear()
+        yield
+        subproc._TOOL_CACHE.clear()
+        subproc._TOOL_CACHE.update(saved)
+
+    @staticmethod
+    def _bin_exists(path):
+        return str(path).startswith("/bin/")
+
+    @staticmethod
+    def _nothing_exists(_path):
+        return False
 
     def test_returns_which_result_when_on_path(self):
         from unittest.mock import patch  # noqa: PLC0415
@@ -767,9 +792,149 @@ class TestResolveTool:
         from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
             subproc,
         )
-        with patch.object(subproc.shutil, "which", return_value=None):
+        with patch.object(subproc.shutil, "which", return_value=None), \
+                patch.object(subproc.os.path, "exists", self._bin_exists):
             assert subproc.resolve_tool("nix-store") == "/bin/nix-store"
             assert subproc.resolve_tool("nix") == "/bin/nix"
+
+    def test_store_glob_prefers_nix_package_path(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        with patch.object(subproc.shutil, "which", return_value=None), \
+                patch.object(
+                    subproc.os.path, "exists", self._nothing_exists,
+                ), \
+                patch.object(
+                    subproc.glob, "glob",
+                    return_value=[
+                        "/nix/store/xyz-system-path/bin/nix-store",
+                        "/nix/store/abc-nix-2.18/bin/nix-store",
+                        "/nix/store/def-foo/bin/nix-store",
+                    ],
+                ):
+            assert subproc.resolve_tool("nix-store") == (
+                "/nix/store/abc-nix-2.18/bin/nix-store"
+            )
+
+    def test_store_glob_first_sorted_when_no_preferred(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        with patch.object(subproc.shutil, "which", return_value=None), \
+                patch.object(
+                    subproc.os.path, "exists", self._nothing_exists,
+                ), \
+                patch.object(
+                    subproc.glob, "glob",
+                    return_value=[
+                        "/nix/store/zzz-bar/bin/jq",
+                        "/nix/store/aaa-foo/bin/jq",
+                    ],
+                ):
+            assert subproc.resolve_tool("jq") == "/nix/store/aaa-foo/bin/jq"
+
+    def test_everything_misses_returns_bare_name(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        with patch.object(subproc.shutil, "which", return_value=None), \
+                patch.object(
+                    subproc.os.path, "exists", self._nothing_exists,
+                ), \
+                patch.object(subproc.glob, "glob", return_value=[]):
+            assert subproc.resolve_tool("nix-store") == "nix-store"
+
+    def test_store_glob_cached_per_tool_name(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        glob_calls: list[str] = []
+
+        def _fake_glob(pattern):
+            glob_calls.append(pattern)
+            return ["/nix/store/abc-nix-2.18/bin/nix-store"]
+
+        with patch.object(subproc.shutil, "which", return_value=None), \
+                patch.object(
+                    subproc.os.path, "exists", self._nothing_exists,
+                ), \
+                patch.object(subproc.glob, "glob", _fake_glob):
+            first = subproc.resolve_tool("nix-store")
+            second = subproc.resolve_tool("nix-store")
+        assert first == second == "/nix/store/abc-nix-2.18/bin/nix-store"
+        assert glob_calls == ["/nix/store/*/bin/nix-store"]
+
+    def test_store_glob_miss_cached_too(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        glob_calls: list[str] = []
+
+        def _fake_glob(pattern):
+            glob_calls.append(pattern)
+            return []
+
+        with patch.object(subproc.shutil, "which", return_value=None), \
+                patch.object(
+                    subproc.os.path, "exists", self._nothing_exists,
+                ), \
+                patch.object(subproc.glob, "glob", _fake_glob):
+            assert subproc.resolve_tool("nix-store") == "nix-store"
+            assert subproc.resolve_tool("nix-store") == "nix-store"
+        assert glob_calls == ["/nix/store/*/bin/nix-store"]
+
+    def test_import_time_which_snapshot_survives_torn_path(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        # PATH intact at import: the snapshot seeds the cache ...
+        with patch.object(
+            subproc.shutil, "which",
+            return_value="/nix/store/abc-nix-2.18/bin/nix-store",
+        ):
+            subproc._snapshot_path_tools(("nix-store",))
+        # ... so after PATH is torn mid-process the cached path wins
+        # without any glob.
+        def _no_glob(_pattern):
+            raise AssertionError("glob must not run; snapshot cached")
+
+        with patch.object(subproc.shutil, "which", return_value=None), \
+                patch.object(
+                    subproc.os.path, "exists", self._nothing_exists,
+                ), \
+                patch.object(subproc.glob, "glob", _no_glob):
+            assert subproc.resolve_tool("nix-store") == (
+                "/nix/store/abc-nix-2.18/bin/nix-store"
+            )
+
+    def test_snapshot_does_not_cache_misses(self):
+        from unittest.mock import patch  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            subproc,
+        )
+        # Torn env at import time: the snapshot must not poison the
+        # cache; a later resolve still reaches the store glob.
+        with patch.object(subproc.shutil, "which", return_value=None):
+            subproc._snapshot_path_tools(("nix-store",))
+        assert "nix-store" not in subproc._TOOL_CACHE
+        with patch.object(subproc.shutil, "which", return_value=None), \
+                patch.object(
+                    subproc.os.path, "exists", self._nothing_exists,
+                ), \
+                patch.object(
+                    subproc.glob, "glob",
+                    return_value=["/nix/store/abc-nix-2.18/bin/nix-store"],
+                ):
+            assert subproc.resolve_tool("nix-store") == (
+                "/nix/store/abc-nix-2.18/bin/nix-store"
+            )
 
     def test_paths_with_slash_pass_through(self):
         from unittest.mock import patch  # noqa: PLC0415
@@ -798,6 +963,7 @@ class TestResolveTool:
             return _Proc()
 
         with patch.object(subproc.shutil, "which", return_value=None), \
+                patch.object(subproc.os.path, "exists", self._bin_exists), \
                 patch.object(subproc.subprocess, "run", _fake_run):
             stdout, stderr, rc = subproc.default_run_subprocess(
                 ["nix-store", "--query", "--tree", "/nix/store/x.drv"],
@@ -832,6 +998,10 @@ class TestResolveTool:
             "compiler_suit_runner.workers.dependency_graph_worker"
             ".subproc.shutil.which",
             return_value=None,
+        ), patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.os.path.exists",
+            lambda path: str(path).startswith("/bin/"),
         ), patch.object(archive_mod.subprocess, "run", _fake_run):
             ok, _err, imported = archive_mod.import_archive(archive)
         assert ok is True
@@ -2275,6 +2445,10 @@ class TestStreamDrvTree:
             "compiler_suit_runner.workers.dependency_graph_worker"
             ".subproc.shutil.which",
             return_value=None,
+        ), patch(
+            "compiler_suit_runner.workers.dependency_graph_worker"
+            ".subproc.os.path.exists",
+            lambda path: str(path).startswith("/bin/"),
         ):
             got = list(dgw.stream_drv_tree("/nix/store/zzzz-sum.drv"))
         assert got == expected
