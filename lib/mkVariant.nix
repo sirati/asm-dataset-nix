@@ -322,6 +322,15 @@ let
     // lib.optionalAttrs (staticLibc != null) {
       buildInputs = (old.buildInputs or [ ]) ++ [ staticLibc ];
     }
+    # Pin the source across the rename below: for finalAttrs-fixpoint
+    # packages whose src URL derives from finalAttrs.pname (e.g. expat),
+    # overriding pname re-resolves the fixpoint and the fetchurl URL becomes
+    # .../<pname>-variant-<version>.tar.* → guaranteed 404. Note `old.src`
+    # is ALSO poisoned (overrideAttrs feeds the original args function the
+    # NEW fixpoint), so the pin must come from the pre-override basePkg.
+    // lib.optionalAttrs (basePkg ? src) {
+      inherit (basePkg) src;
+    }
     // {
       pname = "${old.pname or pkg.attr}-variant";
       hardeningDisable = allHardeningDisable;
