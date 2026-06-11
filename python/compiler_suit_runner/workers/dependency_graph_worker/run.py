@@ -26,6 +26,7 @@ from . import output as _output
 from . import summary as _summary
 from ...streamed_spawn import (
     SPAWN_TOPIC,
+    SUMMARY_OUTPUT_KEY,
     SUMMARY_TOPIC,
     SpawnBatchEncoder,
 )
@@ -34,6 +35,12 @@ from .subproc import RunSubprocess, default_run_subprocess
 
 
 _LOG = logging.getLogger(__name__)
+
+# Seconds to trail the task return behind the final streamed message
+# (see the comment at the _completion_grace_sleep call site). Injectable
+# for tests via the module-level hook below.
+_COMPLETION_GRACE_SECONDS = 5.0
+_completion_grace_sleep = time.sleep
 
 
 __all__ = [
@@ -333,14 +340,38 @@ def _stream_descriptors(
     per_kind_counters = collections.Counter(
         getattr(d, "kind", "<unknown>") for d in descriptors
     )
-    task.send_message(
-        SUMMARY_TOPIC, encoder.encode_summary(dict(per_kind_counters)),
-    )
+    summary_message = encoder.encode_summary(dict(per_kind_counters))
+    task.send_message(SUMMARY_TOPIC, summary_message)
+    # The message channel can lose an ordering race against this task's
+    # completion report (observed in production: the primary processed
+    # the completion ahead of the final in-flight batch + summary and
+    # the phase-end barrier fired early). Task outputs are delivered
+    # atomically WITH the completion, so publish a copy of the summary
+    # there too — the barrier prefers the message-channel summary and
+    # falls back to this one. Non-fatal: the message channel remains
+    # the primary transport.
+    try:
+        task.publish_string(
+            SUMMARY_OUTPUT_KEY, summary_message.decode("utf-8"),
+        )
+    except Exception:  # noqa: BLE001 — best-effort secondary channel
+        _LOG.warning(
+            "publishing %s task output failed (non-fatal; the"
+            " message-channel summary remains authoritative)",
+            SUMMARY_OUTPUT_KEY, exc_info=True,
+        )
     _LOG.info(
         "streamed spawn done: %d descriptors in %d batches; summary sent",
         encoder.descriptors_emitted,
         encoder.batches_emitted,
     )
+    # Completion grace: the messages above ride a different pipeline
+    # than the task's terminal report; returning immediately lets the
+    # completion overtake the still-in-flight tail. Trailing the
+    # return by a few seconds keeps the completion behind the messages
+    # in practice (the framework-side causal fence is the proper
+    # closure; this narrows the window meanwhile).
+    _completion_grace_sleep(_COMPLETION_GRACE_SECONDS)
 
 
 def _import_toolchain_archive_or_raise(

@@ -1304,8 +1304,9 @@ def test_on_phase_end_without_summary_raises_incomplete(tmp_path) -> None:
     )
     import re  # noqa: PLC0415
     expected = re.escape(
-        "dependency_graph handoff incomplete: no summary message"
-        " received (spawned=2)"
+        "dependency_graph handoff incomplete: no summary"
+        " received on either channel (message or task output)"
+        " (spawned=2)"
     )
     with pytest.raises(RuntimeError, match=expected):
         task.on_phase_end("dependency_graph", completed=1, failed=0)
@@ -1327,10 +1328,99 @@ def test_on_phase_end_mismatch_raises_with_pinned_message(tmp_path) -> None:
     import re  # noqa: PLC0415
     expected = re.escape(
         "dependency_graph handoff mismatch: spawned=1 != total=3"
-        " (counters={'build_variant': 3})"
+        " (2 spawn message(s) outstanding at barrier time — the"
+        " completion report overtook the message channel;"
+        " counters={'build_variant': 3})"
     )
     with pytest.raises(RuntimeError, match=expected):
         task.on_phase_end("dependency_graph", completed=1, failed=0)
+
+
+def test_on_phase_end_recovers_summary_from_phase_outputs(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No message-channel summary, but the task-output copy (delivered
+    atomically with the completion) carries the totals — the barrier
+    recovers it, logs the recovery, and reconciles green."""
+    from compiler_suit_runner.streamed_spawn import SUMMARY_OUTPUT_KEY
+
+    task = _streamed_task(tmp_path)
+    handle = task._primary_handle
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC,
+        _batch_bytes([_variant_descriptor(0), _variant_descriptor(1)]),
+        True, handle,
+    )
+    assert task._streamed_expected_total is None
+    summary_text = _summary_bytes(
+        total=2, batches=1, counters={"build_variant": 2},
+    ).decode("utf-8")
+    phase_outputs = {
+        "dependency_graph": {SUMMARY_OUTPUT_KEY: {"value": summary_text}},
+    }
+    with caplog.at_level(logging.INFO):
+        task.on_phase_end(
+            "dependency_graph", completed=1, failed=0,
+            phase_outputs=phase_outputs,
+        )
+    assert task._streamed_expected_total == 2
+    assert any(
+        "summary recovered from the task output" in rec.getMessage()
+        for rec in caplog.records
+    )
+    assert any(
+        "handoff reconciled" in rec.getMessage() for rec in caplog.records
+    )
+
+
+def test_on_phase_end_phase_outputs_plain_string_entry(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The fallback also accepts un-wrapped string entries (framework
+    delivery-shape tolerance)."""
+    from compiler_suit_runner.streamed_spawn import SUMMARY_OUTPUT_KEY
+
+    task = _streamed_task(tmp_path)
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC,
+        _batch_bytes([_variant_descriptor(0)]), True, task._primary_handle,
+    )
+    summary_text = _summary_bytes(
+        total=1, batches=1, counters={"build_variant": 1},
+    ).decode("utf-8")
+    with caplog.at_level(logging.INFO):
+        task.on_phase_end(
+            "dependency_graph", completed=1, failed=0,
+            phase_outputs={SUMMARY_OUTPUT_KEY: summary_text},
+        )
+    assert any(
+        "handoff reconciled" in rec.getMessage() for rec in caplog.records
+    )
+
+
+def test_on_phase_end_malformed_phase_outputs_falls_through(
+    tmp_path,
+) -> None:
+    """A malformed task-output summary never rescues the barrier — the
+    no-summary loud-fail (incl. zero-dispatch protection) stays."""
+    from compiler_suit_runner.streamed_spawn import SUMMARY_OUTPUT_KEY
+
+    task = _streamed_task(tmp_path)
+    import re  # noqa: PLC0415
+    expected = re.escape(
+        "dependency_graph handoff incomplete: no summary"
+        " received on either channel (message or task output)"
+        " (spawned=0)"
+    )
+    with pytest.raises(RuntimeError, match=expected):
+        task.on_phase_end(
+            "dependency_graph", completed=1, failed=0,
+            phase_outputs={
+                "dependency_graph": {
+                    SUMMARY_OUTPUT_KEY: {"value": "not json {"},
+                },
+            },
+        )
 
 
 def test_duplicate_identical_summary_ignored_with_info(

@@ -45,9 +45,30 @@ class _FakeStreamTask:
 
     def __init__(self) -> None:
         self.messages: list[tuple[str, bytes]] = []
+        self.published: list[tuple[str, str]] = []
+        # Ordered trace of stub calls (plus the patched grace sleep)
+        # so tests can assert the tail sequencing of the handoff.
+        self.events: list[tuple[str, object]] = []
 
     def send_message(self, topic: str, data: bytes) -> None:
         self.messages.append((topic, data))
+        self.events.append(("send_message", topic))
+
+    def publish_string(self, key: str, value: str) -> None:
+        self.published.append((key, value))
+        self.events.append(("publish_string", key))
+
+
+@pytest.fixture(autouse=True)
+def _no_completion_grace(monkeypatch):
+    """Neutralize the worker's completion-grace sleep for every test.
+
+    The production grace trails the task return behind the final
+    streamed message (completion-overtakes-sends mitigation); really
+    sleeping 5s per streamed-spawn test would bloat the suite. Tests
+    that assert the grace ORDER re-patch this with a recorder.
+    """
+    monkeypatch.setattr(dgw.run, "_completion_grace_sleep", lambda _s: None)
 
 
 # ---------------------------------------------------------------------------
@@ -2699,4 +2720,74 @@ class TestStreamedSpawnHandoff:
         assert (
             "streamed spawn done: 3 descriptors in 1 batches; summary sent"
             in messages
+        )
+
+    def test_summary_also_published_as_task_output(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        """The terminal summary is duplicated onto the task-output
+        channel (atomic with completion) so the phase-end barrier can
+        recover the totals when the message channel loses the
+        completion ordering race; payloads must be byte-identical."""
+        from compiler_suit_runner.streamed_spawn import (
+            SUMMARY_OUTPUT_KEY,
+            SUMMARY_TOPIC,
+        )
+
+        matrix_dir = self._seed(tmp_path)
+        self._patch_pipeline(monkeypatch, self._descriptors(3))
+        task = _FakeStreamTask()
+        self._run(matrix_dir, task)
+        summary_payloads = [
+            data for topic, data in task.messages if topic == SUMMARY_TOPIC
+        ]
+        assert len(summary_payloads) == 1
+        assert task.published == [
+            (SUMMARY_OUTPUT_KEY, summary_payloads[0].decode("utf-8")),
+        ]
+
+    def test_completion_grace_trails_summary_and_publish(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        """The grace sleep fires AFTER the summary send and the task-
+        output publish — trailing the task return behind the final
+        messages is the whole point of the mitigation."""
+        matrix_dir = self._seed(tmp_path)
+        self._patch_pipeline(monkeypatch, self._descriptors(3))
+        task = _FakeStreamTask()
+        monkeypatch.setattr(
+            dgw.run, "_completion_grace_sleep",
+            lambda s: task.events.append(("grace_sleep", s)),
+        )
+        self._run(matrix_dir, task)
+        assert task.events[-1] == (
+            "grace_sleep", dgw.run._COMPLETION_GRACE_SECONDS,
+        )
+        kinds = [kind for kind, _ in task.events]
+        assert kinds.index("publish_string") > kinds.index("send_message")
+
+    def test_publish_failure_is_non_fatal(
+        self, tmp_path: pathlib.Path, monkeypatch, caplog,
+    ):
+        """A failing task-output publish must not fail the task — the
+        message channel remains the primary transport."""
+        import logging
+
+        class _PublishBoomTask(_FakeStreamTask):
+            def publish_string(self, key: str, value: str) -> None:
+                raise RuntimeError("publish backend down")
+
+        matrix_dir = self._seed(tmp_path)
+        self._patch_pipeline(monkeypatch, self._descriptors(3))
+        task = _PublishBoomTask()
+        with caplog.at_level(
+            logging.WARNING,
+            logger=(
+                "compiler_suit_runner.workers.dependency_graph_worker.run"
+            ),
+        ):
+            self._run(matrix_dir, task)
+        assert any(
+            "task output failed (non-fatal" in rec.getMessage()
+            for rec in caplog.records
         )
