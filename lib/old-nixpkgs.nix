@@ -47,6 +47,12 @@ in
     oldPkgs = oldPkgs_15_09;
     nixpkgsSrc = nixpkgsInputs.nixpkgs-15_09;
     inherit system;
+    # 15.09's cc-wrapper setup-hook reads ``$crossConfig``, which modern
+    # stdenv never sets; under the builder's ``set -u`` every native
+    # build using the legacy wrapper dies with "crossConfig: unbound
+    # variable". old-compilers.nix re-wraps these with the modern
+    # cc-wrapper on the native path (cross paths already do).
+    nativeWrapperBroken = true;
     gccSpecs = [
       {
         attr = "gcc44";
