@@ -255,6 +255,29 @@ let
     else
       null;
 
+  # Whether ``extractClangCC`` will find a REAL cc-wrapper on the old
+  # LLVM package, or fall back to the raw ``llvmPkg.clang`` binary.
+  # Mirrors ``extractClangCC``'s branch condition exactly. The raw
+  # binary (18.03 clang3.4/3.5) has NO nix-support/ at all — no
+  # setup-hook, no libc cflags, no crt1.o/libgcc link flags — so a
+  # native stdenv built on it cannot compile anything ("Missing or
+  # broken C compiler" from every configure script). Such entries must
+  # take the hybrid re-wrap path below.
+  clangHasRealWrapper =
+    llvmPkg:
+    let
+      hasStdenvCC = (llvmPkg ? stdenv) && (llvmPkg.stdenv ? cc) && (llvmPkg.stdenv.cc ? name);
+      stdenvCCName =
+        if hasStdenvCC then
+          builtins.tryEval llvmPkg.stdenv.cc.name
+        else
+          {
+            success = false;
+            value = "";
+          };
+    in
+    stdenvCCName.success && stdenvCCName.value != "";
+
   # Extract the unwrapped clang binary from an old LLVM package.
   # Modern (3.7+): .clang.cc is the unwrapped clang (e.g. "clang-3.7.1")
   # Very old (3.4-3.5): .clang IS the raw binary (no .cc, or .cc is gcc)
@@ -371,6 +394,7 @@ let
       oldPkgs,
       nixpkgsSrc ? null,
       system ? null,
+      nativeWrapperBroken ? false, # unused here — native-path concern only
     }:
     target:
     if oldPkgs ? pkgsCross then
@@ -432,24 +456,50 @@ let
         mkStdenv =
           targetPkgs: target:
           if target.crossAttr == null && !(target ? crossSystem) then
-            # Native: just use the old compiler directly. Backfill
-            # ``targetPrefix = ""`` for very-old wrappers (15.09, 18.03)
-            # that predate the attribute — upstream nixpkgs derivations
-            # (busybox, zlib, ...) read it unconditionally. ``isGNU``,
-            # ``isClang`` and ``libc`` are already present on gcc4_x
-            # wrappers but we pass them through ``ensureCcAttrs`` for
-            # symmetry (idempotent — no-op when attr already present).
-            # ``version`` is the compiler entry's own version (kissfft
-            # reads ``stdenv.cc.version``); modern wrappers expose it
-            # so the patch is a no-op there. ``bintools`` carries the
-            # nested ``isLLVM``/``version`` sub-attrs libgcrypt reads.
+            # Native: use the old compiler directly — EXCEPT when the
+            # source nixpkgs' cc-wrapper is broken under modern stdenv
+            # (``nativeWrapperBroken``, i.e. 15.09: its setup-hook reads
+            # ``$crossConfig`` which modern stdenv never sets, and the
+            # builder runs ``set -u`` → instant "crossConfig: unbound
+            # variable" death in the setup hook). For those, port the
+            # old-gcc-cross.nix hybrid approach to the native path:
+            # re-wrap the UNWRAPPED old gcc with the MODERN cc-wrapper
+            # (old binary for codegen, modern setup-hook/bintools/libc
+            # plumbing), telling the wrapper which hardening flags the
+            # old gcc doesn't understand. The unwrapped ``cleanGcc.cc``
+            # derivation is referenced as-is — only the wrapper layer
+            # changes, so the hours-long compiler builds stay cached.
+            #
+            # Backfill ``targetPrefix = ""`` for very-old wrappers
+            # (15.09, 18.03) that predate the attribute — upstream
+            # nixpkgs derivations (busybox, zlib, ...) read it
+            # unconditionally. ``isGNU``, ``isClang`` and ``libc`` are
+            # already present on gcc4_x wrappers but we pass them
+            # through ``ensureCcAttrs`` for symmetry (idempotent —
+            # no-op when attr already present). ``version`` is the
+            # compiler entry's own version (kissfft reads
+            # ``stdenv.cc.version``); modern wrappers expose it so the
+            # patch is a no-op there. ``bintools`` carries the nested
+            # ``isLLVM``/``version`` sub-attrs libgcrypt reads.
+            let
+              nativeCC =
+                if nixpkgsInfo.nativeWrapperBroken then
+                  targetPkgs.gcc.override {
+                    cc = cleanGcc.cc // {
+                      hardeningUnsupportedFlags =
+                        oldGccCross.getGccUnsupportedHardeningFlags tried.value;
+                    };
+                  }
+                else
+                  cleanGcc;
+            in
             targetPkgs.overrideCC targetPkgs.stdenv (
               ensureCcAttrs
                 (gccCcDefaults targetPkgs // {
                   targetPrefix = "";
                   version = tried.value;
                 })
-                cleanGcc
+                nativeCC
             )
           else if oldPkgs ? pkgsCross then
             # pkgsCross available (22.11+): use buildPackages with
@@ -551,9 +601,35 @@ let
             # gcc-based stdenv; that's mildly inaccurate but only
             # gates ``separateDebugInfo`` downstream and doesn't fail
             # eval, so we leave it.)
+            #
+            # Two failure classes force the hybrid re-wrap (same cure as
+            # the pre-pkgsCross CROSS path below — modern cc-wrapper
+            # around the old unwrapped clang binary):
+            #   - ``nativeWrapperBroken`` (15.09 clang3.6): the old
+            #     wrapper's setup-hook reads ``$crossConfig``, unset
+            #     under modern stdenv's ``set -u`` → instant death.
+            #   - no real wrapper at all (18.03 clang3.4/3.5):
+            #     ``extractClangCC`` falls back to the RAW clang binary
+            #     — no nix-support/, no libc/crt1.o/libgcc wiring, so
+            #     nothing compiles ("Missing or broken C compiler").
             let
               cc = extractClangCC oldPkgs.${attr};
               unwrapped = extractUnwrappedClang oldPkgs.${attr};
+              needsHybrid =
+                nixpkgsInfo.nativeWrapperBroken || !(clangHasRealWrapper oldPkgs.${attr});
+              nativeCC =
+                if needsHybrid then
+                  targetPkgs.llvmPackages.clang.override {
+                    cc = unwrapped // {
+                      hardeningUnsupportedFlags = getClangUnsupportedHardeningFlags version;
+                    };
+                    propagateDoc = false;
+                    extraBuildCommands = lib.optionalString (
+                      clangNeedsMacroPrefixMapStripped version
+                    ) stripMacroPrefixMapCommands;
+                  }
+                else
+                  cc;
             in
             targetPkgs.overrideCC targetPkgs.stdenv (
               ensureCcAttrs
@@ -562,7 +638,7 @@ let
                   inherit version;
                   cc = unwrapped;
                 })
-                cc
+                nativeCC
             )
           else if oldPkgs ? pkgsCross then
             # pkgsCross available (22.11+): get cross-clang from buildPackages.
@@ -641,9 +717,10 @@ let
       clangSpecs,
       nixpkgsSrc ? null,
       system ? null,
+      nativeWrapperBroken ? false,
     }:
     let
-      nixpkgsInfo = { inherit oldPkgs nixpkgsSrc system; };
+      nixpkgsInfo = { inherit oldPkgs nixpkgsSrc system nativeWrapperBroken; };
       gccEntries = builtins.filter (x: x != null) (map (mkOldGccEntry nixpkgsInfo) gccSpecs);
       clangEntries = builtins.filter (x: x != null) (map (mkOldClangEntry nixpkgsInfo) clangSpecs);
     in
