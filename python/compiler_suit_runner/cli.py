@@ -1583,43 +1583,36 @@ def cmd_submit(args: argparse.Namespace) -> int:
             # nested-podman are easy to hit again.
             if os.environ.get("ASM_TRACE_KILLS") == "1":
                 run_args += ["--cap-add=SYS_PTRACE", "-e", "ASM_TRACE_KILLS=1"]
-            # Cap concurrent nix builds inside each secondary's container.
-            # Without this the inner nix-daemon will honor every worker's
-            # parallel-build request — 14 dynrunner workers × heavy cross-
-            # LLVM toolchain builds can sum to >120 GiB peak and OOM the
-            # container before any toolchain finishes (observed on LMU
-            # Krater 2026-05-13: 4 secondaries killed at 28-29 min with
-            # ExitCode 9:0). max-jobs serializes the heavy ones; warm-
-            # cached variants flow at no risk after toolchains. dynrunner-
-            # owner confirmed this is operator territory; ResourceStealing-
-            # Scheduler intentionally doesn't gate at the daemon layer.
-            # Tunable via ASM_NIX_MAX_JOBS (default 2).
-            # Started at 4, but on the 2026-05-13 LMU Krater run that
-            # still hit the same OOM wall ~15 minutes later (jobs
-            # SIGKILL'd at 44m instead of 29m). Dropping to 2 per
-            # dynrunner-owner's curve estimate.
-            # Also injects ``connect-timeout = 1`` and
-            # ``download-attempts = 1``: when a secondary dies, its
-            # harmonia URL stays in the substituter list (peer-mesh
-            # liveness is a framework primitive but consumer-side
-            # policy), so every variant fetch tries the dead peer
-            # first. Default nix waits 30s × 5 attempts = 150s per
-            # narfile per dead peer before falling through to the
-            # next substituter. Capping at 1s × 1 attempt = 1s.
-            # dynrunner-owner endorsed this approach 2026-05-13
-            # 08:31; the long-term fix is content-addressable peer
-            # caching with redundancy but that's a major design
-            # effort.
-            _nix_max_jobs = os.environ.get("ASM_NIX_MAX_JOBS", "2")
-            # connect-timeout / download-attempts are bumped from the
-            # original 1/1 (tuned for many-secondary dead-peer-harmonia
-            # fast-fail) to 5/3: cache.nixos.org legitimately needs >1s
-            # for source-narinfo round-trips on cold flake inputs, and
+            # Bound each worker's nix compile footprint so N workers/node
+            # (--cores 8 = 8 workers per secondary) don't oversubscribe
+            # CPU or fork-storm the container into OOM — the class of
+            # failure that killed earlier LMU Krater runs (2026-05-13:
+            # 4 secondaries SIGKILL'd at 28-44 min, ExitCode 9:0).
+            # max-jobs = 1: only one nix build per worker at a time,
+            # preventing N² parallel spawns when many workers collide on
+            # heavy toolchain compiles. cores = 2: each build uses at
+            # most 2 make-level threads, so 8 workers × 2 threads = 16
+            # threads peak instead of 8 × all-cores. This pair bounds
+            # the per-compile footprint while still allowing moderate
+            # parallelism within a single build. Tunable via
+            # ASM_NIX_MAX_JOBS (default 1) and ASM_NIX_CORES (default 2).
+            # dynrunner-owner confirmed this is operator territory;
+            # ResourceStealing-Scheduler intentionally doesn't gate at
+            # the daemon layer.
+            # Also injects ``connect-timeout = 5`` and
+            # ``download-attempts = 3``: bumped from the original 1/1
+            # (tuned for many-secondary dead-peer-harmonia fast-fail)
+            # because cache.nixos.org legitimately needs >1s for
+            # source-narinfo round-trips on cold flake inputs, and
             # the per-drv broadcast loop has been removed so dead-peer
-            # cost is now minimal (workers consume the matrix .drv.archive
-            # rather than peer-substituting individual drvs).
+            # cost is now minimal (workers consume the matrix
+            # .drv.archive rather than peer-substituting individual
+            # drvs).
+            _nix_max_jobs = os.environ.get("ASM_NIX_MAX_JOBS", "1")
+            _nix_cores = os.environ.get("ASM_NIX_CORES", "2")
             _nix_config = (
                 f"max-jobs = {_nix_max_jobs}\n"
+                f"cores = {_nix_cores}\n"
                 "connect-timeout = 5\n"
                 "download-attempts = 3"
             )
