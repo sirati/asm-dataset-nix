@@ -816,9 +816,9 @@ class _FakeGateway:
 
     Stands in for the framework's ``Gateway`` so the submitter-side
     toolchain-archive upload can be asserted without a real SSH hop.
-    ``download_file_text`` is provided for the realized-archive sidecar
-    skip check; callers that want to simulate a matching sidecar can
-    set ``sidecar_content`` on the instance.
+    ``file_exists`` + ``download_file`` back the realized-archive sidecar
+    skip check (mirroring the real Gateway protocol); callers that want to
+    simulate a matching sidecar can set ``sidecar_content`` on the instance.
     """
 
     def __init__(self, config) -> None:
@@ -839,11 +839,13 @@ class _FakeGateway:
     def upload_file(self, local, remote) -> None:
         self.uploads.append((str(local), str(remote)))
 
-    def download_file_text(self, remote) -> str:
-        """Return the pre-configured sidecar content (empty = absent)."""
-        if not self.sidecar_content:
-            raise FileNotFoundError(f"sidecar absent: {remote}")
-        return self.sidecar_content
+    def file_exists(self, remote) -> bool:
+        """True iff a sidecar was pre-configured (empty string = absent)."""
+        return bool(self.sidecar_content)
+
+    def download_file(self, remote, local) -> None:
+        """Write the pre-configured sidecar content to the local path."""
+        pathlib.Path(local).write_text(self.sidecar_content)
 
     def disconnect(self) -> None:
         self.disconnected = True

@@ -27,6 +27,7 @@ import hashlib
 import logging
 import os
 import pathlib
+import shutil
 import socket
 import subprocess
 import sys
@@ -960,88 +961,101 @@ def _produce_and_upload_toolchain_realized_archive(
     #    requisites walk + export.
     local_dir = pathlib.Path(tempfile.mkdtemp(prefix="csr-tc-out-archive-"))
     try:
-        local_archive = preflight.export_toolchain_realized_archive(
-            tc_out_paths, local_dir,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "toolchain-realized-archive: export failed; workers will fall "
-            "back to substitution: %s",
-            exc,
-        )
-        return
-
-    # 2. Compute content hash for incremental-skip: read the archive and
-    #    sha256-hash it so we can compare against the remote sidecar.
-    try:
-        h = hashlib.sha256()
-        with open(local_archive, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                h.update(chunk)
-        local_hex = h.hexdigest()
-    except OSError as exc:
-        log.warning(
-            "toolchain-realized-archive: cannot hash local archive; "
-            "workers will fall back to substitution: %s",
-            exc,
-        )
-        return
-
-    # 3. Transfer to the gateway (same remote_dir as the .drv archive).
-    cfg = parse_gateway_url(args.gateway)
-    cfg.ssh_identity_file = getattr(args, "ssh_identity_file", None)
-    cfg.ssh_config_file = getattr(args, "ssh_config", None)
-    remote_dir = f"{args.slurm_root_folder}/out/_matrix_eval"
-    remote_archive = f"{remote_dir}/{preflight.TOOLCHAIN_REALIZED_ARCHIVE_NAME}"
-    remote_sidecar = f"{remote_archive}.sha256"
-    gw = create_gateway(cfg)
-    try:
-        gw.connect()
-        # Incremental skip: download the remote sidecar and compare.
-        # If the hash matches, the same archive is already on the gateway
-        # and re-uploading the (potentially multi-GiB) archive is wasteful.
         try:
-            remote_hex = gw.download_file_text(remote_sidecar).strip()
-        except Exception:  # noqa: BLE001 — sidecar absent or no method
-            remote_hex = ""
-        if remote_hex == local_hex:
-            log.info(
-                "toolchain-realized-archive: remote sidecar matches "
-                "(sha256=%s); skipping upload",
-                local_hex[:16],
+            local_archive = preflight.export_toolchain_realized_archive(
+                tc_out_paths, local_dir,
             )
-            return
-        gw.create_directory(remote_dir)
-        gw.upload_file(str(local_archive), remote_archive)
-        # Write the sidecar AFTER a successful upload so a partial upload
-        # never leaves a matching sidecar (the next run re-uploads).
-        try:
-            local_sidecar = local_dir / (
-                preflight.TOOLCHAIN_REALIZED_ARCHIVE_NAME + ".sha256"
-            )
-            local_sidecar.write_text(local_hex + "\n")
-            gw.upload_file(str(local_sidecar), remote_sidecar)
-        except Exception as exc:  # noqa: BLE001 — sidecar upload best-effort
+        except Exception as exc:  # noqa: BLE001
             log.warning(
-                "toolchain-realized-archive: sidecar upload failed "
-                "(next run will re-upload the archive): %s",
+                "toolchain-realized-archive: export failed; workers will fall "
+                "back to substitution: %s",
                 exc,
             )
-        log.info(
-            "toolchain-realized-archive: uploaded %s -> %s",
-            local_archive.name, remote_archive,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "toolchain-realized-archive: upload failed; workers will fall "
-            "back to substitution: %s",
-            exc,
-        )
-    finally:
+            return
+
+        # 2. Compute content hash for incremental-skip: read the archive and
+        #    sha256-hash it so we can compare against the remote sidecar.
         try:
-            gw.disconnect()
-        except Exception:  # noqa: BLE001 — best-effort teardown
-            pass
+            h = hashlib.sha256()
+            with open(local_archive, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            local_hex = h.hexdigest()
+        except OSError as exc:
+            log.warning(
+                "toolchain-realized-archive: cannot hash local archive; "
+                "workers will fall back to substitution: %s",
+                exc,
+            )
+            return
+
+        # 3. Transfer to the gateway (same remote_dir as the .drv archive).
+        cfg = parse_gateway_url(args.gateway)
+        cfg.ssh_identity_file = getattr(args, "ssh_identity_file", None)
+        cfg.ssh_config_file = getattr(args, "ssh_config", None)
+        remote_dir = f"{args.slurm_root_folder}/out/_matrix_eval"
+        remote_archive = (
+            f"{remote_dir}/{preflight.TOOLCHAIN_REALIZED_ARCHIVE_NAME}"
+        )
+        remote_sidecar = f"{remote_archive}.sha256"
+        gw = create_gateway(cfg)
+        try:
+            gw.connect()
+            # Incremental skip: fetch the remote sidecar (if present) and
+            # compare. A match means the same archive is already on the
+            # gateway, so re-uploading the (potentially multi-GiB) archive
+            # is wasteful. Uses the Gateway protocol's file_exists +
+            # download_file (there is no text-download primitive).
+            remote_hex = ""
+            try:
+                if gw.file_exists(remote_sidecar):
+                    remote_sidecar_dl = local_dir / "remote.sha256"
+                    gw.download_file(remote_sidecar, str(remote_sidecar_dl))
+                    remote_hex = remote_sidecar_dl.read_text().strip()
+            except Exception:  # noqa: BLE001 — sidecar absent / unreadable
+                remote_hex = ""
+            if remote_hex and remote_hex == local_hex:
+                log.info(
+                    "toolchain-realized-archive: remote sidecar matches "
+                    "(sha256=%s); skipping upload",
+                    local_hex[:16],
+                )
+                return
+            gw.create_directory(remote_dir)
+            gw.upload_file(str(local_archive), remote_archive)
+            # Write the sidecar AFTER a successful upload so a partial upload
+            # never leaves a matching sidecar (the next run re-uploads).
+            try:
+                local_sidecar = local_dir / (
+                    preflight.TOOLCHAIN_REALIZED_ARCHIVE_NAME + ".sha256"
+                )
+                local_sidecar.write_text(local_hex + "\n")
+                gw.upload_file(str(local_sidecar), remote_sidecar)
+            except Exception as exc:  # noqa: BLE001 — sidecar upload best-effort
+                log.warning(
+                    "toolchain-realized-archive: sidecar upload failed "
+                    "(next run will re-upload the archive): %s",
+                    exc,
+                )
+            log.info(
+                "toolchain-realized-archive: uploaded %s -> %s",
+                local_archive.name, remote_archive,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "toolchain-realized-archive: upload failed; workers will fall "
+                "back to substitution: %s",
+                exc,
+            )
+        finally:
+            try:
+                gw.disconnect()
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                pass
+    finally:
+        # The realized archive is potentially multi-GiB; never leak it in
+        # the submitter's tmp dir across dispatches.
+        shutil.rmtree(local_dir, ignore_errors=True)
 
 
 def cmd_submit(args: argparse.Namespace) -> int:
