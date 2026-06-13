@@ -54,7 +54,6 @@ from compiler_suit_runner.preflight import (
     enumerate_toolchains_only,
     enumerate_variants,
     export_toolchain_archive,
-    export_toolchain_realized_archive,
     preflight as run_preflight,
 )
 from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
@@ -914,32 +913,101 @@ def _produce_and_upload_toolchain_archive(
     return 0
 
 
-def _produce_and_upload_toolchain_realized_archive(
+def _upload_archive_with_sidecar(
+    local_archive: pathlib.Path,
+    remote_archive: str,
+    remote_dir: str,
+    local_dir: pathlib.Path,
+    gw: "object",
+    log: logging.Logger,
+    label: str,
+) -> bool:
+    """Upload ``local_archive`` to ``remote_archive`` with a sha256 sidecar.
+
+    Uses the same incremental-skip pattern as the ``.drv`` archive uploader:
+    computes the local sha256, downloads the remote sidecar (if present),
+    skips the upload when hashes match, otherwise uploads archive + sidecar.
+
+    Returns ``True`` on success (upload done or skipped), ``False`` on
+    any failure (logged as WARNING so callers can continue).
+    """
+    # Hash the archive for incremental skip.
+    try:
+        h = hashlib.sha256()
+        with open(local_archive, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        local_hex = h.hexdigest()
+    except OSError as exc:
+        log.warning(
+            "toolchain-split-archive: cannot hash %s; skipping upload: %s",
+            label, exc,
+        )
+        return False
+
+    remote_sidecar = f"{remote_archive}.sha256"
+    remote_hex = ""
+    try:
+        if gw.file_exists(remote_sidecar):  # type: ignore[attr-defined]
+            dl_path = local_dir / f"{local_archive.name}.remote.sha256"
+            gw.download_file(remote_sidecar, str(dl_path))  # type: ignore[attr-defined]
+            remote_hex = dl_path.read_text().strip()
+    except Exception:  # noqa: BLE001 — sidecar absent / unreadable
+        remote_hex = ""
+    if remote_hex and remote_hex == local_hex:
+        log.info(
+            "toolchain-split-archive: %s remote sidecar matches "
+            "(sha256=%s); skipping upload",
+            label, local_hex[:16],
+        )
+        return True
+
+    gw.create_directory(remote_dir)  # type: ignore[attr-defined]
+    gw.upload_file(str(local_archive), remote_archive)  # type: ignore[attr-defined]
+    # Write sidecar AFTER successful upload so a partial upload never
+    # leaves a matching sidecar that would suppress a re-upload.
+    try:
+        local_sidecar = local_dir / f"{local_archive.name}.sha256"
+        local_sidecar.write_text(local_hex + "\n")
+        gw.upload_file(str(local_sidecar), remote_sidecar)  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001 — sidecar upload best-effort
+        log.warning(
+            "toolchain-split-archive: sidecar upload for %s failed "
+            "(next run will re-upload): %s",
+            label, exc,
+        )
+    log.info(
+        "toolchain-split-archive: uploaded %s -> %s",
+        local_archive.name, remote_archive,
+    )
+    return True
+
+
+def _produce_and_upload_toolchain_split_archives(
     args: argparse.Namespace,
     tc_out_paths: list[str],
     log: logging.Logger,
 ) -> None:
-    """Produce + upload the realized toolchain output closure archive.
+    """Produce + upload the per-toolchain split archives to the gateway.
 
-    Mirrors :func:`_produce_and_upload_toolchain_archive` but for the
-    REALIZED outputs: the compiled toolchain NARs (``/nix/store/*-gcc-*``,
-    etc.) rather than the ``.drv`` graph.  Workers import this archive at
-    cold start so the compiler NARs are already local and require no
-    substitution — eliminating the primary-uplink fan-in that exhausts
-    node pids on large SLURM dispatches.
+    Replaces the monolithic ``toolchains.out.archive`` with a finer split:
 
-    The archive is potentially multi-GiB (compiler binaries + libs for
-    all N toolchains), so the upload is INCREMENTAL: a SHA-256 content
-    hash is computed from the archive bytes and stored as a sidecar
-    ``toolchains.out.archive.sha256`` file on the gateway.  When the
-    remote sidecar already matches the local hash the upload is skipped.
+    * ``toolchains.common.archive`` — the intersection of all toolchain
+      closures (glibc, shared runtime libs, etc.).  Uploaded once.
+    * ``toolchains.<id>.out.archive`` per toolchain — the delta (closure
+      minus COMMON).  Workers import COMMON first, then the delta for
+      the toolchain their variant uses, so the full compiler closure is
+      present locally before ``nix build`` starts.
 
-    SOFT FAIL: a missing or failed realized archive DEGRADES to
-    substitution (existing behaviour) and does NOT abort the dispatch.
-    Errors are logged as warnings and the caller continues unconditionally.
-    This differs from the ``.drv.archive`` path which aborts on failure
-    (the ``.drv`` archive is load-bearing; the output archive is an
-    optimisation).
+    Each file is uploaded with an sha256 sidecar for incremental skip:
+    when the remote sidecar matches the local hash the (potentially
+    multi-GiB) upload is omitted.
+
+    SOFT FAIL: any failure (split computation, export, or upload) logs
+    a WARNING and returns without aborting the dispatch.  Workers that
+    find no archive for their toolchain fall back to substitution as
+    before.  The ``.drv.archive`` upload path remains a HARD FAIL
+    (unchanged); only the realized-output archives degrade gracefully.
     """
     from dynamic_runner.packaging.gateway import (  # noqa: PLC0415
         create_gateway,
@@ -950,100 +1018,59 @@ def _produce_and_upload_toolchain_realized_archive(
 
     if not tc_out_paths:
         log.warning(
-            "toolchain-realized-archive: no realized output paths; "
+            "toolchain-split-archive: no realized output paths; "
             "workers will fall back to substitution"
         )
         return
 
-    # 1. Produce the archive locally in a temporary directory. The
-    #    toolchain outputs are already realised on the submitter (the
-    #    preflight built / verified them), so this is a cheap
-    #    requisites walk + export.
-    local_dir = pathlib.Path(tempfile.mkdtemp(prefix="csr-tc-out-archive-"))
+    local_dir = pathlib.Path(tempfile.mkdtemp(prefix="csr-tc-split-archive-"))
     try:
+        # 1. Compute the split: COMMON + per-toolchain deltas.
         try:
-            local_archive = preflight.export_toolchain_realized_archive(
-                tc_out_paths, local_dir,
-            )
+            split = preflight.compute_toolchain_split(tc_out_paths)
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "toolchain-realized-archive: export failed; workers will fall "
-                "back to substitution: %s",
-                exc,
-            )
-            return
-
-        # 2. Compute content hash for incremental-skip: read the archive and
-        #    sha256-hash it so we can compare against the remote sidecar.
-        try:
-            h = hashlib.sha256()
-            with open(local_archive, "rb") as fh:
-                for chunk in iter(lambda: fh.read(1 << 20), b""):
-                    h.update(chunk)
-            local_hex = h.hexdigest()
-        except OSError as exc:
-            log.warning(
-                "toolchain-realized-archive: cannot hash local archive; "
+                "toolchain-split-archive: split computation failed; "
                 "workers will fall back to substitution: %s",
                 exc,
             )
             return
 
-        # 3. Transfer to the gateway (same remote_dir as the .drv archive).
+        # 2. Export archives (COMMON + each delta) to the local tempdir.
+        try:
+            written = preflight.export_toolchain_split(split, local_dir)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "toolchain-split-archive: export failed; workers will fall "
+                "back to substitution: %s",
+                exc,
+            )
+            return
+
+        if not written:
+            log.warning(
+                "toolchain-split-archive: split produced no archives; "
+                "workers will fall back to substitution"
+            )
+            return
+
+        # 3. Upload each archive + sidecar to the gateway out/_matrix_eval.
         cfg = parse_gateway_url(args.gateway)
         cfg.ssh_identity_file = getattr(args, "ssh_identity_file", None)
         cfg.ssh_config_file = getattr(args, "ssh_config", None)
         remote_dir = f"{args.slurm_root_folder}/out/_matrix_eval"
-        remote_archive = (
-            f"{remote_dir}/{preflight.TOOLCHAIN_REALIZED_ARCHIVE_NAME}"
-        )
-        remote_sidecar = f"{remote_archive}.sha256"
         gw = create_gateway(cfg)
         try:
             gw.connect()
-            # Incremental skip: fetch the remote sidecar (if present) and
-            # compare. A match means the same archive is already on the
-            # gateway, so re-uploading the (potentially multi-GiB) archive
-            # is wasteful. Uses the Gateway protocol's file_exists +
-            # download_file (there is no text-download primitive).
-            remote_hex = ""
-            try:
-                if gw.file_exists(remote_sidecar):
-                    remote_sidecar_dl = local_dir / "remote.sha256"
-                    gw.download_file(remote_sidecar, str(remote_sidecar_dl))
-                    remote_hex = remote_sidecar_dl.read_text().strip()
-            except Exception:  # noqa: BLE001 — sidecar absent / unreadable
-                remote_hex = ""
-            if remote_hex and remote_hex == local_hex:
-                log.info(
-                    "toolchain-realized-archive: remote sidecar matches "
-                    "(sha256=%s); skipping upload",
-                    local_hex[:16],
+            for archive_name, local_archive in written.items():
+                remote_archive = f"{remote_dir}/{archive_name}"
+                _upload_archive_with_sidecar(
+                    local_archive, remote_archive, remote_dir,
+                    local_dir, gw, log, archive_name,
                 )
-                return
-            gw.create_directory(remote_dir)
-            gw.upload_file(str(local_archive), remote_archive)
-            # Write the sidecar AFTER a successful upload so a partial upload
-            # never leaves a matching sidecar (the next run re-uploads).
-            try:
-                local_sidecar = local_dir / (
-                    preflight.TOOLCHAIN_REALIZED_ARCHIVE_NAME + ".sha256"
-                )
-                local_sidecar.write_text(local_hex + "\n")
-                gw.upload_file(str(local_sidecar), remote_sidecar)
-            except Exception as exc:  # noqa: BLE001 — sidecar upload best-effort
-                log.warning(
-                    "toolchain-realized-archive: sidecar upload failed "
-                    "(next run will re-upload the archive): %s",
-                    exc,
-                )
-            log.info(
-                "toolchain-realized-archive: uploaded %s -> %s",
-                local_archive.name, remote_archive,
-            )
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "toolchain-realized-archive: upload failed; workers will fall "
+                "toolchain-split-archive: upload failed; workers will fall "
                 "back to substitution: %s",
                 exc,
             )
@@ -1053,8 +1080,7 @@ def _produce_and_upload_toolchain_realized_archive(
             except Exception:  # noqa: BLE001 — best-effort teardown
                 pass
     finally:
-        # The realized archive is potentially multi-GiB; never leak it in
-        # the submitter's tmp dir across dispatches.
+        # Never leak large archives in the submitter tmp dir.
         shutil.rmtree(local_dir, ignore_errors=True)
 
 
@@ -1442,10 +1468,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
             if rc != 0:
                 return rc
 
-        # Realized toolchain output archive: upload the compiled NAR
-        # closure once so compute nodes skip cold-start substitution.
-        # Soft fail — a missing archive degrades to substitution and
-        # does NOT abort the dispatch (unlike the .drv archive above).
+        # Realized toolchain split archives: upload COMMON + per-toolchain
+        # deltas so compute nodes import only what their variant needs.
+        # Soft fail — missing archives degrade to substitution and do NOT
+        # abort the dispatch (unlike the .drv archive above).
         if (
             toolchain_dedup
             and args.gateway
@@ -1455,7 +1481,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             tc_out_paths = [
                 p for p in partition_drv_outpaths.values() if p
             ]
-            _produce_and_upload_toolchain_realized_archive(
+            _produce_and_upload_toolchain_split_archives(
                 args, tc_out_paths, log,
             )
 

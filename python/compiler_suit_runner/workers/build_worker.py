@@ -61,7 +61,8 @@ __all__ = [
     "build_worker",
     "ensure_binary_archive_imported",
     "ensure_toolchain_archive_imported",
-    "ensure_toolchain_realized_archive_imported",
+    "ensure_common_archive_imported",
+    "ensure_toolchain_out_archive_imported",
 ]
 
 
@@ -88,13 +89,17 @@ _imported_binaries: set[str] = set()
 # bare bool suffices.
 _toolchain_imported: bool = False
 
-# Companion guard for the per-process, once-only import of the realized
-# toolchain output archive (``toolchains.out.archive``). This archive
-# ships the compiled NAR closure (compiler binaries + libs) so workers
-# never need to substitute it at cold start. Unlike the ``.drv`` archive
-# this one is OPTIONAL — a missing archive degrades to substitution and
-# never raises. A bare bool suffices (one archive per run).
-_toolchain_realized_imported: bool = False
+# Per-process, once-only import guard for the COMMON realized-toolchain
+# archive (``toolchains.common.archive``). This archive ships the shared
+# closure (glibc, libgcc, …) that every toolchain depends on. It MUST be
+# imported before any per-toolchain delta archive.  OPTIONAL — a missing
+# archive degrades to substitution and never raises.
+_common_archive_imported: bool = False
+
+# Per-process set of toolchain out-paths whose delta archive has already
+# been imported on this worker.  Keyed by outpath string so workers handle
+# multiple toolchains in one process without redundant imports.
+_imported_toolchain_out_paths: set[str] = set()
 
 # Item-class string tokens (matched against the manifest header). Kept as
 # module-level constants so callers (manifest_gen, suit_task) reference
@@ -1033,46 +1038,28 @@ def ensure_toolchain_archive_imported(
     )
 
 
-def ensure_toolchain_realized_archive_imported(
-    matrix_eval_out_dir: Optional[pathlib.Path],
+def _import_archive_soft(
+    archive_path: pathlib.Path,
+    label: str,
     *,
     run_subprocess: Optional[Callable[..., tuple[bytes, bytes, int]]] = None,
-) -> None:
-    """Import the realized toolchain output archive once per worker process.
+) -> bool:
+    """Import ``archive_path`` via ``nix-store --import``, soft-failing.
 
-    The submitter produces ``toolchains.out.archive`` carrying the
-    compiled NAR closure of every toolchain (compiler binaries, shared
-    libs, etc.) and uploads it to the gateway.  Workers import it here
-    BEFORE any build so the compiler NARs are already local — eliminating
-    the cold-start substitution fan-in that exhausted node pids on large
-    SLURM dispatches.
-
-    This archive is OPTIONAL: if it is absent (older submit, upload
-    failure, or single-process dispatch), the import is skipped and
-    workers fall back to substitution as before.  Any import failure is
-    also a soft failure — logged as a warning, not raised — because the
-    build can still succeed via the substituter and escalating here would
-    turn an optimisation miss into a hard worker crash.
-
-    ``matrix_eval_out_dir`` may be ``None`` (legacy fixtures) — no-op.
-    A zero-byte archive is treated as absent (nothing to import).
+    Logs a WARNING and returns ``False`` on any error (absent, zero-byte,
+    or import failure).  Returns ``True`` on success.  Never raises.
+    Shared by :func:`ensure_common_archive_imported` and
+    :func:`ensure_toolchain_out_archive_imported`.
     """
-    global _toolchain_realized_imported
-    if matrix_eval_out_dir is None:
-        return
-    if _toolchain_realized_imported:
-        return
-    archive_path = matrix_eval_out_dir / "toolchains.out.archive"
-    # A zero-byte or absent archive means the submitter did not produce
-    # it (soft path). Mark done so we don't re-stat on every task.
+    import logging  # noqa: PLC0415 — cheap, called at most once per archive
+
+    log = logging.getLogger("compiler_suit_runner.build_worker.archive_import")
     try:
         size = archive_path.stat().st_size
     except OSError:
-        _toolchain_realized_imported = True
-        return
+        return False  # absent = soft path; caller marks guard + continues
     if size == 0:
-        _toolchain_realized_imported = True
-        return
+        return False
     from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
         archive as _archive,
     )
@@ -1081,26 +1068,101 @@ def ensure_toolchain_realized_archive_imported(
         archive_path, run_subprocess=run_subprocess,
     )
     if not ok:
-        import logging  # noqa: PLC0415 — local import; cheap
+        log.warning(
+            "build_worker: failed to import %s from %s "
+            "(falling back to substitution): %s",
+            label, archive_path,
+            err.decode("utf-8", errors="replace").strip(),
+        )
+        return False
+    log.info("imported %s (%d paths)", label, len(imported))
+    return True
+
+
+def ensure_common_archive_imported(
+    matrix_eval_out_dir: Optional[pathlib.Path],
+    *,
+    run_subprocess: Optional[Callable[..., tuple[bytes, bytes, int]]] = None,
+) -> None:
+    """Import ``toolchains.common.archive`` once per worker process.
+
+    The submitter uploads the COMMON closure (intersection of all toolchain
+    closures: glibc, libgcc, …) as a single archive.  Workers import it
+    BEFORE any per-toolchain delta archive, since the delta references
+    paths that must already be present in the local store.
+
+    OPTIONAL / SOFT FAIL: a missing or unreadable archive logs nothing
+    (the submitter may be older or the upload may have failed) and workers
+    fall back to substitution as before.  The per-toolchain delta import
+    (:func:`ensure_toolchain_out_archive_imported`) is also a soft fail
+    for the same reason.
+
+    ``matrix_eval_out_dir`` may be ``None`` (legacy fixtures) — no-op.
+    """
+    global _common_archive_imported
+    if matrix_eval_out_dir is None:
+        return
+    if _common_archive_imported:
+        return
+    # Mark done first so any early-return path (absent, import failure)
+    # doesn't retry on every subsequent task.
+    _common_archive_imported = True
+    archive_path = matrix_eval_out_dir / "toolchains.common.archive"
+    _import_archive_soft(
+        archive_path, "toolchains.common.archive",
+        run_subprocess=run_subprocess,
+    )
+
+
+def ensure_toolchain_out_archive_imported(
+    toolchain_outpath: Optional[str],
+    matrix_eval_out_dir: Optional[pathlib.Path],
+    *,
+    run_subprocess: Optional[Callable[..., tuple[bytes, bytes, int]]] = None,
+) -> None:
+    """Import the per-toolchain delta archive once per (outpath, process).
+
+    After :func:`ensure_common_archive_imported` has run, this function
+    imports the toolchain-specific delta archive
+    (``toolchains.<id>.out.archive``) whose paths complete the full
+    compiler closure.  The archive name is derived from
+    ``toolchain_outpath`` via
+    :func:`compiler_suit_runner.preflight.toolchain_delta_archive_name`,
+    which uses the Nix store-hash (the first ``-``-delimited token of the
+    basename) — the same derivation the submitter uses so file names
+    match without coordination.
+
+    OPTIONAL / SOFT FAIL: an absent or failed archive logs a WARNING and
+    returns; the subsequent ``nix build`` will fall back to substitution
+    (harmonia peer or cache.nixos.org) exactly as before the split.
+
+    ``toolchain_outpath`` or ``matrix_eval_out_dir`` being ``None``
+    (legacy manifests / fixtures) is a no-op.
+    """
+    if not toolchain_outpath or matrix_eval_out_dir is None:
+        return
+    if toolchain_outpath in _imported_toolchain_out_paths:
+        return
+    # Mark done first so failures don't retry on every task.
+    _imported_toolchain_out_paths.add(toolchain_outpath)
+    from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
+
+    try:
+        archive_name = _preflight.toolchain_delta_archive_name(toolchain_outpath)
+    except ValueError:
+        import logging  # noqa: PLC0415
         logging.getLogger(
             "compiler_suit_runner.build_worker.archive_import"
         ).warning(
-            "build_worker: failed to import toolchains.out.archive from "
-            "%s (falling back to substitution): %s",
-            archive_path,
-            err.decode("utf-8", errors="replace").strip(),
+            "build_worker: cannot derive archive name for toolchain outpath "
+            "%r; falling back to substitution",
+            toolchain_outpath,
         )
-        # Mark imported so we don't retry on every subsequent task —
-        # the substituter is our fallback and repeated failed imports
-        # would just add latency.
-        _toolchain_realized_imported = True
         return
-    _toolchain_realized_imported = True
-    import logging  # noqa: PLC0415 — local import; cheap
-    logging.getLogger(
-        "compiler_suit_runner.build_worker.archive_import"
-    ).info(
-        "imported toolchains.out.archive (%d paths)", len(imported),
+    archive_path = matrix_eval_out_dir / archive_name
+    _import_archive_soft(
+        archive_path, archive_name,
+        run_subprocess=run_subprocess,
     )
 
 
@@ -1111,22 +1173,30 @@ def _run_import_prelude(
 ) -> None:
     """Toolchain-first archive import prelude for build tasks.
 
-    Imports the shared ``toolchains.drv.archive`` FIRST (once per worker
-    process) then the per-binary ``matrix-<binary>.drv.archive`` so the
-    matrix-aggregate drv graph — every variant AND common-dep ``.drv`` —
-    is local before the ``nix build`` below. With toolchain dedup the
-    per-binary archive is a diff against the toolchain closure, so the
-    toolchain import MUST precede it. Both imports are fatal (the drvs
-    must exist locally before the build). Raises :class:`RuntimeError`
-    on any import failure; callers convert that into a failed result.
+    Import order (all soft-fail unless noted):
+      1. ``toolchains.common.archive`` (SOFT) — shared runtime closure.
+      2. ``toolchains.<id>.out.archive`` (SOFT) — per-toolchain delta;
+         the toolchain outpath is read from ``payload["toolchain_outpath"]``.
+      3. ``toolchains.drv.archive`` (HARD) — drv graph closure; must
+         precede the per-binary diff import below.
+      4. ``matrix-<binary>.drv.archive`` (HARD) — per-binary drv diff.
+
+    Steps 1–2 eliminate substitution fan-in at build time. Steps 3–4
+    are load-bearing: a missing drv archive means nix cannot resolve the
+    variant drv locally and the build fails immediately.
     """
-    # Import the realized toolchain output archive first (soft-fail):
-    # compiler NARs become local before the build so no substitution is
-    # needed. A missing archive is a warn-and-continue, not an abort.
-    ensure_toolchain_realized_archive_imported(
+    # 1 & 2: realized toolchain closures (soft-fail).
+    ensure_common_archive_imported(
         env.matrix_eval_out_dir,
         run_subprocess=env.run_subprocess,
     )
+    toolchain_outpath = payload.get("toolchain_outpath")
+    ensure_toolchain_out_archive_imported(
+        toolchain_outpath if isinstance(toolchain_outpath, str) else None,
+        env.matrix_eval_out_dir,
+        run_subprocess=env.run_subprocess,
+    )
+    # 3 & 4: drv graph archives (hard-fail on missing).
     ensure_toolchain_archive_imported(
         env.matrix_eval_out_dir,
         run_subprocess=env.run_subprocess,

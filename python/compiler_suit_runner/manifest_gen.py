@@ -478,6 +478,7 @@ def make_build_variant_header(
     drv_outpaths: Optional[dict[str, str]] = None,
     preferred_secondaries: Optional[list[str]] = None,
     toolchain_task_id: Optional[str] = None,
+    toolchain_outpath: Optional[str] = None,
 ) -> ManifestHeader:
     """Build a build_variant manifest.
 
@@ -510,6 +511,14 @@ def make_build_variant_header(
     it and prefers a candidate from the list when a free worker is
     available there (see plan: Framework Ask #2 — requires upstream
     support to take effect). Empty / ``None`` = no preference.
+
+    ``toolchain_outpath`` is the realized ``/nix/store/…`` output path
+    for the variant's toolchain.  Workers use it to locate the
+    per-toolchain delta archive (``toolchains.<id>.out.archive``) under
+    ``matrix_eval_out_dir`` via
+    :func:`preflight.toolchain_delta_archive_name`.  When absent (older
+    manifests or toolchain not yet realized), workers fall back to
+    substitution.
     """
     pkg = variant["pkg"]
     arch = variant["arch"]
@@ -550,6 +559,11 @@ def make_build_variant_header(
         # Deterministic order so manifest diffs are stable; the
         # scheduler treats this as an unordered preference set anyway.
         payload["preferred_secondaries"] = sorted(preferred_secondaries)
+    if toolchain_outpath:
+        # Workers use this to import the right per-toolchain delta archive
+        # before building.  Omitted when the toolchain outpath is unknown
+        # at manifest-emission time; workers fall back to substitution.
+        payload["toolchain_outpath"] = toolchain_outpath
     return ManifestHeader(
         item_class="build_variant",
         name=label,
@@ -872,6 +886,7 @@ def emit_all_manifests(
             # drv → outpath → placement holders. Empty list when the
             # toolchain hasn't been placed yet (typical at submit time).
             tc_drv = tc_drvs.get((variant["arch"], variant["compiler_id"]))
+            tc_outpath: Optional[str] = None
             preferred: Optional[list[str]] = None
             if tc_drv:
                 tc_outpath = outpaths_map.get(tc_drv)
@@ -898,6 +913,7 @@ def emit_all_manifests(
                     drv_outpaths=outpaths_map if outpaths_map else None,
                     preferred_secondaries=preferred,
                     toolchain_task_id=tc_task_id,
+                    toolchain_outpath=tc_outpath,
                 )
             )
 

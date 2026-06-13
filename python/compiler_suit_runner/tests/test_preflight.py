@@ -17,17 +17,21 @@ import pytest
 from compiler_suit_runner.preflight import (
     PreflightError,
     PreflightResult,
-    TOOLCHAIN_REALIZED_ARCHIVE_NAME,
+    TOOLCHAIN_COMMON_ARCHIVE_NAME,
+    ToolchainSplit,
     build_toolchains_locally,
     check_toolchains_locally,
+    compute_toolchain_split,
     enumerate_toolchains,
     enumerate_toolchains_only,
     enumerate_variants,
-    export_toolchain_realized_archive,
+    export_toolchain_split,
     filter_existing_variants,
     path_info_batch,
     preflight,
     query_initial_toolchain_placement,
+    toolchain_delta_archive_name,
+    toolchain_id_for_outpath,
     run_nix_eval,
 )
 
@@ -1163,60 +1167,194 @@ def test_query_initial_toolchain_placement_probe_failure_falls_back_to_empty():
 
 
 # ---------------------------------------------------------------------------
-# export_toolchain_realized_archive
+# toolchain_id_for_outpath / toolchain_delta_archive_name
 # ---------------------------------------------------------------------------
 
 
-def test_export_toolchain_realized_archive_writes_archive(
+def test_toolchain_id_for_outpath_extracts_store_hash() -> None:
+    """The store-hash (first '-'-delimited token) is returned as-is."""
+    assert toolchain_id_for_outpath("/nix/store/abc123xyz-gcc-14.2.0") == "abc123xyz"
+
+
+def test_toolchain_id_for_outpath_bare_hash_only() -> None:
+    """A path with no trailing name component still works."""
+    assert toolchain_id_for_outpath("/nix/store/hash0000-name") == "hash0000"
+
+
+def test_toolchain_id_for_outpath_raises_for_invalid() -> None:
+    """An empty or non-path-like string raises ValueError."""
+    with pytest.raises(ValueError):
+        toolchain_id_for_outpath("")
+
+
+def test_toolchain_delta_archive_name() -> None:
+    """Archive name is ``toolchains.<hash>.out.archive``."""
+    name = toolchain_delta_archive_name("/nix/store/abc123xyz-gcc-14.2.0")
+    assert name == "toolchains.abc123xyz.out.archive"
+
+
+# ---------------------------------------------------------------------------
+# compute_toolchain_split
+# ---------------------------------------------------------------------------
+
+
+def _make_split_runner(closures: dict[str, list[str]]) -> "object":
+    """Return a run_subprocess stub that answers requisites queries from
+    ``closures`` (mapping outpath → list of closure paths)."""
+    def runner(argv):
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            key = argv[3]
+            paths = closures.get(key, [])
+            return "\n".join(paths).encode() + b"\n", b"", 0
+        if argv[:2] == ["nix-store", "--export"]:
+            return b"NIX_EXPORT:common", b"", 0
+        return b"", b"unexpected call", 1
+    return runner
+
+
+def test_compute_toolchain_split_common_is_intersection() -> None:
+    """COMMON = intersection of all toolchain closures."""
+    closures = {
+        "/nix/store/aaa-gcc": ["/nix/store/aaa-gcc", "/nix/store/glibc", "/nix/store/libgcc"],
+        "/nix/store/bbb-clang": ["/nix/store/bbb-clang", "/nix/store/glibc"],
+    }
+    runner = _make_split_runner(closures)
+    split = compute_toolchain_split(list(closures), run_subprocess=runner)
+    assert split.common_paths == frozenset({"/nix/store/glibc"})
+
+
+def test_compute_toolchain_split_delta_is_closure_minus_common() -> None:
+    """delta(Ti) = closure(Ti) - COMMON."""
+    closures = {
+        "/nix/store/aaa-gcc": ["/nix/store/aaa-gcc", "/nix/store/glibc", "/nix/store/libgcc"],
+        "/nix/store/bbb-clang": ["/nix/store/bbb-clang", "/nix/store/glibc"],
+    }
+    runner = _make_split_runner(closures)
+    split = compute_toolchain_split(list(closures), run_subprocess=runner)
+    assert set(split.delta_paths["/nix/store/aaa-gcc"]) == {
+        "/nix/store/aaa-gcc", "/nix/store/libgcc"
+    }
+    assert set(split.delta_paths["/nix/store/bbb-clang"]) == {"/nix/store/bbb-clang"}
+
+
+def test_compute_toolchain_split_deltas_disjoint_from_common() -> None:
+    """No delta path should appear in COMMON."""
+    closures = {
+        "/nix/store/tc1": ["/nix/store/tc1", "/nix/store/shared", "/nix/store/only1"],
+        "/nix/store/tc2": ["/nix/store/tc2", "/nix/store/shared", "/nix/store/only2"],
+    }
+    runner = _make_split_runner(closures)
+    split = compute_toolchain_split(list(closures), run_subprocess=runner)
+    for delta in split.delta_paths.values():
+        assert not (set(delta) & split.common_paths)
+
+
+def test_compute_toolchain_split_single_toolchain() -> None:
+    """With one toolchain, COMMON = its full closure and delta is empty."""
+    closures = {"/nix/store/only": ["/nix/store/only", "/nix/store/dep"]}
+    runner = _make_split_runner(closures)
+    split = compute_toolchain_split(list(closures), run_subprocess=runner)
+    assert split.common_paths == frozenset({"/nix/store/only", "/nix/store/dep"})
+    assert split.delta_paths["/nix/store/only"] == ()
+
+
+def test_compute_toolchain_split_raises_on_empty_paths() -> None:
+    """Empty out-path list raises RuntimeError without calling nix."""
+    with pytest.raises(RuntimeError, match="no toolchain out-paths"):
+        compute_toolchain_split([])
+
+
+def test_compute_toolchain_split_raises_on_requisites_failure() -> None:
+    """A failing requisites query propagates as RuntimeError."""
+    def runner(argv):
+        return b"", b"nix daemon down", 1
+    with pytest.raises(RuntimeError, match="requisites query failed"):
+        compute_toolchain_split(["/nix/store/aaa-gcc"], run_subprocess=runner)
+
+
+# ---------------------------------------------------------------------------
+# export_toolchain_split
+# ---------------------------------------------------------------------------
+
+
+def test_export_toolchain_split_writes_common_and_deltas(
     tmp_path: pathlib.Path,
 ) -> None:
-    """export_toolchain_realized_archive calls requisites then export and
-    writes the result atomically to ``<out_dir>/toolchains.out.archive``."""
+    """export_toolchain_split writes toolchains.common.archive plus one
+    delta archive per toolchain with a non-empty delta set."""
     calls: list[list[str]] = []
 
     def runner(argv):
         calls.append(list(argv))
         if argv[:3] == ["nix-store", "--query", "--requisites"]:
-            return b"/nix/store/aaa-gcc\n/nix/store/bbb-glibc\n", b"", 0
+            return b"/nix/store/shared\n", b"", 0
         if argv[:2] == ["nix-store", "--export"]:
-            return b"NIX_EXPORT:realized", b"", 0
+            key = "-".join(argv[2:])
+            return f"NIX_EXPORT:{key}".encode(), b"", 0
         return b"", b"unexpected", 1
 
-    out_paths = ["/nix/store/aaa-gcc"]
-    result = export_toolchain_realized_archive(
-        out_paths, tmp_path, run_subprocess=runner,
+    split = ToolchainSplit(
+        common_paths=frozenset({"/nix/store/shared"}),
+        delta_paths={
+            "/nix/store/abc123-gcc": ("/nix/store/abc123-gcc",),
+            "/nix/store/def456-clang": ("/nix/store/def456-clang",),
+        },
     )
-    assert result == tmp_path / TOOLCHAIN_REALIZED_ARCHIVE_NAME
-    assert result.exists()
-    assert result.read_bytes() == b"NIX_EXPORT:realized"
-    # Requisites were queried from the output paths, not a .drv.
-    req_call = calls[0]
-    assert req_call[:3] == ["nix-store", "--query", "--requisites"]
-    assert "/nix/store/aaa-gcc" in req_call
+    written = export_toolchain_split(split, tmp_path, run_subprocess=runner)
+
+    # Common archive always written.
+    assert TOOLCHAIN_COMMON_ARCHIVE_NAME in written
+    assert written[TOOLCHAIN_COMMON_ARCHIVE_NAME].exists()
+
+    # Per-toolchain delta archives.
+    assert toolchain_delta_archive_name("/nix/store/abc123-gcc") in written
+    assert toolchain_delta_archive_name("/nix/store/def456-clang") in written
+
+    # Verify exact-paths export (no --query --requisites for deltas).
+    req_calls = [c for c in calls if "--query" in c and "--requisites" in c]
+    export_calls = [c for c in calls if "--export" in c]
+    # Common uses export_closure (with requisites); deltas use export_closure_exact.
+    # Common: 1 requisites call + 1 export call. Deltas: 1 export call each (no requisites).
+    assert len(req_calls) == 1  # only for common
+    assert len(export_calls) == 3  # common + 2 deltas
 
 
-def test_export_toolchain_realized_archive_raises_on_empty_paths(
+def test_export_toolchain_split_skips_empty_delta(
     tmp_path: pathlib.Path,
 ) -> None:
-    """An empty out_paths list raises RuntimeError without calling nix."""
-    with pytest.raises(RuntimeError, match="no output paths"):
-        export_toolchain_realized_archive([], tmp_path)
-
-
-def test_export_toolchain_realized_archive_raises_on_requisites_failure(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A non-zero requisites exit raises RuntimeError so callers can
-    treat it as a soft failure and warn instead of crashing silently."""
-
+    """A toolchain whose delta is empty (its closure is entirely COMMON)
+    produces no delta archive."""
     def runner(argv):
         if argv[:3] == ["nix-store", "--query", "--requisites"]:
-            return b"", b"nix daemon error\n", 1
-        return b"", b"unexpected", 1
+            return b"/nix/store/shared\n", b"", 0
+        if argv[:2] == ["nix-store", "--export"]:
+            return b"NIX_EXPORT:common", b"", 0
+        return b"", b"", 0
 
-    with pytest.raises(RuntimeError, match="nix-store export of realized"):
-        export_toolchain_realized_archive(
-            ["/nix/store/aaa-gcc"], tmp_path, run_subprocess=runner,
-        )
+    split = ToolchainSplit(
+        common_paths=frozenset({"/nix/store/shared"}),
+        delta_paths={"/nix/store/abc123-gcc": ()},  # empty delta
+    )
+    written = export_toolchain_split(split, tmp_path, run_subprocess=runner)
+    # Only the common archive is written (empty delta skipped).
+    assert TOOLCHAIN_COMMON_ARCHIVE_NAME in written
+    assert toolchain_delta_archive_name("/nix/store/abc123-gcc") not in written
+
+
+def test_export_toolchain_split_raises_on_common_export_failure(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A failure in the common archive export raises RuntimeError."""
+    def runner(argv):
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            return b"/nix/store/shared\n", b"", 0
+        return b"", b"disk full", 1  # export fails
+
+    split = ToolchainSplit(
+        common_paths=frozenset({"/nix/store/shared"}),
+        delta_paths={},
+    )
+    with pytest.raises(RuntimeError, match="common archive"):
+        export_toolchain_split(split, tmp_path, run_subprocess=runner)
 
 

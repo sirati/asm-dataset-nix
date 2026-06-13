@@ -101,6 +101,7 @@ __all__ = [
     "parse_manifest_payload",
     "realise_toolchain",
     "export_closure",
+    "export_closure_exact",
     "run_build_compilers_task",
     "main",
 ]
@@ -453,6 +454,77 @@ def export_closure(
     except OSError as exc:
         return False, req_stderr, str(exc).encode("utf-8")
     return True, req_stderr, exp_stderr
+
+
+def export_closure_exact(
+    archive_path: pathlib.Path,
+    exact_paths: list[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> tuple[bool, bytes]:
+    """Export EXACTLY ``exact_paths`` (no requisites expansion) via
+    ``nix-store --export`` into ``archive_path``.
+
+    Unlike :func:`export_closure` this function does NOT run
+    ``nix-store --query --requisites`` first.  The caller is responsible
+    for supplying a topologically complete and ordered path list (i.e. all
+    dependencies of every path are also present in ``exact_paths``).  The
+    primary use-case is exporting a pre-computed delta set where the
+    common closure has already been stripped out and re-expansion would
+    pull it back in.
+
+    The archive is written atomically via ``.tmp`` + ``os.replace``.
+
+    Returns ``(success, export_stderr)``.
+    """
+    if not exact_paths:
+        return False, b"export_closure_exact: no paths supplied"
+
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_archive = archive_path.with_suffix(archive_path.suffix + ".tmp")
+    if tmp_archive.exists():
+        try:
+            tmp_archive.unlink()
+        except OSError:
+            pass
+
+    export_argv: list[str] = ["nix-store", "--export", *exact_paths]
+    runner = run_subprocess or _default_run_subprocess
+
+    if run_subprocess is None:
+        try:
+            with open(tmp_archive, "wb") as fh:
+                proc = subprocess.run(  # noqa: S603
+                    [resolve_tool(export_argv[0]), *export_argv[1:]],
+                    stdout=fh,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+            exp_rc = proc.returncode
+            exp_stderr = proc.stderr or b""
+        except OSError as exc:
+            return False, str(exc).encode("utf-8")
+    else:
+        exp_stdout, exp_stderr, exp_rc = runner(export_argv)
+        if exp_rc == 0:
+            try:
+                with open(tmp_archive, "wb") as fh:
+                    fh.write(exp_stdout)
+            except OSError as exc:
+                return False, str(exc).encode("utf-8")
+
+    if exp_rc != 0:
+        try:
+            tmp_archive.unlink()
+        except OSError:
+            pass
+        return False, exp_stderr
+
+    try:
+        os.replace(tmp_archive, archive_path)
+    except OSError as exc:
+        return False, str(exc).encode("utf-8")
+    return True, exp_stderr
 
 
 def _archive_path_for(

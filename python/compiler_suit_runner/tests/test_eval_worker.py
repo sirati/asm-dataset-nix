@@ -69,10 +69,12 @@ def _eval_worker_env(monkeypatch, tmp_path):
         "DYNRUNNER_PUBLISH_SRC_ROOT", str(tmp_path / "_publish_staging")
     )
     _bw._toolchain_imported = False
-    _bw._toolchain_realized_imported = False
+    _bw._common_archive_imported = False
+    _bw._imported_toolchain_out_paths.clear()
     yield
     _bw._toolchain_imported = False
-    _bw._toolchain_realized_imported = False
+    _bw._common_archive_imported = False
+    _bw._imported_toolchain_out_paths.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -82,10 +84,6 @@ def _neutralise_toolchain_import(monkeypatch, request):
         return
     monkeypatch.setattr(
         eval_worker, "_import_toolchain_archive",
-        lambda out_dir, *, run_subprocess=None: None,
-    )
-    monkeypatch.setattr(
-        eval_worker, "_import_toolchain_realized_archive",
         lambda out_dir, *, run_subprocess=None: None,
     )
 
@@ -2450,72 +2448,25 @@ class TestDefaultRunnerResolvesTool:
 
 
 # ---------------------------------------------------------------------------
-# _import_toolchain_realized_archive
+# _import_toolchain_archive (drv archive import on dedup path)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.real_toolchain_import
-def test_eval_worker_imports_realized_archive_when_present(
+def test_eval_worker_drv_archive_imported_on_dedup_path(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When ``toolchains.out.archive`` is present and non-empty,
-    ``_import_toolchain_realized_archive`` delegates to
-    ``ensure_toolchain_realized_archive_imported`` and logs a message."""
-    imported: list[pathlib.Path] = []
-
-    def _fake_ensure(out_dir, *, run_subprocess=None):
-        imported.append(out_dir)
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.workers.build_worker"
-        ".ensure_toolchain_realized_archive_imported",
-        _fake_ensure,
-    )
-    archive = tmp_path / "toolchains.out.archive"
-    archive.write_bytes(b"NIX_EXPORT:realized")
-    eval_worker._import_toolchain_realized_archive(tmp_path)
-    assert imported == [tmp_path]
-
-
-@pytest.mark.real_toolchain_import
-def test_eval_worker_realized_archive_absent_logs_warn_does_not_raise(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A missing ``toolchains.out.archive`` is a soft failure: no exception
-    raised, the caller continues to fall back to substitution."""
-    called: list = []
-
-    def _fake_ensure(out_dir, *, run_subprocess=None):
-        called.append(out_dir)
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.workers.build_worker"
-        ".ensure_toolchain_realized_archive_imported",
-        _fake_ensure,
-    )
-    # No archive placed — must not raise.
-    eval_worker._import_toolchain_realized_archive(tmp_path)
-    assert called == []
-
-
-def test_eval_worker_realized_archive_imported_before_drv_archive(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The realized archive is imported BEFORE the .drv archive on the
-    dedup path — so NARs are local before the toolchain drv graph lands.
-    Exercises the import-order logic via direct patching of the two
-    import helpers; the autouse fixture's no-ops are overridden here."""
+    """The shared ``toolchains.drv.archive`` is imported when toolchain_dedup
+    is ON.  Realized-output archives (common + per-toolchain deltas) are the
+    build_worker's concern; the eval worker only needs the drv archive to
+    run ``nix-instantiate`` on the matrix aggregate.
+    """
     _install_wrapper_stub(monkeypatch)
     order: list[str] = []
-
-    def _fake_realized(out_dir, *, run_subprocess=None):
-        order.append("realized")
 
     def _fake_drv(out_dir, *, run_subprocess=None):
         order.append("drv")
 
-    # Override the autouse no-ops with recording stubs.
-    monkeypatch.setattr(eval_worker, "_import_toolchain_realized_archive", _fake_realized)
+    # Override the autouse no-op with a recording stub.
     monkeypatch.setattr(eval_worker, "_import_toolchain_archive", _fake_drv)
 
     payload = _make_payload(
@@ -2527,5 +2478,4 @@ def test_eval_worker_realized_archive_imported_before_drv_archive(
         payload, tmp_path, task=_make_task_mock(),
         run_subprocess=runner, now=lambda: 1.0,
     )
-    # Realized must appear before drv in the call log.
-    assert order.index("realized") < order.index("drv")
+    assert "drv" in order

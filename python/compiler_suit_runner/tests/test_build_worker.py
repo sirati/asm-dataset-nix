@@ -1983,127 +1983,234 @@ class TestDefaultRunnerResolvesTool:
 
 
 # ---------------------------------------------------------------------------
-# ensure_toolchain_realized_archive_imported
+# ensure_common_archive_imported
 # ---------------------------------------------------------------------------
 
 
-def _reset_realized_imported(monkeypatch) -> None:
-    """Reset the per-process realized-import guard between tests."""
-    monkeypatch.setattr(bw, "_toolchain_realized_imported", False)
+def _reset_common_imported(monkeypatch) -> None:
+    """Reset per-process common-archive guard between tests."""
+    monkeypatch.setattr(bw, "_common_archive_imported", False)
 
 
-def test_ensure_toolchain_realized_archive_imported_absent_is_noop(
+def test_ensure_common_archive_imported_absent_is_noop(
     monkeypatch, tmp_path,
 ):
-    """A missing archive is a soft no-op: the guard flips and no
-    nix-store call is made (fall back to substitution path)."""
-    _reset_realized_imported(monkeypatch)
+    """A missing common archive is a soft no-op: guard flips, no
+    nix-store import call is made (fall back to substitution)."""
+    _reset_common_imported(monkeypatch)
     calls: list = []
-
-    def _stub(argv):
-        calls.append(list(argv))
-        return b"", b"", 0
-
-    bw.ensure_toolchain_realized_archive_imported(
-        tmp_path, run_subprocess=_stub,
-    )
-    assert bw._toolchain_realized_imported is True
-    assert calls == []
+    bw.ensure_common_archive_imported(tmp_path, run_subprocess=lambda a: (b"", b"", 0))
+    # Guard must flip even though the archive is absent.
+    assert bw._common_archive_imported is True
+    del calls  # no import calls expected
 
 
-def test_ensure_toolchain_realized_archive_imported_zero_byte_is_noop(
+def test_ensure_common_archive_imported_zero_byte_is_noop(
     monkeypatch, tmp_path,
 ):
-    """A zero-byte archive is also treated as absent — no import attempted."""
-    _reset_realized_imported(monkeypatch)
-    (tmp_path / "toolchains.out.archive").write_bytes(b"")
-    calls: list = []
-
-    def _stub(argv):
-        calls.append(list(argv))
-        return b"", b"", 0
-
-    bw.ensure_toolchain_realized_archive_imported(
-        tmp_path, run_subprocess=_stub,
-    )
-    assert bw._toolchain_realized_imported is True
-    assert calls == []
-
-
-def test_ensure_toolchain_realized_archive_imported_happy(
-    monkeypatch, tmp_path,
-):
-    """A present archive is imported via import_archive and the guard
-    flips on success."""
+    """A zero-byte common archive is treated as absent."""
+    _reset_common_imported(monkeypatch)
+    (tmp_path / "toolchains.common.archive").write_bytes(b"")
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
-    _reset_realized_imported(monkeypatch)
-    (tmp_path / "toolchains.out.archive").write_bytes(b"NIX_EXPORT:realized")
+    imported: list = []
+    monkeypatch.setattr(archive_mod, "import_archive",
+                        lambda a, *, run_subprocess=None: imported.append(a) or (True, b"", []))
+    bw.ensure_common_archive_imported(tmp_path)
+    assert bw._common_archive_imported is True
+    assert imported == []
 
+
+def test_ensure_common_archive_imported_happy(
+    monkeypatch, tmp_path,
+):
+    """A present archive is imported and the guard flips."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_common_imported(monkeypatch)
+    (tmp_path / "toolchains.common.archive").write_bytes(b"NIX_EXPORT:common")
     imported: list = []
 
     def _fake_import(archive, *, run_subprocess=None):
         imported.append(pathlib.Path(archive))
-        return True, b"", ["/nix/store/aaa-gcc"]
+        return True, b"", ["/nix/store/glibc"]
 
     monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+    bw.ensure_common_archive_imported(tmp_path)
+    assert bw._common_archive_imported is True
+    assert imported == [tmp_path / "toolchains.common.archive"]
 
-    bw.ensure_toolchain_realized_archive_imported(tmp_path)
-    assert bw._toolchain_realized_imported is True
-    assert imported == [tmp_path / "toolchains.out.archive"]
 
-
-def test_ensure_toolchain_realized_archive_imported_failure_is_soft(
+def test_ensure_common_archive_imported_failure_is_soft(
     monkeypatch, tmp_path,
 ):
-    """A failed import logs a warning and does NOT raise — the guard
-    still flips so we don't retry on every subsequent task."""
+    """A failed import does NOT raise — guard still flips."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
-    _reset_realized_imported(monkeypatch)
-    (tmp_path / "toolchains.out.archive").write_bytes(b"corrupt")
-
-    def _fake_import(archive, *, run_subprocess=None):
-        return False, b"nix-store: corrupt archive", []
-
-    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
-
-    # Must NOT raise — soft failure.
-    bw.ensure_toolchain_realized_archive_imported(tmp_path)
-    assert bw._toolchain_realized_imported is True
+    _reset_common_imported(monkeypatch)
+    (tmp_path / "toolchains.common.archive").write_bytes(b"corrupt")
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: (False, b"corrupt archive", []),
+    )
+    bw.ensure_common_archive_imported(tmp_path)  # must not raise
+    assert bw._common_archive_imported is True
 
 
-def test_ensure_toolchain_realized_archive_imported_idempotent(
+def test_ensure_common_archive_imported_idempotent(
     monkeypatch, tmp_path,
 ):
-    """A second call is a no-op (guard already set) — import_archive
-    is never called a second time."""
+    """Second call is a no-op (guard already set)."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
-    _reset_realized_imported(monkeypatch)
-    (tmp_path / "toolchains.out.archive").write_bytes(b"NIX_EXPORT:realized")
-
+    _reset_common_imported(monkeypatch)
+    (tmp_path / "toolchains.common.archive").write_bytes(b"NIX_EXPORT:common")
     call_count: list = []
-
-    def _fake_import(archive, *, run_subprocess=None):
-        call_count.append(1)
-        return True, b"", ["/nix/store/aaa-gcc"]
-
-    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
-
-    bw.ensure_toolchain_realized_archive_imported(tmp_path)
-    bw.ensure_toolchain_realized_archive_imported(tmp_path)
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: call_count.append(1) or (True, b"", []),
+    )
+    bw.ensure_common_archive_imported(tmp_path)
+    bw.ensure_common_archive_imported(tmp_path)
     assert len(call_count) == 1
 
 
-def test_ensure_toolchain_realized_archive_imported_none_dir_is_noop(
+def test_ensure_common_archive_imported_none_dir_is_noop(monkeypatch):
+    """``matrix_eval_out_dir=None`` is a safe no-op; guard stays False."""
+    _reset_common_imported(monkeypatch)
+    bw.ensure_common_archive_imported(None)
+    assert bw._common_archive_imported is False
+
+
+# ---------------------------------------------------------------------------
+# ensure_toolchain_out_archive_imported
+# ---------------------------------------------------------------------------
+
+
+def _reset_toolchain_out_imported(monkeypatch) -> None:
+    """Reset per-process per-toolchain import set between tests."""
+    monkeypatch.setattr(bw, "_imported_toolchain_out_paths", set())
+
+
+def test_ensure_toolchain_out_archive_imported_happy(
+    monkeypatch, tmp_path,
+):
+    """A present delta archive is imported and the outpath added to the set."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_toolchain_out_imported(monkeypatch)
+    outpath = "/nix/store/abc123-gcc"
+    archive_name = bw._preflight_toolchain_delta_name(outpath) if hasattr(
+        bw, "_preflight_toolchain_delta_name"
+    ) else f"toolchains.abc123.out.archive"
+    # Derive expected archive name via the real helper.
+    from compiler_suit_runner.preflight import toolchain_delta_archive_name
+    archive_name = toolchain_delta_archive_name(outpath)
+    (tmp_path / archive_name).write_bytes(b"NIX_EXPORT:delta")
+    imported: list = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        imported.append(pathlib.Path(archive))
+        return True, b"", ["/nix/store/abc123-gcc"]
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+    bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
+    assert outpath in bw._imported_toolchain_out_paths
+    assert imported == [tmp_path / archive_name]
+
+
+def test_ensure_toolchain_out_archive_imported_absent_fallback(
+    monkeypatch, tmp_path,
+):
+    """A missing delta archive logs no error and falls back to substitution
+    (guard still set so we don't retry on every task)."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_toolchain_out_imported(monkeypatch)
+    outpath = "/nix/store/abc123-gcc"
+    imported: list = []
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: imported.append(a) or (True, b"", []),
+    )
+    # No archive file created — absent path.
+    bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
+    assert outpath in bw._imported_toolchain_out_paths
+    assert imported == []  # no import attempted for absent archive
+
+
+def test_ensure_toolchain_out_archive_imported_idempotent(
+    monkeypatch, tmp_path,
+):
+    """A second call for the same outpath is a no-op."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_toolchain_out_imported(monkeypatch)
+    outpath = "/nix/store/abc123-gcc"
+    from compiler_suit_runner.preflight import toolchain_delta_archive_name
+    archive_name = toolchain_delta_archive_name(outpath)
+    (tmp_path / archive_name).write_bytes(b"NIX_EXPORT:delta")
+    call_count: list = []
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: call_count.append(1) or (True, b"", []),
+    )
+    bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
+    bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
+    assert len(call_count) == 1
+
+
+def test_ensure_toolchain_out_archive_imported_none_outpath_is_noop(
+    monkeypatch, tmp_path,
+):
+    """A None toolchain_outpath (legacy manifest) is a safe no-op."""
+    _reset_toolchain_out_imported(monkeypatch)
+    bw.ensure_toolchain_out_archive_imported(None, tmp_path)
+    assert bw._imported_toolchain_out_paths == set()
+
+
+def test_ensure_toolchain_out_archive_imported_none_dir_is_noop(
     monkeypatch,
 ):
-    """``matrix_eval_out_dir=None`` (legacy fixtures) is a safe no-op."""
-    _reset_realized_imported(monkeypatch)
-    # Should not raise and should not flip the guard (None path exits early).
-    bw.ensure_toolchain_realized_archive_imported(None)
-    assert bw._toolchain_realized_imported is False
+    """A None matrix_eval_out_dir (legacy fixtures) is a safe no-op."""
+    _reset_toolchain_out_imported(monkeypatch)
+    bw.ensure_toolchain_out_archive_imported("/nix/store/abc-gcc", None)
+    assert bw._imported_toolchain_out_paths == set()
+
+
+def test_ensure_toolchain_out_archive_imported_common_once_then_per_toolchain(
+    monkeypatch, tmp_path,
+):
+    """Calling common+toolchain in order: COMMON imported once, then per-
+    toolchain delta imported for each distinct outpath."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_common_imported(monkeypatch)
+    _reset_toolchain_out_imported(monkeypatch)
+    from compiler_suit_runner.preflight import toolchain_delta_archive_name
+    outpath1 = "/nix/store/abc123-gcc"
+    outpath2 = "/nix/store/def456-clang"
+    (tmp_path / "toolchains.common.archive").write_bytes(b"COMMON")
+    (tmp_path / toolchain_delta_archive_name(outpath1)).write_bytes(b"DELTA1")
+    (tmp_path / toolchain_delta_archive_name(outpath2)).write_bytes(b"DELTA2")
+    imported: list = []
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: imported.append(pathlib.Path(a).name) or (True, b"", []),
+    )
+    bw.ensure_common_archive_imported(tmp_path)
+    bw.ensure_toolchain_out_archive_imported(outpath1, tmp_path)
+    bw.ensure_toolchain_out_archive_imported(outpath2, tmp_path)
+    # Call common a second time — must be idempotent.
+    bw.ensure_common_archive_imported(tmp_path)
+    assert imported.count("toolchains.common.archive") == 1
+    assert toolchain_delta_archive_name(outpath1) in imported
+    assert toolchain_delta_archive_name(outpath2) in imported

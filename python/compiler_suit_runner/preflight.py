@@ -746,7 +746,122 @@ def enumerate_toolchains_only(
 
 
 TOOLCHAIN_ARCHIVE_NAME = "toolchains.drv.archive"
-TOOLCHAIN_REALIZED_ARCHIVE_NAME = "toolchains.out.archive"
+TOOLCHAIN_COMMON_ARCHIVE_NAME = "toolchains.common.archive"
+
+
+def toolchain_id_for_outpath(outpath: str) -> str:
+    """Derive a stable, filesystem-safe id from a realized toolchain out-path.
+
+    The Nix store-hash is the first ``-``-delimited token of the basename
+    (e.g. ``/nix/store/abc123xyz-gcc-14.2.0`` → ``"abc123xyz"``).  This
+    is the canonical 32-char base-32 hash component that uniquely
+    identifies the derivation output — it is stable across re-runs with
+    the same inputs, always filesystem-safe (``[a-z0-9]``), and short
+    enough to compose cleanly into archive filenames.
+
+    The same derivation is used by workers to compute the per-toolchain
+    archive name from ``payload["toolchain_outpath"]``:
+    ``toolchains.<toolchain_id_for_outpath(outpath)>.out.archive``.
+
+    Raises :class:`ValueError` for paths that don't look like
+    ``/nix/store/<hash>-<name>`` (empty string, no ``-`` in basename).
+    """
+    basename = outpath.rsplit("/", 1)[-1]
+    parts = basename.split("-", 1)
+    if not parts[0]:
+        raise ValueError(
+            f"toolchain_id_for_outpath: cannot extract store hash from {outpath!r}"
+        )
+    return parts[0]
+
+
+def toolchain_delta_archive_name(outpath: str) -> str:
+    """Return the per-toolchain delta archive filename for ``outpath``.
+
+    Format: ``toolchains.<id>.out.archive`` where ``<id>`` is derived via
+    :func:`toolchain_id_for_outpath`.  Workers use this to find the
+    archive on the shared mount at
+    ``<matrix_eval_out_dir>/<name>``.
+    """
+    return f"toolchains.{toolchain_id_for_outpath(outpath)}.out.archive"
+
+
+@dataclasses.dataclass
+class ToolchainSplit:
+    """Result of :func:`compute_toolchain_split`.
+
+    ``common_paths`` is the intersection of all toolchain closures —
+    the shared runtime (glibc, libgcc, …).  It forms a self-contained
+    importable closure (by the downward-closed intersection property).
+
+    ``delta_paths`` maps each toolchain out-path to the tuple of store
+    paths in its closure that are NOT in ``common_paths``.  Each delta
+    references paths already in ``common_paths``, so a worker imports
+    COMMON first then each delta to reconstruct the full toolchain.
+    """
+
+    common_paths: frozenset[str]
+    delta_paths: dict[str, tuple[str, ...]]
+
+
+def compute_toolchain_split(
+    toolchain_out_paths: list[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> ToolchainSplit:
+    """Compute COMMON + per-toolchain deltas from realized out-paths.
+
+    For each toolchain out-path ``Ti``:
+      closure(Ti) = ``nix-store --query --requisites Ti``
+
+    COMMON = intersection of all closure(Ti).  By the downward-closed
+    property of Nix closures the intersection is itself a complete
+    closure (all deps of every COMMON path are also in COMMON) so it
+    is directly importable.
+
+    delta(Ti) = closure(Ti) − COMMON.  Each delta imports cleanly after
+    COMMON is present because every dependency of a delta path is
+    either in COMMON or in the same delta.
+
+    Raises :class:`RuntimeError` if any ``nix-store --query
+    --requisites`` call fails (a bad out-path would produce a useless
+    archive so callers must surface the error).
+    """
+    if not toolchain_out_paths:
+        raise RuntimeError(
+            "compute_toolchain_split: no toolchain out-paths supplied"
+        )
+    runner = run_subprocess or _default_run_subprocess
+    closures: dict[str, frozenset[str]] = {}
+    for outpath in toolchain_out_paths:
+        stdout, stderr, rc = runner(
+            ["nix-store", "--query", "--requisites", outpath]
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"compute_toolchain_split: requisites query failed for "
+                f"{outpath!r}: "
+                + stderr.decode("utf-8", errors="replace").strip()
+            )
+        lines = [l for l in stdout.decode("utf-8", errors="replace").splitlines() if l.strip()]
+        if not lines:
+            raise RuntimeError(
+                f"compute_toolchain_split: requisites query returned no paths "
+                f"for {outpath!r}"
+            )
+        closures[outpath] = frozenset(lines)
+
+    # Intersection = COMMON; delta = closure − COMMON per toolchain.
+    all_closures = list(closures.values())
+    common: frozenset[str] = all_closures[0]
+    for c in all_closures[1:]:
+        common = common & c
+
+    delta_paths: dict[str, tuple[str, ...]] = {
+        outpath: tuple(sorted(cl - common))
+        for outpath, cl in closures.items()
+    }
+    return ToolchainSplit(common_paths=common, delta_paths=delta_paths)
 
 
 def export_toolchain_archive(
@@ -806,62 +921,83 @@ def export_toolchain_archive(
     return archive_path
 
 
-def export_toolchain_realized_archive(
-    toolchain_out_paths: list[str],
+def export_toolchain_split(
+    split: ToolchainSplit,
     out_dir: pathlib.Path,
     *,
     run_subprocess: Optional[RunSubprocess] = None,
-) -> pathlib.Path:
-    """Export the realized toolchain output closure into ``toolchains.out.archive``.
+) -> dict[str, pathlib.Path]:
+    """Export COMMON + per-toolchain delta archives from a :class:`ToolchainSplit`.
 
-    Mirrors :func:`export_toolchain_archive` but seeds from the REALIZED
-    OUTPUT paths (``/nix/store/*-gcc-*``, etc.) rather than the ``.drv``
-    graph. Workers import this archive BEFORE building so the compiler
-    NARs are already local and need no substitution at cold start — the
-    primary upload-bandwidth fan-in that causes fleet death on large
-    SLURM dispatches.
+    Writes:
+      * ``<out_dir>/toolchains.common.archive`` — the shared path set.
+      * ``<out_dir>/toolchains.<id>.out.archive`` for each toolchain,
+        containing only the delta paths (i.e. NOT requisites-expanded
+        again — the split already has the exact path sets).
 
-    ``toolchain_out_paths`` is the list of realized ``/nix/store/...``
-    output paths (one per toolchain entry the submitter has locally);
-    ``nix-store --query --requisites`` computes their full transitive
-    runtime closure (shared libs, etc.) and ``nix-store --export`` pipes
-    that closure to disk atomically.
+    The common archive uses :func:`export_closure` (with requisites
+    expansion) so the correct topological order is preserved by nix-store.
+    Each delta archive uses :func:`export_closure_exact` — a direct
+    ``nix-store --export`` of the pre-computed exact path set — to avoid
+    re-pulling COMMON paths back in.
 
-    The landing file is ``<out_dir>/toolchains.out.archive``; workers
-    import it via :func:`workers.build_worker.ensure_toolchain_realized_archive_imported`.
+    Returns a ``{archive_name: path}`` dict for every archive written.
+    Raises :class:`RuntimeError` on any export failure; callers treat
+    this as a soft failure (warn + skip upload).
 
-    Returns the written archive path.  Raises :class:`RuntimeError` on
-    any export failure; callers on the produce path treat this as a soft
-    failure (warn + continue) because the archive is an optimisation, not
-    load-bearing like the ``.drv`` archive.
-
-    Delegates to :func:`workers.build_compilers_worker.export_closure`
-    (requisites → ``nix-store --export`` → atomic ``.tmp`` + ``os.replace``)
-    for subprocess invocation and idempotency conventions.
+    Note: the planned evolution is to overlap these uploads with build
+    dispatch (setup-task kind in the framework), so workers can start
+    building as each per-toolchain archive lands rather than waiting for
+    all uploads to finish.  For now the upload remains a submit-time
+    step before dispatch.
     """
-    if not toolchain_out_paths:
-        raise RuntimeError(
-            "export_toolchain_realized_archive: no output paths supplied"
-        )
     from compiler_suit_runner.workers.build_compilers_worker import (  # noqa: PLC0415
         export_closure,
+        export_closure_exact,
     )
 
-    archive_path = out_dir / TOOLCHAIN_REALIZED_ARCHIVE_NAME
+    written: dict[str, pathlib.Path] = {}
+
+    # Common archive: use the full requisites path so nix-store --export
+    # emits paths in a valid topological (dependency-first) order.
+    common_sorted = sorted(split.common_paths)
+    common_archive = out_dir / TOOLCHAIN_COMMON_ARCHIVE_NAME
     ok, req_stderr, exp_stderr = export_closure(
-        archive_path,
-        toolchain_out_paths,
+        common_archive,
+        common_sorted,
         run_subprocess=run_subprocess,
     )
     if not ok:
         raise RuntimeError(
-            "export_toolchain_realized_archive: nix-store export of realized "
-            "toolchain outputs failed: requisites_stderr="
+            "export_toolchain_split: failed to export common archive: "
+            "requisites_stderr="
             + req_stderr.decode("utf-8", errors="replace").strip()
             + " export_stderr="
             + exp_stderr.decode("utf-8", errors="replace").strip()
         )
-    return archive_path
+    written[TOOLCHAIN_COMMON_ARCHIVE_NAME] = common_archive
+
+    # Per-toolchain delta archives: exact paths only (no requisites re-expansion).
+    for outpath, delta in split.delta_paths.items():
+        if not delta:
+            # Toolchain's closure is entirely COMMON — no delta to ship.
+            continue
+        name = toolchain_delta_archive_name(outpath)
+        archive = out_dir / name
+        ok, exp_stderr = export_closure_exact(
+            archive,
+            list(delta),
+            run_subprocess=run_subprocess,
+        )
+        if not ok:
+            raise RuntimeError(
+                f"export_toolchain_split: failed to export delta archive "
+                f"for {outpath!r} ({name}): export_stderr="
+                + exp_stderr.decode("utf-8", errors="replace").strip()
+            )
+        written[name] = archive
+
+    return written
 
 
 # ---------------------------------------------------------------------------
