@@ -832,7 +832,14 @@ def compute_toolchain_split(
             "compute_toolchain_split: no toolchain out-paths supplied"
         )
     runner = run_subprocess or _default_run_subprocess
-    closures: dict[str, frozenset[str]] = {}
+    # Keep each closure as the ORDERED requisites list: ``nix-store
+    # --query --requisites`` emits paths in topological (dependency-first)
+    # order, which ``nix-store --import`` REQUIRES — a path's references
+    # must already be registered when it is imported. The delta archives
+    # are exported with ``export_closure_exact`` (no requisites re-query),
+    # so we must preserve this order here; sorting alphabetically would
+    # break intra-delta references at import time.
+    closures: dict[str, list[str]] = {}
     for outpath in toolchain_out_paths:
         stdout, stderr, rc = runner(
             ["nix-store", "--query", "--requisites", outpath]
@@ -849,17 +856,18 @@ def compute_toolchain_split(
                 f"compute_toolchain_split: requisites query returned no paths "
                 f"for {outpath!r}"
             )
-        closures[outpath] = frozenset(lines)
+        closures[outpath] = lines
 
-    # Intersection = COMMON; delta = closure − COMMON per toolchain.
-    all_closures = list(closures.values())
-    common: frozenset[str] = all_closures[0]
-    for c in all_closures[1:]:
-        common = common & c
+    # Intersection = COMMON (order-agnostic; the common archive re-queries
+    # requisites at export so its own topological order is recovered).
+    common: frozenset[str] = frozenset(next(iter(closures.values())))
+    for lines in closures.values():
+        common = common & frozenset(lines)
 
+    # delta = closure − COMMON per toolchain, PRESERVING topological order.
     delta_paths: dict[str, tuple[str, ...]] = {
-        outpath: tuple(sorted(cl - common))
-        for outpath, cl in closures.items()
+        outpath: tuple(p for p in lines if p not in common)
+        for outpath, lines in closures.items()
     }
     return ToolchainSplit(common_paths=common, delta_paths=delta_paths)
 
