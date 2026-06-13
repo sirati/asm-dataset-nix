@@ -17,11 +17,13 @@ import pytest
 from compiler_suit_runner.preflight import (
     PreflightError,
     PreflightResult,
+    TOOLCHAIN_REALIZED_ARCHIVE_NAME,
     build_toolchains_locally,
     check_toolchains_locally,
     enumerate_toolchains,
     enumerate_toolchains_only,
     enumerate_variants,
+    export_toolchain_realized_archive,
     filter_existing_variants,
     path_info_batch,
     preflight,
@@ -1158,5 +1160,63 @@ def test_query_initial_toolchain_placement_probe_failure_falls_back_to_empty():
         "/nix/store/aaa-out": [],
         "/nix/store/bbb-out": [],
     }
+
+
+# ---------------------------------------------------------------------------
+# export_toolchain_realized_archive
+# ---------------------------------------------------------------------------
+
+
+def test_export_toolchain_realized_archive_writes_archive(
+    tmp_path: pathlib.Path,
+) -> None:
+    """export_toolchain_realized_archive calls requisites then export and
+    writes the result atomically to ``<out_dir>/toolchains.out.archive``."""
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(list(argv))
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            return b"/nix/store/aaa-gcc\n/nix/store/bbb-glibc\n", b"", 0
+        if argv[:2] == ["nix-store", "--export"]:
+            return b"NIX_EXPORT:realized", b"", 0
+        return b"", b"unexpected", 1
+
+    out_paths = ["/nix/store/aaa-gcc"]
+    result = export_toolchain_realized_archive(
+        out_paths, tmp_path, run_subprocess=runner,
+    )
+    assert result == tmp_path / TOOLCHAIN_REALIZED_ARCHIVE_NAME
+    assert result.exists()
+    assert result.read_bytes() == b"NIX_EXPORT:realized"
+    # Requisites were queried from the output paths, not a .drv.
+    req_call = calls[0]
+    assert req_call[:3] == ["nix-store", "--query", "--requisites"]
+    assert "/nix/store/aaa-gcc" in req_call
+
+
+def test_export_toolchain_realized_archive_raises_on_empty_paths(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An empty out_paths list raises RuntimeError without calling nix."""
+    with pytest.raises(RuntimeError, match="no output paths"):
+        export_toolchain_realized_archive([], tmp_path)
+
+
+def test_export_toolchain_realized_archive_raises_on_requisites_failure(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A non-zero requisites exit raises RuntimeError so callers can
+    treat it as a soft failure and warn instead of crashing silently."""
+
+    def runner(argv):
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            return b"", b"nix daemon error\n", 1
+        return b"", b"unexpected", 1
+
+    with pytest.raises(RuntimeError, match="nix-store export of realized"):
+        export_toolchain_realized_archive(
+            ["/nix/store/aaa-gcc"], tmp_path, run_subprocess=runner,
+        )
 
 

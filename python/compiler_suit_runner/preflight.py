@@ -746,6 +746,7 @@ def enumerate_toolchains_only(
 
 
 TOOLCHAIN_ARCHIVE_NAME = "toolchains.drv.archive"
+TOOLCHAIN_REALIZED_ARCHIVE_NAME = "toolchains.out.archive"
 
 
 def export_toolchain_archive(
@@ -798,6 +799,64 @@ def export_toolchain_archive(
         raise RuntimeError(
             "export_toolchain_archive: nix-store export of "
             f"{toolchain_aggregate_drv!r} failed: requisites_stderr="
+            + req_stderr.decode("utf-8", errors="replace").strip()
+            + " export_stderr="
+            + exp_stderr.decode("utf-8", errors="replace").strip()
+        )
+    return archive_path
+
+
+def export_toolchain_realized_archive(
+    toolchain_out_paths: list[str],
+    out_dir: pathlib.Path,
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> pathlib.Path:
+    """Export the realized toolchain output closure into ``toolchains.out.archive``.
+
+    Mirrors :func:`export_toolchain_archive` but seeds from the REALIZED
+    OUTPUT paths (``/nix/store/*-gcc-*``, etc.) rather than the ``.drv``
+    graph. Workers import this archive BEFORE building so the compiler
+    NARs are already local and need no substitution at cold start — the
+    primary upload-bandwidth fan-in that causes fleet death on large
+    SLURM dispatches.
+
+    ``toolchain_out_paths`` is the list of realized ``/nix/store/...``
+    output paths (one per toolchain entry the submitter has locally);
+    ``nix-store --query --requisites`` computes their full transitive
+    runtime closure (shared libs, etc.) and ``nix-store --export`` pipes
+    that closure to disk atomically.
+
+    The landing file is ``<out_dir>/toolchains.out.archive``; workers
+    import it via :func:`workers.build_worker.ensure_toolchain_realized_archive_imported`.
+
+    Returns the written archive path.  Raises :class:`RuntimeError` on
+    any export failure; callers on the produce path treat this as a soft
+    failure (warn + continue) because the archive is an optimisation, not
+    load-bearing like the ``.drv`` archive.
+
+    Delegates to :func:`workers.build_compilers_worker.export_closure`
+    (requisites → ``nix-store --export`` → atomic ``.tmp`` + ``os.replace``)
+    for subprocess invocation and idempotency conventions.
+    """
+    if not toolchain_out_paths:
+        raise RuntimeError(
+            "export_toolchain_realized_archive: no output paths supplied"
+        )
+    from compiler_suit_runner.workers.build_compilers_worker import (  # noqa: PLC0415
+        export_closure,
+    )
+
+    archive_path = out_dir / TOOLCHAIN_REALIZED_ARCHIVE_NAME
+    ok, req_stderr, exp_stderr = export_closure(
+        archive_path,
+        toolchain_out_paths,
+        run_subprocess=run_subprocess,
+    )
+    if not ok:
+        raise RuntimeError(
+            "export_toolchain_realized_archive: nix-store export of realized "
+            "toolchain outputs failed: requisites_stderr="
             + req_stderr.decode("utf-8", errors="replace").strip()
             + " export_stderr="
             + exp_stderr.decode("utf-8", errors="replace").strip()

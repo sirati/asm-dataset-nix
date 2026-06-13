@@ -23,6 +23,7 @@ CLI; SLURM execution defers to dynamic_runner's pipeline.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import pathlib
@@ -52,6 +53,7 @@ from compiler_suit_runner.preflight import (
     enumerate_toolchains_only,
     enumerate_variants,
     export_toolchain_archive,
+    export_toolchain_realized_archive,
     preflight as run_preflight,
 )
 from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
@@ -911,6 +913,137 @@ def _produce_and_upload_toolchain_archive(
     return 0
 
 
+def _produce_and_upload_toolchain_realized_archive(
+    args: argparse.Namespace,
+    tc_out_paths: list[str],
+    log: logging.Logger,
+) -> None:
+    """Produce + upload the realized toolchain output closure archive.
+
+    Mirrors :func:`_produce_and_upload_toolchain_archive` but for the
+    REALIZED outputs: the compiled toolchain NARs (``/nix/store/*-gcc-*``,
+    etc.) rather than the ``.drv`` graph.  Workers import this archive at
+    cold start so the compiler NARs are already local and require no
+    substitution — eliminating the primary-uplink fan-in that exhausts
+    node pids on large SLURM dispatches.
+
+    The archive is potentially multi-GiB (compiler binaries + libs for
+    all N toolchains), so the upload is INCREMENTAL: a SHA-256 content
+    hash is computed from the archive bytes and stored as a sidecar
+    ``toolchains.out.archive.sha256`` file on the gateway.  When the
+    remote sidecar already matches the local hash the upload is skipped.
+
+    SOFT FAIL: a missing or failed realized archive DEGRADES to
+    substitution (existing behaviour) and does NOT abort the dispatch.
+    Errors are logged as warnings and the caller continues unconditionally.
+    This differs from the ``.drv.archive`` path which aborts on failure
+    (the ``.drv`` archive is load-bearing; the output archive is an
+    optimisation).
+    """
+    from dynamic_runner.packaging.gateway import (  # noqa: PLC0415
+        create_gateway,
+        parse_gateway_url,
+    )
+
+    from compiler_suit_runner import preflight  # noqa: PLC0415
+
+    if not tc_out_paths:
+        log.warning(
+            "toolchain-realized-archive: no realized output paths; "
+            "workers will fall back to substitution"
+        )
+        return
+
+    # 1. Produce the archive locally in a temporary directory. The
+    #    toolchain outputs are already realised on the submitter (the
+    #    preflight built / verified them), so this is a cheap
+    #    requisites walk + export.
+    local_dir = pathlib.Path(tempfile.mkdtemp(prefix="csr-tc-out-archive-"))
+    try:
+        local_archive = preflight.export_toolchain_realized_archive(
+            tc_out_paths, local_dir,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "toolchain-realized-archive: export failed; workers will fall "
+            "back to substitution: %s",
+            exc,
+        )
+        return
+
+    # 2. Compute content hash for incremental-skip: read the archive and
+    #    sha256-hash it so we can compare against the remote sidecar.
+    try:
+        h = hashlib.sha256()
+        with open(local_archive, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        local_hex = h.hexdigest()
+    except OSError as exc:
+        log.warning(
+            "toolchain-realized-archive: cannot hash local archive; "
+            "workers will fall back to substitution: %s",
+            exc,
+        )
+        return
+
+    # 3. Transfer to the gateway (same remote_dir as the .drv archive).
+    cfg = parse_gateway_url(args.gateway)
+    cfg.ssh_identity_file = getattr(args, "ssh_identity_file", None)
+    cfg.ssh_config_file = getattr(args, "ssh_config", None)
+    remote_dir = f"{args.slurm_root_folder}/out/_matrix_eval"
+    remote_archive = f"{remote_dir}/{preflight.TOOLCHAIN_REALIZED_ARCHIVE_NAME}"
+    remote_sidecar = f"{remote_archive}.sha256"
+    gw = create_gateway(cfg)
+    try:
+        gw.connect()
+        # Incremental skip: download the remote sidecar and compare.
+        # If the hash matches, the same archive is already on the gateway
+        # and re-uploading the (potentially multi-GiB) archive is wasteful.
+        try:
+            remote_hex = gw.download_file_text(remote_sidecar).strip()
+        except Exception:  # noqa: BLE001 — sidecar absent or no method
+            remote_hex = ""
+        if remote_hex == local_hex:
+            log.info(
+                "toolchain-realized-archive: remote sidecar matches "
+                "(sha256=%s); skipping upload",
+                local_hex[:16],
+            )
+            return
+        gw.create_directory(remote_dir)
+        gw.upload_file(str(local_archive), remote_archive)
+        # Write the sidecar AFTER a successful upload so a partial upload
+        # never leaves a matching sidecar (the next run re-uploads).
+        try:
+            local_sidecar = local_dir / (
+                preflight.TOOLCHAIN_REALIZED_ARCHIVE_NAME + ".sha256"
+            )
+            local_sidecar.write_text(local_hex + "\n")
+            gw.upload_file(str(local_sidecar), remote_sidecar)
+        except Exception as exc:  # noqa: BLE001 — sidecar upload best-effort
+            log.warning(
+                "toolchain-realized-archive: sidecar upload failed "
+                "(next run will re-upload the archive): %s",
+                exc,
+            )
+        log.info(
+            "toolchain-realized-archive: uploaded %s -> %s",
+            local_archive.name, remote_archive,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "toolchain-realized-archive: upload failed; workers will fall "
+            "back to substitution: %s",
+            exc,
+        )
+    finally:
+        try:
+            gw.disconnect()
+        except Exception:  # noqa: BLE001 — best-effort teardown
+            pass
+
+
 def cmd_submit(args: argparse.Namespace) -> int:
     """Primary host: enumeration (memoized) -> manifests -> dispatch.
 
@@ -1294,6 +1427,23 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
             if rc != 0:
                 return rc
+
+        # Realized toolchain output archive: upload the compiled NAR
+        # closure once so compute nodes skip cold-start substitution.
+        # Soft fail — a missing archive degrades to substitution and
+        # does NOT abort the dispatch (unlike the .drv archive above).
+        if (
+            toolchain_dedup
+            and args.gateway
+            and args.slurm_root_folder
+            and partition_drv_outpaths
+        ):
+            tc_out_paths = [
+                p for p in partition_drv_outpaths.values() if p
+            ]
+            _produce_and_upload_toolchain_realized_archive(
+                args, tc_out_paths, log,
+            )
 
         # Submitter-peer: makes the dispatching machine's local nix
         # store reachable from compute-node containers as a federated

@@ -61,6 +61,7 @@ __all__ = [
     "build_worker",
     "ensure_binary_archive_imported",
     "ensure_toolchain_archive_imported",
+    "ensure_toolchain_realized_archive_imported",
 ]
 
 
@@ -86,6 +87,14 @@ _imported_binaries: set[str] = set()
 # process exit. There is exactly one toolchain archive per run, so a
 # bare bool suffices.
 _toolchain_imported: bool = False
+
+# Companion guard for the per-process, once-only import of the realized
+# toolchain output archive (``toolchains.out.archive``). This archive
+# ships the compiled NAR closure (compiler binaries + libs) so workers
+# never need to substitute it at cold start. Unlike the ``.drv`` archive
+# this one is OPTIONAL — a missing archive degrades to substitution and
+# never raises. A bare bool suffices (one archive per run).
+_toolchain_realized_imported: bool = False
 
 # Item-class string tokens (matched against the manifest header). Kept as
 # module-level constants so callers (manifest_gen, suit_task) reference
@@ -1024,6 +1033,77 @@ def ensure_toolchain_archive_imported(
     )
 
 
+def ensure_toolchain_realized_archive_imported(
+    matrix_eval_out_dir: Optional[pathlib.Path],
+    *,
+    run_subprocess: Optional[Callable[..., tuple[bytes, bytes, int]]] = None,
+) -> None:
+    """Import the realized toolchain output archive once per worker process.
+
+    The submitter produces ``toolchains.out.archive`` carrying the
+    compiled NAR closure of every toolchain (compiler binaries, shared
+    libs, etc.) and uploads it to the gateway.  Workers import it here
+    BEFORE any build so the compiler NARs are already local — eliminating
+    the cold-start substitution fan-in that exhausted node pids on large
+    SLURM dispatches.
+
+    This archive is OPTIONAL: if it is absent (older submit, upload
+    failure, or single-process dispatch), the import is skipped and
+    workers fall back to substitution as before.  Any import failure is
+    also a soft failure — logged as a warning, not raised — because the
+    build can still succeed via the substituter and escalating here would
+    turn an optimisation miss into a hard worker crash.
+
+    ``matrix_eval_out_dir`` may be ``None`` (legacy fixtures) — no-op.
+    A zero-byte archive is treated as absent (nothing to import).
+    """
+    global _toolchain_realized_imported
+    if matrix_eval_out_dir is None:
+        return
+    if _toolchain_realized_imported:
+        return
+    archive_path = matrix_eval_out_dir / "toolchains.out.archive"
+    # A zero-byte or absent archive means the submitter did not produce
+    # it (soft path). Mark done so we don't re-stat on every task.
+    try:
+        size = archive_path.stat().st_size
+    except OSError:
+        _toolchain_realized_imported = True
+        return
+    if size == 0:
+        _toolchain_realized_imported = True
+        return
+    from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+        archive as _archive,
+    )
+
+    ok, err, imported = _archive.import_archive(
+        archive_path, run_subprocess=run_subprocess,
+    )
+    if not ok:
+        import logging  # noqa: PLC0415 — local import; cheap
+        logging.getLogger(
+            "compiler_suit_runner.build_worker.archive_import"
+        ).warning(
+            "build_worker: failed to import toolchains.out.archive from "
+            "%s (falling back to substitution): %s",
+            archive_path,
+            err.decode("utf-8", errors="replace").strip(),
+        )
+        # Mark imported so we don't retry on every subsequent task —
+        # the substituter is our fallback and repeated failed imports
+        # would just add latency.
+        _toolchain_realized_imported = True
+        return
+    _toolchain_realized_imported = True
+    import logging  # noqa: PLC0415 — local import; cheap
+    logging.getLogger(
+        "compiler_suit_runner.build_worker.archive_import"
+    ).info(
+        "imported toolchains.out.archive (%d paths)", len(imported),
+    )
+
+
 def _run_import_prelude(
     item_class: str,
     payload: dict,
@@ -1040,6 +1120,13 @@ def _run_import_prelude(
     must exist locally before the build). Raises :class:`RuntimeError`
     on any import failure; callers convert that into a failed result.
     """
+    # Import the realized toolchain output archive first (soft-fail):
+    # compiler NARs become local before the build so no substitution is
+    # needed. A missing archive is a warn-and-continue, not an abort.
+    ensure_toolchain_realized_archive_imported(
+        env.matrix_eval_out_dir,
+        run_subprocess=env.run_subprocess,
+    )
     ensure_toolchain_archive_imported(
         env.matrix_eval_out_dir,
         run_subprocess=env.run_subprocess,

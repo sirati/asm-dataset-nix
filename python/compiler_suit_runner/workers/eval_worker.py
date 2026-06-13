@@ -634,6 +634,54 @@ def _import_toolchain_archive(
     )
 
 
+def _import_toolchain_realized_archive(
+    out_dir: pathlib.Path,
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> None:
+    """Import the realized toolchain output archive (soft-fail).
+
+    The submitter produces ``toolchains.out.archive`` carrying the
+    compiled NAR closure (compiler binaries + libs) and uploads it to the
+    gateway.  The eval worker imports it BEFORE building the matrix
+    aggregate so the compiler NARs are already local and require no
+    substitution at cold start.
+
+    SOFT FAIL: a missing or zero-byte archive means the submitter did not
+    upload it (older submit, upload failure, or single-process dispatch).
+    In that case we log a warning and return — workers fall back to
+    substitution exactly as today.  Import errors are also non-fatal: the
+    matrix aggregate build can still succeed via the substituter, and
+    escalating here would unnecessarily kill the eval task.
+
+    Delegates to
+    :func:`workers.build_worker.ensure_toolchain_realized_archive_imported`.
+    """
+    from compiler_suit_runner.workers.build_worker import (  # noqa: PLC0415
+        ensure_toolchain_realized_archive_imported,
+    )
+
+    archive = out_dir / "toolchains.out.archive"
+    try:
+        size = archive.stat().st_size
+    except OSError:
+        size = -1
+    if size <= 0:
+        _LOG.warning(
+            "toolchain-realized-archive: %s absent or zero-byte; "
+            "workers will fall back to substitution",
+            archive,
+        )
+        return
+    ensure_toolchain_realized_archive_imported(
+        out_dir, run_subprocess=run_subprocess,
+    )
+    _LOG.info(
+        "toolchain-realized-archive: imported %s (%d bytes)",
+        archive.name, size,
+    )
+
+
 def _publish_src_root() -> pathlib.Path:
     """Worker-local STAGING root for files headed to the shared mount.
 
@@ -1114,6 +1162,12 @@ def run_eval_task(
     # Skipped in dedup-OFF mode (no shared archive; the toolchain must be
     # locally realised / substitutable).
     if parsed["toolchain_dedup"] and parsed["toolchain_aggregate_drv"] is not None:
+        _LOG.info(
+            "matrix_eval binary=%s: importing realized toolchain outputs "
+            "(toolchains.out.archive) — soft fail",
+            binary,
+        )
+        _import_toolchain_realized_archive(out_dir, run_subprocess=runner)
         _LOG.info(
             "matrix_eval binary=%s: importing shared toolchains.drv.archive",
             binary,

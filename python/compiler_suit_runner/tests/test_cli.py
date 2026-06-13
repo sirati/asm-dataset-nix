@@ -816,6 +816,9 @@ class _FakeGateway:
 
     Stands in for the framework's ``Gateway`` so the submitter-side
     toolchain-archive upload can be asserted without a real SSH hop.
+    ``download_file_text`` is provided for the realized-archive sidecar
+    skip check; callers that want to simulate a matching sidecar can
+    set ``sidecar_content`` on the instance.
     """
 
     def __init__(self, config) -> None:
@@ -824,6 +827,8 @@ class _FakeGateway:
         self.created_dirs: list[str] = []
         self.uploads: list[tuple[str, str]] = []
         self.disconnected = False
+        # Set to a hex string to simulate an existing sidecar on the remote.
+        self.sidecar_content: str = ""
 
     def connect(self) -> None:
         self.connected = True
@@ -833,6 +838,12 @@ class _FakeGateway:
 
     def upload_file(self, local, remote) -> None:
         self.uploads.append((str(local), str(remote)))
+
+    def download_file_text(self, remote) -> str:
+        """Return the pre-configured sidecar content (empty = absent)."""
+        if not self.sidecar_content:
+            raise FileNotFoundError(f"sidecar absent: {remote}")
+        return self.sidecar_content
 
     def disconnect(self) -> None:
         self.disconnected = True
@@ -1664,3 +1675,226 @@ def test_apply_unfulfillable_reinject_cap_handles_missing_setter(
 
     # Must not raise.
     task.apply_unfulfillable_reinject_cap(_LegacyHandle())
+
+
+# ---------------------------------------------------------------------------
+# _produce_and_upload_toolchain_realized_archive
+# ---------------------------------------------------------------------------
+
+
+def _patch_gateway_for_realized(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    sidecar_content: str = "",
+) -> dict:
+    """Patch the gateway + realized-archive export for realized-archive tests.
+
+    Returns a state dict with ``gateway``, ``config``, and ``export_calls``
+    so callers can assert on what was produced and uploaded.
+    ``sidecar_content`` pre-sets the remote sidecar the gateway returns
+    (empty string = absent sidecar = upload not skipped).
+    """
+    from dynamic_runner.packaging.gateway import GatewayConfig
+
+    state: dict = {"gateway": None, "config": None, "export_calls": []}
+
+    def fake_parse(url):
+        cfg = GatewayConfig(
+            mode="ssh", ssh_user="kruppb", ssh_host="localhost", ssh_port=2222,
+        )
+        state["config"] = cfg
+        return cfg
+
+    def fake_create(cfg):
+        gw = _FakeGateway(cfg)
+        gw.sidecar_content = sidecar_content
+        state["gateway"] = gw
+        return gw
+
+    monkeypatch.setattr("dynamic_runner.packaging.gateway.parse_gateway_url", fake_parse)
+    monkeypatch.setattr("dynamic_runner.packaging.gateway.create_gateway", fake_create)
+
+    def fake_export(out_paths, out_dir, *, run_subprocess=None):
+        state["export_calls"].append((list(out_paths), pathlib.Path(out_dir)))
+        archive = pathlib.Path(out_dir) / "toolchains.out.archive"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        archive.write_bytes(b"NIX_EXPORT:realized-closure")
+        return archive
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.preflight.export_toolchain_realized_archive",
+        fake_export,
+    )
+    return state
+
+
+def test_produce_and_upload_realized_archive_happy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+):
+    """The submitter produces the realized archive locally and uploads both
+    the archive and its sha256 sidecar to the gateway out/_matrix_eval."""
+    import logging
+
+    state = _patch_gateway_for_realized(monkeypatch)
+    args = _make_args(
+        tmp_path,
+        multi_computer="slurm",
+        gateway="ssh://kruppb@localhost:2222",
+        slurm_root_folder="/data/slurm/asm-dataset",
+        ssh_identity_file="/tmp/id_ed25519",
+        ssh_config="/tmp/ssh_config",
+    )
+    cli_module._produce_and_upload_toolchain_realized_archive(
+        args, ["/nix/store/aaa-gcc"], logging.getLogger("t"),
+    )
+    # Produced locally.
+    assert state["export_calls"]
+    assert state["export_calls"][0][0] == ["/nix/store/aaa-gcc"]
+    # Uploaded archive + sidecar to gateway out/_matrix_eval.
+    gw = state["gateway"]
+    assert gw.connected and gw.disconnected
+    assert "/data/slurm/asm-dataset/out/_matrix_eval" in gw.created_dirs
+    remote_names = [r for _l, r in gw.uploads]
+    assert any(r.endswith("/toolchains.out.archive") for r in remote_names)
+    assert any(r.endswith("/toolchains.out.archive.sha256") for r in remote_names)
+    # AUTH threaded onto the parsed config.
+    assert state["config"].ssh_identity_file == "/tmp/id_ed25519"
+    assert state["config"].ssh_config_file == "/tmp/ssh_config"
+
+
+def test_produce_and_upload_realized_archive_export_failure_warns_no_abort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A failed local export logs a WARNING and does NOT raise — the caller
+    continues with substitution as the fallback (soft failure)."""
+    import logging
+
+    def boom(out_paths, out_dir, *, run_subprocess=None):
+        raise RuntimeError("nix-store export failed")
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.preflight.export_toolchain_realized_archive", boom,
+    )
+    # Gateway should never be created.
+    gateway_created: list = []
+
+    def fake_create(cfg):
+        gateway_created.append(cfg)
+        return _FakeGateway(cfg)
+
+    monkeypatch.setattr("dynamic_runner.packaging.gateway.create_gateway", fake_create)
+    from dynamic_runner.packaging.gateway import GatewayConfig
+    monkeypatch.setattr(
+        "dynamic_runner.packaging.gateway.parse_gateway_url",
+        lambda url: GatewayConfig(mode="ssh", ssh_user="u", ssh_host="h", ssh_port=22),
+    )
+    args = _make_args(
+        tmp_path,
+        multi_computer="slurm",
+        gateway="ssh://kruppb@localhost:2222",
+        slurm_root_folder="/data/slurm/asm-dataset",
+    )
+    with caplog.at_level(logging.WARNING):
+        cli_module._produce_and_upload_toolchain_realized_archive(
+            args, ["/nix/store/aaa-gcc"], logging.getLogger("t"),
+        )
+    assert gateway_created == []
+    assert any("fall back to substitution" in r.message for r in caplog.records)
+
+
+def test_produce_and_upload_realized_archive_upload_failure_warns_no_abort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    """A gateway upload failure also soft-fails (warns + continues) and
+    disconnects the gateway."""
+    import logging
+
+    state = _patch_gateway_for_realized(monkeypatch)
+
+    def fake_create(cfg):
+        gw = _FakeGateway(cfg)
+
+        def _boom(local, remote):
+            raise RuntimeError("scp failed")
+
+        gw.upload_file = _boom  # type: ignore[method-assign]
+        state["gateway"] = gw
+        return gw
+
+    monkeypatch.setattr("dynamic_runner.packaging.gateway.create_gateway", fake_create)
+    args = _make_args(
+        tmp_path,
+        multi_computer="slurm",
+        gateway="ssh://kruppb@localhost:2222",
+        slurm_root_folder="/data/slurm/asm-dataset",
+    )
+    with caplog.at_level(logging.WARNING):
+        cli_module._produce_and_upload_toolchain_realized_archive(
+            args, ["/nix/store/aaa-gcc"], logging.getLogger("t"),
+        )
+    assert state["gateway"].disconnected
+    assert any("fall back to substitution" in r.message for r in caplog.records)
+
+
+def test_produce_and_upload_realized_archive_empty_paths_warns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+):
+    """An empty out_paths list warns and short-circuits without touching
+    the gateway (no realized paths = nothing to export)."""
+    import logging
+
+    from dynamic_runner.packaging.gateway import GatewayConfig
+    monkeypatch.setattr(
+        "dynamic_runner.packaging.gateway.parse_gateway_url",
+        lambda url: GatewayConfig(mode="ssh", ssh_user="u", ssh_host="h", ssh_port=22),
+    )
+    gateway_created: list = []
+    monkeypatch.setattr(
+        "dynamic_runner.packaging.gateway.create_gateway",
+        lambda cfg: gateway_created.append(cfg) or _FakeGateway(cfg),
+    )
+    args = _make_args(
+        tmp_path,
+        multi_computer="slurm",
+        gateway="ssh://kruppb@localhost:2222",
+        slurm_root_folder="/data/slurm/asm-dataset",
+    )
+    with caplog.at_level(logging.WARNING):
+        cli_module._produce_and_upload_toolchain_realized_archive(
+            args, [], logging.getLogger("t"),
+        )
+    assert gateway_created == []
+
+
+def test_produce_and_upload_realized_archive_skips_when_sidecar_matches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+):
+    """When the remote sidecar SHA-256 matches the local archive, the
+    upload is skipped (incremental-skip) — upload_file is never called."""
+    import hashlib
+    import logging
+
+    # Compute the hash of the bytes the fake export writes.
+    archive_bytes = b"NIX_EXPORT:realized-closure"
+    expected_hex = hashlib.sha256(archive_bytes).hexdigest()
+
+    state = _patch_gateway_for_realized(
+        monkeypatch, sidecar_content=expected_hex + "\n",
+    )
+    args = _make_args(
+        tmp_path,
+        multi_computer="slurm",
+        gateway="ssh://kruppb@localhost:2222",
+        slurm_root_folder="/data/slurm/asm-dataset",
+    )
+    cli_module._produce_and_upload_toolchain_realized_archive(
+        args, ["/nix/store/aaa-gcc"], logging.getLogger("t"),
+    )
+    gw = state["gateway"]
+    # Connected + disconnected (the gateway is opened to check the sidecar).
+    assert gw.connected
+    # No upload when sidecar matches.
+    assert gw.uploads == []

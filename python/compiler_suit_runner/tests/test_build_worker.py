@@ -1980,3 +1980,130 @@ class TestDefaultRunnerResolvesTool:
         assert calls == [[
             "/bin/nix", "eval", "--raw", "nixpkgs#bash.outPath",
         ]]
+
+
+# ---------------------------------------------------------------------------
+# ensure_toolchain_realized_archive_imported
+# ---------------------------------------------------------------------------
+
+
+def _reset_realized_imported(monkeypatch) -> None:
+    """Reset the per-process realized-import guard between tests."""
+    monkeypatch.setattr(bw, "_toolchain_realized_imported", False)
+
+
+def test_ensure_toolchain_realized_archive_imported_absent_is_noop(
+    monkeypatch, tmp_path,
+):
+    """A missing archive is a soft no-op: the guard flips and no
+    nix-store call is made (fall back to substitution path)."""
+    _reset_realized_imported(monkeypatch)
+    calls: list = []
+
+    def _stub(argv):
+        calls.append(list(argv))
+        return b"", b"", 0
+
+    bw.ensure_toolchain_realized_archive_imported(
+        tmp_path, run_subprocess=_stub,
+    )
+    assert bw._toolchain_realized_imported is True
+    assert calls == []
+
+
+def test_ensure_toolchain_realized_archive_imported_zero_byte_is_noop(
+    monkeypatch, tmp_path,
+):
+    """A zero-byte archive is also treated as absent — no import attempted."""
+    _reset_realized_imported(monkeypatch)
+    (tmp_path / "toolchains.out.archive").write_bytes(b"")
+    calls: list = []
+
+    def _stub(argv):
+        calls.append(list(argv))
+        return b"", b"", 0
+
+    bw.ensure_toolchain_realized_archive_imported(
+        tmp_path, run_subprocess=_stub,
+    )
+    assert bw._toolchain_realized_imported is True
+    assert calls == []
+
+
+def test_ensure_toolchain_realized_archive_imported_happy(
+    monkeypatch, tmp_path,
+):
+    """A present archive is imported via import_archive and the guard
+    flips on success."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_realized_imported(monkeypatch)
+    (tmp_path / "toolchains.out.archive").write_bytes(b"NIX_EXPORT:realized")
+
+    imported: list = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        imported.append(pathlib.Path(archive))
+        return True, b"", ["/nix/store/aaa-gcc"]
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+
+    bw.ensure_toolchain_realized_archive_imported(tmp_path)
+    assert bw._toolchain_realized_imported is True
+    assert imported == [tmp_path / "toolchains.out.archive"]
+
+
+def test_ensure_toolchain_realized_archive_imported_failure_is_soft(
+    monkeypatch, tmp_path,
+):
+    """A failed import logs a warning and does NOT raise — the guard
+    still flips so we don't retry on every subsequent task."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_realized_imported(monkeypatch)
+    (tmp_path / "toolchains.out.archive").write_bytes(b"corrupt")
+
+    def _fake_import(archive, *, run_subprocess=None):
+        return False, b"nix-store: corrupt archive", []
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+
+    # Must NOT raise — soft failure.
+    bw.ensure_toolchain_realized_archive_imported(tmp_path)
+    assert bw._toolchain_realized_imported is True
+
+
+def test_ensure_toolchain_realized_archive_imported_idempotent(
+    monkeypatch, tmp_path,
+):
+    """A second call is a no-op (guard already set) — import_archive
+    is never called a second time."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_realized_imported(monkeypatch)
+    (tmp_path / "toolchains.out.archive").write_bytes(b"NIX_EXPORT:realized")
+
+    call_count: list = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        call_count.append(1)
+        return True, b"", ["/nix/store/aaa-gcc"]
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+
+    bw.ensure_toolchain_realized_archive_imported(tmp_path)
+    bw.ensure_toolchain_realized_archive_imported(tmp_path)
+    assert len(call_count) == 1
+
+
+def test_ensure_toolchain_realized_archive_imported_none_dir_is_noop(
+    monkeypatch,
+):
+    """``matrix_eval_out_dir=None`` (legacy fixtures) is a safe no-op."""
+    _reset_realized_imported(monkeypatch)
+    # Should not raise and should not flip the guard (None path exits early).
+    bw.ensure_toolchain_realized_archive_imported(None)
+    assert bw._toolchain_realized_imported is False
