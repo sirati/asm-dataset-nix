@@ -560,7 +560,7 @@ class TestConsumerPipelineEndToEnd:
         label = f"hello__x86_64__{suffix}"
         monkeypatch.setattr(
             _archive_mod, "derive_variant_lookup_from_aggregate",
-            lambda _agg: {
+            lambda _agg, **_kw: {
                 ("x86_64", label): {
                     "drv": "/nix/store/" + "v" * 32 + "-hello-elf-folder.drv",
                     "arch": "x86_64",

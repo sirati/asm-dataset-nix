@@ -259,6 +259,7 @@ class TestDeriveVariantLookupFromAggregate:
             "optimization": "O0",
             "variant_dir": expected_vd,
             "metadata_name": f"{expected_vd}.json",
+            "toolchain_outpath": "",
         }
         # variant_dir / compiler_id MUST be non-empty so the spawned
         # build_variant task is complete (the build worker hard-fails
@@ -426,6 +427,53 @@ class TestVariantSpawnPayloadEndToEnd:
         # compiler half is present and non-empty.
         assert ti.affinity_id == "gcc15-aarch64"
         assert not ti.affinity_id.startswith("-")
+
+    def test_toolchain_outpath_flows_from_map_to_build_variant_payload(self):
+        """toolchain_outpaths_map supplied to derive_variant_lookup_from_aggregate
+        causes the build_variant descriptor payload to carry a non-empty
+        toolchain_outpath — proving the full streamed-spawn pipeline threads
+        the outpath from cli.py → dep_graph payload → variant descriptor → TaskInfo.
+        """
+        from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
+            headers_from_descriptors,
+        )
+        from compiler_suit_runner.dependency_graph_planner.descriptors import (  # noqa: PLC0415
+            _variant_descriptor,
+        )
+        from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+            _header_to_task_info,
+        )
+
+        drv = _variant_drv("hello", "x86_64", "O2", comp="gcc15", hash_prefix="tc1")
+        fake_outpath = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gcc15"
+        tc_outpaths_map = {"x86_64/gcc15": fake_outpath}
+
+        stub = _RefsStub(stdout=(drv + "\n").encode("utf-8"))
+        lookup = dgw.derive_variant_lookup_from_aggregate(
+            self.AGG_DRV,
+            run_subprocess=stub,
+            toolchain_outpaths_map=tc_outpaths_map,
+        )
+        assert len(lookup) == 1
+        (arch, label), spec = next(iter(lookup.items()))
+        # The spec must carry the outpath.
+        assert spec["toolchain_outpath"] == fake_outpath
+
+        descriptor = _variant_descriptor(
+            binary="hello",
+            arch=arch,
+            sys_name="x86_64-linux",
+            label=label,
+            variant_spec=spec,
+            depends_on=(),
+        )
+        # The descriptor payload must carry it through to the wire protocol.
+        assert descriptor.payload["toolchain_outpath"] == fake_outpath
+
+        headers = headers_from_descriptors([descriptor])
+        ti = _header_to_task_info(headers[0])
+        # And the TaskInfo.payload (what the build worker sees) must carry it.
+        assert ti.payload["payload"]["toolchain_outpath"] == fake_outpath
 
 
 def lookup_key_for(drv_path: str) -> str:
@@ -1135,7 +1183,7 @@ class TestRunDependencyGraphTask:
             archive as _archive_mod,
         )
 
-        def fake(agg_drv: str) -> dict[tuple[str, str], dict]:
+        def fake(agg_drv: str, **_kw) -> dict[tuple[str, str], dict]:
             return lookups.get(agg_drv, {})
 
         monkeypatch.setattr(
@@ -2284,7 +2332,7 @@ class TestDependencyGraphCounters:
         }
         monkeypatch.setattr(
             _archive_mod, "derive_variant_lookup_from_aggregate",
-            lambda agg: lookups.get(agg, {}), raising=False,
+            lambda agg, **_kw: lookups.get(agg, {}), raising=False,
         )
 
         stub = _SubprocessStub()
@@ -2513,7 +2561,7 @@ class TestStreamedSpawnHandoff:
         label = f"hello__x86_64__{suffix}"
         monkeypatch.setattr(
             _archive_mod, "derive_variant_lookup_from_aggregate",
-            lambda _agg: {
+            lambda _agg, **_kw: {
                 ("x86_64", label): {
                     "drv": "/nix/store/" + "v" * 32 + "-hello-elf-folder.drv",
                     "arch": "x86_64",

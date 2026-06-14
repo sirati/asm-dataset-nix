@@ -859,6 +859,16 @@ class SuitTaskConfig:
     # secondary-container config, where discover_items is never called).
     per_binary_metadata: Optional[dict[str, dict]] = None
 
+    # Per-toolchain realized outpath map built at preflight.  Maps
+    # ``"<arch>/<comp>"`` (e.g. ``"x86_64/gcc15"``) to the realized
+    # ``/nix/store/<hash>-<name>`` outpath.  Threaded into the
+    # dependency_graph task payload so the streamed build_variant
+    # descriptors carry the correct ``toolchain_outpath`` for each
+    # (arch, comp) combination, enabling per-toolchain delta archive
+    # imports on build workers.  ``None`` / empty is tolerated — build
+    # workers skip the delta import when outpath is absent.
+    toolchain_outpaths_map: Optional[dict[str, str]] = None
+
 
 # ---------------------------------------------------------------------------
 # SuitTask
@@ -1165,6 +1175,11 @@ class SuitTask:
             payload={
                 "sys": sys_name,
                 "toolchain_aggregate_drv": toolchain_aggregate_drv,
+                # toolchain_outpaths_map threads {"<arch>/<comp>": outpath}
+                # through the streamed-spawn pipeline so each build_variant
+                # descriptor carries the realized toolchain outpath for
+                # per-toolchain delta archive import on build workers.
+                "toolchain_outpaths_map": self.config.toolchain_outpaths_map or {},
             },
             task_id=DEPENDENCY_GRAPH_TASK_ID,
             # The matrix_eval prerequisites (task_id = bare binary) are

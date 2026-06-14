@@ -329,6 +329,7 @@ def derive_variant_lookup_from_aggregate(
     aggregate_drv_path: str,
     *,
     run_subprocess: Optional[RunSubprocess] = None,
+    toolchain_outpaths_map: Optional[dict[str, str]] = None,
 ) -> dict[tuple[str, str], dict[str, str]]:
     """Enumerate variant leaves referenced by a ``matrix-<binary>`` drv.
 
@@ -347,15 +348,22 @@ def derive_variant_lookup_from_aggregate(
     ``variant_spec`` is the full worker-visible mapping built by
     :func:`_variant_spec_from_parsed` — ``drv``, ``pkg``, ``arch``,
     ``label``, ``suffix``, ``compiler_id``, ``compiler_family``,
-    ``compiler_version``, ``optimization``, ``variant_dir`` and
-    ``metadata_name``. ``variant_dir`` is what the build worker uses
-    for ELF placement, so it MUST be non-empty; deriving it here (not
-    leaving it for the descriptor to default to ``""``) is what keeps
-    the spawned ``build_variant`` task complete. Non-elf-folder
-    references (toolchain aggregate, bash, ...) are filtered out.
-    Leaves whose basename fails ``parse_variant_path`` are skipped
-    with a WARN log line — they are not legitimate variant roots, so
-    they cannot land in the lookup.
+    ``compiler_version``, ``optimization``, ``variant_dir``,
+    ``metadata_name``, and ``toolchain_outpath``. ``variant_dir`` is
+    what the build worker uses for ELF placement, so it MUST be
+    non-empty; deriving it here (not leaving it for the descriptor to
+    default to ``""``) is what keeps the spawned ``build_variant`` task
+    complete. Non-elf-folder references (toolchain aggregate, bash, ...)
+    are filtered out. Leaves whose basename fails ``parse_variant_path``
+    are skipped with a WARN log line — they are not legitimate variant
+    roots, so they cannot land in the lookup.
+
+    ``toolchain_outpaths_map`` is an optional ``{"<arch>/<comp>": outpath}``
+    dict (built by the submitter from the same drv→outpath table used to
+    produce the split archives). When provided, the per-variant
+    ``toolchain_outpath`` is looked up by ``"<arch>/<comp>"`` and stored
+    in the spec so the build worker can import the correct per-toolchain
+    delta archive without a separate payload field injection step.
 
     Raises:
       RuntimeError: if ``nix-store --query --references`` exits
@@ -411,6 +419,9 @@ def derive_variant_lookup_from_aggregate(
                 f"{path!r} — the matrix is supposed to deduplicate "
                 "at sampling time"
             )
+        tc_outpath = ""
+        if toolchain_outpaths_map:
+            tc_outpath = toolchain_outpaths_map.get(f"{arch}/{comp}", "")
         lookup[key] = _variant_spec_from_parsed(
             path=path,
             binary=binary,
@@ -419,6 +430,7 @@ def derive_variant_lookup_from_aggregate(
             opt=opt,
             label=label,
             suffix=suffix,
+            toolchain_outpath=tc_outpath,
         )
     return lookup
 
@@ -432,6 +444,7 @@ def _variant_spec_from_parsed(
     opt: str,
     label: str,
     suffix: str,
+    toolchain_outpath: str = "",
 ) -> dict[str, str]:
     """Build the worker-visible variant_spec from a parsed variant drv.
 
@@ -452,6 +465,11 @@ def _variant_spec_from_parsed(
       formatter the legacy path uses, hashed over ``label`` so the
       ELF placement subdir is stable + collision-free
       (``dataset/<pkg>/<variant_dir>/<elf>``).
+    * ``toolchain_outpath`` is the realized ``/nix/store/<hash>-<name>``
+      output of the variant's cross-toolchain derivation. The build
+      worker uses it to import the correct per-toolchain delta archive
+      (``toolchains.<hash>.out.archive``).  Empty string means the
+      outpath wasn't supplied (older dispatch path or unresolved drv).
 
     ``flag_set`` / ``hardening`` / ``sanitizer`` / ``march`` are not
     recoverable from the drv basename (they collapse into ``suffix``);
@@ -475,6 +493,7 @@ def _variant_spec_from_parsed(
         "optimization": opt,
         "variant_dir": variant_dir,
         "metadata_name": f"{variant_dir}.json",
+        "toolchain_outpath": toolchain_outpath,
     }
 
 

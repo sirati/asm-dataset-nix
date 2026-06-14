@@ -280,6 +280,13 @@ def _variant_descriptor(
         "sanitizer": variant_spec.get("sanitizer", ""),
         "march": variant_spec.get("march", ""),
         "tier": variant_spec.get("tier", 0),
+        # toolchain_outpath threads the realized /nix/store/<hash>-<name>
+        # of the cross-toolchain drv through to the build worker so it
+        # can import the correct per-toolchain delta archive.  Empty
+        # string when the dep_graph planner didn't have the outpaths
+        # map (older dispatch path; build worker then falls back to
+        # substitution — but with the split enabled it MUST be present).
+        "toolchain_outpath": variant_spec.get("toolchain_outpath", ""),
     }
     task_id = _variant_task_id(binary, sys_name, label)
     # Deterministic ordering of both dep tuples so observers comparing

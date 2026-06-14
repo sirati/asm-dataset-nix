@@ -18,7 +18,6 @@ from compiler_suit_runner.preflight import (
     PreflightError,
     PreflightResult,
     TOOLCHAIN_COMMON_ARCHIVE_NAME,
-    TOOLCHAIN_UNION_ARCHIVE_NAME,
     ToolchainSplit,
     build_toolchains_locally,
     check_toolchains_locally,
@@ -27,7 +26,6 @@ from compiler_suit_runner.preflight import (
     enumerate_toolchains_only,
     enumerate_variants,
     export_toolchain_split,
-    export_toolchain_union,
     filter_existing_variants,
     path_info_batch,
     preflight,
@@ -1214,8 +1212,12 @@ def _make_split_runner(closures: dict[str, list[str]]) -> "object":
     return runner
 
 
-def test_compute_toolchain_split_common_is_intersection() -> None:
-    """COMMON = intersection of all toolchain closures."""
+def test_compute_toolchain_split_common_is_freq_ge2() -> None:
+    """COMMON = paths appearing in >=2 toolchain closures (freq>=2).
+
+    With two toolchains, freq>=2 matches the strict intersection, so the
+    expected set is the same as the old intersection test.
+    """
     closures = {
         "/nix/store/aaa-gcc": ["/nix/store/aaa-gcc", "/nix/store/glibc", "/nix/store/libgcc"],
         "/nix/store/bbb-clang": ["/nix/store/bbb-clang", "/nix/store/glibc"],
@@ -1267,10 +1269,10 @@ def test_compute_toolchain_split_raises_on_empty_paths() -> None:
 
 
 def test_compute_toolchain_split_raises_on_requisites_failure() -> None:
-    """A failing requisites query propagates as RuntimeError."""
+    """All paths failing requisites queries raises RuntimeError (no valid closure)."""
     def runner(argv):
         return b"", b"nix daemon down", 1
-    with pytest.raises(RuntimeError, match="requisites query failed"):
+    with pytest.raises(RuntimeError, match="no toolchain produced a valid closure"):
         compute_toolchain_split(["/nix/store/aaa-gcc"], run_subprocess=runner)
 
 
@@ -1361,100 +1363,95 @@ def test_export_toolchain_split_raises_on_common_export_failure(
 
 
 # ---------------------------------------------------------------------------
-# export_toolchain_union
+# compute_toolchain_split — multi-era and property tests
 # ---------------------------------------------------------------------------
 
 
-def _make_union_runner(
-    *,
-    req_rc: int = 0,
-    req_out: bytes = b"/nix/store/dep\n/nix/store/tc\n",
-    exp_rc: int = 0,
-    exp_out: bytes = b"NIX_EXPORT:union",
-) -> "object":
-    """Stub run_subprocess for export_toolchain_union tests."""
+def test_compute_toolchain_split_multi_era_common_nonempty() -> None:
+    """With two toolchain eras that share glibc within each era but not
+    across eras, freq>=2 produces a nonempty COMMON from the intra-era
+    paths while the cross-era strict intersection would be empty.
+
+    Example: gcc-old and clang-old share glibc-2.26; gcc-new and clang-new
+    share glibc-2.42. The strict ALL-toolchains intersection is empty
+    (no path is in all 4); freq>=2 captures glibc-2.26 (freq=2) and
+    glibc-2.42 (freq=2) as COMMON.
+    """
+    closures = {
+        "/nix/store/aaa-gcc-old": [
+            "/nix/store/aaa-gcc-old", "/nix/store/glibc-2.26", "/nix/store/libgcc-old"
+        ],
+        "/nix/store/bbb-clang-old": [
+            "/nix/store/bbb-clang-old", "/nix/store/glibc-2.26"
+        ],
+        "/nix/store/ccc-gcc-new": [
+            "/nix/store/ccc-gcc-new", "/nix/store/glibc-2.42", "/nix/store/libgcc-new"
+        ],
+        "/nix/store/ddd-clang-new": [
+            "/nix/store/ddd-clang-new", "/nix/store/glibc-2.42"
+        ],
+    }
+    runner = _make_split_runner(closures)
+    split = compute_toolchain_split(list(closures), run_subprocess=runner)
+    # Both era-specific glibcs appear in >=2 closures → both in COMMON.
+    assert "/nix/store/glibc-2.26" in split.common_paths
+    assert "/nix/store/glibc-2.42" in split.common_paths
+    # Toolchain-specific paths appear in only one closure → NOT in COMMON.
+    assert "/nix/store/libgcc-old" not in split.common_paths
+    assert "/nix/store/libgcc-new" not in split.common_paths
+
+
+def test_compute_toolchain_split_dedup_union_property() -> None:
+    """COMMON + union(deltas) == union(all closures) (no path lost, no path duplicated).
+
+    Total unique paths across closures = |COMMON ∪ Σ delta_i|.
+    Each path is in exactly one of: COMMON or exactly one delta.
+    """
+    closures = {
+        "/nix/store/tc1": ["/nix/store/tc1", "/nix/store/shared", "/nix/store/only1"],
+        "/nix/store/tc2": ["/nix/store/tc2", "/nix/store/shared", "/nix/store/only2"],
+        "/nix/store/tc3": ["/nix/store/tc3", "/nix/store/shared", "/nix/store/only3"],
+    }
+    runner = _make_split_runner(closures)
+    split = compute_toolchain_split(list(closures), run_subprocess=runner)
+
+    union_all: set[str] = set()
+    for paths in closures.values():
+        union_all.update(paths)
+
+    reconstructed: set[str] = set(split.common_paths)
+    for delta in split.delta_paths.values():
+        reconstructed.update(delta)
+
+    assert reconstructed == union_all
+
+
+def test_compute_toolchain_split_skip_bad_path() -> None:
+    """An unrealized (non-absolute) or requisites-failing path is skipped
+    with a warning, and computation succeeds for the remaining paths."""
+    good_closures = {
+        "/nix/store/aaa-gcc": ["/nix/store/aaa-gcc", "/nix/store/glibc"],
+        "/nix/store/bbb-clang": ["/nix/store/bbb-clang", "/nix/store/glibc"],
+    }
+
     def runner(argv):
         if argv[:3] == ["nix-store", "--query", "--requisites"]:
-            return req_out, b"req_stderr" if req_rc != 0 else b"", req_rc
-        if argv[:2] == ["nix-store", "--export"]:
-            return exp_out, b"exp_stderr" if exp_rc != 0 else b"", exp_rc
-        return b"", b"unexpected call", 1
-    return runner
+            key = argv[3]
+            if key in good_closures:
+                paths = good_closures[key]
+                return "\n".join(paths).encode() + b"\n", b"", 0
+            # bad path: requisites fails
+            return b"", b"path not found", 1
+        return b"", b"unexpected", 1
 
-
-def test_export_toolchain_union_writes_single_archive(
-    tmp_path: pathlib.Path,
-) -> None:
-    """export_toolchain_union writes toolchains.out.archive containing the
-    union closure of all seed paths — exactly ONE archive on success."""
-    runner = _make_union_runner()
-    result = export_toolchain_union(
-        ["/nix/store/abc123-gcc", "/nix/store/def456-clang"],
-        tmp_path,
-        run_subprocess=runner,
-    )
-    assert result == tmp_path / TOOLCHAIN_UNION_ARCHIVE_NAME
-    assert result.exists()
-    assert result.read_bytes() == b"NIX_EXPORT:union"
-
-
-def test_export_toolchain_union_dedup_via_requisites(
-    tmp_path: pathlib.Path,
-) -> None:
-    """All seed paths are passed together to nix-store --query --requisites
-    so nix deduplicates shared paths exactly once."""
-    seen_requisite_calls: list[list[str]] = []
-
-    def runner(argv):
-        if argv[:3] == ["nix-store", "--query", "--requisites"]:
-            seen_requisite_calls.append(list(argv))
-            return b"/nix/store/shared\n/nix/store/tc1\n/nix/store/tc2\n", b"", 0
-        if argv[:2] == ["nix-store", "--export"]:
-            return b"NIX_EXPORT", b"", 0
-        return b"", b"", 1
-
-    export_toolchain_union(
-        ["/nix/store/tc1", "/nix/store/tc2"],
-        tmp_path,
-        run_subprocess=runner,
-    )
-    # One requisites call with ALL seeds — union via single nix-store query.
-    assert len(seen_requisite_calls) == 1
-    assert "/nix/store/tc1" in seen_requisite_calls[0]
-    assert "/nix/store/tc2" in seen_requisite_calls[0]
-
-
-def test_export_toolchain_union_raises_on_empty_paths(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Empty out-path list raises RuntimeError without calling nix."""
-    with pytest.raises(RuntimeError, match="no toolchain out-paths"):
-        export_toolchain_union([], tmp_path)
-
-
-def test_export_toolchain_union_raises_on_relative_path(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A non-absolute path raises RuntimeError (sanity check for unrealized paths)."""
-    with pytest.raises(RuntimeError, match="unrealized or invalid"):
-        export_toolchain_union(["nix/store/abc"], tmp_path)
-
-
-def test_export_toolchain_union_raises_on_export_failure(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A failed nix-store export propagates as RuntimeError."""
-    runner = _make_union_runner(exp_rc=1)
-    with pytest.raises(RuntimeError, match="failed"):
-        export_toolchain_union(["/nix/store/abc-gcc"], tmp_path, run_subprocess=runner)
-
-
-def test_export_toolchain_union_raises_on_requisites_failure(
-    tmp_path: pathlib.Path,
-) -> None:
-    """A failed requisites query propagates as RuntimeError."""
-    runner = _make_union_runner(req_rc=1)
-    with pytest.raises(RuntimeError, match="failed"):
-        export_toolchain_union(["/nix/store/abc-gcc"], tmp_path, run_subprocess=runner)
+    # Mix one bad path (not in good_closures) with two good ones.
+    all_paths = ["/nix/store/bad-unrealized", *good_closures.keys()]
+    split = compute_toolchain_split(all_paths, run_subprocess=runner)
+    # Bad path skipped; good paths produce a nonempty COMMON.
+    assert "/nix/store/glibc" in split.common_paths
+    # Good toolchains are in delta_paths; bad one is absent.
+    assert "/nix/store/aaa-gcc" in split.delta_paths
+    assert "/nix/store/bbb-clang" in split.delta_paths
+    assert "/nix/store/bad-unrealized" not in split.delta_paths
 
 

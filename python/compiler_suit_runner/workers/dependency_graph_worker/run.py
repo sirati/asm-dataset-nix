@@ -51,6 +51,7 @@ def run_dependency_graph_task(
     matrix_drv: Optional[str] = None,
     matrix_drvs: Optional[dict[str, str]] = None,
     toolchain_task_ids: Optional[dict[str, str]] = None,
+    toolchain_outpaths_map: Optional[dict[str, str]] = None,
     sys_name: str = "x86_64-linux",
     run_subprocess: Optional[RunSubprocess] = None,
     clock: Optional[Callable[[], float]] = None,
@@ -88,6 +89,16 @@ def run_dependency_graph_task(
     ``binary`` + ``matrix_drv`` pair (back-compat / ad-hoc CLI path).
     ``toolchain_aggregate_drv`` MUST be non-empty — phase 3 cannot run
     without the producer's toolchain output.
+
+    ``toolchain_outpaths_map`` is an optional ``{"<arch>/<comp>": outpath}``
+    dict threaded from the submitter's pre-flight (the same drv→outpath
+    table used to build the split archives). When present, every
+    ``build_variant`` descriptor's payload carries ``toolchain_outpath``
+    so the build worker can import the correct per-toolchain delta archive
+    without a separate payload injection step. Absent map → empty string
+    in every variant payload (build worker falls back to substitution,
+    but with the mandatory split that is a hard-fail — always supply it
+    when the split archives are uploaded).
 
     ``task`` is the framework task handle and is REQUIRED: the planned
     descriptors are streamed to the primary as batched custom messages
@@ -193,7 +204,10 @@ def run_dependency_graph_task(
     # yields an empty lookup are skipped (the path-form sum-drv helper
     # forbids zero-variant matrix wrappers).
     variant_lookups, plannable_binaries = (
-        _derive_variant_lookups(drv_by_binary=drv_by_binary)
+        _derive_variant_lookups(
+            drv_by_binary=drv_by_binary,
+            toolchain_outpaths_map=toolchain_outpaths_map or {},
+        )
     )
 
     if not plannable_binaries:
@@ -420,6 +434,7 @@ def _import_all_archives(
 def _derive_variant_lookups(
     *,
     drv_by_binary: dict[str, str],
+    toolchain_outpaths_map: dict[str, str],
 ) -> tuple[dict[str, dict[tuple[str, str], dict]], list[str]]:
     """Build the per-binary ``variant_lookup`` map + plannable-binary
     list from every binary's matrix aggregate drv path.
@@ -432,6 +447,11 @@ def _derive_variant_lookups(
     returned ``plannable_binaries`` list is sorted and contains only
     the binaries with a non-empty lookup.
 
+    ``toolchain_outpaths_map`` is passed through to
+    :func:`archive.derive_variant_lookup_from_aggregate` so each
+    variant spec carries ``toolchain_outpath`` for the build worker's
+    per-toolchain delta archive import.
+
     Raises :class:`DependencyGraphWorkerError` tagged with the offending
     binary + stage ``"variant_lookup"`` if the helper itself raises
     (e.g. malformed aggregate, missing closure entries).
@@ -443,6 +463,7 @@ def _derive_variant_lookups(
         try:
             lookup = _archive.derive_variant_lookup_from_aggregate(
                 matrix_drv,
+                toolchain_outpaths_map=toolchain_outpaths_map,
             )
         except Exception as exc:  # noqa: BLE001
             raise DependencyGraphWorkerError(

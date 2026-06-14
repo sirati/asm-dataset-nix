@@ -1525,7 +1525,6 @@ def test_main_handle_dependency_graph_without_matrix_eval_out_dir_is_non_recover
 def _reset_imported_binaries() -> None:
     """Clear the module-level import caches so tests stay hermetic."""
     bw._imported_binaries.clear()
-    bw._union_archive_imported = False
     bw._toolchain_imported = False
     bw._common_archive_imported = False
     bw._imported_toolchain_out_paths.clear()
@@ -1724,7 +1723,7 @@ def test_build_worker_build_variant_imports_archive_first_time(
     _reset_imported_binaries()
     # Pre-mark union archive as imported so this test focuses on the
     # per-binary archive import behaviour.
-    bw._union_archive_imported = True
+    bw._common_archive_imported = True
     captured: list[tuple[str, pathlib.Path]] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1764,7 +1763,7 @@ def test_build_worker_build_common_dep_imports_archive(monkeypatch, tmp_path):
     _reset_imported_binaries()
     # Pre-mark union archive as imported so this test focuses on the
     # per-binary archive import behaviour.
-    bw._union_archive_imported = True
+    bw._common_archive_imported = True
     captured: list[tuple[str, pathlib.Path]] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1809,7 +1808,7 @@ def test_build_worker_build_variant_does_not_re_import_same_binary(
     _reset_imported_binaries()
     # Pre-mark union archive as imported so this test focuses on the
     # per-binary import idempotency behaviour.
-    bw._union_archive_imported = True
+    bw._common_archive_imported = True
     captured: list[pathlib.Path] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1860,7 +1859,7 @@ def test_build_worker_build_variant_imports_new_binary_after_switch(
     _reset_imported_binaries()
     # Pre-mark union archive as imported so this test focuses on the
     # per-binary import switching behaviour.
-    bw._union_archive_imported = True
+    bw._common_archive_imported = True
     captured: list[pathlib.Path] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1909,7 +1908,7 @@ def test_build_worker_build_variant_archive_import_failure_is_failure_result(
     _reset_imported_binaries()
     # Pre-mark union archive as imported so this test focuses on the
     # per-binary archive import failure path.
-    bw._union_archive_imported = True
+    bw._common_archive_imported = True
 
     def _fake_import(archive, *, run_subprocess=None):
         return False, b"missing archive", []
@@ -2006,41 +2005,6 @@ class TestDefaultRunnerResolvesTool:
 # ---------------------------------------------------------------------------
 
 
-def _reset_common_imported(monkeypatch) -> None:
-    """Reset per-process common-archive guard between tests."""
-    monkeypatch.setattr(bw, "_common_archive_imported", False)
-
-
-def test_ensure_common_archive_imported_absent_is_noop(
-    monkeypatch, tmp_path,
-):
-    """A missing common archive is a soft no-op: guard flips, no
-    nix-store import call is made (fall back to substitution)."""
-    _reset_common_imported(monkeypatch)
-    calls: list = []
-    bw.ensure_common_archive_imported(tmp_path, run_subprocess=lambda a: (b"", b"", 0))
-    # Guard must flip even though the archive is absent.
-    assert bw._common_archive_imported is True
-    del calls  # no import calls expected
-
-
-def test_ensure_common_archive_imported_zero_byte_is_noop(
-    monkeypatch, tmp_path,
-):
-    """A zero-byte common archive is treated as absent."""
-    _reset_common_imported(monkeypatch)
-    (tmp_path / "toolchains.common.archive").write_bytes(b"")
-    from compiler_suit_runner.workers.dependency_graph_worker import (
-        archive as archive_mod,
-    )
-    imported: list = []
-    monkeypatch.setattr(archive_mod, "import_archive",
-                        lambda a, *, run_subprocess=None: imported.append(a) or (True, b"", []))
-    bw.ensure_common_archive_imported(tmp_path)
-    assert bw._common_archive_imported is True
-    assert imported == []
-
-
 def test_ensure_common_archive_imported_happy(
     monkeypatch, tmp_path,
 ):
@@ -2060,25 +2024,6 @@ def test_ensure_common_archive_imported_happy(
     bw.ensure_common_archive_imported(tmp_path)
     assert bw._common_archive_imported is True
     assert imported == [tmp_path / "toolchains.common.archive"]
-
-
-def test_ensure_common_archive_imported_failure_is_soft(
-    monkeypatch, tmp_path,
-):
-    """A failed import does NOT raise — guard still flips."""
-    from compiler_suit_runner.workers.dependency_graph_worker import (
-        archive as archive_mod,
-    )
-    _reset_common_imported(monkeypatch)
-    (tmp_path / "toolchains.common.archive").write_bytes(b"corrupt")
-    monkeypatch.setattr(
-        archive_mod, "import_archive",
-        lambda a, *, run_subprocess=None: (False, b"corrupt archive", []),
-    )
-    bw.ensure_common_archive_imported(tmp_path)  # must not raise
-    assert bw._common_archive_imported is True
-
-
 def test_ensure_common_archive_imported_idempotent(
     monkeypatch, tmp_path,
 ):
@@ -2141,29 +2086,6 @@ def test_ensure_toolchain_out_archive_imported_happy(
     bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
     assert outpath in bw._imported_toolchain_out_paths
     assert imported == [tmp_path / archive_name]
-
-
-def test_ensure_toolchain_out_archive_imported_absent_fallback(
-    monkeypatch, tmp_path,
-):
-    """A missing delta archive logs no error and falls back to substitution
-    (guard still set so we don't retry on every task)."""
-    from compiler_suit_runner.workers.dependency_graph_worker import (
-        archive as archive_mod,
-    )
-    _reset_toolchain_out_imported(monkeypatch)
-    outpath = "/nix/store/abc123-gcc"
-    imported: list = []
-    monkeypatch.setattr(
-        archive_mod, "import_archive",
-        lambda a, *, run_subprocess=None: imported.append(a) or (True, b"", []),
-    )
-    # No archive file created — absent path.
-    bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
-    assert outpath in bw._imported_toolchain_out_paths
-    assert imported == []  # no import attempted for absent archive
-
-
 def test_ensure_toolchain_out_archive_imported_idempotent(
     monkeypatch, tmp_path,
 ):
@@ -2236,142 +2158,122 @@ def test_ensure_toolchain_out_archive_imported_common_once_then_per_toolchain(
 
 
 # ---------------------------------------------------------------------------
-# ensure_union_archive_imported
+# ensure_common_archive_imported + ensure_toolchain_out_archive_imported
+# HARD-FAIL behaviour tests
 # ---------------------------------------------------------------------------
 
 
-def _reset_union_imported(monkeypatch) -> None:
-    """Reset per-process union-archive guard between tests."""
-    monkeypatch.setattr(bw, "_union_archive_imported", False)
+def _reset_common_imported(monkeypatch) -> None:
+    """Reset per-process common-archive guard between tests."""
+    monkeypatch.setattr(bw, "_common_archive_imported", False)
+    bw._imported_toolchain_out_paths.clear()
 
 
-def test_ensure_union_archive_imported_happy(
-    monkeypatch, tmp_path,
-):
-    """A present union archive is imported and the guard flips."""
+def test_ensure_common_archive_imported_happy(monkeypatch, tmp_path):
+    """A present common archive is imported and the guard flips."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
-    _reset_union_imported(monkeypatch)
-    (tmp_path / "toolchains.out.archive").write_bytes(b"NIX_EXPORT:union")
+    _reset_common_imported(monkeypatch)
+    (tmp_path / "toolchains.common.archive").write_bytes(b"NIX_EXPORT:common")
     imported: list = []
 
     def _fake_import(archive, *, run_subprocess=None):
         imported.append(pathlib.Path(archive))
-        return True, b"", ["/nix/store/glibc", "/nix/store/gcc"]
+        return True, b"", ["/nix/store/glibc"]
 
     monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
-    bw.ensure_union_archive_imported(tmp_path)
-    assert bw._union_archive_imported is True
-    assert imported == [tmp_path / "toolchains.out.archive"]
+    bw.ensure_common_archive_imported(tmp_path)
+    assert bw._common_archive_imported is True
+    assert imported == [tmp_path / "toolchains.common.archive"]
 
 
-def test_ensure_union_archive_imported_absent_raises(
-    monkeypatch, tmp_path,
-):
-    """An absent union archive raises RuntimeError (HARD FAIL — no substitution)."""
-    _reset_union_imported(monkeypatch)
-    with pytest.raises(RuntimeError, match="toolchains.out.archive is absent"):
-        bw.ensure_union_archive_imported(tmp_path)
-    # Guard must NOT flip — the error is non-recoverable; let the caller fail.
-    assert bw._union_archive_imported is False
+def test_ensure_common_archive_imported_absent_raises(monkeypatch, tmp_path):
+    """An absent common archive raises RuntimeError (HARD FAIL)."""
+    _reset_common_imported(monkeypatch)
+    with pytest.raises(RuntimeError, match="toolchains.common.archive"):
+        bw.ensure_common_archive_imported(tmp_path)
 
 
-def test_ensure_union_archive_imported_zero_byte_raises(
-    monkeypatch, tmp_path,
-):
-    """A zero-byte union archive raises RuntimeError (export failed at submit time)."""
-    _reset_union_imported(monkeypatch)
-    (tmp_path / "toolchains.out.archive").write_bytes(b"")
+def test_ensure_common_archive_imported_zero_byte_raises(monkeypatch, tmp_path):
+    """A zero-byte common archive raises RuntimeError."""
+    _reset_common_imported(monkeypatch)
+    (tmp_path / "toolchains.common.archive").write_bytes(b"")
     with pytest.raises(RuntimeError, match="zero-byte"):
-        bw.ensure_union_archive_imported(tmp_path)
-    assert bw._union_archive_imported is False
+        bw.ensure_common_archive_imported(tmp_path)
 
 
-def test_ensure_union_archive_imported_import_failure_raises(
-    monkeypatch, tmp_path,
-):
-    """A failed import_archive call raises RuntimeError (no soft-fall)."""
+def test_ensure_common_archive_imported_import_failure_raises(monkeypatch, tmp_path):
+    """A failed import_archive for common raises RuntimeError (no soft-fail)."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
-    _reset_union_imported(monkeypatch)
-    (tmp_path / "toolchains.out.archive").write_bytes(b"corrupt")
+    _reset_common_imported(monkeypatch)
+    (tmp_path / "toolchains.common.archive").write_bytes(b"corrupt")
     monkeypatch.setattr(
         archive_mod, "import_archive",
         lambda a, *, run_subprocess=None: (False, b"corrupt archive", []),
     )
     with pytest.raises(RuntimeError, match="failed to import"):
-        bw.ensure_union_archive_imported(tmp_path)
-    assert bw._union_archive_imported is False
+        bw.ensure_common_archive_imported(tmp_path)
 
 
-def test_ensure_union_archive_imported_idempotent(
+def test_ensure_toolchain_out_archive_imported_absent_raises(monkeypatch, tmp_path):
+    """A missing per-toolchain delta archive raises RuntimeError (HARD FAIL)."""
+    _reset_common_imported(monkeypatch)
+    outpath = "/nix/store/abc123hhhhhhhhhhhhhhhhhhhhhhhh-gcc15"
+    with pytest.raises(RuntimeError):
+        bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
+
+
+def test_ensure_toolchain_out_archive_imported_zero_byte_raises(monkeypatch, tmp_path):
+    """A zero-byte delta archive raises RuntimeError."""
+    _reset_common_imported(monkeypatch)
+    outpath = "/nix/store/abc123hhhhhhhhhhhhhhhhhhhhhhhh-gcc15"
+    from compiler_suit_runner.preflight import toolchain_delta_archive_name
+    delta_name = toolchain_delta_archive_name(outpath)
+    (tmp_path / delta_name).write_bytes(b"")
+    with pytest.raises(RuntimeError, match="zero-byte"):
+        bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
+
+
+def test_ensure_toolchain_out_archive_imported_import_failure_raises(
     monkeypatch, tmp_path,
 ):
-    """Second call is a no-op (guard already set — import_archive not called again)."""
+    """A failed import for the delta archive raises RuntimeError (no soft-fail)."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
-    _reset_union_imported(monkeypatch)
-    (tmp_path / "toolchains.out.archive").write_bytes(b"NIX_EXPORT:union")
-    call_count: list = []
+    _reset_common_imported(monkeypatch)
+    outpath = "/nix/store/abc123hhhhhhhhhhhhhhhhhhhhhhhh-gcc15"
+    from compiler_suit_runner.preflight import toolchain_delta_archive_name
+    delta_name = toolchain_delta_archive_name(outpath)
+    (tmp_path / delta_name).write_bytes(b"data")
     monkeypatch.setattr(
         archive_mod, "import_archive",
-        lambda a, *, run_subprocess=None: call_count.append(1) or (True, b"", []),
+        lambda a, *, run_subprocess=None: (False, b"import failed", []),
     )
-    bw.ensure_union_archive_imported(tmp_path)
-    bw.ensure_union_archive_imported(tmp_path)
-    assert len(call_count) == 1
-    assert bw._union_archive_imported is True
+    with pytest.raises(RuntimeError, match="failed to import"):
+        bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
 
 
-def test_ensure_union_archive_imported_none_dir_is_noop(monkeypatch):
-    """``matrix_eval_out_dir=None`` (legacy fixtures) is a safe no-op."""
-    _reset_union_imported(monkeypatch)
-    bw.ensure_union_archive_imported(None)  # must not raise
-    assert bw._union_archive_imported is False
+# ---------------------------------------------------------------------------
+# _run_import_prelude — split-based, item_class-branched import order
+# ---------------------------------------------------------------------------
 
 
-def test_ensure_union_archive_imported_ungated_no_payload_check(
+def test_run_import_prelude_build_variant_imports_common_then_delta_then_drv(
     monkeypatch, tmp_path,
 ):
-    """ensure_union_archive_imported takes no payload argument and does NOT
-    gate on toolchain_outpath — it always imports the union regardless of
-    which toolchain the current task uses."""
+    """_run_import_prelude for build_variant imports common FIRST, then the
+    per-toolchain delta (keyed on payload["toolchain_outpath"]), then the
+    drv-graph and binary archives."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
-    _reset_union_imported(monkeypatch)
-    (tmp_path / "toolchains.out.archive").write_bytes(b"NIX_EXPORT:union")
-    imported: list = []
-    monkeypatch.setattr(
-        archive_mod, "import_archive",
-        lambda a, *, run_subprocess=None: imported.append(pathlib.Path(a)) or (True, b"", []),
-    )
-    # Call with no payload-like argument — the function signature only takes
-    # matrix_eval_out_dir + run_subprocess; toolchain_outpath is not involved.
-    import inspect
-    sig = inspect.signature(bw.ensure_union_archive_imported)
-    param_names = list(sig.parameters.keys())
-    assert "toolchain_outpath" not in param_names, (
-        "ensure_union_archive_imported must NOT accept toolchain_outpath"
-    )
-    bw.ensure_union_archive_imported(tmp_path)
-    assert imported == [tmp_path / "toolchains.out.archive"]
-
-
-def test_run_import_prelude_calls_union_import_before_drv_import(
-    monkeypatch, tmp_path,
-):
-    """_run_import_prelude calls ensure_union_archive_imported FIRST (ungated),
-    then the drv-graph and binary-archive imports. The union import is
-    independent of payload content."""
-    from compiler_suit_runner.workers.dependency_graph_worker import (
-        archive as archive_mod,
-    )
-    _reset_union_imported(monkeypatch)
+    _reset_common_imported(monkeypatch)
     bw._toolchain_imported = False
+    bw._imported_binaries.clear()
 
     call_order: list[str] = []
 
@@ -2381,8 +2283,12 @@ def test_run_import_prelude_calls_union_import_before_drv_import(
 
     monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
 
-    # Create the archives on disk so stat() succeeds.
-    (tmp_path / "toolchains.out.archive").write_bytes(b"UNION")
+    outpath = "/nix/store/abc123hhhhhhhhhhhhhhhhhhhhhhhh-gcc15"
+    from compiler_suit_runner.preflight import toolchain_delta_archive_name
+    delta_name = toolchain_delta_archive_name(outpath)
+
+    (tmp_path / "toolchains.common.archive").write_bytes(b"COMMON")
+    (tmp_path / delta_name).write_bytes(b"DELTA")
     (tmp_path / "toolchains.drv.archive").write_bytes(b"DRV")
     (tmp_path / "matrix-hello.drv.archive").write_bytes(b"BINARY")
 
@@ -2392,11 +2298,99 @@ def test_run_import_prelude_calls_union_import_before_drv_import(
         dataset_output_dir=tmp_path / "ds",
         matrix_eval_out_dir=tmp_path,
     )
-    _run_import_prelude("build_variant", {"pkg": "hello"}, env)
+    payload = {"pkg": "hello", "toolchain_outpath": outpath}
+    _run_import_prelude("build_variant", payload, env)
 
-    # Union archive must be first.
-    assert call_order[0] == "toolchains.out.archive"
-    # DRV archive must follow.
+    assert call_order[0] == "toolchains.common.archive"
+    assert delta_name in call_order
+    assert call_order.index(delta_name) > call_order.index("toolchains.common.archive")
     assert "toolchains.drv.archive" in call_order
-    # Binary archive imported for "hello".
     assert "matrix-hello.drv.archive" in call_order
+
+
+def test_run_import_prelude_build_common_dep_imports_common_only_no_delta(
+    monkeypatch, tmp_path,
+):
+    """_run_import_prelude for build_common_dep imports common archive but
+    does NOT call ensure_toolchain_out_archive_imported (no delta)."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_common_imported(monkeypatch)
+    bw._toolchain_imported = False
+    bw._imported_binaries.clear()
+
+    call_order: list[str] = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        call_order.append(pathlib.Path(archive).name)
+        return True, b"", []
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+
+    (tmp_path / "toolchains.common.archive").write_bytes(b"COMMON")
+    (tmp_path / "toolchains.drv.archive").write_bytes(b"DRV")
+    (tmp_path / "matrix-hello.drv.archive").write_bytes(b"BINARY")
+
+    from compiler_suit_runner.workers.build_worker import BuildWorkerEnv, _run_import_prelude
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "ds",
+        matrix_eval_out_dir=tmp_path,
+    )
+    payload = {"binary": "hello"}  # no toolchain_outpath
+    _run_import_prelude("build_common_dep", payload, env)
+
+    # Common must be imported; no delta archive (no toolchain_outpath in payload).
+    assert "toolchains.common.archive" in call_order
+    delta_names = [n for n in call_order if n.startswith("toolchains.") and "out.archive" in n]
+    assert delta_names == [], f"Expected no delta imports but got: {delta_names}"
+    assert "toolchains.drv.archive" in call_order
+    assert "matrix-hello.drv.archive" in call_order
+
+
+def test_run_import_prelude_missing_common_archive_raises_for_build_variant(
+    monkeypatch, tmp_path,
+):
+    """_run_import_prelude raises RuntimeError when common archive is absent
+    for build_variant (HARD FAIL — no substitution fallback)."""
+    _reset_common_imported(monkeypatch)
+    # Do NOT create toolchains.common.archive
+    from compiler_suit_runner.workers.build_worker import BuildWorkerEnv, _run_import_prelude
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "ds",
+        matrix_eval_out_dir=tmp_path,
+    )
+    with pytest.raises(RuntimeError, match="toolchains.common.archive"):
+        _run_import_prelude("build_variant", {"pkg": "hello"}, env)
+
+
+def test_run_import_prelude_missing_delta_archive_raises_for_build_variant(
+    monkeypatch, tmp_path,
+):
+    """_run_import_prelude raises RuntimeError when the per-toolchain delta
+    archive is absent for build_variant (HARD FAIL)."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_common_imported(monkeypatch)
+    bw._toolchain_imported = False
+    # Only create the common archive; leave the delta absent.
+    (tmp_path / "toolchains.common.archive").write_bytes(b"COMMON")
+
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: (True, b"", []),
+    )
+
+    from compiler_suit_runner.workers.build_worker import BuildWorkerEnv, _run_import_prelude
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "ds",
+        matrix_eval_out_dir=tmp_path,
+    )
+    outpath = "/nix/store/abc123hhhhhhhhhhhhhhhhhhhhhhhh-gcc15"
+    payload = {"pkg": "hello", "toolchain_outpath": outpath}
+    with pytest.raises(RuntimeError):
+        _run_import_prelude("build_variant", payload, env)
