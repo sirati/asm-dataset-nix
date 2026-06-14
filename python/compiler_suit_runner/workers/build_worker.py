@@ -1167,37 +1167,19 @@ def _run_import_prelude(
 ) -> None:
     """Toolchain-first archive import prelude for build tasks.
 
-    Import order (per item_class):
+    The common realized-toolchain archive (``toolchains.common.archive``)
+    and per-toolchain delta archive (``toolchains.<hash>.out.archive``) are
+    now imported ONCE PER SECONDARY NODE by the framework's secondary-affine
+    import gate mechanism (``SuitTask.import_action``), not per-worker-process
+    here.  This prelude handles the remaining drv graph archives only:
 
-    build_variant:
-      1. ``toolchains.common.archive`` (HARD, once/process) — shared
-         toolchain closure (paths in >=2 toolchain closures).
-      2. ``toolchains.<hash>.out.archive`` (HARD, once/outpath/process) —
-         per-toolchain delta for ``payload["toolchain_outpath"]``.
-      3. ``toolchains.drv.archive`` (HARD) — drv graph closure.
-      4. ``matrix-<binary>.drv.archive`` (HARD) — per-binary drv diff.
+    build_variant / build_common_dep:
+      1. ``toolchains.drv.archive`` (HARD) — drv graph closure.
+      2. ``matrix-<binary>.drv.archive`` (HARD) — per-binary drv diff.
 
-    build_common_dep:
-      1. ``toolchains.common.archive`` (HARD, once/process) only.
-      2. ``toolchains.drv.archive`` (HARD).
-      3. ``matrix-<binary>.drv.archive`` (HARD).
-
-    Steps 3–4 are load-bearing: a missing drv archive means nix cannot
-    resolve the variant drv locally and the build fails immediately.
+    These are load-bearing: a missing drv archive means nix cannot resolve
+    the variant drv locally and the build fails immediately.
     """
-    # Common archive: HARD-FAIL, imported once per process for all item classes.
-    ensure_common_archive_imported(
-        env.matrix_eval_out_dir,
-        run_subprocess=env.run_subprocess,
-    )
-    # Per-toolchain delta: only build_variant items carry a toolchain_outpath.
-    if item_class == ITEM_CLASS_BUILD_VARIANT:
-        toolchain_outpath = payload.get("toolchain_outpath") or ""
-        ensure_toolchain_out_archive_imported(
-            toolchain_outpath or None,
-            env.matrix_eval_out_dir,
-            run_subprocess=env.run_subprocess,
-        )
     # Drv graph archives (hard-fail on missing).
     ensure_toolchain_archive_imported(
         env.matrix_eval_out_dir,

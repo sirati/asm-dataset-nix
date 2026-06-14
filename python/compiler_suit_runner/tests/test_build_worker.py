@@ -2262,12 +2262,13 @@ def test_ensure_toolchain_out_archive_imported_import_failure_raises(
 # ---------------------------------------------------------------------------
 
 
-def test_run_import_prelude_build_variant_imports_common_then_delta_then_drv(
+def test_run_import_prelude_build_variant_imports_drv_and_binary(
     monkeypatch, tmp_path,
 ):
-    """_run_import_prelude for build_variant imports common FIRST, then the
-    per-toolchain delta (keyed on payload["toolchain_outpath"]), then the
-    drv-graph and binary archives."""
+    """_run_import_prelude for build_variant imports ONLY the drv-graph and
+    binary archives.  The common and per-toolchain delta archives are now
+    imported ONCE PER SECONDARY NODE via the secondary-affine import gate
+    (SuitTask.import_action), not per-worker-process here."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
@@ -2284,11 +2285,7 @@ def test_run_import_prelude_build_variant_imports_common_then_delta_then_drv(
     monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
 
     outpath = "/nix/store/abc123hhhhhhhhhhhhhhhhhhhhhhhh-gcc15"
-    from compiler_suit_runner.preflight import toolchain_delta_archive_name
-    delta_name = toolchain_delta_archive_name(outpath)
 
-    (tmp_path / "toolchains.common.archive").write_bytes(b"COMMON")
-    (tmp_path / delta_name).write_bytes(b"DELTA")
     (tmp_path / "toolchains.drv.archive").write_bytes(b"DRV")
     (tmp_path / "matrix-hello.drv.archive").write_bytes(b"BINARY")
 
@@ -2301,18 +2298,20 @@ def test_run_import_prelude_build_variant_imports_common_then_delta_then_drv(
     payload = {"pkg": "hello", "toolchain_outpath": outpath}
     _run_import_prelude("build_variant", payload, env)
 
-    assert call_order[0] == "toolchains.common.archive"
-    assert delta_name in call_order
-    assert call_order.index(delta_name) > call_order.index("toolchains.common.archive")
     assert "toolchains.drv.archive" in call_order
     assert "matrix-hello.drv.archive" in call_order
+    # The common and delta archives are NOT imported by the per-process prelude
+    # any more — the secondary-affine gate handles them.
+    assert "toolchains.common.archive" not in call_order
+    delta_names = [n for n in call_order if "out.archive" in n]
+    assert delta_names == [], f"Unexpected delta import in per-process prelude: {delta_names}"
 
 
-def test_run_import_prelude_build_common_dep_imports_common_only_no_delta(
+def test_run_import_prelude_build_common_dep_imports_drv_and_binary(
     monkeypatch, tmp_path,
 ):
-    """_run_import_prelude for build_common_dep imports common archive but
-    does NOT call ensure_toolchain_out_archive_imported (no delta)."""
+    """_run_import_prelude for build_common_dep imports the drv-graph and binary
+    archives only.  Common archive is now a secondary-affine gate import."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
@@ -2328,7 +2327,6 @@ def test_run_import_prelude_build_common_dep_imports_common_only_no_delta(
 
     monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
 
-    (tmp_path / "toolchains.common.archive").write_bytes(b"COMMON")
     (tmp_path / "toolchains.drv.archive").write_bytes(b"DRV")
     (tmp_path / "matrix-hello.drv.archive").write_bytes(b"BINARY")
 
@@ -2341,48 +2339,36 @@ def test_run_import_prelude_build_common_dep_imports_common_only_no_delta(
     payload = {"binary": "hello"}  # no toolchain_outpath
     _run_import_prelude("build_common_dep", payload, env)
 
-    # Common must be imported; no delta archive (no toolchain_outpath in payload).
-    assert "toolchains.common.archive" in call_order
-    delta_names = [n for n in call_order if n.startswith("toolchains.") and "out.archive" in n]
-    assert delta_names == [], f"Expected no delta imports but got: {delta_names}"
+    # Common archive is NOT imported here; the secondary-affine gate handles it.
+    assert "toolchains.common.archive" not in call_order
     assert "toolchains.drv.archive" in call_order
     assert "matrix-hello.drv.archive" in call_order
 
 
-def test_run_import_prelude_missing_common_archive_raises_for_build_variant(
+def test_run_import_prelude_missing_binary_archive_raises_for_build_variant(
     monkeypatch, tmp_path,
 ):
-    """_run_import_prelude raises RuntimeError when common archive is absent
-    for build_variant (HARD FAIL — no substitution fallback)."""
-    _reset_common_imported(monkeypatch)
-    # Do NOT create toolchains.common.archive
-    from compiler_suit_runner.workers.build_worker import BuildWorkerEnv, _run_import_prelude
-    env = BuildWorkerEnv(
-        flake_ref=".",
-        dataset_output_dir=tmp_path / "ds",
-        matrix_eval_out_dir=tmp_path,
-    )
-    with pytest.raises(RuntimeError, match="toolchains.common.archive"):
-        _run_import_prelude("build_variant", {"pkg": "hello"}, env)
-
-
-def test_run_import_prelude_missing_delta_archive_raises_for_build_variant(
-    monkeypatch, tmp_path,
-):
-    """_run_import_prelude raises RuntimeError when the per-toolchain delta
-    archive is absent for build_variant (HARD FAIL)."""
+    """_run_import_prelude raises RuntimeError when the binary drv archive
+    import fails for build_variant (the binary archive is load-bearing)."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
     _reset_common_imported(monkeypatch)
     bw._toolchain_imported = False
-    # Only create the common archive; leave the delta absent.
-    (tmp_path / "toolchains.common.archive").write_bytes(b"COMMON")
+    bw._imported_binaries.clear()
+    # Create toolchains.drv.archive (soft — present so stat passes; fake
+    # import succeeds for it).
+    (tmp_path / "toolchains.drv.archive").write_bytes(b"DRV")
+    # Do NOT create matrix-hello.drv.archive (fake returns failure for it).
 
-    monkeypatch.setattr(
-        archive_mod, "import_archive",
-        lambda a, *, run_subprocess=None: (True, b"", []),
-    )
+    def _fake_import(archive, *, run_subprocess=None):
+        name = pathlib.Path(archive).name
+        if name == "toolchains.drv.archive":
+            return True, b"", []
+        # Binary archive: signal failure.
+        return False, b"archive not found", []
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
 
     from compiler_suit_runner.workers.build_worker import BuildWorkerEnv, _run_import_prelude
     env = BuildWorkerEnv(
@@ -2390,7 +2376,5 @@ def test_run_import_prelude_missing_delta_archive_raises_for_build_variant(
         dataset_output_dir=tmp_path / "ds",
         matrix_eval_out_dir=tmp_path,
     )
-    outpath = "/nix/store/abc123hhhhhhhhhhhhhhhhhhhhhhhh-gcc15"
-    payload = {"pkg": "hello", "toolchain_outpath": outpath}
-    with pytest.raises(RuntimeError):
-        _run_import_prelude("build_variant", payload, env)
+    with pytest.raises(RuntimeError, match="matrix-hello.drv.archive"):
+        _run_import_prelude("build_variant", {"pkg": "hello"}, env)
