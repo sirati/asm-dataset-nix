@@ -475,6 +475,25 @@ def build_parser() -> argparse.ArgumentParser:
             "CSR_TOOLCHAIN_DEDUP=0."
         ),
     )
+    # CSR consumer flag: enable build-deps-local pre-loading.  When ON the
+    # dependency_graph worker computes + exports the realised OUTPUT closure
+    # of every variant's build-input derivations (minus the toolchain
+    # closure already shipped) as ``build_deps.out.archive``, and every
+    # build_variant / build_common_dep worker imports it via an affine gate
+    # before any ``nix build`` fires.  Default OFF = byte-identical current
+    # behaviour.  Also honoured via env ``CSR_BUILD_DEPS_LOCAL=1``.
+    p_submit.add_argument(
+        "--build-deps-local",
+        dest="build_deps_local",
+        action="store_true",
+        default=False,
+        help=(
+            "Ship the realised OUTPUT closure of all variant build-input "
+            "derivations as build_deps.out.archive so build nodes need "
+            "zero substituter queries for pre-loaded paths. Default OFF. "
+            "Also via env CSR_BUILD_DEPS_LOCAL=1."
+        ),
+    )
     _restore_framework_flag_defaults(p_submit)
 
     p_secondary = sub.add_parser(
@@ -537,6 +556,24 @@ def _resolve_jobs(args: argparse.Namespace) -> int:
     if getattr(args, "jobs", None):
         return max(1, int(args.jobs))
     return max(1, os.cpu_count() or 1)
+
+
+def _resolve_build_deps_local(args: argparse.Namespace) -> bool:
+    """Resolve the build-deps-local feature flag (default OFF).
+
+    Precedence: the ``--build-deps-local`` submit flag wins (when the
+    operator explicitly passed it), then the ``CSR_BUILD_DEPS_LOCAL`` env
+    override (``1`` / ``true`` / ``yes`` / ``on`` enable), then the
+    default (OFF).  When ON the dep_graph worker exports the build-deps
+    output closure archive and every build worker imports it before
+    building.
+    """
+    if getattr(args, "build_deps_local", False):
+        return True
+    env = os.environ.get("CSR_BUILD_DEPS_LOCAL")
+    if env is not None and env.strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    return False
 
 
 def _resolve_toolchain_dedup(args: argparse.Namespace) -> bool:
@@ -640,6 +677,9 @@ def _config_from_args(
         per_binary_metadata=per_binary_metadata or None,
         # {"<arch>/<comp>": outpath} for per-toolchain delta archive import.
         toolchain_outpaths_map=toolchain_outpaths_map or None,
+        # build_deps_local: OFF by default; caller resolves via
+        # _resolve_build_deps_local when building the submit config.
+        build_deps_local=getattr(args, "_build_deps_local_resolved", False),
     )
 
 
@@ -1125,6 +1165,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # env override (``0`` disables); the resolved bool rides each
     # matrix_eval task payload via ``per_binary_metadata``.
     toolchain_dedup = _resolve_toolchain_dedup(args)
+    # Build-deps-local feature flag: when ON the dep_graph worker produces
+    # build_deps.out.archive so build workers pre-load all variant
+    # build-input paths.  Stash the resolved bool on args so
+    # _config_from_args can read it via getattr without an extra param.
+    args._build_deps_local_resolved = _resolve_build_deps_local(args)  # noqa: SLF001
 
     cache = IncrementalCache(args.cache_root)
     # Repo-state half of the memoization keys; ``None`` (collection

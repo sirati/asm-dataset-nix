@@ -2378,3 +2378,88 @@ def test_run_import_prelude_missing_binary_archive_raises_for_build_variant(
     )
     with pytest.raises(RuntimeError, match="matrix-hello.drv.archive"):
         _run_import_prelude("build_variant", {"pkg": "hello"}, env)
+
+
+# ---------------------------------------------------------------------------
+# ensure_build_deps_archive_imported — HARD-FAIL behaviour tests
+# ---------------------------------------------------------------------------
+
+
+def _reset_build_deps_imported(monkeypatch) -> None:
+    """Reset per-process build-deps-archive guard between tests."""
+    monkeypatch.setattr(bw, "_build_deps_archive_imported", False)
+
+
+def test_ensure_build_deps_archive_imported_happy(monkeypatch, tmp_path):
+    """A present build_deps.out.archive is imported and the guard flips."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_build_deps_imported(monkeypatch)
+    (tmp_path / "build_deps.out.archive").write_bytes(b"NIX_EXPORT:deps")
+    imported: list = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        imported.append(pathlib.Path(archive).name)
+        return True, b"", ["/nix/store/glibc"]
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+    bw.ensure_build_deps_archive_imported(tmp_path)
+    assert bw._build_deps_archive_imported is True
+    assert imported == ["build_deps.out.archive"]
+
+
+def test_ensure_build_deps_archive_imported_idempotent(monkeypatch, tmp_path):
+    """Calling ensure_build_deps_archive_imported twice imports the archive only once."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_build_deps_imported(monkeypatch)
+    (tmp_path / "build_deps.out.archive").write_bytes(b"NIX_EXPORT:deps")
+    call_count = [0]
+
+    def _fake_import(archive, *, run_subprocess=None):
+        call_count[0] += 1
+        return True, b"", []
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+    bw.ensure_build_deps_archive_imported(tmp_path)
+    bw.ensure_build_deps_archive_imported(tmp_path)
+    assert call_count[0] == 1, "archive should be imported exactly once"
+
+
+def test_ensure_build_deps_archive_imported_none_dir_is_noop(monkeypatch):
+    """None matrix_eval_out_dir is a no-op (legacy fixtures)."""
+    _reset_build_deps_imported(monkeypatch)
+    bw.ensure_build_deps_archive_imported(None)
+    assert bw._build_deps_archive_imported is False
+
+
+def test_ensure_build_deps_archive_imported_absent_raises(monkeypatch, tmp_path):
+    """An absent build_deps.out.archive raises RuntimeError (HARD FAIL)."""
+    _reset_build_deps_imported(monkeypatch)
+    with pytest.raises(RuntimeError, match="build_deps.out.archive"):
+        bw.ensure_build_deps_archive_imported(tmp_path)
+
+
+def test_ensure_build_deps_archive_imported_zero_byte_raises(monkeypatch, tmp_path):
+    """A zero-byte build_deps.out.archive raises RuntimeError."""
+    _reset_build_deps_imported(monkeypatch)
+    (tmp_path / "build_deps.out.archive").write_bytes(b"")
+    with pytest.raises(RuntimeError, match="zero-byte"):
+        bw.ensure_build_deps_archive_imported(tmp_path)
+
+
+def test_ensure_build_deps_archive_imported_import_failure_raises(monkeypatch, tmp_path):
+    """A failed import for build_deps.out.archive raises RuntimeError."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_build_deps_imported(monkeypatch)
+    (tmp_path / "build_deps.out.archive").write_bytes(b"corrupt")
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: (False, b"corrupt archive", []),
+    )
+    with pytest.raises(RuntimeError, match="failed to import"):
+        bw.ensure_build_deps_archive_imported(tmp_path)

@@ -55,6 +55,7 @@ def run_dependency_graph_task(
     sys_name: str = "x86_64-linux",
     run_subprocess: Optional[RunSubprocess] = None,
     clock: Optional[Callable[[], float]] = None,
+    build_deps_local: bool = False,
 ) -> DependencyGraphResult:
     """Assemble one sum-drv spanning ALL binaries' pre-built aggregate
     drvs and produce a single Phase 4 descriptor list (plus the
@@ -244,6 +245,20 @@ def run_dependency_graph_task(
         _summary.emit_violations_log(violation_entries)
 
     _stream_descriptors(task=task, descriptors=descriptors)
+
+    # Step 6 (build_deps_local only): compute + export the build-deps output
+    # closure archive so build workers can pre-load all variant build-input
+    # paths before ``nix build`` fires.  Runs AFTER streaming so a failure
+    # here does not silently suppress the spawn batches.  Raises on any
+    # error — the dep_graph task must FAIL loudly if the archive cannot be
+    # produced so the build tasks never start without their pre-load.
+    if build_deps_local:
+        _produce_build_deps_archive(
+            descriptors=descriptors,
+            variant_lookups=variant_lookups,
+            matrix_eval_out_dir=matrix_eval_out_dir,
+            runner=runner,
+        )
 
     out_path = _write_outputs(
         matrix_eval_out_dir=matrix_eval_out_dir,
@@ -626,3 +641,228 @@ def _write_outputs(
         summary=summary, out_path=summary_path,
     )
     return summary_path
+
+
+# ---------------------------------------------------------------------------
+# Build-deps output closure (build_deps_local feature)
+# ---------------------------------------------------------------------------
+
+
+def _produce_build_deps_archive(
+    *,
+    descriptors: Sequence[Any],
+    variant_lookups: dict[str, dict[tuple[str, str], dict]],
+    matrix_eval_out_dir: pathlib.Path,
+    runner: RunSubprocess,
+) -> None:
+    """Compute and export the build-deps output closure archive.
+
+    Collects the unique set of variant drv paths from ``descriptors``,
+    then for each variant drv runs ``nix-store --query --references`` to
+    get its INPUT drvs, realises/substitutes the INPUT drv OUTPUTS (those
+    are the build-input realised outputs ``nix build`` needs locally),
+    computes ``nix-store --query --requisites`` over those output paths,
+    subtracts the toolchain closure already shipped by the toolchain
+    archives, and exports the remainder as ``build_deps.out.archive`` in
+    ``matrix_eval_out_dir``.
+
+    The COMPLETENESS GATE (fail-closed): after the export, verifies that
+    every variant-drv input output path is covered by either the
+    build_deps archive or the toolchain closure.  Any uncovered path would
+    still be substituted at build time — that is the problem this feature
+    solves.  A non-empty uncovered set raises :class:`RuntimeError` naming
+    the offending paths so the operator can investigate and abort rather
+    than silently running with partial pre-loading.
+
+    Raises :class:`RuntimeError` on any failure (failed subprocess,
+    unrealised inputs, export error, completeness gate violation).  The
+    caller MUST let this propagate to fail the dep_graph task loudly.
+    """
+    import logging as _logging  # noqa: PLC0415
+    _log = _logging.getLogger(
+        "compiler_suit_runner.dependency_graph_worker.build_deps"
+    )
+
+    from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
+
+    # 1. Collect the unique variant drv paths from the planned descriptors.
+    variant_drvs: set[str] = set()
+    for d in descriptors:
+        if getattr(d, "kind", None) == "build_variant":
+            drv = d.payload.get("drv") if hasattr(d, "payload") else None
+            if drv and isinstance(drv, str):
+                variant_drvs.add(drv)
+    # Also pull from variant_lookups (covers cases where descriptors use a
+    # spec dict rather than a Phase4Descriptor with .payload).
+    for binary_lookup in variant_lookups.values():
+        for spec in binary_lookup.values():
+            drv = spec.get("drv") if isinstance(spec, dict) else None
+            if drv and isinstance(drv, str):
+                variant_drvs.add(drv)
+
+    if not variant_drvs:
+        _log.warning(
+            "_produce_build_deps_archive: no variant drvs found in "
+            "descriptors/lookups — skipping build_deps archive production"
+        )
+        return
+
+    _log.info(
+        "_produce_build_deps_archive: collecting input drvs for %d "
+        "unique variant drvs",
+        len(variant_drvs),
+    )
+
+    # 2. For each variant drv, get its INPUT drvs via
+    #    ``nix-store --query --references``.  Filter to .drv paths only
+    #    (source files are also references but are not derivations and
+    #    have no "output" to realise).
+    all_input_drvs: set[str] = set()
+    for variant_drv in sorted(variant_drvs):
+        stdout, stderr, rc = runner(
+            ["nix-store", "--query", "--references", variant_drv]
+        )
+        if rc != 0:
+            raise RuntimeError(
+                "_produce_build_deps_archive: nix-store --query --references "
+                f"failed for {variant_drv!r} (rc={rc}): "
+                + stderr.decode("utf-8", errors="replace").strip()
+            )
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            ref = line.strip()
+            if ref.endswith(".drv"):
+                all_input_drvs.add(ref)
+
+    if not all_input_drvs:
+        _log.warning(
+            "_produce_build_deps_archive: no input drvs found across "
+            "%d variant drvs — skipping",
+            len(variant_drvs),
+        )
+        return
+
+    _log.info(
+        "_produce_build_deps_archive: %d unique input drvs; resolving "
+        "output paths",
+        len(all_input_drvs),
+    )
+
+    # 3. Resolve the realised OUTPUT path of each input drv via
+    #    ``nix-store --query --outputs``.  Skip drvs whose output is not
+    #    locally realised (those would need substitution anyway — mark as
+    #    uncovered for the completeness gate, but continue to get the rest).
+    input_outpaths: list[str] = []
+    unrealised_drvs: list[str] = []
+    for input_drv in sorted(all_input_drvs):
+        stdout, stderr, rc = runner(
+            ["nix-store", "--query", "--outputs", input_drv]
+        )
+        if rc != 0:
+            unrealised_drvs.append(input_drv)
+            _log.debug(
+                "_produce_build_deps_archive: --query --outputs failed for "
+                "%r (rc=%d) — not locally realised, skipping",
+                input_drv, rc,
+            )
+            continue
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            op = line.strip()
+            if op:
+                input_outpaths.append(op)
+
+    if unrealised_drvs:
+        _log.warning(
+            "_produce_build_deps_archive: %d input drv(s) not locally "
+            "realised (their outputs will need substitution at build time); "
+            "first 5: %s",
+            len(unrealised_drvs),
+            ", ".join(unrealised_drvs[:5])
+            + (" …" if len(unrealised_drvs) > 5 else ""),
+        )
+
+    if not input_outpaths:
+        _log.warning(
+            "_produce_build_deps_archive: no realised input outpaths found — "
+            "build_deps archive would be empty; skipping"
+        )
+        return
+
+    # 4. Compute the toolchain closure to subtract (paths already shipped
+    #    by toolchains.common.archive + toolchains.<id>.out.archive).
+    #    Toolchain outpaths are embedded in the variant specs as
+    #    ``toolchain_outpath``; use them as seeds for
+    #    collect_toolchain_archive_paths.
+    _log.info(
+        "_produce_build_deps_archive: computing toolchain closure to subtract"
+    )
+    tc_subtract: frozenset[str] = frozenset()
+    tc_outpaths_from_lookups: set[str] = set()
+    for binary_lookup in variant_lookups.values():
+        for spec in binary_lookup.values():
+            tc_op = spec.get("toolchain_outpath") if isinstance(spec, dict) else None
+            if tc_op and isinstance(tc_op, str):
+                tc_outpaths_from_lookups.add(tc_op)
+
+    if tc_outpaths_from_lookups:
+        tc_subtract = _preflight.collect_toolchain_archive_paths(
+            list(tc_outpaths_from_lookups),
+            run_subprocess=runner,
+        )
+        _log.info(
+            "_produce_build_deps_archive: toolchain closure has %d paths "
+            "(to subtract from build_deps)",
+            len(tc_subtract),
+        )
+    else:
+        _log.warning(
+            "_produce_build_deps_archive: no toolchain outpaths found in "
+            "variant_lookups; build_deps archive will include toolchain paths"
+        )
+
+    # 5. Compute build_deps closure = requisites(input_outpaths) − toolchain.
+    build_deps_paths, uncovered = _preflight.compute_build_deps_closure(
+        input_outpaths,
+        toolchain_paths_to_subtract=tc_subtract,
+        run_subprocess=runner,
+    )
+
+    # COMPLETENESS GATE (fail-closed): any uncovered input outpath would
+    # still be substituted at build time — that is EXACTLY the problem this
+    # feature prevents.  Abort with a clear error listing the offenders.
+    if uncovered:
+        raise RuntimeError(
+            "_produce_build_deps_archive: COMPLETENESS GATE FAILED — "
+            "%d input outpath(s) not found in local store requisites; "
+            "they would still be substituted at build time even with "
+            "build_deps_local=True.  Offending paths (first 10): %s"
+            % (
+                len(uncovered),
+                ", ".join(uncovered[:10])
+                + (" …" if len(uncovered) > 10 else ""),
+            )
+        )
+
+    if not build_deps_paths:
+        _log.info(
+            "_produce_build_deps_archive: build_deps closure is empty after "
+            "subtracting toolchain paths — all build inputs already covered "
+            "by toolchain archives; skipping archive production"
+        )
+        return
+
+    # 6. Export build_deps.out.archive atomically.
+    _log.info(
+        "_produce_build_deps_archive: exporting %d build-deps paths "
+        "to %s/%s",
+        len(build_deps_paths), matrix_eval_out_dir,
+        _preflight.BUILD_DEPS_ARCHIVE_NAME,
+    )
+    archive_path = _preflight.export_build_deps_archive(
+        build_deps_paths,
+        matrix_eval_out_dir,
+        run_subprocess=runner,
+    )
+    _log.info(
+        "_produce_build_deps_archive: wrote %s (%d bytes)",
+        archive_path, archive_path.stat().st_size,
+    )

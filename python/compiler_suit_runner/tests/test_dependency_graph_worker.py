@@ -2748,3 +2748,287 @@ class TestStreamedSpawnHandoff:
             "streamed spawn done: 3 descriptors in 1 batches; summary sent"
             in messages
         )
+
+
+# ---------------------------------------------------------------------------
+# _produce_build_deps_archive — unit tests
+# ---------------------------------------------------------------------------
+#
+# These tests exercise the build_deps_local Phase 1 logic directly via
+# the internal function, using a fully-controlled subprocess stub so no
+# real nix store is accessed.
+#
+# The subprocess stub handles:
+#   nix-store --query --references <variant.drv>  → input drv list
+#   nix-store --query --outputs <input.drv>       → output paths
+#   nix-store --query --requisites <outpath...>   → requisites closure
+#   nix-store --export <path...>                  → archive bytes (via stdin)
+#
+# export_closure_exact is a separate helper that handles the atomic write;
+# we monkeypatch preflight.export_build_deps_archive directly so we don't
+# need to stub the Popen-level export machinery.
+
+
+class _BuildDepsSubprocessStub:
+    """Configurable stub for _produce_build_deps_archive's subprocess calls."""
+
+    def __init__(
+        self,
+        *,
+        references_map: "dict[str, list[str]] | None" = None,
+        outputs_map: "dict[str, list[str]] | None" = None,
+        requisites_map: "dict[tuple, list[str]] | None" = None,
+    ) -> None:
+        # variant.drv → list of input .drv references
+        self.references_map: dict[str, list[str]] = references_map or {}
+        # input.drv → list of output outpaths
+        self.outputs_map: dict[str, list[str]] = outputs_map or {}
+        # (seed,) → requisites list (keyed by tuple of all argv seeds)
+        self.requisites_map: dict[tuple, list[str]] = requisites_map or {}
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str]) -> "tuple[bytes, bytes, int]":
+        self.calls.append(list(argv))
+        if argv[:3] == ["nix-store", "--query", "--references"]:
+            key = argv[3]
+            refs = self.references_map.get(key, [])
+            return ("\n".join(refs) + "\n").encode(), b"", 0
+        if argv[:3] == ["nix-store", "--query", "--outputs"]:
+            key = argv[3]
+            out = self.outputs_map.get(key)
+            if out is None:
+                return b"", b"not realised\n", 1
+            return ("\n".join(out) + "\n").encode(), b"", 0
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            seeds = tuple(argv[3:])
+            paths = self.requisites_map.get(seeds, [])
+            return ("\n".join(paths) + "\n").encode(), b"", 0
+        raise AssertionError(f"unexpected argv to _BuildDepsSubprocessStub: {argv!r}")
+
+
+def _make_build_deps_descriptors(
+    drv: str, kind: str = "build_variant",
+) -> list:
+    """Return a list containing one Phase4Descriptor with the given drv."""
+    return [Phase4Descriptor(
+        kind=kind,
+        task_id=f"{kind}__0",
+        name=f"{kind}__0",
+        payload={"drv": drv, "pkg": "hello", "arch": "x86_64"},
+        depends_on=(),
+    )]
+
+
+class TestProduceBuildDepsArchive:
+    """Tests for ``_produce_build_deps_archive`` in the dep_graph worker."""
+
+    _VARIANT_DRV = "/nix/store/" + "v" * 32 + "-hello-elf-folder.drv"
+    _INPUT_DRV = "/nix/store/" + "i" * 32 + "-glibc.drv"
+    _INPUT_OUTPATH = "/nix/store/" + "o" * 32 + "-glibc"
+    _TC_OUTPATH = "/nix/store/" + "t" * 32 + "-gcc15"
+
+    def _run(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch,
+        *,
+        descriptors=None,
+        variant_lookups=None,
+        runner=None,
+        export_paths_out: "list | None" = None,
+    ) -> None:
+        """Helper: run _produce_build_deps_archive with stubbed export."""
+        from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
+            _produce_build_deps_archive,
+        )
+        from compiler_suit_runner import preflight as _pf  # noqa: PLC0415
+
+        if descriptors is None:
+            descriptors = _make_build_deps_descriptors(self._VARIANT_DRV)
+        if variant_lookups is None:
+            variant_lookups = {
+                "hello": {
+                    ("x86_64", "hello__x86_64__gcc15-O0"): {
+                        "drv": self._VARIANT_DRV,
+                        "toolchain_outpath": self._TC_OUTPATH,
+                    },
+                },
+            }
+        if runner is None:
+            runner = _BuildDepsSubprocessStub(
+                references_map={
+                    self._VARIANT_DRV: [self._INPUT_DRV],
+                },
+                outputs_map={
+                    self._INPUT_DRV: [self._INPUT_OUTPATH],
+                },
+                requisites_map={
+                    (self._INPUT_OUTPATH,): [self._INPUT_OUTPATH],
+                    (self._TC_OUTPATH,): [self._TC_OUTPATH],
+                },
+            )
+
+        captured: list = []
+
+        def _fake_export_build_deps(paths, out_dir, *, run_subprocess=None):
+            captured.extend(paths)
+            archive_path = out_dir / _pf.BUILD_DEPS_ARCHIVE_NAME
+            archive_path.write_bytes(b"NIX_EXPORT:fake")
+            return archive_path
+
+        monkeypatch.setattr(_pf, "export_build_deps_archive", _fake_export_build_deps)
+
+        _produce_build_deps_archive(
+            descriptors=descriptors,
+            variant_lookups=variant_lookups,
+            matrix_eval_out_dir=tmp_path,
+            runner=runner,
+        )
+        if export_paths_out is not None:
+            export_paths_out.extend(captured)
+
+    def test_happy_path_exports_input_outpath(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        """Happy path: variant drv → input drv → output path → exported."""
+        exported: list = []
+        self._run(tmp_path, monkeypatch, export_paths_out=exported)
+        # The input outpath (after toolchain subtraction) should be exported.
+        assert self._INPUT_OUTPATH in exported
+
+    def test_toolchain_outpath_subtracted(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        """Toolchain outpath from variant_lookups is subtracted from export list."""
+        # Include TC_OUTPATH in the input's requisites closure so it would appear
+        # without subtraction.
+        from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
+            _produce_build_deps_archive,
+        )
+        from compiler_suit_runner import preflight as _pf  # noqa: PLC0415
+
+        runner = _BuildDepsSubprocessStub(
+            references_map={self._VARIANT_DRV: [self._INPUT_DRV]},
+            outputs_map={self._INPUT_DRV: [self._INPUT_OUTPATH]},
+            requisites_map={
+                (self._INPUT_OUTPATH,): [self._INPUT_OUTPATH, self._TC_OUTPATH],
+                (self._TC_OUTPATH,): [self._TC_OUTPATH],
+            },
+        )
+        variant_lookups = {
+            "hello": {
+                ("x86_64", "lbl"): {
+                    "drv": self._VARIANT_DRV,
+                    "toolchain_outpath": self._TC_OUTPATH,
+                },
+            },
+        }
+
+        exported: list = []
+
+        def _fake_export(paths, out_dir, *, run_subprocess=None):
+            exported.extend(paths)
+            p = out_dir / _pf.BUILD_DEPS_ARCHIVE_NAME
+            p.write_bytes(b"x")
+            return p
+
+        monkeypatch.setattr(_pf, "export_build_deps_archive", _fake_export)
+        _produce_build_deps_archive(
+            descriptors=_make_build_deps_descriptors(self._VARIANT_DRV),
+            variant_lookups=variant_lookups,
+            matrix_eval_out_dir=tmp_path,
+            runner=runner,
+        )
+        # TC path must have been subtracted.
+        assert self._TC_OUTPATH not in exported
+        # Input outpath is still present.
+        assert self._INPUT_OUTPATH in exported
+
+    def test_completeness_gate_raises_on_uncovered_outpath(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        """If an input outpath is not in the requisites result, the completeness
+        gate raises RuntimeError naming the offending path."""
+        from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
+            _produce_build_deps_archive,
+        )
+        from compiler_suit_runner import preflight as _pf  # noqa: PLC0415
+
+        uncovered = "/nix/store/" + "x" * 32 + "-missing"
+        runner = _BuildDepsSubprocessStub(
+            references_map={self._VARIANT_DRV: [self._INPUT_DRV]},
+            outputs_map={self._INPUT_DRV: [uncovered]},
+            # Requisites does NOT include uncovered → completeness gate fails.
+            requisites_map={
+                (uncovered,): [],
+                (self._TC_OUTPATH,): [self._TC_OUTPATH],
+            },
+        )
+
+        with pytest.raises(RuntimeError, match="COMPLETENESS GATE FAILED"):
+            _produce_build_deps_archive(
+                descriptors=_make_build_deps_descriptors(self._VARIANT_DRV),
+                variant_lookups={
+                    "hello": {
+                        ("x86_64", "lbl"): {
+                            "drv": self._VARIANT_DRV,
+                            "toolchain_outpath": self._TC_OUTPATH,
+                        },
+                    },
+                },
+                matrix_eval_out_dir=tmp_path,
+                runner=runner,
+            )
+
+    def test_no_variant_drvs_logs_warning_and_skips(
+        self, tmp_path: pathlib.Path, monkeypatch, caplog,
+    ) -> None:
+        """If descriptors and variant_lookups produce no variant drvs, a warning
+        is logged and no archive is produced."""
+        import logging  # noqa: PLC0415
+        from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
+            _produce_build_deps_archive,
+        )
+        from compiler_suit_runner import preflight as _pf  # noqa: PLC0415
+
+        export_calls: list = []
+        monkeypatch.setattr(
+            _pf, "export_build_deps_archive",
+            lambda *a, **kw: export_calls.append(a) or (tmp_path / _pf.BUILD_DEPS_ARCHIVE_NAME),
+        )
+
+        runner = _BuildDepsSubprocessStub()
+        with caplog.at_level(logging.WARNING, logger=(
+            "compiler_suit_runner.dependency_graph_worker.build_deps"
+        )):
+            _produce_build_deps_archive(
+                descriptors=[],          # no variant descriptors
+                variant_lookups={},      # no variant lookups
+                matrix_eval_out_dir=tmp_path,
+                runner=runner,
+            )
+        assert export_calls == [], "should not export when no variant drvs found"
+        assert any("no variant drvs" in r.message for r in caplog.records)
+
+    def test_references_failure_raises_runtime_error(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        """A non-zero rc from nix-store --query --references raises RuntimeError."""
+        from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
+            _produce_build_deps_archive,
+        )
+
+        def _failing_runner(argv):
+            if argv[:3] == ["nix-store", "--query", "--references"]:
+                return b"", b"derivation not found\n", 1
+            if argv[:3] == ["nix-store", "--query", "--requisites"]:
+                return b"", b"", 0
+            raise AssertionError(f"unexpected: {argv!r}")
+
+        with pytest.raises(RuntimeError, match="--query --references"):
+            _produce_build_deps_archive(
+                descriptors=_make_build_deps_descriptors(self._VARIANT_DRV),
+                variant_lookups={},
+                matrix_eval_out_dir=tmp_path,
+                runner=_failing_runner,
+            )

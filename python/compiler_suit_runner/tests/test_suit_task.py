@@ -1763,3 +1763,155 @@ def test_import_action_unknown_task_id_raises(
     assert action is not None
     with pytest.raises(RuntimeError, match="unknown gate task_id"):
         action("not_an_import_task")
+
+
+# ---------------------------------------------------------------------------
+# build_deps_local Phase 0+1: gate emission + import_action + dep wiring
+# ---------------------------------------------------------------------------
+
+
+def test_discover_import_gate_tasks_emits_import_build_deps_when_flag_set(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With build_deps_local=True, discover_items yields an import_build_deps
+    gate task in addition to the toolchain gates."""
+    import dataclasses as _dc  # noqa: PLC0415
+    from compiler_suit_runner.suit_task import IMPORT_BUILD_DEPS_TASK_ID  # noqa: PLC0415
+
+    config = _dc.replace(
+        _config_with_outpaths(tmp_path),
+        build_deps_local=True,
+    )
+    task = SuitTask(config)
+    items = list(task.discover_items())
+    gate_ids = {
+        getattr(ti, "task_id", None) for ti in items
+        if getattr(ti, "type_id", None) == "toolchain_import"
+    }
+    assert IMPORT_BUILD_DEPS_TASK_ID in gate_ids
+
+
+def test_discover_import_gate_tasks_no_import_build_deps_when_flag_off(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With build_deps_local=False (default), no import_build_deps gate is emitted."""
+    from compiler_suit_runner.suit_task import IMPORT_BUILD_DEPS_TASK_ID  # noqa: PLC0415
+
+    config = _config_with_outpaths(tmp_path)  # build_deps_local=False by default
+    task = SuitTask(config)
+    items = list(task.discover_items())
+    gate_ids = {
+        getattr(ti, "task_id", None) for ti in items
+        if getattr(ti, "type_id", None) == "toolchain_import"
+    }
+    assert IMPORT_BUILD_DEPS_TASK_ID not in gate_ids
+
+
+def test_header_depends_on_build_variant_includes_import_build_deps_when_flag(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With build_deps_local=True, _header_depends_on adds IMPORT_BUILD_DEPS_TASK_ID
+    for build_variant headers."""
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        IMPORT_BUILD_DEPS_TASK_ID,
+        _header_depends_on,
+    )
+
+    header = ManifestHeader(
+        item_class="build_variant",
+        name="hello-x86_64-gcc15-O0",
+        size=0,
+        payload={
+            "sys": _SYS,
+            "pkg": "hello",
+            "arch": "x86_64",
+            "toolchain_outpath": _TC_OUTPATH,
+        },
+        task_id="build_variant__x86_64-linux__hello__gcc15-O0",
+    )
+    deps = _header_depends_on(header, build_deps_local=True)
+    bare = [d for d in deps if isinstance(d, str)]
+    assert IMPORT_BUILD_DEPS_TASK_ID in bare
+
+
+def test_header_depends_on_build_variant_no_import_build_deps_when_flag_off(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With build_deps_local=False (default), IMPORT_BUILD_DEPS_TASK_ID is absent."""
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        IMPORT_BUILD_DEPS_TASK_ID,
+        _header_depends_on,
+    )
+
+    header = ManifestHeader(
+        item_class="build_variant",
+        name="hello-x86_64-gcc15-O0",
+        size=0,
+        payload={
+            "sys": _SYS,
+            "pkg": "hello",
+            "arch": "x86_64",
+            "toolchain_outpath": _TC_OUTPATH,
+        },
+        task_id="build_variant__x86_64-linux__hello__gcc15-O0",
+    )
+    deps = _header_depends_on(header, build_deps_local=False)
+    bare = [d for d in deps if isinstance(d, str)]
+    assert IMPORT_BUILD_DEPS_TASK_ID not in bare
+
+
+def test_header_depends_on_build_common_dep_includes_import_build_deps_when_flag(
+    tmp_path: pathlib.Path,
+) -> None:
+    """build_common_dep also gets IMPORT_BUILD_DEPS_TASK_ID when build_deps_local=True."""
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        IMPORT_BUILD_DEPS_TASK_ID,
+        _header_depends_on,
+    )
+
+    header = ManifestHeader(
+        item_class="build_common_dep",
+        name="common_dep__glibc",
+        size=0,
+        payload={
+            "drv": "/nix/store/x-glibc.drv",
+            "label": "glibc",
+        },
+        task_id="build_common_dep__x-glibc.drv",
+    )
+    deps = _header_depends_on(header, build_deps_local=True)
+    bare = [d for d in deps if isinstance(d, str)]
+    assert IMPORT_BUILD_DEPS_TASK_ID in bare
+
+
+def test_import_action_import_build_deps_calls_ensure_build_deps_imported(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """import_action('import_build_deps') calls ensure_build_deps_archive_imported
+    with matrix_eval_out_dir."""
+    import dataclasses as _dc  # noqa: PLC0415
+    from compiler_suit_runner.suit_task import IMPORT_BUILD_DEPS_TASK_ID  # noqa: PLC0415
+
+    config = _dc.replace(
+        _make_config(tmp_path),
+        matrix_eval_out_dir=tmp_path / "out",
+        build_deps_local=True,
+    )
+    (tmp_path / "out").mkdir()
+
+    calls: list[tuple] = []
+
+    def _fake_ensure_build_deps(out_dir, *, run_subprocess=None):
+        calls.append(("build_deps", out_dir))
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.build_worker.ensure_build_deps_archive_imported",
+        _fake_ensure_build_deps,
+    )
+
+    task = SuitTask(config)
+    action = task.import_action
+    assert action is not None
+    action(IMPORT_BUILD_DEPS_TASK_ID)
+    assert calls == [("build_deps", tmp_path / "out")]

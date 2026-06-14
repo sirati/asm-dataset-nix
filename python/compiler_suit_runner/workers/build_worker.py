@@ -63,6 +63,7 @@ __all__ = [
     "ensure_toolchain_archive_imported",
     "ensure_common_archive_imported",
     "ensure_toolchain_out_archive_imported",
+    "ensure_build_deps_archive_imported",
 ]
 
 
@@ -100,6 +101,14 @@ _common_archive_imported: bool = False
 # been imported on this worker.  Keyed by outpath string so workers handle
 # multiple toolchains in one process without redundant imports.
 _imported_toolchain_out_paths: set[str] = set()
+
+# Per-process, once-only import guard for the build-deps output closure
+# archive (``build_deps.out.archive``).  This archive ships the realised
+# OUTPUT closure of every variant's build-input derivations (minus the
+# toolchain closure already shipped by the toolchain archives) so build
+# nodes have all paths pre-loaded before ``nix build`` fires.
+# Only set when config.build_deps_local is True.
+_build_deps_archive_imported: bool = False
 
 # Item-class string tokens (matched against the manifest header). Kept as
 # module-level constants so callers (manifest_gen, suit_task) reference
@@ -1114,6 +1123,43 @@ def ensure_common_archive_imported(
     )
 
 
+def ensure_build_deps_archive_imported(
+    matrix_eval_out_dir: Optional[pathlib.Path],
+    *,
+    run_subprocess: Optional[Callable[..., tuple[bytes, bytes, int]]] = None,
+) -> None:
+    """Import ``build_deps.out.archive`` once per worker process.
+
+    The dependency_graph worker produces ONE ``build_deps.out.archive``
+    carrying the realised OUTPUT closure of every variant's build-input
+    derivations (minus the toolchain closure already shipped by the
+    toolchain archives).  Workers import it BEFORE any ``build_variant``
+    or ``build_common_dep`` task fires so ``nix build`` needs zero
+    substituter queries for pre-loaded paths.
+
+    Only active when ``config.build_deps_local`` is True (the archive
+    is produced by the dep_graph worker only in that mode).
+
+    HARD FAIL: a missing, zero-byte, or un-importable archive raises
+    :class:`RuntimeError`.  There is NO substitution fallback — if the
+    archive is absent the dep_graph worker must be investigated.
+
+    ``matrix_eval_out_dir`` may be ``None`` (legacy fixtures) — no-op.
+    """
+    global _build_deps_archive_imported
+    if matrix_eval_out_dir is None:
+        return
+    if _build_deps_archive_imported:
+        return
+    _build_deps_archive_imported = True
+    from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
+    archive_path = matrix_eval_out_dir / _preflight.BUILD_DEPS_ARCHIVE_NAME
+    _import_archive_hard(
+        archive_path, _preflight.BUILD_DEPS_ARCHIVE_NAME,
+        run_subprocess=run_subprocess,
+    )
+
+
 def ensure_toolchain_out_archive_imported(
     toolchain_outpath: Optional[str],
     matrix_eval_out_dir: Optional[pathlib.Path],
@@ -1898,6 +1944,10 @@ def main() -> int:
             tc_outpaths_map = dg_payload.get("toolchain_outpaths_map")
             if not isinstance(tc_outpaths_map, dict):
                 tc_outpaths_map = {}
+            # build_deps_local: when True the dep_graph worker computes and
+            # exports the build-deps output closure archive so build workers
+            # pre-load all variant build-input paths before ``nix build``.
+            build_deps_local_flag = bool(dg_payload.get("build_deps_local", False))
             if env.matrix_eval_out_dir is None:
                 raise NonRecoverableError(
                     "dependency_graph requires --matrix-eval-out-dir"
@@ -1959,6 +2009,7 @@ def main() -> int:
                     matrix_drvs=matrix_drvs,
                     sys_name=sys_name,
                     toolchain_outpaths_map=tc_outpaths_map,
+                    build_deps_local=build_deps_local_flag,
                 )
             except BaseException as exc:  # noqa: BLE001
                 _handle_log.exception(

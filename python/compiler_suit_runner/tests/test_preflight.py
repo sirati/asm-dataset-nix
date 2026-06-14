@@ -1455,3 +1455,236 @@ def test_compute_toolchain_split_skip_bad_path() -> None:
     assert "/nix/store/bad-unrealized" not in split.delta_paths
 
 
+# ---------------------------------------------------------------------------
+# compute_build_deps_closure
+# ---------------------------------------------------------------------------
+
+
+from compiler_suit_runner.preflight import (  # noqa: E402
+    BUILD_DEPS_ARCHIVE_NAME,
+    compute_build_deps_closure,
+    collect_toolchain_archive_paths,
+)
+
+
+def _make_requisites_runner(
+    requisites_map: "dict[tuple, list[str]]",
+) -> "callable":
+    """Return a subprocess stub that answers ``nix-store --query --requisites``
+    based on ``requisites_map`` keyed by a tuple of the seed args."""
+
+    def runner(argv):
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            seeds = tuple(argv[3:])
+            paths = requisites_map.get(seeds, [])
+            return ("\n".join(paths) + "\n").encode(), b"", 0
+        raise AssertionError(f"unexpected argv: {argv!r}")
+
+    return runner
+
+
+def test_compute_build_deps_closure_empty_input() -> None:
+    """Empty input_outpaths → ([], []) with no subprocess calls."""
+    calls: list = []
+
+    def runner(argv):
+        calls.append(argv)
+        return b"", b"", 0
+
+    result = compute_build_deps_closure([], run_subprocess=runner)
+    assert result == ([], [])
+    assert calls == []
+
+
+def test_compute_build_deps_closure_subtracts_toolchain_paths() -> None:
+    """Toolchain paths in toolchain_paths_to_subtract are removed from the
+    ordered output, preserving topological order for the remaining paths."""
+    seed = "/nix/store/out-hello"
+    tc_path = "/nix/store/tc-gcc"
+    dep_path = "/nix/store/dep-glibc"
+    all_req = [dep_path, tc_path, seed]  # topological order
+
+    runner = _make_requisites_runner({(seed,): all_req})
+    paths, uncovered = compute_build_deps_closure(
+        [seed],
+        toolchain_paths_to_subtract=frozenset([tc_path]),
+        run_subprocess=runner,
+    )
+    assert tc_path not in paths
+    assert dep_path in paths
+    assert seed in paths
+    assert uncovered == []
+    # Topological order preserved (dep before seed).
+    assert paths.index(dep_path) < paths.index(seed)
+
+
+def test_compute_build_deps_closure_returns_uncovered_for_missing_seed() -> None:
+    """A seed outpath not appearing in the requisites output is returned in
+    uncovered (completeness gate: it's not locally realised)."""
+    good_seed = "/nix/store/good-realised"
+    bad_seed = "/nix/store/bad-unrealised"
+
+    runner = _make_requisites_runner({(good_seed, bad_seed): [good_seed]})
+    paths, uncovered = compute_build_deps_closure(
+        [good_seed, bad_seed],
+        run_subprocess=runner,
+    )
+    assert good_seed in paths
+    assert bad_seed not in paths
+    assert uncovered == [bad_seed]
+
+
+def test_compute_build_deps_closure_nonzero_rc_raises() -> None:
+    """A non-zero return code from nix-store --query --requisites raises RuntimeError."""
+
+    def runner(argv):
+        return b"", b"nix-store: path not found\n", 1
+
+    with pytest.raises(RuntimeError, match="nix-store --query --requisites"):
+        compute_build_deps_closure(
+            ["/nix/store/any-path"],
+            run_subprocess=runner,
+        )
+
+
+def test_compute_build_deps_closure_no_subtract_returns_all() -> None:
+    """Without toolchain subtraction, all requisites paths are returned."""
+    seed = "/nix/store/out-hello"
+    paths_in_store = ["/nix/store/dep-a", "/nix/store/dep-b", seed]
+
+    runner = _make_requisites_runner({(seed,): paths_in_store})
+    paths, uncovered = compute_build_deps_closure(
+        [seed],
+        toolchain_paths_to_subtract=None,
+        run_subprocess=runner,
+    )
+    assert paths == paths_in_store
+    assert uncovered == []
+
+
+# ---------------------------------------------------------------------------
+# collect_toolchain_archive_paths
+# ---------------------------------------------------------------------------
+
+
+def test_collect_toolchain_archive_paths_union_of_closures() -> None:
+    """Returns the union of requisites for all toolchain out-paths."""
+    tc1 = "/nix/store/tc1-gcc"
+    tc2 = "/nix/store/tc2-clang"
+    closures = {
+        tc1: [tc1, "/nix/store/shared-glibc", "/nix/store/only-gcc"],
+        tc2: [tc2, "/nix/store/shared-glibc", "/nix/store/only-clang"],
+    }
+
+    def runner(argv):
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            seed = argv[3]
+            return ("\n".join(closures.get(seed, [])) + "\n").encode(), b"", 0
+        raise AssertionError(f"unexpected argv: {argv!r}")
+
+    result = collect_toolchain_archive_paths([tc1, tc2], run_subprocess=runner)
+    assert isinstance(result, frozenset)
+    assert tc1 in result
+    assert tc2 in result
+    assert "/nix/store/shared-glibc" in result
+    assert "/nix/store/only-gcc" in result
+    assert "/nix/store/only-clang" in result
+
+
+def test_collect_toolchain_archive_paths_skips_failed_outpath() -> None:
+    """A requisites failure for one toolchain is skipped; the rest still contribute."""
+    tc_good = "/nix/store/tc-good-gcc"
+    tc_bad = "/nix/store/tc-bad-clang"
+
+    def runner(argv):
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            seed = argv[3]
+            if seed == tc_good:
+                return (tc_good + "\n/nix/store/glibc\n").encode(), b"", 0
+            return b"", b"not in store\n", 1
+        raise AssertionError(f"unexpected argv: {argv!r}")
+
+    result = collect_toolchain_archive_paths([tc_good, tc_bad], run_subprocess=runner)
+    assert tc_good in result
+    assert "/nix/store/glibc" in result
+    assert tc_bad not in result
+
+
+def test_collect_toolchain_archive_paths_empty_list() -> None:
+    """Empty outpaths list returns an empty frozenset."""
+    calls: list = []
+
+    def runner(argv):
+        calls.append(argv)
+        return b"", b"", 0
+
+    result = collect_toolchain_archive_paths([], run_subprocess=runner)
+    assert result == frozenset()
+    assert calls == []
+
+
+def test_collect_toolchain_archive_paths_skips_non_absolute() -> None:
+    """Non-absolute paths (e.g. empty string) are skipped silently."""
+    calls: list = []
+
+    def runner(argv):
+        calls.append(argv)
+        return b"", b"", 0
+
+    result = collect_toolchain_archive_paths(["", "relative/path"], run_subprocess=runner)
+    assert result == frozenset()
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# export_build_deps_archive
+# ---------------------------------------------------------------------------
+
+
+def test_export_build_deps_archive_writes_file(monkeypatch, tmp_path) -> None:
+    """export_build_deps_archive delegates to export_closure_exact and
+    returns the archive path under BUILD_DEPS_ARCHIVE_NAME."""
+    from compiler_suit_runner.preflight import export_build_deps_archive  # noqa: PLC0415
+
+    paths = ["/nix/store/dep-a", "/nix/store/dep-b"]
+    exported: list = []
+
+    def _fake_export_closure(archive_path, export_paths, *, run_subprocess=None):
+        exported.append((archive_path, list(export_paths)))
+        # Simulate writing the archive file.
+        archive_path.write_bytes(b"NIX_EXPORT:fake")
+        return True, b""
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.build_compilers_worker.export_closure_exact",
+        _fake_export_closure,
+    )
+
+    result = export_build_deps_archive(paths, tmp_path)
+    assert result == tmp_path / BUILD_DEPS_ARCHIVE_NAME
+    assert len(exported) == 1
+    assert exported[0][0] == tmp_path / BUILD_DEPS_ARCHIVE_NAME
+    assert exported[0][1] == paths
+
+
+def test_export_build_deps_archive_raises_on_empty_paths(tmp_path) -> None:
+    """export_build_deps_archive raises RuntimeError if paths list is empty."""
+    from compiler_suit_runner.preflight import export_build_deps_archive  # noqa: PLC0415
+
+    with pytest.raises(RuntimeError, match="no paths to export"):
+        export_build_deps_archive([], tmp_path)
+
+
+def test_export_build_deps_archive_raises_on_export_failure(monkeypatch, tmp_path) -> None:
+    """export_build_deps_archive raises RuntimeError when export_closure_exact
+    returns ok=False."""
+    from compiler_suit_runner.preflight import export_build_deps_archive  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.build_compilers_worker.export_closure_exact",
+        lambda *a, **kw: (False, b"export failed: no space left\n"),
+    )
+    with pytest.raises(RuntimeError, match="nix-store --export failed"):
+        export_build_deps_archive(["/nix/store/dep-a"], tmp_path)
+
+

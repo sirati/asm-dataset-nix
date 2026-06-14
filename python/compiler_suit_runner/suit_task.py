@@ -197,6 +197,14 @@ _BUILD_DISPATCH_CLASSES: frozenset[str] = frozenset(
 # One per run; wired as a dep on every build_common_dep and build_variant.
 IMPORT_COMMON_TASK_ID = "import_common"
 
+# Task-id for the build-deps output closure import gate.
+# One per run; wired as a dep on every build_common_dep and build_variant
+# when config.build_deps_local is True.  The archive ships the realised
+# OUTPUT closure of every variant's build-input derivations (minus the
+# toolchain closure already shipped by the toolchain archives) so each
+# build node has all substituter-queried paths pre-loaded locally.
+IMPORT_BUILD_DEPS_TASK_ID = "import_build_deps"
+
 
 def _import_tc_task_id(toolchain_outpath: str) -> str:
     """Return the import gate task_id for a realized toolchain outpath.
@@ -715,7 +723,7 @@ class _PeerLifecycleListener:
 # ---------------------------------------------------------------------------
 
 
-def _header_depends_on(header: ManifestHeader) -> tuple:
+def _header_depends_on(header: ManifestHeader, *, build_deps_local: bool = False) -> tuple:
     """Assemble a header's full ``task_depends_on`` tuple.
 
     Intra-phase deps in ``header.task_depends_on`` pass through as bare
@@ -731,6 +739,9 @@ def _header_depends_on(header: ManifestHeader) -> tuple:
 
     * ``build_common_dep`` / ``build_variant`` → ``import_common`` (the
       common realized-toolchain closure import gate).
+    * ``build_common_dep`` / ``build_variant`` → ``import_build_deps``
+      when ``build_deps_local`` is True (the build-deps output closure
+      import gate).
     * ``build_variant`` only → ``import_tc_<hash>`` derived from the
       variant's ``toolchain_outpath`` payload field (the per-toolchain
       delta import gate).  Silently skipped when the outpath is absent
@@ -745,6 +756,8 @@ def _header_depends_on(header: ManifestHeader) -> tuple:
     import_deps: list[str] = []
     if header.item_class in ("build_common_dep", "build_variant"):
         import_deps.append(IMPORT_COMMON_TASK_ID)
+        if build_deps_local:
+            import_deps.append(IMPORT_BUILD_DEPS_TASK_ID)
     if header.item_class == "build_variant":
         toolchain_outpath = header.payload.get("toolchain_outpath") or ""
         if toolchain_outpath:
@@ -755,7 +768,7 @@ def _header_depends_on(header: ManifestHeader) -> tuple:
     return tuple(header.task_depends_on) + tuple(import_deps) + toolchain_deps
 
 
-def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = False):
+def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = False, build_deps_local: bool = False):
     """Convert one :class:`ManifestHeader` directly into a framework
     ``TaskInfo``. Mirrors the call shape used by
     :func:`_make_task_info` (the disk-round-trip path used by
@@ -805,7 +818,7 @@ def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = Fa
         affinity_id=affinity_id,
         payload=header_dict,
         task_id=header.task_id or "",
-        task_depends_on=() if disable_task_deps else _header_depends_on(header),
+        task_depends_on=() if disable_task_deps else _header_depends_on(header, build_deps_local=build_deps_local),
     )
 
 
@@ -946,6 +959,15 @@ class SuitTaskConfig:
     # imports on build workers.  ``None`` / empty is tolerated — build
     # workers skip the delta import when outpath is absent.
     toolchain_outpaths_map: Optional[dict[str, str]] = None
+
+    # Feature flag: ship the realised OUTPUT closure of every variant's
+    # build-input derivations as a single ``build_deps.out.archive`` so
+    # build nodes pre-load all substituter-queried paths before running
+    # ``nix build``.  The dependency_graph worker produces the archive
+    # into ``matrix_eval_out_dir``; build workers import it via an
+    # affine gate before any ``build_variant`` or ``build_common_dep``
+    # task fires.  Default FALSE = byte-identical current behaviour.
+    build_deps_local: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1092,6 +1114,11 @@ class SuitTask:
         def _action(task_id: str) -> None:
             if task_id == IMPORT_COMMON_TASK_ID:
                 ensure_common_archive_imported(out_dir)
+            elif task_id == IMPORT_BUILD_DEPS_TASK_ID:
+                from compiler_suit_runner.workers.build_worker import (  # noqa: PLC0415
+                    ensure_build_deps_archive_imported,
+                )
+                ensure_build_deps_archive_imported(out_dir)
             elif task_id.startswith("import_tc_"):
                 outpath = hash_to_outpath.get(task_id)
                 if outpath is None:
@@ -1326,6 +1353,11 @@ class SuitTask:
                 # descriptor carries the realized toolchain outpath for
                 # per-toolchain delta archive import on build workers.
                 "toolchain_outpaths_map": self.config.toolchain_outpaths_map or {},
+                # build_deps_local tells the dep_graph worker to produce
+                # build_deps.out.archive after planning so build workers
+                # can pre-load all variant build-input closures before
+                # ``nix build`` fires.  False = byte-identical behaviour.
+                "build_deps_local": self.config.build_deps_local,
             },
             task_id=DEPENDENCY_GRAPH_TASK_ID,
             # The matrix_eval prerequisites (task_id = bare binary) are
@@ -1351,8 +1383,10 @@ class SuitTask:
           (i.e. there are realized toolchains to import).
         * one ``import_tc_<hash>`` gate per distinct realized toolchain
           outpath in ``config.toolchain_outpaths_map``.
+        * one ``import_build_deps`` gate when ``config.build_deps_local``
+          is True (the build-deps output closure import gate).
 
-        Both task types are ``is_secondary_affine=True`` with empty
+        All task types are ``is_secondary_affine=True`` with empty
         ``task_depends_on`` (archives are pre-staged on the shared FS before
         dispatch; no upstream upload wait needed).
 
@@ -1382,6 +1416,9 @@ class SuitTask:
             )
 
         yield _gate(IMPORT_COMMON_TASK_ID)
+
+        if self.config.build_deps_local:
+            yield _gate(IMPORT_BUILD_DEPS_TASK_ID)
 
         seen_tc_task_ids: set[str] = set()
         for outpath in outpaths_map.values():
@@ -1455,7 +1492,9 @@ class SuitTask:
         """
         if self.config.disable_task_deps:
             return ()
-        return _header_depends_on(header)
+        return _header_depends_on(
+            header, build_deps_local=self.config.build_deps_local,
+        )
 
     # ── Memory estimator (disabled) ───────────────────────────────────
 
@@ -2731,6 +2770,7 @@ class SuitTask:
             _header_to_task_info(
                 header,
                 disable_task_deps=self.config.disable_task_deps,
+                build_deps_local=self.config.build_deps_local,
             )
             for header in headers
         ]

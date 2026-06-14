@@ -747,6 +747,7 @@ def enumerate_toolchains_only(
 
 TOOLCHAIN_ARCHIVE_NAME = "toolchains.drv.archive"
 TOOLCHAIN_COMMON_ARCHIVE_NAME = "toolchains.common.archive"
+BUILD_DEPS_ARCHIVE_NAME = "build_deps.out.archive"
 
 
 def toolchain_id_for_outpath(outpath: str) -> str:
@@ -1455,3 +1456,175 @@ def build_toolchains_locally(
                 f"local toolchain build failed for {drv} (rc={rc}): "
                 f"{decoded[-1000:]}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Build-deps output closure (build_deps_local feature)
+# ---------------------------------------------------------------------------
+
+
+def compute_build_deps_closure(
+    input_outpaths: list[str],
+    *,
+    toolchain_paths_to_subtract: Optional[frozenset[str]] = None,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> tuple[list[str], list[str]]:
+    """Compute the ordered requisites closure of ``input_outpaths``, minus
+    any paths already shipped by toolchain archives.
+
+    ``input_outpaths`` are the realised OUTPUT paths of every build-input
+    derivation that ``nix build variant.drv^*`` needs locally before it can
+    build (e.g. glibc, libgcc, gcc, stdenv, bash, coreutils, …).  These
+    must already be realised in the local nix store (caller is responsible
+    for substituting/realising them first).
+
+    ``toolchain_paths_to_subtract`` is the union of every store path already
+    shipped by the toolchain archives (``toolchains.common.archive`` +
+    every ``toolchains.<id>.out.archive``).  Subtracting them avoids
+    re-shipping data the build workers already imported.
+
+    Returns ``(ordered_build_deps_paths, uncovered_paths)`` where:
+
+    * ``ordered_build_deps_paths`` is the topologically-ordered list of
+      store paths to export into :data:`BUILD_DEPS_ARCHIVE_NAME`.  Topological
+      order is preserved from the ``nix-store --query --requisites`` output so
+      ``nix-store --import`` can register them in dependency order.
+    * ``uncovered_paths`` is the list of seed outpaths that either were not
+      realised locally (not present in the requisites output) or were silently
+      absent from the query result — the caller uses this for the completeness
+      gate.
+
+    Raises :class:`RuntimeError` if ``nix-store --query --requisites`` exits
+    non-zero on any seed path.  An empty ``input_outpaths`` list returns two
+    empty lists immediately.
+    """
+    import logging as _logging  # noqa: PLC0415
+    _log = _logging.getLogger("compiler_suit_runner.preflight.build_deps")
+
+    if not input_outpaths:
+        return [], []
+
+    runner = run_subprocess or _default_run_subprocess
+    subtract: frozenset[str] = toolchain_paths_to_subtract or frozenset()
+
+    # Run a single batched requisites query across all seed paths.
+    req_stdout, req_stderr, req_rc = runner(
+        ["nix-store", "--query", "--requisites", *input_outpaths]
+    )
+    if req_rc != 0:
+        raise RuntimeError(
+            "compute_build_deps_closure: nix-store --query --requisites "
+            "failed (rc=%d): %s" % (
+                req_rc,
+                req_stderr.decode("utf-8", errors="replace").strip(),
+            )
+        )
+
+    all_requisites: list[str] = [
+        ln for ln in (
+            raw.strip()
+            for raw in req_stdout.decode("utf-8", errors="replace").splitlines()
+        )
+        if ln
+    ]
+    req_set: frozenset[str] = frozenset(all_requisites)
+
+    # Identify seed outpaths absent from the requisites output (not
+    # realised locally) so the caller can fail closed.
+    uncovered: list[str] = [
+        op for op in input_outpaths
+        if op and op not in req_set
+    ]
+    if uncovered:
+        _log.warning(
+            "compute_build_deps_closure: %d input outpath(s) not found in "
+            "requisites output (not locally realised): %s",
+            len(uncovered),
+            ", ".join(uncovered[:5]) + (" …" if len(uncovered) > 5 else ""),
+        )
+
+    # Filter out paths already shipped by toolchain archives, preserving
+    # topological order (nix-store --query --requisites guarantees
+    # dependency-first ordering).
+    build_deps_paths: list[str] = [
+        p for p in all_requisites
+        if p not in subtract
+    ]
+    return build_deps_paths, uncovered
+
+
+def collect_toolchain_archive_paths(
+    toolchain_out_paths: list[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> frozenset[str]:
+    """Return the union of requisites closures for all toolchain out-paths.
+
+    Used by the build_deps_local feature to compute the set of paths that
+    are already covered by the toolchain archives so they can be subtracted
+    from the build-deps closure to avoid duplication.
+
+    Silently skips out-paths whose requisites query fails (one bad toolchain
+    does not zero the subtraction set).  Returns an empty frozenset if no
+    toolchain produces a valid requisites list.
+    """
+    import logging as _logging  # noqa: PLC0415
+    _log = _logging.getLogger("compiler_suit_runner.preflight.build_deps")
+    runner = run_subprocess or _default_run_subprocess
+    all_paths: set[str] = set()
+    for outpath in toolchain_out_paths:
+        if not outpath or not outpath.startswith("/"):
+            continue
+        stdout, stderr, rc = runner(
+            ["nix-store", "--query", "--requisites", outpath]
+        )
+        if rc != 0:
+            _log.warning(
+                "collect_toolchain_archive_paths: requisites failed for "
+                "%r (rc=%d): %s — skipping",
+                outpath, rc,
+                stderr.decode("utf-8", errors="replace").strip(),
+            )
+            continue
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line:
+                all_paths.add(line)
+    return frozenset(all_paths)
+
+
+def export_build_deps_archive(
+    build_deps_paths: list[str],
+    out_dir: pathlib.Path,
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> pathlib.Path:
+    """Export ``build_deps_paths`` as :data:`BUILD_DEPS_ARCHIVE_NAME`.
+
+    Writes the archive atomically via ``.tmp`` + ``os.replace``.
+    The paths MUST be in topological order (dependency-first) as produced
+    by :func:`compute_build_deps_closure`.
+
+    Returns the written archive path.  Raises :class:`RuntimeError` on
+    export failure.
+    """
+    from compiler_suit_runner.workers.build_compilers_worker import (  # noqa: PLC0415
+        export_closure_exact,
+    )
+    archive_path = out_dir / BUILD_DEPS_ARCHIVE_NAME
+    if not build_deps_paths:
+        raise RuntimeError(
+            "export_build_deps_archive: no paths to export — "
+            "build_deps closure is empty after subtracting toolchain paths"
+        )
+    ok, exp_stderr = export_closure_exact(
+        archive_path,
+        build_deps_paths,
+        run_subprocess=run_subprocess,
+    )
+    if not ok:
+        raise RuntimeError(
+            "export_build_deps_archive: nix-store --export failed: "
+            + exp_stderr.decode("utf-8", errors="replace").strip()
+        )
+    return archive_path
