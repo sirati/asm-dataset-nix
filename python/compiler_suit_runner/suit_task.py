@@ -133,6 +133,8 @@ from compiler_suit_runner import peer_paths_fetch
 from compiler_suit_runner.workers.build_worker import (
     BuildWorkerEnv,
     build_worker,
+    ensure_common_archive_imported,
+    ensure_toolchain_out_archive_imported,
 )
 
 
@@ -186,6 +188,27 @@ def _push_url_to_substituter_url(push_url: str) -> Optional[str]:
 _BUILD_DISPATCH_CLASSES: frozenset[str] = frozenset(
     {"toolchain_validate", "build_common_dep", "build_variant"}
 )
+
+# ---------------------------------------------------------------------------
+# Secondary-affine import gate task identifiers
+# ---------------------------------------------------------------------------
+
+# Task-id for the COMMON realized-toolchain archive import gate task.
+# One per run; wired as a dep on every build_common_dep and build_variant.
+IMPORT_COMMON_TASK_ID = "import_common"
+
+
+def _import_tc_task_id(toolchain_outpath: str) -> str:
+    """Return the import gate task_id for a realized toolchain outpath.
+
+    Extracts the Nix store-hash via
+    :func:`~compiler_suit_runner.preflight.toolchain_id_for_outpath` and
+    returns ``"import_tc_<hash>"``.  Raises :class:`ValueError` when the
+    outpath does not look like a Nix store path (propagated from
+    ``toolchain_id_for_outpath``).
+    """
+    from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
+    return f"import_tc_{_preflight.toolchain_id_for_outpath(toolchain_outpath)}"
 
 
 def _classify(header: ManifestHeader) -> tuple[str, str, Optional[str]]:
@@ -254,6 +277,7 @@ def _make_task_info(
     payload: dict,
     task_id: str = "",
     task_depends_on: tuple[str, ...] = (),
+    is_secondary_affine: bool = False,
 ):
     """Return a framework-compatible :class:`TaskInfo`, falling back to a stub.
 
@@ -268,6 +292,13 @@ def _make_task_info(
     framework builds round-trip cleanly. Entries may be bare strings
     (intra-phase) or :class:`TaskDep` (cross-phase, phase-tagged by the
     caller that knows the prerequisite's phase).
+
+    ``is_secondary_affine`` marks a task as a framework gate that runs
+    ONCE per secondary node (never worker-assigned, never primary-executed,
+    never counted in success/fail).  Added in dynamic_runner #497.  Older
+    framework pins will get a ``TypeError`` which is caught and the task
+    is constructed without the kwarg (safe for normal tasks; callers must
+    not pass ``True`` against a pre-#497 pin in production).
     """
     try:
         from dynamic_runner._shared import (  # type: ignore[import-not-found]
@@ -284,6 +315,7 @@ def _make_task_info(
             payload=payload,
             task_id=task_id,
             task_depends_on=task_depends_on,
+            is_secondary_affine=is_secondary_affine,
         )
 
     identifier = BinaryIdentifier(
@@ -294,9 +326,9 @@ def _make_task_info(
         opt_level="manifest",
     )
     # ``TaskInfo`` gained ``task_id`` + ``task_depends_on`` in
-    # framework commit a1ebbaa. Older framework builds don't have
-    # the kwargs; fall back to constructing without them so a stale
-    # pin doesn't fail-import.
+    # framework commit a1ebbaa; ``is_secondary_affine`` in #497.
+    # Older pins reject unknown kwargs with TypeError; fall back
+    # progressively so a stale pin doesn't fail-import.
     try:
         return TaskInfo(
             path=path,
@@ -308,17 +340,31 @@ def _make_task_info(
             payload=dict(payload),
             task_id=task_id,
             task_depends_on=task_depends_on,
+            is_secondary_affine=is_secondary_affine,
         )
     except TypeError:
-        return TaskInfo(
-            path=path,
-            size=size,
-            identifier=identifier,
-            phase_id=phase_id,
-            type_id=type_id,
-            affinity_id=affinity_id,
-            payload=dict(payload),
-        )
+        try:
+            return TaskInfo(
+                path=path,
+                size=size,
+                identifier=identifier,
+                phase_id=phase_id,
+                type_id=type_id,
+                affinity_id=affinity_id,
+                payload=dict(payload),
+                task_id=task_id,
+                task_depends_on=task_depends_on,
+            )
+        except TypeError:
+            return TaskInfo(
+                path=path,
+                size=size,
+                identifier=identifier,
+                phase_id=phase_id,
+                type_id=type_id,
+                affinity_id=affinity_id,
+                payload=dict(payload),
+            )
 
 
 def _make_task_dep(task_id: str, *, phase_id: str = "", inherit_outputs: bool = False):
@@ -473,6 +519,16 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
             phase_id=Phase.BUILD,
             depends_on=(Phase.DEPENDENCY_GRAPH,),
             types=(
+                # Secondary-affine import gate: runs ONCE per secondary node,
+                # never dispatched to a worker subprocess. ``worker_module``
+                # is required by the PhaseSpec API but the framework never
+                # actually launches a worker for secondary-affine tasks; the
+                # import action is invoked directly via the ``import_action``
+                # duck-typed off the task definition object.
+                TaskTypeSpec(
+                    type_id="toolchain_import",
+                    worker_module="compiler_suit_runner.workers.build_worker",
+                ),
                 TaskTypeSpec(
                     type_id="toolchain_validate",
                     worker_module="compiler_suit_runner.workers.build_worker",
@@ -669,12 +725,34 @@ def _header_depends_on(header: ManifestHeader) -> tuple:
     :attr:`Phase.BUILD_COMPILERS` rather than the declaring task's own
     phase. Shared by the spawn-side :func:`_header_to_task_info` and the
     in-memory :meth:`SuitTask._task_info_from_header`.
+
+    Secondary-affine import gate dependencies (all intra-phase, bare
+    strings resolved to Phase.BUILD):
+
+    * ``build_common_dep`` / ``build_variant`` → ``import_common`` (the
+      common realized-toolchain closure import gate).
+    * ``build_variant`` only → ``import_tc_<hash>`` derived from the
+      variant's ``toolchain_outpath`` payload field (the per-toolchain
+      delta import gate).  Silently skipped when the outpath is absent
+      or has an undecodable store-hash (legacy manifests / tests without
+      outpath).
     """
     toolchain_deps = tuple(
         _make_task_dep(tc_id, phase_id=Phase.BUILD_COMPILERS)
         for tc_id in header.build_compilers_depends_on
     )
-    return tuple(header.task_depends_on) + toolchain_deps
+    # Secondary-affine import gate deps (intra-phase bare strings).
+    import_deps: list[str] = []
+    if header.item_class in ("build_common_dep", "build_variant"):
+        import_deps.append(IMPORT_COMMON_TASK_ID)
+    if header.item_class == "build_variant":
+        toolchain_outpath = header.payload.get("toolchain_outpath") or ""
+        if toolchain_outpath:
+            try:
+                import_deps.append(_import_tc_task_id(toolchain_outpath))
+            except ValueError:
+                pass  # undecodable store path — legacy fixture / no outpath
+    return tuple(header.task_depends_on) + tuple(import_deps) + toolchain_deps
 
 
 def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = False):
@@ -969,6 +1047,67 @@ class SuitTask:
     # contracted public surface.
 
     @property
+    def import_action(self) -> Optional[Callable[[str], None]]:
+        """Secondary-affine import action for toolchain archive gate tasks.
+
+        Duck-typed by the framework's ``run_secondary()`` /
+        ``RustSecondaryCoordinator`` via
+        ``getattr(task_definition, "import_action", None)``. When non-None,
+        the framework calls ``import_action(task_id)`` ONCE per secondary
+        node for each secondary-affine gate task whose dependent work tasks
+        are assigned to that node.
+
+        Callable contract (from affine_action_bridge.rs):
+
+        * ``task_id: str`` — the gate task's id (e.g. ``"import_common"``
+          or ``"import_tc_<hash>"``).
+        * Return ``None`` on success.
+        * Raise ``OSError`` for transient failures (framework retries).
+        * Raise any other ``Exception`` for non-recoverable failures
+          (framework marks the gate and all dependent tasks permanently
+          failed).
+
+        When ``config.matrix_eval_out_dir`` is ``None`` (legacy, no dedup)
+        this property returns ``None`` and the framework never fires the
+        import hook, falling back to the per-process import in
+        ``_run_import_prelude``.
+        """
+        if self.config.matrix_eval_out_dir is None:
+            return None
+        # Build an outpath→task_id reverse map from the toolchain_outpaths_map
+        # so the import callable can look up the right outpath for each
+        # import_tc_<hash> task_id without scanning the map on every call.
+        outpaths_map = self.config.toolchain_outpaths_map or {}
+        hash_to_outpath: dict[str, str] = {}
+        for outpath in outpaths_map.values():
+            if not outpath:
+                continue
+            try:
+                tc_task_id = _import_tc_task_id(outpath)
+            except ValueError:
+                continue
+            hash_to_outpath[tc_task_id] = outpath
+        out_dir = self.config.matrix_eval_out_dir
+
+        def _action(task_id: str) -> None:
+            if task_id == IMPORT_COMMON_TASK_ID:
+                ensure_common_archive_imported(out_dir)
+            elif task_id.startswith("import_tc_"):
+                outpath = hash_to_outpath.get(task_id)
+                if outpath is None:
+                    raise RuntimeError(
+                        f"import_action: no toolchain outpath for {task_id!r};"
+                        " toolchain_outpaths_map may be incomplete"
+                    )
+                ensure_toolchain_out_archive_imported(outpath, out_dir)
+            else:
+                raise RuntimeError(
+                    f"import_action: unknown gate task_id {task_id!r}"
+                )
+
+        return _action
+
+    @property
     def fulfillability_matcher(self) -> Optional[Callable[..., bool]]:
         return self._fulfillability_matcher
 
@@ -1034,6 +1173,13 @@ class SuitTask:
         # Phase 2 + 3: JSON-free, built in-memory from the preflight's
         # per-binary metadata threaded onto the config.
         yield from self._discover_matrix_eval_and_dep_graph_items()
+
+        # Secondary-affine import gate tasks (Phase 4 / BUILD phase).
+        # Emitted before the disk manifest scan so build_common_dep and
+        # build_variant tasks (spawned by dependency_graph streamed-spawn)
+        # can reference them as existing task IDs via bare-string intra-
+        # phase deps.
+        yield from self._discover_import_gate_tasks()
 
         # Phases 1 + 4: build-shaped JSON manifests on the shared FS.
         target = self.config.manifest_dir
@@ -1194,6 +1340,66 @@ class SuitTask:
             ),
         )
         yield self._task_info_from_header(dep_graph_header)
+
+    def _discover_import_gate_tasks(self) -> Iterable:
+        """Yield the secondary-affine import gate TaskInfos for Phase.BUILD.
+
+        Emits:
+
+        * one ``import_common`` gate (common realized-toolchain closure),
+          unconditionally when ``toolchain_outpaths_map`` is non-empty
+          (i.e. there are realized toolchains to import).
+        * one ``import_tc_<hash>`` gate per distinct realized toolchain
+          outpath in ``config.toolchain_outpaths_map``.
+
+        Both task types are ``is_secondary_affine=True`` with empty
+        ``task_depends_on`` (archives are pre-staged on the shared FS before
+        dispatch; no upstream upload wait needed).
+
+        When ``toolchain_outpaths_map`` is absent or empty, nothing is emitted
+        (legacy flows without dedup, or secondary-container configs).
+        """
+        outpaths_map = self.config.toolchain_outpaths_map or {}
+        if not outpaths_map:
+            return
+
+        # Synthetic zero-byte path; framework treats it as an opaque tag
+        # (SuitTask.uses_file_based_items = False).
+        def _gate(task_id: str) -> object:
+            return _make_task_info(
+                pathlib.Path(f"{task_id}.json"),
+                0,
+                phase_id=Phase.BUILD,
+                type_id="toolchain_import",
+                affinity_id=None,
+                payload={
+                    "item_class": "toolchain_import",
+                    "task_id": task_id,
+                },
+                task_id=task_id,
+                task_depends_on=(),
+                is_secondary_affine=True,
+            )
+
+        yield _gate(IMPORT_COMMON_TASK_ID)
+
+        seen_tc_task_ids: set[str] = set()
+        for outpath in outpaths_map.values():
+            if not outpath:
+                continue
+            try:
+                tc_task_id = _import_tc_task_id(outpath)
+            except ValueError:
+                self._logger.warning(
+                    "_discover_import_gate_tasks: cannot derive import"
+                    " task_id for toolchain outpath %r; skipping",
+                    outpath,
+                )
+                continue
+            if tc_task_id in seen_tc_task_ids:
+                continue
+            seen_tc_task_ids.add(tc_task_id)
+            yield _gate(tc_task_id)
 
     def _task_info_from_header(self, header: ManifestHeader):
         """Build a framework :class:`TaskInfo` directly from an
