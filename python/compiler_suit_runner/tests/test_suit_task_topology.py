@@ -136,7 +136,6 @@ def test_build_phase_carries_validate_common_dep_variant_types(
     types = phases["build"].types
     type_ids = {t.type_id for t in types}
     assert type_ids == {
-        "toolchain_import",
         "toolchain_validate",
         "common_dep",
         "variant",
