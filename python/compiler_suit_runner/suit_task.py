@@ -1111,15 +1111,19 @@ class SuitTask:
         Duck-typed by the framework's ``run_secondary()`` /
         ``RustSecondaryCoordinator`` via
         ``getattr(task_definition, "import_action", None)``. When non-None,
-        the framework calls ``import_action(task_id)`` ONCE per secondary
-        node for each secondary-affine gate task whose dependent work tasks
-        are assigned to that node.
+        the framework calls ``import_action(task_id, payload_json)`` ONCE per
+        secondary node for each secondary-affine gate task whose dependent
+        work tasks are assigned to that node (as of pin fed78773,
+        ``affine_action_bridge`` passes two positional args; ``payload_json``
+        is currently unused by the consumer but must be accepted).
 
         Callable contract (from affine_action_bridge.rs):
 
         * ``task_id: str`` — the gate task's id (e.g. ``"import_common"``,
           ``"import_tc_<hash>"``, ``"import_toolchain_drv"``, or
           ``"import_matrix_drv_<binary>"``).
+        * ``payload_json: object`` — the raw JSON payload for the gate task
+          (passed by the framework since fed78773; currently unused here).
         * Return ``None`` on success.
         * Raise ``OSError`` for transient failures (framework retries).
         * Raise any other ``Exception`` for non-recoverable failures
@@ -1156,7 +1160,9 @@ class SuitTask:
             hash_to_outpath[tc_task_id] = outpath
         out_dir = self.config.matrix_eval_out_dir
 
-        def _action(task_id: str) -> None:
+        # fed78773's affine_action_bridge calls (task_id, payload_json);
+        # payload_json is accepted for forward-compatibility but currently unused.
+        def _action(task_id: str, payload_json: object = None) -> None:
             if task_id == IMPORT_COMMON_TASK_ID:
                 ensure_common_archive_imported(out_dir)
             elif task_id == IMPORT_BUILD_DEPS_TASK_ID:

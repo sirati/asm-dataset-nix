@@ -1765,6 +1765,94 @@ def test_import_action_unknown_task_id_raises(
         action("not_an_import_task")
 
 
+def test_import_action_two_arg_call_dispatches_correctly(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """import_action accepts two positional args (task_id, payload_json) as
+    required by fed78773's affine_action_bridge, and dispatches correctly.
+    payload_json is ignored by the consumer."""
+    import dataclasses as _dc  # noqa: PLC0415
+
+    config = _dc.replace(_make_config(tmp_path), matrix_eval_out_dir=tmp_path / "out")
+    (tmp_path / "out").mkdir()
+
+    calls: list[tuple] = []
+
+    def _fake_ensure_common(out_dir, *, run_subprocess=None):
+        calls.append(("common", out_dir))
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.ensure_common_archive_imported",
+        _fake_ensure_common,
+    )
+
+    task = SuitTask(config)
+    action = task.import_action
+    assert action is not None
+    # Two-arg call as the framework makes it (fed78773+): payload_json is None here
+    action("import_common", None)
+    assert calls == [("common", tmp_path / "out")]
+
+
+def test_import_action_two_arg_call_with_payload_dispatches_correctly(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """import_action accepts a non-None payload_json second arg (future-proof)
+    and still dispatches to the correct ensure_* function."""
+    import dataclasses as _dc  # noqa: PLC0415
+
+    config = _dc.replace(_make_config(tmp_path), matrix_eval_out_dir=tmp_path / "out")
+    (tmp_path / "out").mkdir()
+
+    calls: list[tuple] = []
+
+    def _fake_ensure_common(out_dir, *, run_subprocess=None):
+        calls.append(("common", out_dir))
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.ensure_common_archive_imported",
+        _fake_ensure_common,
+    )
+
+    task = SuitTask(config)
+    action = task.import_action
+    assert action is not None
+    # Simulate a richer payload the framework might pass in future pins
+    action("import_common", {"some": "payload"})
+    assert calls == [("common", tmp_path / "out")]
+
+
+def test_import_action_one_arg_call_still_works(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """import_action still works with a single positional arg (older pins /
+    direct consumer calls) — the payload_json default keeps back-compat."""
+    import dataclasses as _dc  # noqa: PLC0415
+
+    config = _dc.replace(_make_config(tmp_path), matrix_eval_out_dir=tmp_path / "out")
+    (tmp_path / "out").mkdir()
+
+    calls: list[tuple] = []
+
+    def _fake_ensure_common(out_dir, *, run_subprocess=None):
+        calls.append(("common", out_dir))
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.ensure_common_archive_imported",
+        _fake_ensure_common,
+    )
+
+    task = SuitTask(config)
+    action = task.import_action
+    assert action is not None
+    # One-arg call (old contract / direct test usage)
+    action("import_common")
+    assert calls == [("common", tmp_path / "out")]
+
+
 # ---------------------------------------------------------------------------
 # build_deps_local Phase 0+1: gate emission + import_action + dep wiring
 # ---------------------------------------------------------------------------
