@@ -49,10 +49,14 @@ from template_graph.tests.test_streaming.fixtures import (
         "fetchurl-something.drv",
         "foo-fetchurl-bar.drv",
         "fetchurl.drv",
-        # Builder scripts.
+        # Builder scripts (incl. bare ``builder.sh`` with no dash prefix —
+        # the store name once ``drv_role`` strips the hash).
         "hello-builder.sh.drv",
         "hello-builder.pl.drv",
         "hello-builder.sh",
+        "builder.sh",
+        "builder.pl",
+        "builder.sh.drv",
         # Patch files.
         "some-fix.patch.drv",
         "some-fix.patch",
@@ -92,6 +96,9 @@ def test_predicate_positive(role: str) -> None:
         "hello.tar.foo.drv",
         # Builder-like but wrong extension.
         "hello-builder.py.drv",
+        # ``builder.sh`` matches only at a start/dash boundary — a name that
+        # merely embeds "builder" must NOT false-positive.
+        "makebuilder.sh",
         # ``-source`` only ENDS the role (mid-string is fine).
     ],
 )

@@ -473,6 +473,39 @@ def test_build_worker_build_common_dep_uses_plain_nix_build(tmp_path):
     assert "--skip-existing" not in argv
 
 
+def test_build_worker_build_common_dep_non_drv_ident(tmp_path):
+    # Regression: script/file common-dep idents that lack a ``.drv`` suffix
+    # (e.g. ``builder.sh``, ``validate-pkg-config.sh``) must reconstruct the
+    # absolute /nix/store/ path and build by store path — NOT fall through
+    # to the flake-ref form (which needs a flake.nix on the secondary /app,
+    # which is absent → ``could not find a flake.nix file`` NonRecoverable).
+    ident = "119w10l5ic8izi6igxqpq0wdmccs9mbc-builder.sh"
+    manifest = _write_manifest(
+        tmp_path / "m.json",
+        item_class=ITEM_CLASS_BUILD_COMMON_DEP,
+        name="some-script-dep",
+        payload={"attr": ident, "binary": "hello"},
+    )
+    runner = RecordingRunner(stdout=b"/nix/store/bbb\n")
+    clock = FakeClock(start=10.0, step=2.5)
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "dataset",
+        run_subprocess=runner,
+        clock=clock,
+    )
+    result = build_worker(manifest, env)
+    assert isinstance(result, BuildWorkerResult)
+    assert result.success is True
+    assert result.error is None
+    argv = runner.calls[0]
+    # Built by absolute store path, NOT a flake ref, and NOT with ``^*``
+    # (it is a realised store path, not a .drv).
+    assert f"/nix/store/{ident}" in argv
+    assert f"/nix/store/{ident}^*" not in argv
+    assert f".#{ident}" not in argv
+
+
 def test_build_worker_build_variant_copies_elf_folder(tmp_path):
     out_dir = tmp_path / "nix-out"
     _make_elf_folder(out_dir, {"hello": b"elf-bytes"})

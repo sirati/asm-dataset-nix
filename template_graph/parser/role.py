@@ -134,7 +134,9 @@ _SOURCE_TERMINAL_RES: tuple[re.Pattern[str], ...] = (
     # ``fetchurl-…`` (and the ``builtins.fetchurl`` family) drv names.
     re.compile(r"(?:^|-)fetchurl(?:-|\.drv$|$)"),
     # Builder scripts inlined as separate drvs (uncommon but real).
-    re.compile(r"-builder\.(?:sh|pl)(?:\.drv)?$"),
+    # ``(?:^|-)`` so a bare ``builder.sh`` (no dash prefix) is matched too,
+    # not only ``<pkg>-builder.sh``.
+    re.compile(r"(?:^|-)builder\.(?:sh|pl)(?:\.drv)?$"),
     # Patch files referenced as drv inputs.
     re.compile(r"\.patch(?:\.drv)?$"),
     # Setup-hook shell snippets.

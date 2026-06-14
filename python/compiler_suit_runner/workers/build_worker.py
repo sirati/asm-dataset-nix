@@ -435,15 +435,21 @@ def build_attr(
         argv.extend(_read_substituters_file(env.substituters_file))
     if extra_args:
         argv.extend(extra_args)
-    # ``attr`` is interpreted in two modes:
-    #   - absolute drv path  (e.g. /nix/store/...drv) → build by drv,
-    #     no flake source needed on the secondary; the drv is fetched
-    #     from a peer harmonia via substituters.
-    #   - flake attribute    (e.g. _crossToolchainMap.x86_64-linux...) →
+    # ``attr`` is interpreted in three modes:
+    #   - absolute drv path   (/nix/store/...drv) → build with ``^*`` output
+    #     selector; the drv (and closure) substitutes from peer harmonias
+    #     without needing the flake source on the secondary.
+    #   - absolute store path (/nix/store/<hash>-<name>, no .drv) → pass
+    #     as-is; nix realises it from substituters. build_common_dep script
+    #     idents (``builder.sh`` / ``validate-pkg-config.sh``) land here.
+    #   - flake attribute     (e.g. _crossToolchainMap.x86_64-linux...) →
     #     legacy single-process / dev-box path; needs flake_ref to
     #     resolve to a checked-out tree.
-    if attr.startswith("/nix/store/") and attr.endswith(".drv"):
-        argv.append(f"{attr}^*")
+    if attr.startswith("/nix/store/"):
+        if attr.endswith(".drv"):
+            argv.append(f"{attr}^*")
+        else:
+            argv.append(attr)
     else:
         argv.append(f"{env.flake_ref}#{attr}")
 
@@ -1386,14 +1392,17 @@ def build_worker(
         )
 
     # build_common_dep descriptors carry a bare store basename
-    # (``<hash>-<name>.drv``, the ``.drv`` already in the name);
-    # reconstruct the absolute drv path so build_attr takes the
-    # ``nix build /nix/store/<ident>^*`` branch instead of the flake-ref
-    # fallback (which needs a flake.nix on the secondary's /app cwd).
+    # (``<hash>-<name>``, which MAY end in ``.drv`` but for script idents
+    # like ``builder.sh`` / ``validate-pkg-config.sh`` does not);
+    # reconstruct the absolute ``/nix/store/`` path so build_attr takes the
+    # store-path branch instead of the flake-ref fallback (which needs a
+    # flake.nix on the secondary's /app cwd). Idents that are already
+    # absolute paths or flake attrs (contain ``/`` or ``#``) are left as-is.
     if (
         item_class == ITEM_CLASS_BUILD_COMMON_DEP
-        and attr.endswith(".drv")
         and not attr.startswith("/nix/store/")
+        and "/" not in attr
+        and "#" not in attr
     ):
         attr = "/nix/store/" + attr
 
