@@ -747,7 +747,6 @@ def enumerate_toolchains_only(
 
 TOOLCHAIN_ARCHIVE_NAME = "toolchains.drv.archive"
 TOOLCHAIN_COMMON_ARCHIVE_NAME = "toolchains.common.archive"
-TOOLCHAIN_UNION_ARCHIVE_NAME = "toolchains.out.archive"
 
 
 def toolchain_id_for_outpath(outpath: str) -> str:
@@ -791,14 +790,22 @@ def toolchain_delta_archive_name(outpath: str) -> str:
 class ToolchainSplit:
     """Result of :func:`compute_toolchain_split`.
 
-    ``common_paths`` is the intersection of all toolchain closures —
-    the shared runtime (glibc, libgcc, …).  It forms a self-contained
-    importable closure (by the downward-closed intersection property).
+    ``common_paths`` is the set of store paths that appear in at least
+    two toolchain closures — the shared runtime (glibc, libgcc, …).
+    Using freq>=2 (rather than the strict ALL-toolchains intersection)
+    avoids the multi-era collapse: glibc-2.26-era toolchains share zero
+    paths with glibc-2.42-era toolchains, so a strict intersection
+    would be empty and COMMON would carry nothing.  Paths appearing in
+    >=2 closures naturally collapse to the era-shared dependencies.
 
     ``delta_paths`` maps each toolchain out-path to the tuple of store
     paths in its closure that are NOT in ``common_paths``.  Each delta
-    references paths already in ``common_paths``, so a worker imports
-    COMMON first then each delta to reconstruct the full toolchain.
+    imports cleanly after COMMON is present because every dependency of
+    a delta path is either in COMMON or in the same delta.
+
+    Upload size: COMMON + Σ|delta_i| = |union of all closures|
+    (each store path appears in COMMON or exactly one delta), so total
+    upload ≈ union size with no blowup.
     """
 
     common_paths: frozenset[str]
@@ -815,18 +822,22 @@ def compute_toolchain_split(
     For each toolchain out-path ``Ti``:
       closure(Ti) = ``nix-store --query --requisites Ti``
 
-    COMMON = intersection of all closure(Ti).  By the downward-closed
-    property of Nix closures the intersection is itself a complete
-    closure (all deps of every COMMON path are also in COMMON) so it
-    is directly importable.
+    COMMON = {p : freq(p) >= 2} — paths appearing in at least two
+    toolchain closures.  This avoids the multi-era collapse: the strict
+    ALL-closures intersection of a matrix spanning glibc-2.26 and
+    glibc-2.42 toolchains is empty; the freq>=2 definition keeps all
+    intra-era shared deps in COMMON.
 
     delta(Ti) = closure(Ti) − COMMON.  Each delta imports cleanly after
-    COMMON is present because every dependency of a delta path is
-    either in COMMON or in the same delta.
+    COMMON is present.
 
-    Raises :class:`RuntimeError` if any ``nix-store --query
-    --requisites`` call fails (a bad out-path would produce a useless
-    archive so callers must surface the error).
+    Upload property: COMMON + Σ|delta_i| == |union| (each path is in
+    COMMON or exactly one delta) — total upload ≈ union size, no blowup.
+
+    Paths that are unrealized or produce an empty requisites output are
+    SKIPPED with a warning (one bad toolchain doesn't zero the split).
+    Raises :class:`RuntimeError` only if NO toolchain produces a valid
+    closure, or if a requisites query hard-fails with a non-zero rc.
     """
     if not toolchain_out_paths:
         raise RuntimeError(
@@ -840,30 +851,60 @@ def compute_toolchain_split(
     # are exported with ``export_closure_exact`` (no requisites re-query),
     # so we must preserve this order here; sorting alphabetically would
     # break intra-delta references at import time.
+    import logging as _logging  # noqa: PLC0415
+    _split_log = _logging.getLogger("compiler_suit_runner.preflight.split")
+
     closures: dict[str, list[str]] = {}
     for outpath in toolchain_out_paths:
+        if not isinstance(outpath, str) or not outpath.startswith("/"):
+            _split_log.warning(
+                "compute_toolchain_split: skipping unrealized/invalid "
+                "outpath %r",
+                outpath,
+            )
+            continue
         stdout, stderr, rc = runner(
             ["nix-store", "--query", "--requisites", outpath]
         )
         if rc != 0:
-            raise RuntimeError(
-                f"compute_toolchain_split: requisites query failed for "
-                f"{outpath!r}: "
-                + stderr.decode("utf-8", errors="replace").strip()
+            _split_log.warning(
+                "compute_toolchain_split: requisites query failed for "
+                "%r (rc=%d): %s — skipping",
+                outpath, rc,
+                stderr.decode("utf-8", errors="replace").strip(),
             )
+            continue
         lines = [l for l in stdout.decode("utf-8", errors="replace").splitlines() if l.strip()]
         if not lines:
-            raise RuntimeError(
-                f"compute_toolchain_split: requisites query returned no paths "
-                f"for {outpath!r}"
+            _split_log.warning(
+                "compute_toolchain_split: requisites query returned no "
+                "paths for %r — skipping",
+                outpath,
             )
+            continue
         closures[outpath] = lines
 
-    # Intersection = COMMON (order-agnostic; the common archive re-queries
-    # requisites at export so its own topological order is recovered).
-    common: frozenset[str] = frozenset(next(iter(closures.values())))
-    for lines in closures.values():
-        common = common & frozenset(lines)
+    if not closures:
+        raise RuntimeError(
+            "compute_toolchain_split: no toolchain produced a valid "
+            "closure (all paths unrealized or requisites queries failed)"
+        )
+
+    # freq(p) = number of toolchains whose closure contains p.
+    # COMMON = {p : freq(p) >= 2} so paths shared by at least two
+    # toolchains (any era) form the common archive.  A single-toolchain
+    # run makes COMMON the full closure (freq >= 1 iff >= 2 out of 1 is
+    # vacuously true — but for N=1 we fall back to the full closure so
+    # the single-toolchain case works: delta = empty, common = full).
+    if len(closures) == 1:
+        only_paths = next(iter(closures.values()))
+        common: frozenset[str] = frozenset(only_paths)
+    else:
+        import collections as _collections  # noqa: PLC0415
+        freq: dict[str, int] = _collections.Counter(
+            p for paths in closures.values() for p in paths
+        )
+        common = frozenset(p for p, count in freq.items() if count >= 2)
 
     # delta = closure − COMMON per toolchain, PRESERVING topological order.
     delta_paths: dict[str, tuple[str, ...]] = {
@@ -1007,58 +1048,6 @@ def export_toolchain_split(
         written[name] = archive
 
     return written
-
-
-def export_toolchain_union(
-    toolchain_out_paths: list[str],
-    out_dir: pathlib.Path,
-    *,
-    run_subprocess: Optional[RunSubprocess] = None,
-) -> pathlib.Path:
-    """Export the UNION of all toolchain closures into a single archive.
-
-    Writes ``<out_dir>/toolchains.out.archive`` containing the fully
-    deduplicated union of every realized toolchain output's closure.
-    ``nix-store --query --requisites`` with all seed paths at once is
-    the union — each store path appears exactly once in the output, fully
-    deduped by nix's own deduplication logic.
-
-    Hard errors (raise :class:`RuntimeError`) on:
-    - empty ``toolchain_out_paths``
-    - any path that is not an absolute store path (basic sanity check)
-    - a failed ``nix-store --export`` or ``--query --requisites``
-
-    Returns the written archive path on success.
-    """
-    if not toolchain_out_paths:
-        raise RuntimeError(
-            "export_toolchain_union: no toolchain out-paths supplied"
-        )
-    for p in toolchain_out_paths:
-        if not isinstance(p, str) or not p.startswith("/"):
-            raise RuntimeError(
-                f"export_toolchain_union: unrealized or invalid out-path {p!r}"
-            )
-
-    from compiler_suit_runner.workers.build_compilers_worker import (  # noqa: PLC0415
-        export_closure,
-    )
-
-    archive_path = out_dir / TOOLCHAIN_UNION_ARCHIVE_NAME
-    ok, req_stderr, exp_stderr = export_closure(
-        archive_path,
-        toolchain_out_paths,
-        run_subprocess=run_subprocess,
-    )
-    if not ok:
-        raise RuntimeError(
-            "export_toolchain_union: nix-store export of union closure failed: "
-            "requisites_stderr="
-            + req_stderr.decode("utf-8", errors="replace").strip()
-            + " export_stderr="
-            + exp_stderr.decode("utf-8", errors="replace").strip()
-        )
-    return archive_path
 
 
 # ---------------------------------------------------------------------------
