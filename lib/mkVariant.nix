@@ -249,6 +249,24 @@ let
   # Override the package with our custom stdenv and flags
   basePkg = targetPkgs.${pkg.attr}.override { stdenv = customStdenv; };
 
+  # Per-package compatibility shims applied BEFORE the variant overrideAttrs.
+  # These resolve deep ABI mismatches between nixpkgs-unstable deps and old
+  # compiler stdenvs (old clang brings old glibc; some deps require newer glibc).
+  #
+  # dash: nixpkgs-unstable libedit-20251016-3.1 requires GLIBC_2.38 and GLIBC_2.42
+  # versioned symbols. Old clang stdenvs (clang5-17) bring glibc 2.35/2.38/2.39 —
+  # all below 2.42 — so AC_CHECK_LIB(-ledit) fails and configure aborts. Strip
+  # libedit support entirely: dash is never used interactively in this dataset, and
+  # the resulting binaries are fully valid POSIX shell executables.
+  basePkg' =
+    if pkg.attr == "dash" then
+      basePkg.overrideAttrs (_old: {
+        buildInputs = [ ];
+        configureFlags = [ ];
+      })
+    else
+      basePkg;
+
   # Combine hardening disables from the hardening mode + flag set
   allHardeningDisable =
     if hardening.hardeningDisable == [ "all" ] then
@@ -257,7 +275,7 @@ let
       hardening.hardeningDisable ++ extraHardeningDisable;
   allHardeningEnable = hardening.hardeningEnable or [ ];
 
-  variantPkg = basePkg.overrideAttrs (
+  variantPkg = basePkg'.overrideAttrs (
     old:
     let
       # Some packages use env.NIX_CFLAGS_COMPILE (newer pattern), others use the
