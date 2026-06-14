@@ -2770,7 +2770,14 @@ class TestStreamedSpawnHandoff:
 
 
 class _BuildDepsSubprocessStub:
-    """Configurable stub for _produce_build_deps_archive's subprocess calls."""
+    """Configurable stub for _produce_build_deps_archive's subprocess calls.
+
+    Handles the full sequence of nix-store calls the function makes:
+      1. ``--query --references <variant.drv>``  → input drv list
+      2. ``--query --outputs <input.drv>``        → output outpaths (reads .drv)
+      3. ``--realise <outpath…>``                 → realise/substitute outputs
+      4. ``--query --requisites <outpath…>``      → full closure for export
+    """
 
     def __init__(
         self,
@@ -2778,13 +2785,18 @@ class _BuildDepsSubprocessStub:
         references_map: "dict[str, list[str]] | None" = None,
         outputs_map: "dict[str, list[str]] | None" = None,
         requisites_map: "dict[tuple, list[str]] | None" = None,
+        realise_rc: int = 0,
+        realise_stderr: bytes = b"",
     ) -> None:
         # variant.drv → list of input .drv references
         self.references_map: dict[str, list[str]] = references_map or {}
-        # input.drv → list of output outpaths
+        # input.drv → list of output outpaths; None means .drv not in store (rc=1)
         self.outputs_map: dict[str, list[str]] = outputs_map or {}
         # (seed,) → requisites list (keyed by tuple of all argv seeds)
         self.requisites_map: dict[tuple, list[str]] = requisites_map or {}
+        # return code and stderr for ``nix-store --realise`` calls
+        self.realise_rc: int = realise_rc
+        self.realise_stderr: bytes = realise_stderr
         self.calls: list[list[str]] = []
 
     def __call__(self, argv: list[str]) -> "tuple[bytes, bytes, int]":
@@ -2797,8 +2809,15 @@ class _BuildDepsSubprocessStub:
             key = argv[3]
             out = self.outputs_map.get(key)
             if out is None:
-                return b"", b"not realised\n", 1
+                # The .drv itself is not in the local store (import failed).
+                return b"", b"path not known\n", 1
             return ("\n".join(out) + "\n").encode(), b"", 0
+        if argv[:2] == ["nix-store", "--realise"]:
+            # Realise/substitute the listed output paths.
+            outpaths = argv[2:]
+            if self.realise_rc == 0:
+                return ("\n".join(outpaths) + "\n").encode(), b"", 0
+            return b"", self.realise_stderr, self.realise_rc
         if argv[:3] == ["nix-store", "--query", "--requisites"]:
             seeds = tuple(argv[3:])
             paths = self.requisites_map.get(seeds, [])
@@ -3031,4 +3050,122 @@ class TestProduceBuildDepsArchive:
                 variant_lookups={},
                 matrix_eval_out_dir=tmp_path,
                 runner=_failing_runner,
+            )
+
+    def test_realise_invoked_on_input_outpaths_before_requisites(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        """``nix-store --realise`` must be called on the resolved input
+        output paths BEFORE ``nix-store --query --requisites``.
+
+        The dep_graph worker only holds the drv graph (imported archives),
+        not the built outputs.  Without realisation the --requisites and
+        export calls fail on the unrealised majority.  This test asserts:
+
+        1. A ``--realise`` call appears in the stub's call list.
+        2. The ``--realise`` call lists the input outpaths (not the drvs).
+        3. The ``--realise`` call precedes any ``--query --requisites`` call.
+        """
+        from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
+            _produce_build_deps_archive,
+        )
+        from compiler_suit_runner import preflight as _pf  # noqa: PLC0415
+
+        runner = _BuildDepsSubprocessStub(
+            references_map={self._VARIANT_DRV: [self._INPUT_DRV]},
+            outputs_map={self._INPUT_DRV: [self._INPUT_OUTPATH]},
+            requisites_map={
+                (self._INPUT_OUTPATH,): [self._INPUT_OUTPATH],
+                (self._TC_OUTPATH,): [self._TC_OUTPATH],
+            },
+        )
+
+        captured_export: list = []
+
+        def _fake_export(paths, out_dir, *, run_subprocess=None):
+            captured_export.extend(paths)
+            p = out_dir / _pf.BUILD_DEPS_ARCHIVE_NAME
+            p.write_bytes(b"x")
+            return p
+
+        monkeypatch.setattr(_pf, "export_build_deps_archive", _fake_export)
+
+        _produce_build_deps_archive(
+            descriptors=_make_build_deps_descriptors(self._VARIANT_DRV),
+            variant_lookups={
+                "hello": {
+                    ("x86_64", "hello__x86_64__gcc15-O0"): {
+                        "drv": self._VARIANT_DRV,
+                        "toolchain_outpath": self._TC_OUTPATH,
+                    },
+                },
+            },
+            matrix_eval_out_dir=tmp_path,
+            runner=runner,
+        )
+
+        # Collect the positions of --realise and --query --requisites calls.
+        realise_positions = [
+            i for i, c in enumerate(runner.calls)
+            if c[:2] == ["nix-store", "--realise"]
+        ]
+        requisites_positions = [
+            i for i, c in enumerate(runner.calls)
+            if c[:3] == ["nix-store", "--query", "--requisites"]
+        ]
+
+        assert realise_positions, (
+            "expected at least one 'nix-store --realise' call; "
+            f"got calls: {runner.calls!r}"
+        )
+        # The --realise call must list the input outpath (not the drv).
+        realise_argv = runner.calls[realise_positions[0]]
+        assert self._INPUT_OUTPATH in realise_argv, (
+            f"--realise argv must include {self._INPUT_OUTPATH!r}; "
+            f"got: {realise_argv!r}"
+        )
+        # --realise must precede --query --requisites.
+        assert requisites_positions, (
+            "expected at least one '--query --requisites' call"
+        )
+        assert realise_positions[0] < requisites_positions[0], (
+            "--realise must be called before --query --requisites; "
+            f"realise pos={realise_positions[0]}, "
+            f"requisites pos={requisites_positions[0]}"
+        )
+
+    def test_realise_failure_raises_runtime_error(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        """A non-zero rc from ``nix-store --realise`` raises RuntimeError
+        naming the unrealisable paths.
+
+        A build input that cannot be realised (neither in the store nor
+        substitutable) is a hard gap; the feature must fail loud rather
+        than silently skipping and producing an incomplete archive.
+        """
+        from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
+            _produce_build_deps_archive,
+        )
+
+        runner = _BuildDepsSubprocessStub(
+            references_map={self._VARIANT_DRV: [self._INPUT_DRV]},
+            outputs_map={self._INPUT_DRV: [self._INPUT_OUTPATH]},
+            realise_rc=1,
+            realise_stderr=b"error: cannot substitute /nix/store/oo...-glibc",
+        )
+
+        with pytest.raises(RuntimeError, match="--realise failed"):
+            _produce_build_deps_archive(
+                descriptors=_make_build_deps_descriptors(self._VARIANT_DRV),
+                variant_lookups={
+                    "hello": {
+                        ("x86_64", "lbl"): {
+                            "drv": self._VARIANT_DRV,
+                            "toolchain_outpath": self._TC_OUTPATH,
+                        },
+                    },
+                },
+                matrix_eval_out_dir=tmp_path,
+                runner=runner,
             )

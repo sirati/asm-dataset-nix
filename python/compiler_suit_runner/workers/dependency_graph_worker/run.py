@@ -747,45 +747,68 @@ def _produce_build_deps_archive(
         len(all_input_drvs),
     )
 
-    # 3. Resolve the realised OUTPUT path of each input drv via
-    #    ``nix-store --query --outputs``.  Skip drvs whose output is not
-    #    locally realised (those would need substitution anyway — mark as
-    #    uncovered for the completeness gate, but continue to get the rest).
+    # 3. Resolve the OUTPUT path of each input drv via
+    #    ``nix-store --query --outputs``.  Note: this reads the .drv file
+    #    and always returns the output path regardless of whether the path
+    #    is realised in the store; a non-zero rc here means the .drv itself
+    #    is missing from the local store (import failure), which is fatal.
     input_outpaths: list[str] = []
-    unrealised_drvs: list[str] = []
     for input_drv in sorted(all_input_drvs):
         stdout, stderr, rc = runner(
             ["nix-store", "--query", "--outputs", input_drv]
         )
         if rc != 0:
-            unrealised_drvs.append(input_drv)
-            _log.debug(
-                "_produce_build_deps_archive: --query --outputs failed for "
-                "%r (rc=%d) — not locally realised, skipping",
-                input_drv, rc,
+            raise RuntimeError(
+                "_produce_build_deps_archive: nix-store --query --outputs "
+                f"failed for {input_drv!r} (rc={rc}) — the .drv is not "
+                "resident in the local store (import archive missing/corrupt?): "
+                + stderr.decode("utf-8", errors="replace").strip()
             )
-            continue
         for line in stdout.decode("utf-8", errors="replace").splitlines():
             op = line.strip()
             if op:
                 input_outpaths.append(op)
 
-    if unrealised_drvs:
-        _log.warning(
-            "_produce_build_deps_archive: %d input drv(s) not locally "
-            "realised (their outputs will need substitution at build time); "
-            "first 5: %s",
-            len(unrealised_drvs),
-            ", ".join(unrealised_drvs[:5])
-            + (" …" if len(unrealised_drvs) > 5 else ""),
-        )
-
     if not input_outpaths:
         _log.warning(
-            "_produce_build_deps_archive: no realised input outpaths found — "
+            "_produce_build_deps_archive: no input outpaths resolved — "
             "build_deps archive would be empty; skipping"
         )
         return
+
+    # 3b. REALISE the input output paths before compute_build_deps_closure.
+    #     ``--query --requisites`` requires the paths to be valid in the
+    #     store and export also needs them realised.  The dep_graph worker
+    #     only holds the drv graph (imported drv archives), NOT the built
+    #     outputs; we must substitute them from the configured substituters
+    #     (cache.nixos.org etc.) first.  Build is attempted only when
+    #     substitution is unavailable.
+    #
+    #     This realises the build-input closure on the dep_graph worker node
+    #     (one-time).  It may add noticeable dep_graph-phase latency for
+    #     large closures but is required for correctness.
+    _log.info(
+        "_produce_build_deps_archive: realising %d input outpath(s) via "
+        "nix-store --realise (may add dep_graph-phase latency)",
+        len(input_outpaths),
+    )
+    stdout, stderr, rc = runner(["nix-store", "--realise"] + input_outpaths)
+    if rc != 0:
+        failed_hint = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            "_produce_build_deps_archive: nix-store --realise failed "
+            f"(rc={rc}) for {len(input_outpaths)} input outpath(s) — "
+            "one or more build inputs cannot be substituted or built.  "
+            "This is a hard gap: the build_deps feature cannot pre-load "
+            "paths that are neither in the store nor substitutable.  "
+            f"First 5 paths: {', '.join(input_outpaths[:5])}"
+            + (" …" if len(input_outpaths) > 5 else "")
+            + (f"\nnix-store stderr: {failed_hint}" if failed_hint else "")
+        )
+    _log.info(
+        "_produce_build_deps_archive: all %d input outpath(s) realised",
+        len(input_outpaths),
+    )
 
     # 4. Compute the toolchain closure to subtract (paths already shipped
     #    by toolchains.common.archive + toolchains.<id>.out.archive).
