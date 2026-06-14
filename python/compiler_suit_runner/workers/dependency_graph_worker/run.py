@@ -718,6 +718,7 @@ def _produce_build_deps_archive(
     #    (source files are also references but are not derivations and
     #    have no "output" to realise).
     all_input_drvs: set[str] = set()
+    _variant_pkg_drvs_skipped = 0
     for variant_drv in sorted(variant_drvs):
         stdout, stderr, rc = runner(
             ["nix-store", "--query", "--references", variant_drv]
@@ -730,8 +731,31 @@ def _produce_build_deps_archive(
             )
         for line in stdout.decode("utf-8", errors="replace").splitlines():
             ref = line.strip()
-            if ref.endswith(".drv"):
-                all_input_drvs.add(ref)
+            if not ref.endswith(".drv"):
+                continue
+            # Exclude the variant PACKAGE drv (``<pkg>-variant-<arch>-…``).
+            # mkBinaryFolder.nix interpolates the variant package's outputs
+            # into the elf-folder build script, so the variant package drv is
+            # an inputDrv of the elf-folder drv we just queried. Its OUTPUT
+            # (``…-<pkg>-variant-<arch>-…``) is exactly what the build phase
+            # PRODUCES — it is not pre-fetchable from any substituter, so it
+            # must never enter the realise/closure set (including it caused
+            # the build_deps ``nix-store --realise`` hard gap). The
+            # ``-variant-`` infix is set unconditionally by
+            # ``pname = "${pkg.attr}-variant"`` (mkVariant.nix) and never
+            # appears in a genuine build input.
+            if "-variant-" in ref.rsplit("/", 1)[-1]:
+                _variant_pkg_drvs_skipped += 1
+                continue
+            all_input_drvs.add(ref)
+
+    if _variant_pkg_drvs_skipped:
+        _log.info(
+            "_produce_build_deps_archive: excluded %d variant-package drv(s) "
+            "from the build-deps input set (their outputs are produced by the "
+            "build phase, not pre-fetchable)",
+            _variant_pkg_drvs_skipped,
+        )
 
     if not all_input_drvs:
         _log.warning(

@@ -2915,6 +2915,56 @@ class TestProduceBuildDepsArchive:
         # The input outpath (after toolchain subtraction) should be exported.
         assert self._INPUT_OUTPATH in exported
 
+    def test_variant_pkg_drv_excluded_from_realise(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        """The variant PACKAGE drv (``-variant-``) must not enter the build-deps
+        set. mkBinaryFolder.nix interpolates the variant package's outputs into
+        the elf-folder build script, so the variant package drv is an inputDrv
+        of the elf-folder drv we query via ``--references``. Its OUTPUT is what
+        the build phase PRODUCES (not pre-fetchable) — including it caused the
+        #61 ``nix-store --realise`` hard gap. Regression for that filter.
+        """
+        variant_pkg_drv = "/nix/store/" + "p" * 32 + "-hello-variant-x86_64-1.0.drv"
+        variant_pkg_out = "/nix/store/" + "q" * 32 + "-hello-variant-x86_64-1.0"
+        runner = _BuildDepsSubprocessStub(
+            references_map={
+                # The elf-folder drv references the variant pkg drv AND a real
+                # build input (glibc).
+                self._VARIANT_DRV: [variant_pkg_drv, self._INPUT_DRV],
+            },
+            outputs_map={
+                variant_pkg_drv: [variant_pkg_out],
+                self._INPUT_DRV: [self._INPUT_OUTPATH],
+            },
+            requisites_map={
+                (self._INPUT_OUTPATH,): [self._INPUT_OUTPATH],
+                (self._TC_OUTPATH,): [self._TC_OUTPATH],
+            },
+        )
+        exported: list = []
+        self._run(tmp_path, monkeypatch, runner=runner, export_paths_out=exported)
+
+        # The variant package drv must be filtered BEFORE output resolution —
+        # its ``--query --outputs`` must never be called.
+        assert [
+            "nix-store", "--query", "--outputs", variant_pkg_drv,
+        ] not in runner.calls
+        # …so its output is never realised nor exported.
+        realised = {
+            p
+            for c in runner.calls
+            if c[:2] == ["nix-store", "--realise"]
+            for p in c[2:]
+        }
+        assert variant_pkg_out not in realised, (
+            f"variant package output {variant_pkg_out!r} must not be realised — "
+            f"it is what the build phase produces. realised={realised!r}"
+        )
+        assert variant_pkg_out not in exported
+        # The legitimate glibc input is still exported.
+        assert self._INPUT_OUTPATH in exported
+
     def test_toolchain_outpath_subtracted(
         self, tmp_path: pathlib.Path, monkeypatch,
     ) -> None:
