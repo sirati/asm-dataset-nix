@@ -455,7 +455,7 @@ in
         select_expr,
         "--force-recurse",
         "--max-jobs",
-        "1",
+        os.environ.get("ASM_NIX_EVAL_MAX_JOBS", "8"),
     ]
     try:
         stdout, stderr, rc = run_subprocess(argv)
