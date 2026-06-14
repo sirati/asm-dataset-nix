@@ -1680,33 +1680,26 @@ def test_apply_unfulfillable_reinject_cap_handles_missing_setter(
 
 
 # ---------------------------------------------------------------------------
-# _produce_and_upload_toolchain_split_archives
+# _produce_and_upload_toolchain_union_archive
 # ---------------------------------------------------------------------------
 
 
-def _patch_gateway_for_split(
+def _patch_gateway_for_union(
     monkeypatch: pytest.MonkeyPatch,
     *,
     sidecar_content: str = "",
-    split_archive_names: list[str] | None = None,
+    archive_name: str = "toolchains.out.archive",
 ) -> dict:
-    """Patch the gateway + split export for split-archive tests.
+    """Patch the gateway + union export for union-archive tests.
 
-    ``split_archive_names`` controls which archive basenames the fake
-    ``export_toolchain_split`` writes into the out_dir
-    (default: ``["toolchains.common.archive", "toolchains.abc123.out.archive"]``).
     ``sidecar_content`` pre-sets the remote sidecar the gateway returns
     (empty string = absent sidecar = upload not skipped).
+    ``archive_name`` controls the archive basename the fake
+    ``export_toolchain_union`` writes (default: ``toolchains.out.archive``).
     """
     from dynamic_runner.packaging.gateway import GatewayConfig
 
-    if split_archive_names is None:
-        split_archive_names = [
-            "toolchains.common.archive",
-            "toolchains.abc123.out.archive",
-        ]
-
-    state: dict = {"gateway": None, "config": None, "split_calls": [], "export_calls": []}
+    state: dict = {"gateway": None, "config": None, "export_calls": []}
 
     def fake_parse(url):
         cfg = GatewayConfig(
@@ -1724,38 +1717,25 @@ def _patch_gateway_for_split(
     monkeypatch.setattr("dynamic_runner.packaging.gateway.parse_gateway_url", fake_parse)
     monkeypatch.setattr("dynamic_runner.packaging.gateway.create_gateway", fake_create)
 
-    def fake_compute_split(out_paths, **_kw):
-        state["split_calls"].append(list(out_paths))
-        from compiler_suit_runner.preflight import ToolchainSplit
-        return ToolchainSplit(
-            common_paths=frozenset({"/nix/store/glibc"}),
-            delta_paths={"/nix/store/abc123-gcc": ("/nix/store/abc123-gcc",)},
-        )
+    def fake_export_union(out_paths, out_dir, **_kw):
+        state["export_calls"].append((list(out_paths), pathlib.Path(out_dir)))
+        archive = pathlib.Path(out_dir) / archive_name
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        archive.write_bytes(b"NIX_UNION_EXPORT")
+        return archive
 
-    monkeypatch.setattr("compiler_suit_runner.preflight.compute_toolchain_split", fake_compute_split)
-
-    def fake_export_split(split, out_dir, **_kw):
-        state["export_calls"].append((split, pathlib.Path(out_dir)))
-        written = {}
-        for name in split_archive_names:
-            archive = pathlib.Path(out_dir) / name
-            archive.parent.mkdir(parents=True, exist_ok=True)
-            archive.write_bytes(b"NIX_EXPORT:" + name.encode())
-            written[name] = archive
-        return written
-
-    monkeypatch.setattr("compiler_suit_runner.preflight.export_toolchain_split", fake_export_split)
+    monkeypatch.setattr("compiler_suit_runner.preflight.export_toolchain_union", fake_export_union)
     return state
 
 
-def test_produce_and_upload_split_archives_happy(
+def test_produce_and_upload_union_archive_happy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ):
-    """The submitter computes the split, exports COMMON + per-toolchain delta
-    archives, and uploads each with a sha256 sidecar to gateway out/_matrix_eval."""
+    """The submitter exports the union archive and uploads it with a sha256
+    sidecar to gateway out/_matrix_eval; returns 0 on success."""
     import logging
 
-    state = _patch_gateway_for_split(monkeypatch)
+    state = _patch_gateway_for_union(monkeypatch)
     args = _make_args(
         tmp_path,
         multi_computer="slurm",
@@ -1764,43 +1744,40 @@ def test_produce_and_upload_split_archives_happy(
         ssh_identity_file="/tmp/id_ed25519",
         ssh_config="/tmp/ssh_config",
     )
-    cli_module._produce_and_upload_toolchain_split_archives(
+    rc = cli_module._produce_and_upload_toolchain_union_archive(
         args, ["/nix/store/abc123-gcc"], logging.getLogger("t"),
     )
-    # Split computed and exported.
-    assert state["split_calls"] == [["/nix/store/abc123-gcc"]]
+    assert rc == 0
+    # Export was called with the correct out-paths.
     assert state["export_calls"]
-    # Gateway was used to upload archives to the right remote dir.
+    assert state["export_calls"][0][0] == ["/nix/store/abc123-gcc"]
+    # Gateway was used to upload the union archive to the right remote dir.
     gw = state["gateway"]
     assert gw.connected and gw.disconnected
     assert "/data/slurm/asm-dataset/out/_matrix_eval" in gw.created_dirs
     remote_names = [r for _l, r in gw.uploads]
-    assert any("toolchains.common.archive" in r for r in remote_names)
-    assert any("toolchains.abc123.out.archive" in r for r in remote_names)
-    # SHA-256 sidecars uploaded.
+    assert any("toolchains.out.archive" in r for r in remote_names)
+    # SHA-256 sidecar uploaded.
     assert any(r.endswith(".sha256") for r in remote_names)
     # AUTH threaded onto the parsed config.
     assert state["config"].ssh_identity_file == "/tmp/id_ed25519"
     assert state["config"].ssh_config_file == "/tmp/ssh_config"
 
 
-def test_produce_and_upload_split_archives_split_failure_warns_no_abort(
+def test_produce_and_upload_union_archive_empty_paths_hard_aborts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
     caplog: pytest.LogCaptureFixture,
 ):
-    """A failed split computation logs a WARNING and does NOT raise."""
+    """An empty out_paths list logs error and returns 1 (hard abort) without
+    touching the gateway."""
     import logging
 
-    def boom(out_paths, **_kw):
-        raise RuntimeError("nix requisites error")
-
-    monkeypatch.setattr("compiler_suit_runner.preflight.compute_toolchain_split", boom)
-    gateway_created: list = []
     from dynamic_runner.packaging.gateway import GatewayConfig
     monkeypatch.setattr(
         "dynamic_runner.packaging.gateway.parse_gateway_url",
         lambda url: GatewayConfig(mode="ssh", ssh_user="u", ssh_host="h", ssh_port=22),
     )
+    gateway_created: list = []
     monkeypatch.setattr(
         "dynamic_runner.packaging.gateway.create_gateway",
         lambda cfg: gateway_created.append(cfg) or _FakeGateway(cfg),
@@ -1811,34 +1788,26 @@ def test_produce_and_upload_split_archives_split_failure_warns_no_abort(
         gateway="ssh://kruppb@localhost:2222",
         slurm_root_folder="/data/slurm/asm-dataset",
     )
-    with caplog.at_level(logging.WARNING):
-        cli_module._produce_and_upload_toolchain_split_archives(
-            args, ["/nix/store/abc123-gcc"], logging.getLogger("t"),
+    with caplog.at_level(logging.ERROR):
+        rc = cli_module._produce_and_upload_toolchain_union_archive(
+            args, [], logging.getLogger("t"),
         )
+    assert rc == 1
     assert gateway_created == []
-    assert any("fall back to substitution" in r.message for r in caplog.records)
+    assert any("aborting dispatch" in r.message for r in caplog.records)
 
 
-def test_produce_and_upload_split_archives_export_failure_warns_no_abort(
+def test_produce_and_upload_union_archive_export_failure_hard_aborts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
     caplog: pytest.LogCaptureFixture,
 ):
-    """A failed export logs a WARNING and does NOT raise — soft failure."""
+    """A failed export logs error and returns 1 (hard abort), no gateway used."""
     import logging
 
-    from compiler_suit_runner.preflight import ToolchainSplit
-
-    def fake_compute_split(out_paths, **_kw):
-        return ToolchainSplit(
-            common_paths=frozenset({"/nix/store/glibc"}),
-            delta_paths={"/nix/store/abc123-gcc": ("/nix/store/abc123-gcc",)},
-        )
-
-    def boom_export(split, out_dir, **_kw):
+    def boom_export(out_paths, out_dir, **_kw):
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr("compiler_suit_runner.preflight.compute_toolchain_split", fake_compute_split)
-    monkeypatch.setattr("compiler_suit_runner.preflight.export_toolchain_split", boom_export)
+    monkeypatch.setattr("compiler_suit_runner.preflight.export_toolchain_union", boom_export)
     gateway_created: list = []
     from dynamic_runner.packaging.gateway import GatewayConfig
     monkeypatch.setattr(
@@ -1855,23 +1824,24 @@ def test_produce_and_upload_split_archives_export_failure_warns_no_abort(
         gateway="ssh://kruppb@localhost:2222",
         slurm_root_folder="/data/slurm/asm-dataset",
     )
-    with caplog.at_level(logging.WARNING):
-        cli_module._produce_and_upload_toolchain_split_archives(
+    with caplog.at_level(logging.ERROR):
+        rc = cli_module._produce_and_upload_toolchain_union_archive(
             args, ["/nix/store/abc123-gcc"], logging.getLogger("t"),
         )
+    assert rc == 1
     assert gateway_created == []
-    assert any("fall back to substitution" in r.message for r in caplog.records)
+    assert any("aborting dispatch" in r.message for r in caplog.records)
 
 
-def test_produce_and_upload_split_archives_upload_failure_warns_no_abort(
+def test_produce_and_upload_union_archive_upload_failure_hard_aborts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
     caplog: pytest.LogCaptureFixture,
 ):
-    """A gateway upload failure also soft-fails (warns + continues) and
-    disconnects the gateway."""
+    """A gateway upload failure logs error and returns 1 (hard abort);
+    the gateway is still disconnected."""
     import logging
 
-    state = _patch_gateway_for_split(monkeypatch)
+    state = _patch_gateway_for_union(monkeypatch)
 
     def fake_create(cfg):
         gw = _FakeGateway(cfg)
@@ -1890,62 +1860,31 @@ def test_produce_and_upload_split_archives_upload_failure_warns_no_abort(
         gateway="ssh://kruppb@localhost:2222",
         slurm_root_folder="/data/slurm/asm-dataset",
     )
-    with caplog.at_level(logging.WARNING):
-        cli_module._produce_and_upload_toolchain_split_archives(
+    with caplog.at_level(logging.ERROR):
+        rc = cli_module._produce_and_upload_toolchain_union_archive(
             args, ["/nix/store/abc123-gcc"], logging.getLogger("t"),
         )
+    assert rc == 1
     assert state["gateway"].disconnected
-    assert any("fall back to substitution" in r.message for r in caplog.records)
+    assert any("aborting dispatch" in r.message for r in caplog.records)
 
 
-def test_produce_and_upload_split_archives_empty_paths_warns(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
-    caplog: pytest.LogCaptureFixture,
-):
-    """An empty out_paths list warns and short-circuits without touching
-    the gateway."""
-    import logging
-
-    from dynamic_runner.packaging.gateway import GatewayConfig
-    monkeypatch.setattr(
-        "dynamic_runner.packaging.gateway.parse_gateway_url",
-        lambda url: GatewayConfig(mode="ssh", ssh_user="u", ssh_host="h", ssh_port=22),
-    )
-    gateway_created: list = []
-    monkeypatch.setattr(
-        "dynamic_runner.packaging.gateway.create_gateway",
-        lambda cfg: gateway_created.append(cfg) or _FakeGateway(cfg),
-    )
-    args = _make_args(
-        tmp_path,
-        multi_computer="slurm",
-        gateway="ssh://kruppb@localhost:2222",
-        slurm_root_folder="/data/slurm/asm-dataset",
-    )
-    with caplog.at_level(logging.WARNING):
-        cli_module._produce_and_upload_toolchain_split_archives(
-            args, [], logging.getLogger("t"),
-        )
-    assert gateway_created == []
-
-
-def test_produce_and_upload_split_archives_skips_when_sidecar_matches(
+def test_produce_and_upload_union_archive_skips_when_sidecar_matches(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
 ):
     """When the remote sidecar SHA-256 matches the local archive, the
-    upload is skipped (incremental-skip) — upload_file is never called."""
+    upload is skipped (incremental-skip) — upload_file is never called;
+    returns 0."""
     import hashlib
     import logging
 
-    # Compute the hash the fake export writes for the common archive.
-    archive_bytes = b"NIX_EXPORT:toolchains.common.archive"
+    # Compute the hash the fake export writes.
+    archive_bytes = b"NIX_UNION_EXPORT"
     expected_hex = hashlib.sha256(archive_bytes).hexdigest()
 
-    state = _patch_gateway_for_split(
+    state = _patch_gateway_for_union(
         monkeypatch,
         sidecar_content=expected_hex + "\n",
-        # Only one archive so the sidecar match applies to it.
-        split_archive_names=["toolchains.common.archive"],
     )
     args = _make_args(
         tmp_path,
@@ -1953,10 +1892,11 @@ def test_produce_and_upload_split_archives_skips_when_sidecar_matches(
         gateway="ssh://kruppb@localhost:2222",
         slurm_root_folder="/data/slurm/asm-dataset",
     )
-    cli_module._produce_and_upload_toolchain_split_archives(
+    rc = cli_module._produce_and_upload_toolchain_union_archive(
         args, ["/nix/store/abc123-gcc"], logging.getLogger("t"),
     )
+    assert rc == 0
     gw = state["gateway"]
     assert gw.connected
-    # No upload when every sidecar matches.
+    # No upload when sidecar matches.
     assert gw.uploads == []

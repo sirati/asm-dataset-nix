@@ -61,6 +61,7 @@ __all__ = [
     "build_worker",
     "ensure_binary_archive_imported",
     "ensure_toolchain_archive_imported",
+    "ensure_union_archive_imported",
     "ensure_common_archive_imported",
     "ensure_toolchain_out_archive_imported",
 ]
@@ -100,6 +101,14 @@ _common_archive_imported: bool = False
 # been imported on this worker.  Keyed by outpath string so workers handle
 # multiple toolchains in one process without redundant imports.
 _imported_toolchain_out_paths: set[str] = set()
+
+# Per-process, once-only import guard for the UNION realized-toolchain
+# archive (``toolchains.out.archive``).  This single archive carries the
+# deduplicated union closure of every toolchain — imported ONCE per worker
+# process at the start of the first build task, ungated (no per-task
+# toolchain_outpath check).  Absence or import failure is a HARD FAIL
+# (raises RuntimeError); there is no substitution fallback.
+_union_archive_imported: bool = False
 
 # Item-class string tokens (matched against the manifest header). Kept as
 # module-level constants so callers (manifest_gen, suit_task) reference
@@ -1038,6 +1047,69 @@ def ensure_toolchain_archive_imported(
     )
 
 
+def ensure_union_archive_imported(
+    matrix_eval_out_dir: Optional[pathlib.Path],
+    *,
+    run_subprocess: Optional[Callable[..., tuple[bytes, bytes, int]]] = None,
+) -> None:
+    """Import ``toolchains.out.archive`` ONCE per worker process, HARD-FAIL on miss.
+
+    The submitter uploads ONE union archive containing the deduplicated
+    closure of every realized toolchain output.  This function imports it
+    at the start of the first build task on this worker process; subsequent
+    tasks short-circuit via :data:`_union_archive_imported`.
+
+    Unlike the old split approach this import is UNGATED — it does NOT
+    check ``payload["toolchain_outpath"]``.  Every build worker needs all
+    toolchains regardless of which variant it processes.
+
+    HARD FAIL: a missing, zero-byte, or un-importable archive raises
+    :class:`RuntimeError`.  There is NO substitution fallback — if the
+    archive is absent the operator must investigate the submit-time upload.
+
+    ``matrix_eval_out_dir`` may be ``None`` (legacy fixtures) — no-op.
+    """
+    global _union_archive_imported
+    if matrix_eval_out_dir is None:
+        return
+    if _union_archive_imported:
+        return
+    from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
+    archive_path = matrix_eval_out_dir / _preflight.TOOLCHAIN_UNION_ARCHIVE_NAME
+    try:
+        size = archive_path.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(
+            "build_worker: toolchains.out.archive is absent — "
+            f"union archive was not uploaded at submit time: {archive_path}: {exc}"
+        ) from exc
+    if size == 0:
+        raise RuntimeError(
+            f"build_worker: toolchains.out.archive is zero-byte at {archive_path}; "
+            "union archive export failed at submit time"
+        )
+    from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+        archive as _archive,
+    )
+
+    ok, err, imported = _archive.import_archive(
+        archive_path, run_subprocess=run_subprocess,
+    )
+    if not ok:
+        raise RuntimeError(
+            "build_worker: failed to import toolchains.out.archive "
+            f"from {archive_path}: "
+            + err.decode("utf-8", errors="replace").strip()
+        )
+    _union_archive_imported = True
+    import logging  # noqa: PLC0415 — local import; cheap
+    logging.getLogger(
+        "compiler_suit_runner.build_worker.archive_import"
+    ).info(
+        "imported toolchains.out.archive (%d paths)", len(imported),
+    )
+
+
 def _import_archive_soft(
     archive_path: pathlib.Path,
     label: str,
@@ -1173,30 +1245,25 @@ def _run_import_prelude(
 ) -> None:
     """Toolchain-first archive import prelude for build tasks.
 
-    Import order (all soft-fail unless noted):
-      1. ``toolchains.common.archive`` (SOFT) — shared runtime closure.
-      2. ``toolchains.<id>.out.archive`` (SOFT) — per-toolchain delta;
-         the toolchain outpath is read from ``payload["toolchain_outpath"]``.
-      3. ``toolchains.drv.archive`` (HARD) — drv graph closure; must
+    Import order:
+      1. ``toolchains.out.archive`` (HARD, UNGATED) — union of all toolchain
+         closures; imported ONCE per process regardless of which variant this
+         task builds.  Absence or import failure is non-recoverable (raises).
+      2. ``toolchains.drv.archive`` (HARD) — drv graph closure; must
          precede the per-binary diff import below.
-      4. ``matrix-<binary>.drv.archive`` (HARD) — per-binary drv diff.
+      3. ``matrix-<binary>.drv.archive`` (HARD) — per-binary drv diff.
 
-    Steps 1–2 eliminate substitution fan-in at build time. Steps 3–4
+    Step 1 eliminates all substitution fan-in at build time: every worker
+    has every toolchain locally before ``nix build`` starts.  Steps 2–3
     are load-bearing: a missing drv archive means nix cannot resolve the
     variant drv locally and the build fails immediately.
     """
-    # 1 & 2: realized toolchain closures (soft-fail).
-    ensure_common_archive_imported(
+    # 1: union realized-toolchain closure (HARD-FAIL, UNGATED).
+    ensure_union_archive_imported(
         env.matrix_eval_out_dir,
         run_subprocess=env.run_subprocess,
     )
-    toolchain_outpath = payload.get("toolchain_outpath")
-    ensure_toolchain_out_archive_imported(
-        toolchain_outpath if isinstance(toolchain_outpath, str) else None,
-        env.matrix_eval_out_dir,
-        run_subprocess=env.run_subprocess,
-    )
-    # 3 & 4: drv graph archives (hard-fail on missing).
+    # 2 & 3: drv graph archives (hard-fail on missing).
     ensure_toolchain_archive_imported(
         env.matrix_eval_out_dir,
         run_subprocess=env.run_subprocess,

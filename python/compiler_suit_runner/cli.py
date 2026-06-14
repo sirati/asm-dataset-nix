@@ -983,31 +983,26 @@ def _upload_archive_with_sidecar(
     return True
 
 
-def _produce_and_upload_toolchain_split_archives(
+def _produce_and_upload_toolchain_union_archive(
     args: argparse.Namespace,
     tc_out_paths: list[str],
     log: logging.Logger,
-) -> None:
-    """Produce + upload the per-toolchain split archives to the gateway.
+) -> int:
+    """Produce + upload the monolithic union toolchain archive to the gateway.
 
-    Replaces the monolithic ``toolchains.out.archive`` with a finer split:
+    Exports ONE ``toolchains.out.archive`` containing the deduplicated
+    union closure of every realized toolchain output path.  Workers import
+    it ONCE at the start of their first build task; the archive is present
+    before ``nix build`` runs so substitution fan-in is eliminated.
 
-    * ``toolchains.common.archive`` — the intersection of all toolchain
-      closures (glibc, shared runtime libs, etc.).  Uploaded once.
-    * ``toolchains.<id>.out.archive`` per toolchain — the delta (closure
-      minus COMMON).  Workers import COMMON first, then the delta for
-      the toolchain their variant uses, so the full compiler closure is
-      present locally before ``nix build`` starts.
+    Each upload uses an sha256 sidecar for incremental skip: when the
+    remote sidecar matches the local hash the (potentially multi-GiB)
+    upload is omitted.
 
-    Each file is uploaded with an sha256 sidecar for incremental skip:
-    when the remote sidecar matches the local hash the (potentially
-    multi-GiB) upload is omitted.
-
-    SOFT FAIL: any failure (split computation, export, or upload) logs
-    a WARNING and returns without aborting the dispatch.  Workers that
-    find no archive for their toolchain fall back to substitution as
-    before.  The ``.drv.archive`` upload path remains a HARD FAIL
-    (unchanged); only the realized-output archives degrade gracefully.
+    HARD FAIL: any failure (empty/unrealized paths, export, or upload)
+    logs log.error and returns 1.  The caller MUST abort the dispatch —
+    a missing union archive means every worker will stall (no toolchains
+    locally and no substitution fallback).  Returns 0 on success.
     """
     from dynamic_runner.packaging.gateway import (  # noqa: PLC0415
         create_gateway,
@@ -1017,68 +1012,56 @@ def _produce_and_upload_toolchain_split_archives(
     from compiler_suit_runner import preflight  # noqa: PLC0415
 
     if not tc_out_paths:
-        log.warning(
-            "toolchain-split-archive: no realized output paths; "
-            "workers will fall back to substitution"
+        log.error(
+            "toolchain-union-archive: no realized toolchain output paths; "
+            "cannot produce union archive — aborting dispatch"
         )
-        return
+        return 1
 
-    local_dir = pathlib.Path(tempfile.mkdtemp(prefix="csr-tc-split-archive-"))
+    local_dir = pathlib.Path(tempfile.mkdtemp(prefix="csr-tc-union-archive-"))
     try:
-        # 1. Compute the split: COMMON + per-toolchain deltas.
+        # 1. Export the union archive to the local tempdir.
         try:
-            split = preflight.compute_toolchain_split(tc_out_paths)
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "toolchain-split-archive: split computation failed; "
-                "workers will fall back to substitution: %s",
+            local_archive = preflight.export_toolchain_union(tc_out_paths, local_dir)
+        except Exception as exc:
+            log.error(
+                "toolchain-union-archive: export failed — aborting dispatch: %s",
                 exc,
             )
-            return
+            return 1
 
-        # 2. Export archives (COMMON + each delta) to the local tempdir.
-        try:
-            written = preflight.export_toolchain_split(split, local_dir)
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "toolchain-split-archive: export failed; workers will fall "
-                "back to substitution: %s",
-                exc,
-            )
-            return
-
-        if not written:
-            log.warning(
-                "toolchain-split-archive: split produced no archives; "
-                "workers will fall back to substitution"
-            )
-            return
-
-        # 3. Upload each archive + sidecar to the gateway out/_matrix_eval.
+        # 2. Upload archive + sidecar to the gateway out/_matrix_eval.
         cfg = parse_gateway_url(args.gateway)
         cfg.ssh_identity_file = getattr(args, "ssh_identity_file", None)
         cfg.ssh_config_file = getattr(args, "ssh_config", None)
         remote_dir = f"{args.slurm_root_folder}/out/_matrix_eval"
+        archive_name = preflight.TOOLCHAIN_UNION_ARCHIVE_NAME
+        remote_archive = f"{remote_dir}/{archive_name}"
         gw = create_gateway(cfg)
         try:
             gw.connect()
-            for archive_name, local_archive in written.items():
-                remote_archive = f"{remote_dir}/{archive_name}"
-                _upload_archive_with_sidecar(
-                    local_archive, remote_archive, remote_dir,
-                    local_dir, gw, log, archive_name,
-                )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "toolchain-split-archive: upload failed; workers will fall "
-                "back to substitution: %s",
+            ok = _upload_archive_with_sidecar(
+                local_archive, remote_archive, remote_dir,
+                local_dir, gw, log, archive_name,
+            )
+        except Exception as exc:
+            log.error(
+                "toolchain-union-archive: upload failed — aborting dispatch: %s",
                 exc,
             )
+            return 1
         finally:
             try:
                 gw.disconnect()
             except Exception:  # noqa: BLE001 — best-effort teardown
                 pass
+        if not ok:
+            log.error(
+                "toolchain-union-archive: upload of %s failed — aborting dispatch",
+                archive_name,
+            )
+            return 1
+        return 0
     finally:
         # Never leak large archives in the submitter tmp dir.
         shutil.rmtree(local_dir, ignore_errors=True)
@@ -1468,10 +1451,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
             if rc != 0:
                 return rc
 
-        # Realized toolchain split archives: upload COMMON + per-toolchain
-        # deltas so compute nodes import only what their variant needs.
-        # Soft fail — missing archives degrade to substitution and do NOT
-        # abort the dispatch (unlike the .drv archive above).
+        # Realized toolchain union archive: upload the single deduplicated
+        # union closure so compute nodes import ALL toolchains once per node
+        # before any build task fires.  HARD FAIL — a missing union archive
+        # means workers have no toolchain locally and no substitution fallback.
         if (
             toolchain_dedup
             and args.gateway
@@ -1481,9 +1464,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
             tc_out_paths = [
                 p for p in partition_drv_outpaths.values() if p
             ]
-            _produce_and_upload_toolchain_split_archives(
+            rc = _produce_and_upload_toolchain_union_archive(
                 args, tc_out_paths, log,
             )
+            if rc != 0:
+                return rc
 
         # Submitter-peer: makes the dispatching machine's local nix
         # store reachable from compute-node containers as a federated

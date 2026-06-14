@@ -747,6 +747,7 @@ def enumerate_toolchains_only(
 
 TOOLCHAIN_ARCHIVE_NAME = "toolchains.drv.archive"
 TOOLCHAIN_COMMON_ARCHIVE_NAME = "toolchains.common.archive"
+TOOLCHAIN_UNION_ARCHIVE_NAME = "toolchains.out.archive"
 
 
 def toolchain_id_for_outpath(outpath: str) -> str:
@@ -1006,6 +1007,58 @@ def export_toolchain_split(
         written[name] = archive
 
     return written
+
+
+def export_toolchain_union(
+    toolchain_out_paths: list[str],
+    out_dir: pathlib.Path,
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> pathlib.Path:
+    """Export the UNION of all toolchain closures into a single archive.
+
+    Writes ``<out_dir>/toolchains.out.archive`` containing the fully
+    deduplicated union of every realized toolchain output's closure.
+    ``nix-store --query --requisites`` with all seed paths at once is
+    the union — each store path appears exactly once in the output, fully
+    deduped by nix's own deduplication logic.
+
+    Hard errors (raise :class:`RuntimeError`) on:
+    - empty ``toolchain_out_paths``
+    - any path that is not an absolute store path (basic sanity check)
+    - a failed ``nix-store --export`` or ``--query --requisites``
+
+    Returns the written archive path on success.
+    """
+    if not toolchain_out_paths:
+        raise RuntimeError(
+            "export_toolchain_union: no toolchain out-paths supplied"
+        )
+    for p in toolchain_out_paths:
+        if not isinstance(p, str) or not p.startswith("/"):
+            raise RuntimeError(
+                f"export_toolchain_union: unrealized or invalid out-path {p!r}"
+            )
+
+    from compiler_suit_runner.workers.build_compilers_worker import (  # noqa: PLC0415
+        export_closure,
+    )
+
+    archive_path = out_dir / TOOLCHAIN_UNION_ARCHIVE_NAME
+    ok, req_stderr, exp_stderr = export_closure(
+        archive_path,
+        toolchain_out_paths,
+        run_subprocess=run_subprocess,
+    )
+    if not ok:
+        raise RuntimeError(
+            "export_toolchain_union: nix-store export of union closure failed: "
+            "requisites_stderr="
+            + req_stderr.decode("utf-8", errors="replace").strip()
+            + " export_stderr="
+            + exp_stderr.decode("utf-8", errors="replace").strip()
+        )
+    return archive_path
 
 
 # ---------------------------------------------------------------------------

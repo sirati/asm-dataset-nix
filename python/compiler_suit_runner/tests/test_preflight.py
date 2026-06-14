@@ -18,6 +18,7 @@ from compiler_suit_runner.preflight import (
     PreflightError,
     PreflightResult,
     TOOLCHAIN_COMMON_ARCHIVE_NAME,
+    TOOLCHAIN_UNION_ARCHIVE_NAME,
     ToolchainSplit,
     build_toolchains_locally,
     check_toolchains_locally,
@@ -26,6 +27,7 @@ from compiler_suit_runner.preflight import (
     enumerate_toolchains_only,
     enumerate_variants,
     export_toolchain_split,
+    export_toolchain_union,
     filter_existing_variants,
     path_info_batch,
     preflight,
@@ -1356,5 +1358,103 @@ def test_export_toolchain_split_raises_on_common_export_failure(
     )
     with pytest.raises(RuntimeError, match="common archive"):
         export_toolchain_split(split, tmp_path, run_subprocess=runner)
+
+
+# ---------------------------------------------------------------------------
+# export_toolchain_union
+# ---------------------------------------------------------------------------
+
+
+def _make_union_runner(
+    *,
+    req_rc: int = 0,
+    req_out: bytes = b"/nix/store/dep\n/nix/store/tc\n",
+    exp_rc: int = 0,
+    exp_out: bytes = b"NIX_EXPORT:union",
+) -> "object":
+    """Stub run_subprocess for export_toolchain_union tests."""
+    def runner(argv):
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            return req_out, b"req_stderr" if req_rc != 0 else b"", req_rc
+        if argv[:2] == ["nix-store", "--export"]:
+            return exp_out, b"exp_stderr" if exp_rc != 0 else b"", exp_rc
+        return b"", b"unexpected call", 1
+    return runner
+
+
+def test_export_toolchain_union_writes_single_archive(
+    tmp_path: pathlib.Path,
+) -> None:
+    """export_toolchain_union writes toolchains.out.archive containing the
+    union closure of all seed paths — exactly ONE archive on success."""
+    runner = _make_union_runner()
+    result = export_toolchain_union(
+        ["/nix/store/abc123-gcc", "/nix/store/def456-clang"],
+        tmp_path,
+        run_subprocess=runner,
+    )
+    assert result == tmp_path / TOOLCHAIN_UNION_ARCHIVE_NAME
+    assert result.exists()
+    assert result.read_bytes() == b"NIX_EXPORT:union"
+
+
+def test_export_toolchain_union_dedup_via_requisites(
+    tmp_path: pathlib.Path,
+) -> None:
+    """All seed paths are passed together to nix-store --query --requisites
+    so nix deduplicates shared paths exactly once."""
+    seen_requisite_calls: list[list[str]] = []
+
+    def runner(argv):
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            seen_requisite_calls.append(list(argv))
+            return b"/nix/store/shared\n/nix/store/tc1\n/nix/store/tc2\n", b"", 0
+        if argv[:2] == ["nix-store", "--export"]:
+            return b"NIX_EXPORT", b"", 0
+        return b"", b"", 1
+
+    export_toolchain_union(
+        ["/nix/store/tc1", "/nix/store/tc2"],
+        tmp_path,
+        run_subprocess=runner,
+    )
+    # One requisites call with ALL seeds — union via single nix-store query.
+    assert len(seen_requisite_calls) == 1
+    assert "/nix/store/tc1" in seen_requisite_calls[0]
+    assert "/nix/store/tc2" in seen_requisite_calls[0]
+
+
+def test_export_toolchain_union_raises_on_empty_paths(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Empty out-path list raises RuntimeError without calling nix."""
+    with pytest.raises(RuntimeError, match="no toolchain out-paths"):
+        export_toolchain_union([], tmp_path)
+
+
+def test_export_toolchain_union_raises_on_relative_path(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A non-absolute path raises RuntimeError (sanity check for unrealized paths)."""
+    with pytest.raises(RuntimeError, match="unrealized or invalid"):
+        export_toolchain_union(["nix/store/abc"], tmp_path)
+
+
+def test_export_toolchain_union_raises_on_export_failure(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A failed nix-store export propagates as RuntimeError."""
+    runner = _make_union_runner(exp_rc=1)
+    with pytest.raises(RuntimeError, match="failed"):
+        export_toolchain_union(["/nix/store/abc-gcc"], tmp_path, run_subprocess=runner)
+
+
+def test_export_toolchain_union_raises_on_requisites_failure(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A failed requisites query propagates as RuntimeError."""
+    runner = _make_union_runner(req_rc=1)
+    with pytest.raises(RuntimeError, match="failed"):
+        export_toolchain_union(["/nix/store/abc-gcc"], tmp_path, run_subprocess=runner)
 
 

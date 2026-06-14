@@ -1523,8 +1523,12 @@ def test_main_handle_dependency_graph_without_matrix_eval_out_dir_is_non_recover
 
 
 def _reset_imported_binaries() -> None:
-    """Clear the module-level cache so tests stay hermetic."""
+    """Clear the module-level import caches so tests stay hermetic."""
     bw._imported_binaries.clear()
+    bw._union_archive_imported = False
+    bw._toolchain_imported = False
+    bw._common_archive_imported = False
+    bw._imported_toolchain_out_paths.clear()
 
 
 def _make_variant_manifest(
@@ -1718,6 +1722,9 @@ def test_build_worker_build_variant_imports_archive_first_time(
     ``ensure_binary_archive_imported`` with the BuildWorkerEnv's
     matrix-eval-out-dir + the binary from the payload."""
     _reset_imported_binaries()
+    # Pre-mark union archive as imported so this test focuses on the
+    # per-binary archive import behaviour.
+    bw._union_archive_imported = True
     captured: list[tuple[str, pathlib.Path]] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1755,6 +1762,9 @@ def test_build_worker_build_common_dep_imports_archive(monkeypatch, tmp_path):
     common-dep ``.drv`` is local) using the binary from
     ``payload["binary"]``, then builds the reconstructed drv path."""
     _reset_imported_binaries()
+    # Pre-mark union archive as imported so this test focuses on the
+    # per-binary archive import behaviour.
+    bw._union_archive_imported = True
     captured: list[tuple[str, pathlib.Path]] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1797,6 +1807,9 @@ def test_build_worker_build_variant_does_not_re_import_same_binary(
     SAME process MUST NOT re-trigger ``import_archive`` — the cache
     short-circuit lives in :data:`_imported_binaries`."""
     _reset_imported_binaries()
+    # Pre-mark union archive as imported so this test focuses on the
+    # per-binary import idempotency behaviour.
+    bw._union_archive_imported = True
     captured: list[pathlib.Path] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1845,6 +1858,9 @@ def test_build_worker_build_variant_imports_new_binary_after_switch(
     triggers a fresh import for ``matrix-Y.drv.archive`` (one per
     binary cache key, not one per process)."""
     _reset_imported_binaries()
+    # Pre-mark union archive as imported so this test focuses on the
+    # per-binary import switching behaviour.
+    bw._union_archive_imported = True
     captured: list[pathlib.Path] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1891,6 +1907,9 @@ def test_build_worker_build_variant_archive_import_failure_is_failure_result(
     the framework worker-handle wraps that into NonRecoverableError
     (Bug A's exit-1 contract) further upstream."""
     _reset_imported_binaries()
+    # Pre-mark union archive as imported so this test focuses on the
+    # per-binary archive import failure path.
+    bw._union_archive_imported = True
 
     def _fake_import(archive, *, run_subprocess=None):
         return False, b"missing archive", []
@@ -2214,3 +2233,170 @@ def test_ensure_toolchain_out_archive_imported_common_once_then_per_toolchain(
     assert imported.count("toolchains.common.archive") == 1
     assert toolchain_delta_archive_name(outpath1) in imported
     assert toolchain_delta_archive_name(outpath2) in imported
+
+
+# ---------------------------------------------------------------------------
+# ensure_union_archive_imported
+# ---------------------------------------------------------------------------
+
+
+def _reset_union_imported(monkeypatch) -> None:
+    """Reset per-process union-archive guard between tests."""
+    monkeypatch.setattr(bw, "_union_archive_imported", False)
+
+
+def test_ensure_union_archive_imported_happy(
+    monkeypatch, tmp_path,
+):
+    """A present union archive is imported and the guard flips."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_union_imported(monkeypatch)
+    (tmp_path / "toolchains.out.archive").write_bytes(b"NIX_EXPORT:union")
+    imported: list = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        imported.append(pathlib.Path(archive))
+        return True, b"", ["/nix/store/glibc", "/nix/store/gcc"]
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+    bw.ensure_union_archive_imported(tmp_path)
+    assert bw._union_archive_imported is True
+    assert imported == [tmp_path / "toolchains.out.archive"]
+
+
+def test_ensure_union_archive_imported_absent_raises(
+    monkeypatch, tmp_path,
+):
+    """An absent union archive raises RuntimeError (HARD FAIL — no substitution)."""
+    _reset_union_imported(monkeypatch)
+    with pytest.raises(RuntimeError, match="toolchains.out.archive is absent"):
+        bw.ensure_union_archive_imported(tmp_path)
+    # Guard must NOT flip — the error is non-recoverable; let the caller fail.
+    assert bw._union_archive_imported is False
+
+
+def test_ensure_union_archive_imported_zero_byte_raises(
+    monkeypatch, tmp_path,
+):
+    """A zero-byte union archive raises RuntimeError (export failed at submit time)."""
+    _reset_union_imported(monkeypatch)
+    (tmp_path / "toolchains.out.archive").write_bytes(b"")
+    with pytest.raises(RuntimeError, match="zero-byte"):
+        bw.ensure_union_archive_imported(tmp_path)
+    assert bw._union_archive_imported is False
+
+
+def test_ensure_union_archive_imported_import_failure_raises(
+    monkeypatch, tmp_path,
+):
+    """A failed import_archive call raises RuntimeError (no soft-fall)."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_union_imported(monkeypatch)
+    (tmp_path / "toolchains.out.archive").write_bytes(b"corrupt")
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: (False, b"corrupt archive", []),
+    )
+    with pytest.raises(RuntimeError, match="failed to import"):
+        bw.ensure_union_archive_imported(tmp_path)
+    assert bw._union_archive_imported is False
+
+
+def test_ensure_union_archive_imported_idempotent(
+    monkeypatch, tmp_path,
+):
+    """Second call is a no-op (guard already set — import_archive not called again)."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_union_imported(monkeypatch)
+    (tmp_path / "toolchains.out.archive").write_bytes(b"NIX_EXPORT:union")
+    call_count: list = []
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: call_count.append(1) or (True, b"", []),
+    )
+    bw.ensure_union_archive_imported(tmp_path)
+    bw.ensure_union_archive_imported(tmp_path)
+    assert len(call_count) == 1
+    assert bw._union_archive_imported is True
+
+
+def test_ensure_union_archive_imported_none_dir_is_noop(monkeypatch):
+    """``matrix_eval_out_dir=None`` (legacy fixtures) is a safe no-op."""
+    _reset_union_imported(monkeypatch)
+    bw.ensure_union_archive_imported(None)  # must not raise
+    assert bw._union_archive_imported is False
+
+
+def test_ensure_union_archive_imported_ungated_no_payload_check(
+    monkeypatch, tmp_path,
+):
+    """ensure_union_archive_imported takes no payload argument and does NOT
+    gate on toolchain_outpath — it always imports the union regardless of
+    which toolchain the current task uses."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_union_imported(monkeypatch)
+    (tmp_path / "toolchains.out.archive").write_bytes(b"NIX_EXPORT:union")
+    imported: list = []
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: imported.append(pathlib.Path(a)) or (True, b"", []),
+    )
+    # Call with no payload-like argument — the function signature only takes
+    # matrix_eval_out_dir + run_subprocess; toolchain_outpath is not involved.
+    import inspect
+    sig = inspect.signature(bw.ensure_union_archive_imported)
+    param_names = list(sig.parameters.keys())
+    assert "toolchain_outpath" not in param_names, (
+        "ensure_union_archive_imported must NOT accept toolchain_outpath"
+    )
+    bw.ensure_union_archive_imported(tmp_path)
+    assert imported == [tmp_path / "toolchains.out.archive"]
+
+
+def test_run_import_prelude_calls_union_import_before_drv_import(
+    monkeypatch, tmp_path,
+):
+    """_run_import_prelude calls ensure_union_archive_imported FIRST (ungated),
+    then the drv-graph and binary-archive imports. The union import is
+    independent of payload content."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_union_imported(monkeypatch)
+    bw._toolchain_imported = False
+
+    call_order: list[str] = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        call_order.append(pathlib.Path(archive).name)
+        return True, b"", []
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+
+    # Create the archives on disk so stat() succeeds.
+    (tmp_path / "toolchains.out.archive").write_bytes(b"UNION")
+    (tmp_path / "toolchains.drv.archive").write_bytes(b"DRV")
+    (tmp_path / "matrix-hello.drv.archive").write_bytes(b"BINARY")
+
+    from compiler_suit_runner.workers.build_worker import BuildWorkerEnv, _run_import_prelude
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "ds",
+        matrix_eval_out_dir=tmp_path,
+    )
+    _run_import_prelude("build_variant", {"pkg": "hello"}, env)
+
+    # Union archive must be first.
+    assert call_order[0] == "toolchains.out.archive"
+    # DRV archive must follow.
+    assert "toolchains.drv.archive" in call_order
+    # Binary archive imported for "hello".
+    assert "matrix-hello.drv.archive" in call_order
