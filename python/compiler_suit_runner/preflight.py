@@ -310,9 +310,167 @@ def _conflict_fastmath_san_undefined(meta: dict) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Deterministic-invalid variant exclusions (confirmed from failure logs,
+# cross-checked against 12,421 actual successes — only combos with zero
+# successes are listed).
+#
+# Rule A: bzip2 + clang 3.{4-8} + arch != x86_64
+#   clang 3.x mis-parses the BZ_EXTERN ``__attribute__`` form in bzlib.h
+#   for cross targets. Fails at every compile attempt; fixed in clang 4.
+#   x86_64 uses a different wrapper path that survives.
+#
+# Rule C1: xz + clang 3.9 (all arches)
+#   xz configure passes -Werror; clang 3.9 aborts on a CFLAGS-ordering
+#   edge case that mis-detects the compiler. Fails deterministically.
+#
+# Rule C2: xz + stackclash hardening + clang 11..17 + specific cross arches
+#   Same xz -Werror abort as C1 but triggered by clang 11-17 emitting a
+#   stack-clash-protection diagnostic on specific cross targets.
+#
+# Rule D2/E: staticpie + arch in {ppc64,ppc32,mipsel,mips64el,armv7l-hf}
+#   Cross sysroot for these arches lacks rcrt1.o / Scrt1.o.
+#   i686 is EXCLUDED — cross-check found lz4+i686+staticpie succeeds.
+#
+# Rule D3: zerocallregs hardening + arch in {ppc64,armv7l-hf,mipsel,mips64el}
+#          AND family=clang
+#   Clang's -fzero-call-used-regs=used-gpr fails to link on these cross
+#   arches. GCC zerocallregs works there — rule is clang-only.
+# ---------------------------------------------------------------------------
+_BZIP2_CLANG3_BAD_MINORS: frozenset[int] = frozenset({4, 5, 6, 7, 8})
+_STATICPIE_CROSS_BROKEN_ARCHES: frozenset[str] = frozenset({
+    "ppc64", "ppc32", "mipsel", "mips64el", "armv7l-hf",
+})
+_ZEROCALLREGS_CROSS_BROKEN_ARCHES: frozenset[str] = frozenset({
+    "ppc64", "armv7l-hf", "mipsel", "mips64el",
+})
+_XZ_STACKCLASH_CLANG_BROKEN_ARCHES: frozenset[str] = frozenset({
+    "mipsel", "mips64el", "riscv64", "ppc64", "armv7l-hf",
+})
+
+
+def _conflict_bzip2_clang3x_non_x86_64(meta: dict) -> Optional[str]:
+    """Rule A: bzip2 + clang 3.{4..8} + arch != x86_64.
+
+    clang 3.x mis-parses the BZ_EXTERN ``__attribute__`` form in bzlib.h
+    for cross targets. Fails at every compile attempt; fixed in clang 4.
+    """
+    if meta.get("package") != "bzip2":
+        return None
+    if meta.get("compilerFamily") != "clang":
+        return None
+    major = _parse_compiler_major(meta.get("compilerVersion", ""))
+    if major != 3:
+        return None
+    minor = _parse_compiler_minor(meta.get("compilerVersion", ""))
+    if minor not in _BZIP2_CLANG3_BAD_MINORS:
+        return None
+    arch = meta.get("arch", "")
+    if arch == "x86_64":
+        return None
+    return (
+        f"bzip2 BZ_EXTERN __attribute__ parse error: "
+        f"clang 3.{minor} on {arch} mis-parses bzlib.h attribute syntax"
+    )
+
+
+def _conflict_xz_clang3_9(meta: dict) -> Optional[str]:
+    """Rule C1: xz + clang 3.9 (all arches).
+
+    xz's configure passes -Werror and clang 3.9 aborts on a CFLAGS
+    ordering edge case that causes configure to mis-detect the compiler.
+    Fails deterministically across every arch.
+    """
+    if meta.get("package") != "xz":
+        return None
+    if meta.get("compilerFamily") != "clang":
+        return None
+    major = _parse_compiler_major(meta.get("compilerVersion", ""))
+    minor = _parse_compiler_minor(meta.get("compilerVersion", ""))
+    if (major, minor) != (3, 9):
+        return None
+    return (
+        "xz configure -Werror abort: clang 3.9 triggers a CFLAGS-ordering "
+        "false-positive in xz's configure Werror check"
+    )
+
+
+def _conflict_xz_stackclash_clang_cross(meta: dict) -> Optional[str]:
+    """Rule C2: xz + hardening=stackclash + clang 11..17 + cross arch.
+
+    Same xz -Werror abort as C1 but triggered by clang 11-17 emitting a
+    stack-clash-protection diagnostic that xz's configure treats as fatal.
+    Only affects cross targets where the stack probing code path differs.
+    """
+    if meta.get("package") != "xz":
+        return None
+    if meta.get("hardening") != "stackclash":
+        return None
+    if meta.get("compilerFamily") != "clang":
+        return None
+    major = _parse_compiler_major(meta.get("compilerVersion", ""))
+    if major is None or not (11 <= major <= 17):
+        return None
+    arch = meta.get("arch", "")
+    if arch not in _XZ_STACKCLASH_CLANG_BROKEN_ARCHES:
+        return None
+    return (
+        f"xz configure -Werror abort: clang {major} -fstack-clash-protection "
+        f"emits a diagnostic xz configure treats as fatal on {arch}"
+    )
+
+
+def _conflict_staticpie_cross_sysroot_arches(meta: dict) -> Optional[str]:
+    """Rule D2/E: staticpie + cross sysroot arches lacking rcrt1.o/Scrt1.o.
+
+    The cross sysroot for ppc64/ppc32/mipsel/mips64el/armv7l-hf lacks
+    rcrt1.o / Scrt1.o (the static-PIE CRT files). Arch-structural — no
+    compiler version can fix it. i686 is excluded: cross-check found
+    lz4+i686+staticpie builds successfully (109+ successes).
+    """
+    if meta.get("flags") != "staticpie":
+        return None
+    arch = meta.get("arch", "")
+    if arch not in _STATICPIE_CROSS_BROKEN_ARCHES:
+        return None
+    return (
+        f"static-PIE requires rcrt1.o/Scrt1.o; cross sysroot for {arch} "
+        f"lacks these CRT files — -static-pie link always fails"
+    )
+
+
+def _conflict_zerocallregs_clang_cross_arches(meta: dict) -> Optional[str]:
+    """Rule D3: hardening=zerocallregs + clang + cross arches.
+
+    Clang's -fzero-call-used-regs=used-gpr fails to link on cross arches
+    ppc64/armv7l-hf/mipsel/mips64el. GCC handles zerocallregs correctly
+    on these arches — rule is clang-only. Cross-check confirmed gcc12+
+    zerocallregs succeeds on mipsel and bzip2+mips64el+gcc18+zerocallregs
+    builds fine.
+    """
+    if meta.get("hardening") != "zerocallregs":
+        return None
+    if meta.get("compilerFamily") != "clang":
+        return None
+    arch = meta.get("arch", "")
+    if arch not in _ZEROCALLREGS_CROSS_BROKEN_ARCHES:
+        return None
+    return (
+        f"clang -fzero-call-used-regs=used-gpr fails to link on {arch}: "
+        f"cross-linker relocation pattern rejected (gcc works there)"
+    )
+
+
 _FLAG_CONFLICTS = (
     _conflict_sanitizer_o0,
     _conflict_fastmath_san_undefined,
+    # Binary-scoped intrinsic failures (confirmed deterministic from logs):
+    _conflict_bzip2_clang3x_non_x86_64,        # Rule A
+    _conflict_xz_clang3_9,                      # Rule C1
+    _conflict_xz_stackclash_clang_cross,        # Rule C2
+    # Arch-structural cross-toolchain failures:
+    _conflict_staticpie_cross_sysroot_arches,   # Rule D2/E (i686 excluded)
+    _conflict_zerocallregs_clang_cross_arches,  # Rule D3 (clang-only)
 )
 
 

@@ -349,3 +349,218 @@ def test_known_bad_combo_default_hardening_and_march_never_fails() -> None:
             sanitizer="san-off",
         )
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule A: bzip2 + clang 3.{4..8} + non-x86_64
+# ---------------------------------------------------------------------------
+
+def test_rule_a_bzip2_clang3_5_mipsel_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(
+            package="bzip2",
+            compilerFamily="clang",
+            compilerVersion="3.5.0",
+            arch="mipsel",
+        )
+    )
+    assert reason is not None
+    assert "bzip2" in reason.lower() or "BZ_EXTERN" in reason or "attribute" in reason.lower()
+
+
+def test_rule_a_near_miss_bzip2_clang3_9_aarch64_is_fine() -> None:
+    # minor=9 is NOT in the bad set {4,5,6,7,8} — near miss
+    assert is_known_bad_combo(
+        _meta(
+            package="bzip2",
+            compilerFamily="clang",
+            compilerVersion="3.9.1",
+            arch="aarch64",
+        )
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule C1: xz + clang 3.9 (all arches)
+# ---------------------------------------------------------------------------
+
+def test_rule_c1_xz_clang3_9_aarch64_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(
+            package="xz",
+            compilerFamily="clang",
+            compilerVersion="3.9.0",
+            arch="aarch64",
+        )
+    )
+    assert reason is not None
+    assert "xz" in reason.lower() or "Werror" in reason or "3.9" in reason
+
+
+def test_rule_c1_near_miss_xz_clang3_8_x86_64_is_fine() -> None:
+    # minor=8 — only 3.9 is affected (near miss)
+    assert is_known_bad_combo(
+        _meta(
+            package="xz",
+            compilerFamily="clang",
+            compilerVersion="3.8.1",
+            arch="x86_64",
+        )
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule C2: xz + stackclash hardening + clang 11..17 + cross arches
+# ---------------------------------------------------------------------------
+
+def test_rule_c2_xz_stackclash_clang14_mipsel_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(
+            package="xz",
+            compilerFamily="clang",
+            compilerVersion="14.0.6",
+            hardening="stackclash",
+            arch="mipsel",
+        )
+    )
+    assert reason is not None
+    assert "xz" in reason.lower() or "stack" in reason.lower() or "Werror" in reason
+
+
+def test_rule_c2_near_miss_xz_stackclash_clang18_mipsel_is_fine() -> None:
+    # major=18 is outside the 11..17 window (near miss)
+    assert is_known_bad_combo(
+        _meta(
+            package="xz",
+            compilerFamily="clang",
+            compilerVersion="18.0.0",
+            hardening="stackclash",
+            arch="mipsel",
+        )
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule D2/E: staticpie + cross sysroot arches (i686 excluded)
+# ---------------------------------------------------------------------------
+
+def test_rule_d2_staticpie_ppc64_clang18_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(
+            compilerFamily="clang",
+            compilerVersion="18.0.0",
+            flags="staticpie",
+            arch="ppc64",
+        )
+    )
+    assert reason is not None
+    assert "static" in reason.lower() or "rcrt1" in reason.lower() or "Scrt1" in reason
+
+
+def test_rule_d2_near_miss_staticpie_x86_64_is_fine() -> None:
+    # x86_64 cross sysroot has rcrt1.o (near miss)
+    assert is_known_bad_combo(
+        _meta(
+            compilerFamily="clang",
+            compilerVersion="18.0.0",
+            flags="staticpie",
+            arch="x86_64",
+        )
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule D3: hardening=zerocallregs + clang + cross arches
+# ---------------------------------------------------------------------------
+
+def test_rule_d3_zerocallregs_ppc64_clang18_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(
+            compilerFamily="clang",
+            compilerVersion="18.0.0",
+            hardening="zerocallregs",
+            arch="ppc64",
+        )
+    )
+    assert reason is not None
+    assert "zero" in reason.lower() or "call" in reason.lower() or "clang" in reason.lower()
+
+
+def test_rule_d3_near_miss_zerocallregs_ppc64_gcc15_is_fine() -> None:
+    # GCC handles zerocallregs on these arches — clang-only rule (near miss)
+    assert is_known_bad_combo(
+        _meta(
+            compilerFamily="gcc",
+            compilerVersion="15.2.0",
+            hardening="zerocallregs",
+            arch="ppc64",
+        )
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Cross-check regression guards: combos with real successes that must NOT
+# be excluded (drawn from the 12,421 verified successes).
+# ---------------------------------------------------------------------------
+
+def test_regression_lz4_i686_clang18_staticpie_not_excluded() -> None:
+    # lz4 + i686 + staticpie builds successfully — i686 removed from D2/E
+    assert is_known_bad_combo(
+        _meta(
+            package="lz4",
+            compilerFamily="clang",
+            compilerVersion="18.0.0",
+            flags="staticpie",
+            arch="i686",
+        )
+    ) is None
+
+
+def test_regression_bzip2_mipsel_gcc12_zerocallregs_not_excluded() -> None:
+    # bzip2 + mipsel + gcc12 + zerocallregs: gcc works there (D3 is clang-only)
+    assert is_known_bad_combo(
+        _meta(
+            package="bzip2",
+            compilerFamily="gcc",
+            compilerVersion="12.3.0",
+            hardening="zerocallregs",
+            arch="mipsel",
+        )
+    ) is None
+
+
+def test_regression_bzip2_mips64el_clang18_lto_not_excluded() -> None:
+    # bzip2 + mips64el + clang18 + lto: 109 successes — D1 was dropped
+    assert is_known_bad_combo(
+        _meta(
+            package="bzip2",
+            compilerFamily="clang",
+            compilerVersion="18.0.0",
+            flags="lto",
+            arch="mips64el",
+        )
+    ) is None
+
+
+def test_regression_m4_mips64el_clang16_not_excluded() -> None:
+    # m4 + mips64el + clang16: 86 successes — Rule G was dropped
+    assert is_known_bad_combo(
+        _meta(
+            package="m4",
+            compilerFamily="clang",
+            compilerVersion="16.0.0",
+            arch="mips64el",
+        )
+    ) is None
+
+
+def test_regression_bzip2_aarch64_clang3_9_not_excluded() -> None:
+    # bzip2 + aarch64 + clang3.9: minor=9 not in A's bad set {4,5,6,7,8}
+    assert is_known_bad_combo(
+        _meta(
+            package="bzip2",
+            compilerFamily="clang",
+            compilerVersion="3.9.1",
+            arch="aarch64",
+        )
+    ) is None
