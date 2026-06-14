@@ -133,7 +133,9 @@ from compiler_suit_runner import peer_paths_fetch
 from compiler_suit_runner.workers.build_worker import (
     BuildWorkerEnv,
     build_worker,
+    ensure_binary_archive_imported,
     ensure_common_archive_imported,
+    ensure_toolchain_archive_imported,
     ensure_toolchain_out_archive_imported,
 )
 
@@ -204,6 +206,22 @@ IMPORT_COMMON_TASK_ID = "import_common"
 # toolchain closure already shipped by the toolchain archives) so each
 # build node has all substituter-queried paths pre-loaded locally.
 IMPORT_BUILD_DEPS_TASK_ID = "import_build_deps"
+
+# Task-id for the toolchain DRV-graph archive import gate.
+# One per run; wired as a dep on every build_common_dep and build_variant
+# when matrix_eval_out_dir is set.  The archive ships the toolchain drv
+# closure (``toolchains.drv.archive``) so the nix daemon can resolve
+# variant .drv paths locally without querying a peer harmonia.
+IMPORT_TOOLCHAIN_DRV_TASK_ID = "import_toolchain_drv"
+
+
+def _import_matrix_drv_task_id(binary: str) -> str:
+    """Return the import gate task_id for a binary's matrix-drv archive.
+
+    Returns ``"import_matrix_drv_<binary>"`` for the per-binary
+    ``matrix-<binary>.drv.archive`` import gate task.
+    """
+    return f"import_matrix_drv_{binary}"
 
 
 def _import_tc_task_id(toolchain_outpath: str) -> str:
@@ -723,7 +741,12 @@ class _PeerLifecycleListener:
 # ---------------------------------------------------------------------------
 
 
-def _header_depends_on(header: ManifestHeader, *, build_deps_local: bool = False) -> tuple:
+def _header_depends_on(
+    header: ManifestHeader,
+    *,
+    build_deps_local: bool = False,
+    matrix_eval_gates: bool = False,
+) -> tuple:
     """Assemble a header's full ``task_depends_on`` tuple.
 
     Intra-phase deps in ``header.task_depends_on`` pass through as bare
@@ -747,6 +770,13 @@ def _header_depends_on(header: ManifestHeader, *, build_deps_local: bool = False
       delta import gate).  Silently skipped when the outpath is absent
       or has an undecodable store-hash (legacy manifests / tests without
       outpath).
+    * ``build_common_dep`` / ``build_variant`` → ``import_toolchain_drv``
+      when ``matrix_eval_gates`` is True (the toolchain drv-graph archive
+      import gate; one per run per machine).
+    * ``build_variant`` only → ``import_matrix_drv_<binary>`` derived from
+      ``header.payload["pkg"]`` when ``matrix_eval_gates`` is True (the
+      per-binary matrix-drv-graph archive import gate).  Silently skipped
+      when ``pkg`` is absent from the payload (legacy fixtures).
     """
     toolchain_deps = tuple(
         _make_task_dep(tc_id, phase_id=Phase.BUILD_COMPILERS)
@@ -758,6 +788,8 @@ def _header_depends_on(header: ManifestHeader, *, build_deps_local: bool = False
         import_deps.append(IMPORT_COMMON_TASK_ID)
         if build_deps_local:
             import_deps.append(IMPORT_BUILD_DEPS_TASK_ID)
+        if matrix_eval_gates:
+            import_deps.append(IMPORT_TOOLCHAIN_DRV_TASK_ID)
     if header.item_class == "build_variant":
         toolchain_outpath = header.payload.get("toolchain_outpath") or ""
         if toolchain_outpath:
@@ -765,10 +797,14 @@ def _header_depends_on(header: ManifestHeader, *, build_deps_local: bool = False
                 import_deps.append(_import_tc_task_id(toolchain_outpath))
             except ValueError:
                 pass  # undecodable store path — legacy fixture / no outpath
+        if matrix_eval_gates:
+            binary = header.payload.get("pkg") or ""
+            if binary:
+                import_deps.append(_import_matrix_drv_task_id(binary))
     return tuple(header.task_depends_on) + tuple(import_deps) + toolchain_deps
 
 
-def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = False, build_deps_local: bool = False):
+def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = False, build_deps_local: bool = False, matrix_eval_gates: bool = False):
     """Convert one :class:`ManifestHeader` directly into a framework
     ``TaskInfo``. Mirrors the call shape used by
     :func:`_make_task_info` (the disk-round-trip path used by
@@ -818,7 +854,7 @@ def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = Fa
         affinity_id=affinity_id,
         payload=header_dict,
         task_id=header.task_id or "",
-        task_depends_on=() if disable_task_deps else _header_depends_on(header, build_deps_local=build_deps_local),
+        task_depends_on=() if disable_task_deps else _header_depends_on(header, build_deps_local=build_deps_local, matrix_eval_gates=matrix_eval_gates),
     )
 
 
@@ -1070,7 +1106,7 @@ class SuitTask:
 
     @property
     def import_action(self) -> Optional[Callable[[str], None]]:
-        """Secondary-affine import action for toolchain archive gate tasks.
+        """Secondary-affine import action for all archive gate tasks.
 
         Duck-typed by the framework's ``run_secondary()`` /
         ``RustSecondaryCoordinator`` via
@@ -1081,18 +1117,27 @@ class SuitTask:
 
         Callable contract (from affine_action_bridge.rs):
 
-        * ``task_id: str`` — the gate task's id (e.g. ``"import_common"``
-          or ``"import_tc_<hash>"``).
+        * ``task_id: str`` — the gate task's id (e.g. ``"import_common"``,
+          ``"import_tc_<hash>"``, ``"import_toolchain_drv"``, or
+          ``"import_matrix_drv_<binary>"``).
         * Return ``None`` on success.
         * Raise ``OSError`` for transient failures (framework retries).
         * Raise any other ``Exception`` for non-recoverable failures
           (framework marks the gate and all dependent tasks permanently
           failed).
 
-        When ``config.matrix_eval_out_dir`` is ``None`` (legacy, no dedup)
-        this property returns ``None`` and the framework never fires the
-        import hook, falling back to the per-process import in
-        ``_run_import_prelude``.
+        Gate task IDs dispatched here:
+
+        * ``import_common``              → :func:`ensure_common_archive_imported`
+        * ``import_build_deps``          → :func:`ensure_build_deps_archive_imported`
+        * ``import_toolchain_drv``       → :func:`ensure_toolchain_archive_imported`
+        * ``import_matrix_drv_<binary>`` → :func:`ensure_binary_archive_imported`
+        * ``import_tc_<hash>``           → :func:`ensure_toolchain_out_archive_imported`
+
+        When ``config.matrix_eval_out_dir`` is ``None`` (legacy / test
+        flows) this property returns ``None`` and the framework never fires
+        the import hook.  All ``ensure_*`` helpers are no-ops when their
+        archive directory is ``None``, so legacy callers are unaffected.
         """
         if self.config.matrix_eval_out_dir is None:
             return None
@@ -1119,6 +1164,11 @@ class SuitTask:
                     ensure_build_deps_archive_imported,
                 )
                 ensure_build_deps_archive_imported(out_dir)
+            elif task_id == IMPORT_TOOLCHAIN_DRV_TASK_ID:
+                ensure_toolchain_archive_imported(out_dir)
+            elif task_id.startswith("import_matrix_drv_"):
+                binary = task_id[len("import_matrix_drv_"):]
+                ensure_binary_archive_imported(binary, out_dir)
             elif task_id.startswith("import_tc_"):
                 outpath = hash_to_outpath.get(task_id)
                 if outpath is None:
@@ -1378,9 +1428,15 @@ class SuitTask:
 
         Emits:
 
+        * one ``import_toolchain_drv`` gate (toolchain drv-graph closure),
+          when ``matrix_eval_out_dir`` is set (the archive always exists
+          alongside the matrix-eval outputs, independent of dedup).
+        * one ``import_matrix_drv_<binary>`` gate per binary in
+          ``config.per_binary_metadata`` when ``matrix_eval_out_dir`` is
+          set (the per-binary drv-diff archive).
         * one ``import_common`` gate (common realized-toolchain closure),
-          unconditionally when ``toolchain_outpaths_map`` is non-empty
-          (i.e. there are realized toolchains to import).
+          when ``toolchain_outpaths_map`` is non-empty (i.e. there are
+          realized toolchains to import).
         * one ``import_tc_<hash>`` gate per distinct realized toolchain
           outpath in ``config.toolchain_outpaths_map``.
         * one ``import_build_deps`` gate when ``config.build_deps_local``
@@ -1390,11 +1446,13 @@ class SuitTask:
         ``task_depends_on`` (archives are pre-staged on the shared FS before
         dispatch; no upstream upload wait needed).
 
-        When ``toolchain_outpaths_map`` is absent or empty, nothing is emitted
-        (legacy flows without dedup, or secondary-container configs).
+        When both ``matrix_eval_out_dir`` and ``toolchain_outpaths_map`` are
+        absent or empty, nothing is emitted (legacy flows without dedup, or
+        secondary-container configs).
         """
+        out_dir = self.config.matrix_eval_out_dir
         outpaths_map = self.config.toolchain_outpaths_map or {}
-        if not outpaths_map:
+        if out_dir is None and not outpaths_map:
             return
 
         # Synthetic zero-byte path; framework treats it as an opaque tag
@@ -1414,6 +1472,22 @@ class SuitTask:
                 task_depends_on=(),
                 is_secondary_affine=True,
             )
+
+        # DRV-graph archive gates: toolchain drv closure + per-binary drv diff.
+        # Emitted whenever matrix_eval ran (matrix_eval_out_dir is set),
+        # independent of dedup (the archives always exist when matrix_eval ran).
+        if out_dir is not None:
+            yield _gate(IMPORT_TOOLCHAIN_DRV_TASK_ID)
+            per_binary = self.config.per_binary_metadata or {}
+            seen_binaries: set[str] = set()
+            for binary in sorted(per_binary.keys()):
+                if not binary or binary in seen_binaries:
+                    continue
+                seen_binaries.add(binary)
+                yield _gate(_import_matrix_drv_task_id(binary))
+
+        if not outpaths_map:
+            return
 
         yield _gate(IMPORT_COMMON_TASK_ID)
 
@@ -1493,7 +1567,9 @@ class SuitTask:
         if self.config.disable_task_deps:
             return ()
         return _header_depends_on(
-            header, build_deps_local=self.config.build_deps_local,
+            header,
+            build_deps_local=self.config.build_deps_local,
+            matrix_eval_gates=(self.config.matrix_eval_out_dir is not None),
         )
 
     # ── Memory estimator (disabled) ───────────────────────────────────
@@ -2771,6 +2847,7 @@ class SuitTask:
                 header,
                 disable_task_deps=self.config.disable_task_deps,
                 build_deps_local=self.config.build_deps_local,
+                matrix_eval_gates=(self.config.matrix_eval_out_dir is not None),
             )
             for header in headers
         ]

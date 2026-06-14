@@ -1714,16 +1714,14 @@ def test_ensure_toolchain_archive_imported_permanent_failure_still_raises(
     assert bw._toolchain_imported is False
 
 
-def test_build_worker_build_variant_imports_archive_first_time(
+def test_ensure_binary_archive_imported_imports_first_time(
     monkeypatch, tmp_path,
 ):
-    """A first ``build_variant`` task for binary X invokes
-    ``ensure_binary_archive_imported`` with the BuildWorkerEnv's
-    matrix-eval-out-dir + the binary from the payload."""
+    """A first call to ensure_binary_archive_imported for binary X imports
+    the archive; subsequent calls for the same binary are no-ops.
+    (The gate SuitTask.import_action calls this exactly once per machine
+    per binary when build tasks are assigned to a secondary.)"""
     _reset_imported_binaries()
-    # Pre-mark union archive as imported so this test focuses on the
-    # per-binary archive import behaviour.
-    bw._common_archive_imported = True
     captured: list[tuple[str, pathlib.Path]] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1738,32 +1736,25 @@ def test_build_worker_build_variant_imports_archive_first_time(
 
     out_dir = tmp_path / "phase0"
     out_dir.mkdir()
-    nix_out = tmp_path / "nix-out"
-    _make_elf_folder(nix_out, {"hello": b"v"})
-    manifest = _make_variant_manifest(
-        tmp_path, pkg="hello", variant_dir="hello__x86_64__gcc15__O2",
-    )
-    runner = RecordingRunner(stdout=f"{nix_out}\n".encode("utf-8"))
-    env = BuildWorkerEnv(
-        flake_ref=".",
-        dataset_output_dir=tmp_path / "dataset",
-        run_subprocess=runner,
-        matrix_eval_out_dir=out_dir,
-    )
-    result = build_worker(manifest, env)
-    assert result.success is True
+    (out_dir / "matrix-hello.drv.archive").write_bytes(b"DRV")
+
+    # First call: archive is imported.
+    bw.ensure_binary_archive_imported("hello", out_dir)
     assert captured == [("import", out_dir / "matrix-hello.drv.archive")]
+    assert "hello" in bw._imported_binaries
+
+    # Second call: cache short-circuits; no re-import.
+    bw.ensure_binary_archive_imported("hello", out_dir)
+    assert len(captured) == 1, "should not re-import the same binary"
     _reset_imported_binaries()
 
 
-def test_build_worker_build_common_dep_imports_archive(monkeypatch, tmp_path):
-    """A ``build_common_dep`` task imports the per-binary archive (so the
-    common-dep ``.drv`` is local) using the binary from
-    ``payload["binary"]``, then builds the reconstructed drv path."""
+def test_build_worker_build_common_dep_does_not_import_archives(monkeypatch, tmp_path):
+    """A ``build_common_dep`` task no longer triggers any archive import from
+    the per-process prelude — all imports are now secondary-affine gate actions
+    (SuitTask.import_action).  The worker just rebuilds the absolute drv path
+    and calls ``nix build``."""
     _reset_imported_binaries()
-    # Pre-mark union archive as imported so this test focuses on the
-    # per-binary archive import behaviour.
-    bw._common_archive_imported = True
     captured: list[tuple[str, pathlib.Path]] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1794,21 +1785,23 @@ def test_build_worker_build_common_dep_imports_archive(monkeypatch, tmp_path):
     )
     result = build_worker(manifest, env)
     assert result.success is True
-    assert captured == [("import", out_dir / "matrix-hello.drv.archive")]
+    # No archive import from the per-process prelude.
+    assert captured == [], (
+        f"build_worker should not import archives (gate-driven now): {captured}"
+    )
+    # The drv path is still reconstructed and passed to nix build.
     assert f"/nix/store/{ident}^*" in runner.calls[0]
     _reset_imported_binaries()
 
 
-def test_build_worker_build_variant_does_not_re_import_same_binary(
+def test_ensure_binary_archive_imported_idempotent_same_binary(
     monkeypatch, tmp_path,
 ):
-    """The second ``build_variant`` task for the SAME binary on the
-    SAME process MUST NOT re-trigger ``import_archive`` — the cache
-    short-circuit lives in :data:`_imported_binaries`."""
+    """The second call to ensure_binary_archive_imported for the SAME binary
+    MUST NOT re-trigger import_archive — the cache lives in _imported_binaries.
+    The gate fires this only once per secondary per binary, so cache hits
+    only arise when the prelude was called directly (legacy / test paths)."""
     _reset_imported_binaries()
-    # Pre-mark union archive as imported so this test focuses on the
-    # per-binary import idempotency behaviour.
-    bw._common_archive_imported = True
     captured: list[pathlib.Path] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1823,43 +1816,25 @@ def test_build_worker_build_variant_does_not_re_import_same_binary(
 
     out_dir = tmp_path / "phase0"
     out_dir.mkdir()
-    env = BuildWorkerEnv(
-        flake_ref=".",
-        dataset_output_dir=tmp_path / "dataset",
-        matrix_eval_out_dir=out_dir,
+    (out_dir / "matrix-hello.drv.archive").write_bytes(b"DRV")
+
+    # Call twice for the same binary; only one archive import must occur.
+    bw.ensure_binary_archive_imported("hello", out_dir)
+    bw.ensure_binary_archive_imported("hello", out_dir)
+
+    assert captured == [out_dir / "matrix-hello.drv.archive"], (
+        "must import only once per process per binary"
     )
-
-    # Two variant tasks back-to-back for the same binary.
-    for variant_dir in (
-        "hello__x86_64__gcc15__O2", "hello__x86_64__gcc15__O0",
-    ):
-        nix_out = tmp_path / f"nix-out-{variant_dir}"
-        _make_elf_folder(nix_out, {"hello": b"v"})
-        manifest = _make_variant_manifest(
-            tmp_path, pkg="hello", variant_dir=variant_dir,
-        )
-        env.run_subprocess = RecordingRunner(
-            stdout=f"{nix_out}\n".encode("utf-8"),
-        )
-        result = build_worker(manifest, env)
-        assert result.success is True
-
-    # Exactly ONE import — even though two variant tasks ran.
-    assert captured == [out_dir / "matrix-hello.drv.archive"]
     _reset_imported_binaries()
 
 
-def test_build_worker_build_variant_imports_new_binary_after_switch(
+def test_ensure_binary_archive_imported_per_binary_key(
     monkeypatch, tmp_path,
 ):
-    """After a build_variant task for binary X imports its archive,
-    a build_variant task for binary Y on the same worker process
-    triggers a fresh import for ``matrix-Y.drv.archive`` (one per
-    binary cache key, not one per process)."""
+    """ensure_binary_archive_imported uses the binary as the cache key:
+    a second binary triggers a fresh import (matrix-world.drv.archive)
+    even after matrix-hello.drv.archive was already imported."""
     _reset_imported_binaries()
-    # Pre-mark union archive as imported so this test focuses on the
-    # per-binary import switching behaviour.
-    bw._common_archive_imported = True
     captured: list[pathlib.Path] = []
 
     def _fake_import(archive, *, run_subprocess=None):
@@ -1874,23 +1849,11 @@ def test_build_worker_build_variant_imports_new_binary_after_switch(
 
     out_dir = tmp_path / "phase0"
     out_dir.mkdir()
-    env = BuildWorkerEnv(
-        flake_ref=".",
-        dataset_output_dir=tmp_path / "dataset",
-        matrix_eval_out_dir=out_dir,
-    )
+    (out_dir / "matrix-hello.drv.archive").write_bytes(b"DRV")
+    (out_dir / "matrix-world.drv.archive").write_bytes(b"DRV")
 
-    for pkg in ("hello", "world"):
-        nix_out = tmp_path / f"nix-out-{pkg}"
-        _make_elf_folder(nix_out, {pkg: b"v"})
-        manifest = _make_variant_manifest(
-            tmp_path, pkg=pkg, variant_dir=f"{pkg}__x86_64__gcc15__O2",
-        )
-        env.run_subprocess = RecordingRunner(
-            stdout=f"{nix_out}\n".encode("utf-8"),
-        )
-        result = build_worker(manifest, env)
-        assert result.success is True
+    bw.ensure_binary_archive_imported("hello", out_dir)
+    bw.ensure_binary_archive_imported("world", out_dir)
 
     assert captured == [
         out_dir / "matrix-hello.drv.archive",
@@ -1899,16 +1862,13 @@ def test_build_worker_build_variant_imports_new_binary_after_switch(
     _reset_imported_binaries()
 
 
-def test_build_worker_build_variant_archive_import_failure_is_failure_result(
+def test_ensure_binary_archive_imported_failure_raises(
     monkeypatch, tmp_path,
 ):
-    """Archive import failure surfaces as ``result.success=False``;
-    the framework worker-handle wraps that into NonRecoverableError
-    (Bug A's exit-1 contract) further upstream."""
+    """A failed import_archive for matrix-<binary>.drv.archive raises
+    RuntimeError, so the gate (SuitTask.import_action) surfaces it as a
+    gate failure (framework marks all dependent build tasks as failed)."""
     _reset_imported_binaries()
-    # Pre-mark union archive as imported so this test focuses on the
-    # per-binary archive import failure path.
-    bw._common_archive_imported = True
 
     def _fake_import(archive, *, run_subprocess=None):
         return False, b"missing archive", []
@@ -1921,17 +1881,52 @@ def test_build_worker_build_variant_archive_import_failure_is_failure_result(
 
     out_dir = tmp_path / "phase0"
     out_dir.mkdir()
+    (out_dir / "matrix-hello.drv.archive").write_bytes(b"data")
+
+    with pytest.raises(RuntimeError, match="matrix-hello.drv.archive"):
+        bw.ensure_binary_archive_imported("hello", out_dir)
+    _reset_imported_binaries()
+
+
+def test_build_worker_build_variant_does_not_import_archives_from_prelude(
+    monkeypatch, tmp_path,
+):
+    """build_worker for build_variant no longer imports any archive from
+    _run_import_prelude — drv archives are now secondary-affine gate actions
+    (SuitTask.import_action) fired before any dependent build task runs."""
+    _reset_imported_binaries()
+    captured: list[pathlib.Path] = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        captured.append(archive)
+        return True, b"", []
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.dependency_graph_worker"
+        ".archive.import_archive",
+        _fake_import,
+    )
+
+    out_dir = tmp_path / "phase0"
+    out_dir.mkdir()
+    nix_out = tmp_path / "nix-out"
+    _make_elf_folder(nix_out, {"hello": b"v"})
     manifest = _make_variant_manifest(
         tmp_path, pkg="hello", variant_dir="hello__x86_64__gcc15__O2",
     )
+    runner = RecordingRunner(stdout=f"{nix_out}\n".encode("utf-8"))
     env = BuildWorkerEnv(
         flake_ref=".",
         dataset_output_dir=tmp_path / "dataset",
+        run_subprocess=runner,
         matrix_eval_out_dir=out_dir,
     )
     result = build_worker(manifest, env)
-    assert result.success is False
-    assert "matrix-hello.drv.archive" in (result.error or "")
+    assert result.success is True
+    # No archive import triggered by build_worker; gate drives it.
+    assert captured == [], (
+        f"build_worker should not import archives (gate-driven): {captured}"
+    )
     _reset_imported_binaries()
 
 
@@ -2258,17 +2253,18 @@ def test_ensure_toolchain_out_archive_imported_import_failure_raises(
 
 
 # ---------------------------------------------------------------------------
-# _run_import_prelude — split-based, item_class-branched import order
+# _run_import_prelude — all imports now delegated to secondary-affine gates
 # ---------------------------------------------------------------------------
 
 
-def test_run_import_prelude_build_variant_imports_drv_and_binary(
+def test_run_import_prelude_is_noop_for_build_variant(
     monkeypatch, tmp_path,
 ):
-    """_run_import_prelude for build_variant imports ONLY the drv-graph and
-    binary archives.  The common and per-toolchain delta archives are now
-    imported ONCE PER SECONDARY NODE via the secondary-affine import gate
-    (SuitTask.import_action), not per-worker-process here."""
+    """_run_import_prelude is a no-op for build_variant: ALL archive imports
+    (toolchains.drv.archive, matrix-<binary>.drv.archive, toolchains.common.archive,
+    per-toolchain delta archives, and build_deps.out.archive) are now handled
+    ONCE PER SECONDARY NODE via the secondary-affine import gate
+    (SuitTask.import_action).  The per-process prelude performs no I/O."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
@@ -2298,20 +2294,17 @@ def test_run_import_prelude_build_variant_imports_drv_and_binary(
     payload = {"pkg": "hello", "toolchain_outpath": outpath}
     _run_import_prelude("build_variant", payload, env)
 
-    assert "toolchains.drv.archive" in call_order
-    assert "matrix-hello.drv.archive" in call_order
-    # The common and delta archives are NOT imported by the per-process prelude
-    # any more — the secondary-affine gate handles them.
-    assert "toolchains.common.archive" not in call_order
-    delta_names = [n for n in call_order if "out.archive" in n]
-    assert delta_names == [], f"Unexpected delta import in per-process prelude: {delta_names}"
+    # All archives are now gate-driven; the per-process prelude does nothing.
+    assert call_order == [], (
+        f"_run_import_prelude should be a no-op but imported: {call_order}"
+    )
 
 
-def test_run_import_prelude_build_common_dep_imports_drv_and_binary(
+def test_run_import_prelude_is_noop_for_build_common_dep(
     monkeypatch, tmp_path,
 ):
-    """_run_import_prelude for build_common_dep imports the drv-graph and binary
-    archives only.  Common archive is now a secondary-affine gate import."""
+    """_run_import_prelude is a no-op for build_common_dep: all archive imports
+    are handled by the secondary-affine gate (SuitTask.import_action)."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
@@ -2339,45 +2332,10 @@ def test_run_import_prelude_build_common_dep_imports_drv_and_binary(
     payload = {"binary": "hello"}  # no toolchain_outpath
     _run_import_prelude("build_common_dep", payload, env)
 
-    # Common archive is NOT imported here; the secondary-affine gate handles it.
-    assert "toolchains.common.archive" not in call_order
-    assert "toolchains.drv.archive" in call_order
-    assert "matrix-hello.drv.archive" in call_order
-
-
-def test_run_import_prelude_missing_binary_archive_raises_for_build_variant(
-    monkeypatch, tmp_path,
-):
-    """_run_import_prelude raises RuntimeError when the binary drv archive
-    import fails for build_variant (the binary archive is load-bearing)."""
-    from compiler_suit_runner.workers.dependency_graph_worker import (
-        archive as archive_mod,
+    # All archives are now gate-driven; the per-process prelude does nothing.
+    assert call_order == [], (
+        f"_run_import_prelude should be a no-op but imported: {call_order}"
     )
-    _reset_common_imported(monkeypatch)
-    bw._toolchain_imported = False
-    bw._imported_binaries.clear()
-    # Create toolchains.drv.archive (soft — present so stat passes; fake
-    # import succeeds for it).
-    (tmp_path / "toolchains.drv.archive").write_bytes(b"DRV")
-    # Do NOT create matrix-hello.drv.archive (fake returns failure for it).
-
-    def _fake_import(archive, *, run_subprocess=None):
-        name = pathlib.Path(archive).name
-        if name == "toolchains.drv.archive":
-            return True, b"", []
-        # Binary archive: signal failure.
-        return False, b"archive not found", []
-
-    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
-
-    from compiler_suit_runner.workers.build_worker import BuildWorkerEnv, _run_import_prelude
-    env = BuildWorkerEnv(
-        flake_ref=".",
-        dataset_output_dir=tmp_path / "ds",
-        matrix_eval_out_dir=tmp_path,
-    )
-    with pytest.raises(RuntimeError, match="matrix-hello.drv.archive"):
-        _run_import_prelude("build_variant", {"pkg": "hello"}, env)
 
 
 # ---------------------------------------------------------------------------

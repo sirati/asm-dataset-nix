@@ -1915,3 +1915,320 @@ def test_import_action_import_build_deps_calls_ensure_build_deps_imported(
     assert action is not None
     action(IMPORT_BUILD_DEPS_TASK_ID)
     assert calls == [("build_deps", tmp_path / "out")]
+
+
+# ---------------------------------------------------------------------------
+# DRV-archive gate tasks: import_toolchain_drv + import_matrix_drv_<binary>
+# ---------------------------------------------------------------------------
+
+
+def _config_with_binaries(
+    tmp_path: pathlib.Path,
+    *,
+    binaries: "list[str] | None" = None,
+) -> "SuitTaskConfig":
+    """Config with matrix_eval_out_dir + per_binary_metadata (for drv gates)."""
+    import dataclasses as _dc  # noqa: PLC0415
+    binaries = binaries or ["hello", "zlib"]
+    per_binary = {
+        b: {
+            "archs": ["x86_64"],
+            "toolchain_aggregate_drv": "/nix/store/tc-agg.drv",
+            "toolchain_dedup": True,
+        }
+        for b in binaries
+    }
+    return _dc.replace(
+        _make_config(tmp_path),
+        matrix_eval_out_dir=tmp_path / "out",
+        toolchain_outpaths_map={"x86_64/gcc15": _TC_OUTPATH},
+        per_binary_metadata=per_binary,
+    )
+
+
+def test_discover_import_gate_tasks_emits_toolchain_drv_gate(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When matrix_eval_out_dir is set, discover_items yields an
+    import_toolchain_drv gate task."""
+    from compiler_suit_runner.suit_task import IMPORT_TOOLCHAIN_DRV_TASK_ID  # noqa: PLC0415
+
+    config = _config_with_outpaths(tmp_path)  # matrix_eval_out_dir is set
+    task = SuitTask(config)
+    items = list(task.discover_items())
+    gate_ids = {
+        getattr(ti, "task_id", None) for ti in items
+        if getattr(ti, "type_id", None) == "toolchain_import"
+    }
+    assert IMPORT_TOOLCHAIN_DRV_TASK_ID in gate_ids
+
+
+def test_discover_import_gate_tasks_emits_per_binary_matrix_drv_gates(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When matrix_eval_out_dir is set and per_binary_metadata is populated,
+    discover_items yields one import_matrix_drv_<binary> gate per binary."""
+    from compiler_suit_runner.suit_task import _import_matrix_drv_task_id  # noqa: PLC0415
+
+    config = _config_with_binaries(tmp_path, binaries=["hello", "zlib"])
+    task = SuitTask(config)
+    items = list(task.discover_items())
+    gate_ids = {
+        getattr(ti, "task_id", None) for ti in items
+        if getattr(ti, "type_id", None) == "toolchain_import"
+    }
+    assert _import_matrix_drv_task_id("hello") in gate_ids
+    assert _import_matrix_drv_task_id("zlib") in gate_ids
+
+
+def test_discover_import_gate_tasks_no_matrix_drv_gates_without_per_binary_metadata(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When per_binary_metadata is absent (secondary-container config),
+    no import_matrix_drv_* gates are emitted."""
+    from compiler_suit_runner.suit_task import _import_matrix_drv_task_id  # noqa: PLC0415
+
+    config = _config_with_outpaths(tmp_path)  # per_binary_metadata=None
+    task = SuitTask(config)
+    items = list(task.discover_items())
+    gate_ids = {
+        getattr(ti, "task_id", None) for ti in items
+        if getattr(ti, "type_id", None) == "toolchain_import"
+        and (getattr(ti, "task_id", "") or "").startswith("import_matrix_drv_")
+    }
+    assert gate_ids == set()
+
+
+def test_discover_import_gate_tasks_no_toolchain_drv_without_matrix_eval_out_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """When matrix_eval_out_dir is absent, no import_toolchain_drv gate is emitted."""
+    from compiler_suit_runner.suit_task import IMPORT_TOOLCHAIN_DRV_TASK_ID  # noqa: PLC0415
+
+    # _make_config has no matrix_eval_out_dir; also no outpaths_map
+    config = _make_config(tmp_path)
+    task = SuitTask(config)
+    items = list(task.discover_items())
+    gate_ids = {
+        getattr(ti, "task_id", None) for ti in items
+        if getattr(ti, "type_id", None) == "toolchain_import"
+    }
+    assert IMPORT_TOOLCHAIN_DRV_TASK_ID not in gate_ids
+
+
+def test_header_depends_on_build_variant_includes_drv_gates_when_matrix_eval_gates(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With matrix_eval_gates=True, _header_depends_on adds IMPORT_TOOLCHAIN_DRV_TASK_ID
+    and import_matrix_drv_<binary> for build_variant headers."""
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        IMPORT_TOOLCHAIN_DRV_TASK_ID,
+        _header_depends_on,
+        _import_matrix_drv_task_id,
+    )
+
+    header = ManifestHeader(
+        item_class="build_variant",
+        name="hello-x86_64-gcc15-O0",
+        size=0,
+        payload={
+            "sys": _SYS,
+            "pkg": "hello",
+            "arch": "x86_64",
+            "toolchain_outpath": _TC_OUTPATH,
+        },
+        task_id="build_variant__x86_64-linux__hello__gcc15-O0",
+    )
+    deps = _header_depends_on(header, matrix_eval_gates=True)
+    bare = [d for d in deps if isinstance(d, str)]
+    assert IMPORT_TOOLCHAIN_DRV_TASK_ID in bare
+    assert _import_matrix_drv_task_id("hello") in bare
+
+
+def test_header_depends_on_build_common_dep_includes_toolchain_drv_gate(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With matrix_eval_gates=True, _header_depends_on adds IMPORT_TOOLCHAIN_DRV_TASK_ID
+    for build_common_dep headers (no per-binary gate since no pkg field)."""
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        IMPORT_TOOLCHAIN_DRV_TASK_ID,
+        _header_depends_on,
+        _import_matrix_drv_task_id,
+    )
+
+    header = ManifestHeader(
+        item_class="build_common_dep",
+        name="common_dep__glibc",
+        size=0,
+        payload={"drv": "/nix/store/x-glibc.drv", "label": "glibc"},
+        task_id="build_common_dep__x-glibc.drv",
+    )
+    deps = _header_depends_on(header, matrix_eval_gates=True)
+    bare = [d for d in deps if isinstance(d, str)]
+    assert IMPORT_TOOLCHAIN_DRV_TASK_ID in bare
+    # No per-binary matrix drv gate for common deps (no pkg field).
+    assert not any(d.startswith("import_matrix_drv_") for d in bare)
+
+
+def test_header_depends_on_no_drv_gates_when_matrix_eval_gates_off(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With matrix_eval_gates=False (default), no drv gate deps are added."""
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        IMPORT_TOOLCHAIN_DRV_TASK_ID,
+        _header_depends_on,
+        _import_matrix_drv_task_id,
+    )
+
+    header = ManifestHeader(
+        item_class="build_variant",
+        name="hello-x86_64-gcc15-O0",
+        size=0,
+        payload={"sys": _SYS, "pkg": "hello", "arch": "x86_64"},
+        task_id="build_variant__x86_64-linux__hello__gcc15-O0",
+    )
+    deps = _header_depends_on(header)  # default: matrix_eval_gates=False
+    bare = [d for d in deps if isinstance(d, str)]
+    assert IMPORT_TOOLCHAIN_DRV_TASK_ID not in bare
+    assert not any(d.startswith("import_matrix_drv_") for d in bare)
+
+
+def test_import_action_import_toolchain_drv_calls_ensure_toolchain_archive(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """import_action('import_toolchain_drv') calls ensure_toolchain_archive_imported
+    with matrix_eval_out_dir."""
+    import dataclasses as _dc  # noqa: PLC0415
+    from compiler_suit_runner.suit_task import IMPORT_TOOLCHAIN_DRV_TASK_ID  # noqa: PLC0415
+
+    config = _dc.replace(
+        _make_config(tmp_path),
+        matrix_eval_out_dir=tmp_path / "out",
+        toolchain_outpaths_map={"x86_64/gcc15": _TC_OUTPATH},
+    )
+    (tmp_path / "out").mkdir()
+
+    calls: list[tuple] = []
+
+    def _fake_ensure_tc_archive(out_dir, *, run_subprocess=None):
+        calls.append(("toolchain_drv", out_dir))
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.ensure_toolchain_archive_imported",
+        _fake_ensure_tc_archive,
+    )
+
+    task = SuitTask(config)
+    action = task.import_action
+    assert action is not None
+    action(IMPORT_TOOLCHAIN_DRV_TASK_ID)
+    assert calls == [("toolchain_drv", tmp_path / "out")]
+
+
+def test_import_action_import_matrix_drv_calls_ensure_binary_archive(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """import_action('import_matrix_drv_hello') calls ensure_binary_archive_imported
+    with binary='hello' and matrix_eval_out_dir."""
+    import dataclasses as _dc  # noqa: PLC0415
+    from compiler_suit_runner.suit_task import _import_matrix_drv_task_id  # noqa: PLC0415
+
+    config = _dc.replace(
+        _make_config(tmp_path),
+        matrix_eval_out_dir=tmp_path / "out",
+        toolchain_outpaths_map={"x86_64/gcc15": _TC_OUTPATH},
+    )
+    (tmp_path / "out").mkdir()
+
+    calls: list[tuple] = []
+
+    def _fake_ensure_binary(binary, out_dir, *, run_subprocess=None):
+        calls.append(("binary_drv", binary, out_dir))
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.ensure_binary_archive_imported",
+        _fake_ensure_binary,
+    )
+
+    task = SuitTask(config)
+    action = task.import_action
+    assert action is not None
+    action(_import_matrix_drv_task_id("hello"))
+    assert calls == [("binary_drv", "hello", tmp_path / "out")]
+
+
+def test_streamed_spawn_variant_carries_drv_gate_deps_when_matrix_eval_out_dir_set(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The streamed-spawn path carries import_toolchain_drv and
+    import_matrix_drv_<binary> as bare-string deps when the config has
+    matrix_eval_out_dir set."""
+    import dataclasses as _dc  # noqa: PLC0415
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        IMPORT_TOOLCHAIN_DRV_TASK_ID,
+        _import_matrix_drv_task_id,
+    )
+
+    task = _streamed_task(
+        tmp_path,
+        matrix_eval_out_dir=tmp_path / "out",
+    )
+    handle = task._primary_handle
+    descriptor = Phase4Descriptor(
+        kind="build_variant",
+        task_id="build_variant__x86_64-linux__hello__gcc15-O0",
+        name="hello-x86_64-gcc15-O0",
+        payload={
+            "sys": _SYS,
+            "pkg": "hello",
+            "arch": "x86_64",
+            "label": "hello-x86_64-gcc15-O0",
+            "drv": "/nix/store/v-hello.drv",
+            "variant_dir": "hello-x86_64-gcc15-O0",
+            "metadata_name": "hello-x86_64-gcc15-O0.json",
+            "compiler_id": "gcc15",
+        },
+        depends_on=(),
+        build_compilers_depends_on=(),
+    )
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC,
+        _batch_bytes([descriptor]),
+        True, handle,
+    )
+    assert len(handle.calls) == 1
+    (ti,) = handle.calls[0]
+    bare_deps = [d for d in ti.task_depends_on if isinstance(d, str)]
+    assert IMPORT_TOOLCHAIN_DRV_TASK_ID in bare_deps
+    assert _import_matrix_drv_task_id("hello") in bare_deps
+
+
+def test_header_task_depends_on_includes_drv_gates_when_matrix_eval_out_dir(
+    tmp_path: pathlib.Path,
+) -> None:
+    """SuitTask._header_task_depends_on passes matrix_eval_gates=True when
+    config.matrix_eval_out_dir is set, so build tasks get drv gate deps."""
+    import dataclasses as _dc  # noqa: PLC0415
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        IMPORT_TOOLCHAIN_DRV_TASK_ID,
+        _import_matrix_drv_task_id,
+    )
+
+    config = _dc.replace(
+        _make_config(tmp_path),
+        matrix_eval_out_dir=tmp_path / "out",
+    )
+    task = SuitTask(config)
+    header = ManifestHeader(
+        item_class="build_variant",
+        name="hello-x86_64-gcc15-O0",
+        size=0,
+        payload={"sys": _SYS, "pkg": "hello", "arch": "x86_64"},
+        task_id="build_variant__x86_64-linux__hello__gcc15-O0",
+    )
+    deps = task._header_task_depends_on(header)
+    bare = [d for d in deps if isinstance(d, str)]
+    assert IMPORT_TOOLCHAIN_DRV_TASK_ID in bare
+    assert _import_matrix_drv_task_id("hello") in bare

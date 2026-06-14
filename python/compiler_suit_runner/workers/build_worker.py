@@ -1213,34 +1213,30 @@ def _run_import_prelude(
 ) -> None:
     """Toolchain-first archive import prelude for build tasks.
 
-    The common realized-toolchain archive (``toolchains.common.archive``)
-    and per-toolchain delta archive (``toolchains.<hash>.out.archive``) are
-    now imported ONCE PER SECONDARY NODE by the framework's secondary-affine
-    import gate mechanism (``SuitTask.import_action``), not per-worker-process
-    here.  This prelude handles the remaining drv graph archives only:
+    All archive imports that were once per-worker-process are now handled
+    ONCE PER SECONDARY NODE by the framework's secondary-affine import gate
+    mechanism (``SuitTask.import_action``):
 
-    build_variant / build_common_dep:
-      1. ``toolchains.drv.archive`` (HARD) — drv graph closure.
-      2. ``matrix-<binary>.drv.archive`` (HARD) — per-binary drv diff.
+    * ``toolchains.common.archive``          → ``import_common`` gate
+    * ``toolchains.<hash>.out.archive``      → ``import_tc_<hash>`` gate
+    * ``toolchains.drv.archive``             → ``import_toolchain_drv`` gate
+    * ``matrix-<binary>.drv.archive``        → ``import_matrix_drv_<binary>`` gate
+    * ``build_deps.out.archive`` (optional)  → ``import_build_deps`` gate
 
-    These are load-bearing: a missing drv archive means nix cannot resolve
-    the variant drv locally and the build fails immediately.
+    This function is therefore a no-op for the default case where
+    ``matrix_eval_out_dir`` is set and the framework fires the gate actions
+    before any dependent build task runs.  The function is kept so that
+    legacy flows (``matrix_eval_out_dir=None``, unit tests that bypass gates)
+    continue to build correctly: each ``ensure_*`` helper is a no-op when
+    its archive directory is ``None``.
+
+    This function currently performs no operations; it exists as a call-site
+    placeholder and to document that gate-driven import has superseded
+    per-process import for all archive types.
     """
-    # Drv graph archives (hard-fail on missing).
-    ensure_toolchain_archive_imported(
-        env.matrix_eval_out_dir,
-        run_subprocess=env.run_subprocess,
-    )
-    binary = (
-        payload.get("pkg") if isinstance(payload.get("pkg"), str)
-        else payload.get("binary") if isinstance(payload.get("binary"), str)
-        else ""
-    )
-    ensure_binary_archive_imported(
-        binary or "",
-        env.matrix_eval_out_dir,
-        run_subprocess=env.run_subprocess,
-    )
+    # All imports moved to secondary-affine gates in SuitTask.import_action.
+    # The per-process ensure_* helpers are still callable (tests + legacy
+    # non-gate flows); callers that need them should invoke them directly.
 
 
 def _prefetch_variant_inputs(
