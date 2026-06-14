@@ -1701,21 +1701,23 @@ def test_import_action_import_tc_calls_ensure_toolchain_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """import_action('import_tc_<hash>') calls ensure_toolchain_out_archive_imported
-    with the corresponding outpath from toolchain_outpaths_map."""
+    with the tc_id (hash) extracted from the task_id — no toolchain_outpaths_map
+    needed (secondary case: toolchain_outpaths_map is None/empty)."""
     import dataclasses as _dc  # noqa: PLC0415
     from compiler_suit_runner.suit_task import _import_tc_task_id  # noqa: PLC0415
+    from compiler_suit_runner.preflight import toolchain_id_for_outpath  # noqa: PLC0415
 
+    # Secondary case: toolchain_outpaths_map is not provided (None → default).
     config = _dc.replace(
         _make_config(tmp_path),
         matrix_eval_out_dir=tmp_path / "out",
-        toolchain_outpaths_map={"x86_64/gcc15": _TC_OUTPATH},
     )
     (tmp_path / "out").mkdir()
 
     calls: list[tuple] = []
 
-    def _fake_ensure_tc(outpath, out_dir, *, run_subprocess=None):
-        calls.append(("tc", outpath, out_dir))
+    def _fake_ensure_tc(tc_id, out_dir, *, run_subprocess=None):
+        calls.append(("tc", tc_id, out_dir))
 
     monkeypatch.setattr(
         "compiler_suit_runner.suit_task.ensure_toolchain_out_archive_imported",
@@ -1725,26 +1727,47 @@ def test_import_action_import_tc_calls_ensure_toolchain_out(
     task = SuitTask(config)
     action = task.import_action
     assert action is not None
-    action(_import_tc_task_id(_TC_OUTPATH))
-    assert calls == [("tc", _TC_OUTPATH, tmp_path / "out")]
+    task_id = _import_tc_task_id(_TC_OUTPATH)
+    action(task_id)
+    expected_tc_id = toolchain_id_for_outpath(_TC_OUTPATH)
+    assert calls == [("tc", expected_tc_id, tmp_path / "out")]
 
 
-def test_import_action_unknown_tc_task_id_raises(
+def test_import_action_import_tc_works_with_empty_outpaths_map(
     tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """import_action raises RuntimeError for an import_tc_<hash> not in the map."""
+    """import_tc_<hash> works even when toolchain_outpaths_map is empty — the
+    secondary never receives this map but must still import archives correctly."""
     import dataclasses as _dc  # noqa: PLC0415
+    from compiler_suit_runner.suit_task import _import_tc_task_id  # noqa: PLC0415
+    from compiler_suit_runner.preflight import toolchain_id_for_outpath  # noqa: PLC0415
 
     config = _dc.replace(
         _make_config(tmp_path),
         matrix_eval_out_dir=tmp_path / "out",
-        toolchain_outpaths_map={"x86_64/gcc15": _TC_OUTPATH},
+        toolchain_outpaths_map={},  # empty — mimics secondary config
     )
+    (tmp_path / "out").mkdir()
+
+    calls: list[tuple] = []
+
+    def _fake_ensure_tc(tc_id, out_dir, *, run_subprocess=None):
+        calls.append(("tc", tc_id, out_dir))
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.suit_task.ensure_toolchain_out_archive_imported",
+        _fake_ensure_tc,
+    )
+
     task = SuitTask(config)
     action = task.import_action
     assert action is not None
-    with pytest.raises(RuntimeError, match="import_tc_unknown_hash"):
-        action("import_tc_unknown_hash")
+    task_id = _import_tc_task_id(_TC_OUTPATH)
+    action(task_id)
+    expected_tc_id = toolchain_id_for_outpath(_TC_OUTPATH)
+    # Archive named toolchains.<hash>.out.archive — ensure_* receives the hash.
+    assert calls == [("tc", expected_tc_id, tmp_path / "out")]
 
 
 def test_import_action_unknown_task_id_raises(

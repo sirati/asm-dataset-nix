@@ -97,9 +97,10 @@ _toolchain_imported: bool = False
 # import failure raises RuntimeError; there is no substitution fallback.
 _common_archive_imported: bool = False
 
-# Per-process set of toolchain out-paths whose delta archive has already
-# been imported on this worker.  Keyed by outpath string so workers handle
-# multiple toolchains in one process without redundant imports.
+# Per-process set of toolchain ids whose delta archive has already been
+# imported on this worker.  Keyed by tc_id (the Nix store-hash extracted
+# from the outpath) so workers handle multiple toolchains without redundant
+# imports and without needing the full outpath at import time.
 _imported_toolchain_out_paths: set[str] = set()
 
 # Per-process, once-only import guard for the build-deps output closure
@@ -1161,44 +1162,37 @@ def ensure_build_deps_archive_imported(
 
 
 def ensure_toolchain_out_archive_imported(
-    toolchain_outpath: Optional[str],
+    tc_id: Optional[str],
     matrix_eval_out_dir: Optional[pathlib.Path],
     *,
     run_subprocess: Optional[Callable[..., tuple[bytes, bytes, int]]] = None,
 ) -> None:
-    """Import the per-toolchain delta archive once per (outpath, process).
+    """Import the per-toolchain delta archive once per (tc_id, process).
 
     After :func:`ensure_common_archive_imported` has run, this function
     imports the toolchain-specific delta archive
-    (``toolchains.<id>.out.archive``) whose paths complete the full
-    compiler closure.  The archive name is derived from
-    ``toolchain_outpath`` via
-    :func:`compiler_suit_runner.preflight.toolchain_delta_archive_name`,
-    which uses the Nix store-hash (the first ``-``-delimited token of the
-    basename) — the same derivation the submitter uses so file names
-    match without coordination.
+    (``toolchains.<tc_id>.out.archive``) whose paths complete the full
+    compiler closure.  ``tc_id`` is the Nix store-hash (the first
+    ``-``-delimited token of the outpath basename), which is also the
+    ``<hash>`` component in the gate task_id ``import_tc_<hash>``.  The
+    archive name is constructed directly as
+    ``toolchains.<tc_id>.out.archive`` — identical to what
+    :func:`compiler_suit_runner.preflight.toolchain_delta_archive_name`
+    would derive from the full outpath.
 
-    HARD FAIL: a missing, zero-byte, un-importable archive, or an
-    undecodable outpath raises :class:`RuntimeError`.  There is NO
-    substitution fallback for the realized-toolchain closure.
+    HARD FAIL: a missing, zero-byte, or un-importable archive raises
+    :class:`RuntimeError`.  There is NO substitution fallback for the
+    realized-toolchain closure.
 
-    ``toolchain_outpath`` or ``matrix_eval_out_dir`` being ``None`` or
-    empty (legacy manifests / fixtures) is a no-op.
+    ``tc_id`` or ``matrix_eval_out_dir`` being ``None`` or empty (legacy
+    manifests / fixtures) is a no-op.
     """
-    if not toolchain_outpath or matrix_eval_out_dir is None:
+    if not tc_id or matrix_eval_out_dir is None:
         return
-    if toolchain_outpath in _imported_toolchain_out_paths:
+    if tc_id in _imported_toolchain_out_paths:
         return
-    _imported_toolchain_out_paths.add(toolchain_outpath)
-    from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
-
-    try:
-        archive_name = _preflight.toolchain_delta_archive_name(toolchain_outpath)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"build_worker: cannot derive delta archive name for toolchain "
-            f"outpath {toolchain_outpath!r}: {exc}"
-        ) from exc
+    _imported_toolchain_out_paths.add(tc_id)
+    archive_name = f"toolchains.{tc_id}.out.archive"
     archive_path = matrix_eval_out_dir / archive_name
     _import_archive_hard(
         archive_path, archive_name,

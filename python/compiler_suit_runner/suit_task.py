@@ -1145,19 +1145,6 @@ class SuitTask:
         """
         if self.config.matrix_eval_out_dir is None:
             return None
-        # Build an outpath→task_id reverse map from the toolchain_outpaths_map
-        # so the import callable can look up the right outpath for each
-        # import_tc_<hash> task_id without scanning the map on every call.
-        outpaths_map = self.config.toolchain_outpaths_map or {}
-        hash_to_outpath: dict[str, str] = {}
-        for outpath in outpaths_map.values():
-            if not outpath:
-                continue
-            try:
-                tc_task_id = _import_tc_task_id(outpath)
-            except ValueError:
-                continue
-            hash_to_outpath[tc_task_id] = outpath
         out_dir = self.config.matrix_eval_out_dir
 
         # fed78773's affine_action_bridge calls (task_id, payload_json);
@@ -1176,13 +1163,8 @@ class SuitTask:
                 binary = task_id[len("import_matrix_drv_"):]
                 ensure_binary_archive_imported(binary, out_dir)
             elif task_id.startswith("import_tc_"):
-                outpath = hash_to_outpath.get(task_id)
-                if outpath is None:
-                    raise RuntimeError(
-                        f"import_action: no toolchain outpath for {task_id!r};"
-                        " toolchain_outpaths_map may be incomplete"
-                    )
-                ensure_toolchain_out_archive_imported(outpath, out_dir)
+                tc_id = task_id[len("import_tc_"):]
+                ensure_toolchain_out_archive_imported(tc_id, out_dir)
             else:
                 raise RuntimeError(
                     f"import_action: unknown gate task_id {task_id!r}"

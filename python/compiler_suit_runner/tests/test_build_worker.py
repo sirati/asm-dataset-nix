@@ -2058,18 +2058,13 @@ def _reset_toolchain_out_imported(monkeypatch) -> None:
 def test_ensure_toolchain_out_archive_imported_happy(
     monkeypatch, tmp_path,
 ):
-    """A present delta archive is imported and the outpath added to the set."""
+    """A present delta archive is imported and the tc_id added to the set."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
     _reset_toolchain_out_imported(monkeypatch)
-    outpath = "/nix/store/abc123-gcc"
-    archive_name = bw._preflight_toolchain_delta_name(outpath) if hasattr(
-        bw, "_preflight_toolchain_delta_name"
-    ) else f"toolchains.abc123.out.archive"
-    # Derive expected archive name via the real helper.
-    from compiler_suit_runner.preflight import toolchain_delta_archive_name
-    archive_name = toolchain_delta_archive_name(outpath)
+    tc_id = "abc123"
+    archive_name = f"toolchains.{tc_id}.out.archive"
     (tmp_path / archive_name).write_bytes(b"NIX_EXPORT:delta")
     imported: list = []
 
@@ -2078,35 +2073,36 @@ def test_ensure_toolchain_out_archive_imported_happy(
         return True, b"", ["/nix/store/abc123-gcc"]
 
     monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
-    bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
-    assert outpath in bw._imported_toolchain_out_paths
+    bw.ensure_toolchain_out_archive_imported(tc_id, tmp_path)
+    assert tc_id in bw._imported_toolchain_out_paths
     assert imported == [tmp_path / archive_name]
+
+
 def test_ensure_toolchain_out_archive_imported_idempotent(
     monkeypatch, tmp_path,
 ):
-    """A second call for the same outpath is a no-op."""
+    """A second call for the same tc_id is a no-op."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
     _reset_toolchain_out_imported(monkeypatch)
-    outpath = "/nix/store/abc123-gcc"
-    from compiler_suit_runner.preflight import toolchain_delta_archive_name
-    archive_name = toolchain_delta_archive_name(outpath)
+    tc_id = "abc123"
+    archive_name = f"toolchains.{tc_id}.out.archive"
     (tmp_path / archive_name).write_bytes(b"NIX_EXPORT:delta")
     call_count: list = []
     monkeypatch.setattr(
         archive_mod, "import_archive",
         lambda a, *, run_subprocess=None: call_count.append(1) or (True, b"", []),
     )
-    bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
-    bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
+    bw.ensure_toolchain_out_archive_imported(tc_id, tmp_path)
+    bw.ensure_toolchain_out_archive_imported(tc_id, tmp_path)
     assert len(call_count) == 1
 
 
-def test_ensure_toolchain_out_archive_imported_none_outpath_is_noop(
+def test_ensure_toolchain_out_archive_imported_none_tc_id_is_noop(
     monkeypatch, tmp_path,
 ):
-    """A None toolchain_outpath (legacy manifest) is a safe no-op."""
+    """A None tc_id (legacy manifest / empty gate id) is a safe no-op."""
     _reset_toolchain_out_imported(monkeypatch)
     bw.ensure_toolchain_out_archive_imported(None, tmp_path)
     assert bw._imported_toolchain_out_paths == set()
@@ -2117,7 +2113,7 @@ def test_ensure_toolchain_out_archive_imported_none_dir_is_noop(
 ):
     """A None matrix_eval_out_dir (legacy fixtures) is a safe no-op."""
     _reset_toolchain_out_imported(monkeypatch)
-    bw.ensure_toolchain_out_archive_imported("/nix/store/abc-gcc", None)
+    bw.ensure_toolchain_out_archive_imported("abc123", None)
     assert bw._imported_toolchain_out_paths == set()
 
 
@@ -2125,31 +2121,32 @@ def test_ensure_toolchain_out_archive_imported_common_once_then_per_toolchain(
     monkeypatch, tmp_path,
 ):
     """Calling common+toolchain in order: COMMON imported once, then per-
-    toolchain delta imported for each distinct outpath."""
+    toolchain delta imported for each distinct tc_id."""
     from compiler_suit_runner.workers.dependency_graph_worker import (
         archive as archive_mod,
     )
     _reset_common_imported(monkeypatch)
     _reset_toolchain_out_imported(monkeypatch)
-    from compiler_suit_runner.preflight import toolchain_delta_archive_name
-    outpath1 = "/nix/store/abc123-gcc"
-    outpath2 = "/nix/store/def456-clang"
+    tc_id1 = "abc123"
+    tc_id2 = "def456"
+    archive_name1 = f"toolchains.{tc_id1}.out.archive"
+    archive_name2 = f"toolchains.{tc_id2}.out.archive"
     (tmp_path / "toolchains.common.archive").write_bytes(b"COMMON")
-    (tmp_path / toolchain_delta_archive_name(outpath1)).write_bytes(b"DELTA1")
-    (tmp_path / toolchain_delta_archive_name(outpath2)).write_bytes(b"DELTA2")
+    (tmp_path / archive_name1).write_bytes(b"DELTA1")
+    (tmp_path / archive_name2).write_bytes(b"DELTA2")
     imported: list = []
     monkeypatch.setattr(
         archive_mod, "import_archive",
         lambda a, *, run_subprocess=None: imported.append(pathlib.Path(a).name) or (True, b"", []),
     )
     bw.ensure_common_archive_imported(tmp_path)
-    bw.ensure_toolchain_out_archive_imported(outpath1, tmp_path)
-    bw.ensure_toolchain_out_archive_imported(outpath2, tmp_path)
+    bw.ensure_toolchain_out_archive_imported(tc_id1, tmp_path)
+    bw.ensure_toolchain_out_archive_imported(tc_id2, tmp_path)
     # Call common a second time — must be idempotent.
     bw.ensure_common_archive_imported(tmp_path)
     assert imported.count("toolchains.common.archive") == 1
-    assert toolchain_delta_archive_name(outpath1) in imported
-    assert toolchain_delta_archive_name(outpath2) in imported
+    assert archive_name1 in imported
+    assert archive_name2 in imported
 
 
 # ---------------------------------------------------------------------------
@@ -2216,20 +2213,19 @@ def test_ensure_common_archive_imported_import_failure_raises(monkeypatch, tmp_p
 def test_ensure_toolchain_out_archive_imported_absent_raises(monkeypatch, tmp_path):
     """A missing per-toolchain delta archive raises RuntimeError (HARD FAIL)."""
     _reset_common_imported(monkeypatch)
-    outpath = "/nix/store/abc123hhhhhhhhhhhhhhhhhhhhhhhh-gcc15"
+    tc_id = "abc123hhhhhhhhhhhhhhhhhhhhhhhh"
     with pytest.raises(RuntimeError):
-        bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
+        bw.ensure_toolchain_out_archive_imported(tc_id, tmp_path)
 
 
 def test_ensure_toolchain_out_archive_imported_zero_byte_raises(monkeypatch, tmp_path):
     """A zero-byte delta archive raises RuntimeError."""
     _reset_common_imported(monkeypatch)
-    outpath = "/nix/store/abc123hhhhhhhhhhhhhhhhhhhhhhhh-gcc15"
-    from compiler_suit_runner.preflight import toolchain_delta_archive_name
-    delta_name = toolchain_delta_archive_name(outpath)
+    tc_id = "abc123hhhhhhhhhhhhhhhhhhhhhhhh"
+    delta_name = f"toolchains.{tc_id}.out.archive"
     (tmp_path / delta_name).write_bytes(b"")
     with pytest.raises(RuntimeError, match="zero-byte"):
-        bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
+        bw.ensure_toolchain_out_archive_imported(tc_id, tmp_path)
 
 
 def test_ensure_toolchain_out_archive_imported_import_failure_raises(
@@ -2240,16 +2236,15 @@ def test_ensure_toolchain_out_archive_imported_import_failure_raises(
         archive as archive_mod,
     )
     _reset_common_imported(monkeypatch)
-    outpath = "/nix/store/abc123hhhhhhhhhhhhhhhhhhhhhhhh-gcc15"
-    from compiler_suit_runner.preflight import toolchain_delta_archive_name
-    delta_name = toolchain_delta_archive_name(outpath)
+    tc_id = "abc123hhhhhhhhhhhhhhhhhhhhhhhh"
+    delta_name = f"toolchains.{tc_id}.out.archive"
     (tmp_path / delta_name).write_bytes(b"data")
     monkeypatch.setattr(
         archive_mod, "import_archive",
         lambda a, *, run_subprocess=None: (False, b"import failed", []),
     )
     with pytest.raises(RuntimeError, match="failed to import"):
-        bw.ensure_toolchain_out_archive_imported(outpath, tmp_path)
+        bw.ensure_toolchain_out_archive_imported(tc_id, tmp_path)
 
 
 # ---------------------------------------------------------------------------
