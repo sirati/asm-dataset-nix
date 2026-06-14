@@ -982,6 +982,35 @@ def load_store_db_registration(
     return True
 
 
+def _make_daemon_preexec_fn() -> Callable[[], None]:
+    """Return a preexec_fn that sets nix-daemon's priority to nice 11.
+
+    Called in the child between fork and exec.  Uses absolute
+    ``os.setpriority`` (NOT ``os.nice`` which is relative and would
+    compound the parent's existing niceness).  A ``PermissionError`` or
+    any ``OSError`` is logged and swallowed so a missing ``CAP_SYS_NICE``
+    never aborts daemon bring-up.
+
+    Why nice 11?  Framework worker processes run at nice 10; builders the
+    daemon forks inherit the daemon's nice.  Keeping daemon/builders one
+    step lower (higher nice number = lower priority) ensures coordination
+    stays CPU-responsive under build saturation.
+    """
+    def _set_priority() -> None:
+        try:
+            os.setpriority(os.PRIO_PROCESS, 0, 11)
+        except OSError as exc:
+            # Log via stderr — we're in the child after fork so the
+            # parent's logger handlers are not safe to call.
+            import sys
+            print(
+                f"[nix-daemon preexec] warning: could not set nice 11: {exc}",
+                file=sys.stderr,
+            )
+
+    return _set_priority
+
+
 def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
     """Start ``nix-daemon`` detached. No-op if its socket already exists.
 
@@ -1083,6 +1112,7 @@ def start_nix_daemon(log_path: pathlib.Path | None = None) -> int | None:
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         close_fds=True,
+        preexec_fn=_make_daemon_preexec_fn(),
     )
     # Wait until the daemon is actually accepting connections, not
     # just until its socket inode exists. ``nix-daemon`` creates the

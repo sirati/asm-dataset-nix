@@ -1577,3 +1577,75 @@ def test_start_nix_daemon_fails_loudly_on_missing_registration(
 
     with pytest.raises(peer_cache.NixStoreRegistrationError):
         peer_cache.start_nix_daemon(tmp_path / "nix-daemon.log")
+
+
+# ---------------------------------------------------------------------------
+# _make_daemon_preexec_fn — nice-11 priority setter
+# ---------------------------------------------------------------------------
+
+
+def test_make_daemon_preexec_fn_sets_nice_11(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The preexec_fn produced by _make_daemon_preexec_fn must call
+    os.setpriority(PRIO_PROCESS, 0, 11) — the absolute-nice form so it
+    does not compound any existing niceness of the spawning process."""
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        peer_cache.os, "setpriority",
+        lambda which, who, prio: calls.append((which, who, prio)),
+    )
+    fn = peer_cache._make_daemon_preexec_fn()
+    fn()
+    assert calls == [(os.PRIO_PROCESS, 0, 11)]
+
+
+def test_make_daemon_preexec_fn_survives_permission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PermissionError from setpriority (missing CAP_SYS_NICE) must
+    not propagate — the preexec_fn swallows it so daemon bring-up is
+    never aborted by a priority failure."""
+    def _raise(*_args):
+        raise PermissionError("not permitted")
+
+    monkeypatch.setattr(peer_cache.os, "setpriority", _raise)
+    fn = peer_cache._make_daemon_preexec_fn()
+    fn()  # must not raise
+
+
+def test_start_nix_daemon_passes_preexec_fn_to_popen(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """start_nix_daemon must pass a preexec_fn kwarg to the daemon Popen so
+    the child process sets its nice value before exec."""
+    script, _, _ = _write_fake_nix_store(tmp_path)
+    monkeypatch.setattr(
+        peer_cache, "NIX_DAEMON_SOCKET", str(tmp_path / "daemon.sock")
+    )
+    monkeypatch.delenv(peer_cache.NIX_DB_REGISTRATION_ENV, raising=False)
+    monkeypatch.setattr(peer_cache.shutil, "which", lambda _name: str(script))
+
+    class _FakeDaemon:
+        pid = 7777
+
+    spawn_kwargs: list[dict] = []
+    real_popen = subprocess.Popen
+
+    def capturing_popen(argv, **kwargs):
+        if kwargs.get("start_new_session"):
+            spawn_kwargs.append(dict(kwargs))
+            return _FakeDaemon()
+        return real_popen(argv, **kwargs)
+
+    monkeypatch.setattr(peer_cache.subprocess, "Popen", capturing_popen)
+    monkeypatch.setattr(
+        peer_cache, "_nix_daemon_accepts_connections", lambda: True
+    )
+
+    peer_cache.start_nix_daemon(tmp_path / "nix-daemon.log")
+
+    assert spawn_kwargs, "daemon Popen was never called"
+    assert "preexec_fn" in spawn_kwargs[0], (
+        "preexec_fn not passed to daemon Popen"
+    )
+    assert callable(spawn_kwargs[0]["preexec_fn"])
