@@ -639,10 +639,17 @@ def test_rule_n2_near_miss_simdjson_gcc7_is_fine() -> None:
     ) is None
 
 
-def test_rule_n2_near_miss_simdjson_clang5_is_fine() -> None:
-    # clang 5 is the first C++17-capable release
+def test_rule_n2_simdjson_clang5_is_bad() -> None:
+    # clang 5's C++17 is incomplete (default-member-init DR) → simdjson fails
     assert is_known_bad_combo(
         _meta(package="simdjson", compilerFamily="clang", compilerVersion="5.0.2")
+    ) is not None
+
+
+def test_rule_n2_near_miss_simdjson_clang6_is_fine() -> None:
+    # clang 6 is the real C++17 floor for simdjson (clang5 DR is fixed)
+    assert is_known_bad_combo(
+        _meta(package="simdjson", compilerFamily="clang", compilerVersion="6.0.1")
     ) is None
 
 
@@ -820,6 +827,96 @@ def test_rule_n6_near_miss_brotli_ofast_clang6_is_fine() -> None:
             optimization="Ofast",
         )
     ) is None
+
+
+def test_rule_n6_libpng_fastmath_clang8_is_bad() -> None:
+    # N6 widened to libpng (pow → __pow_finite under fast-math on clang7-9)
+    assert is_known_bad_combo(
+        _meta(package="libpng", compilerFamily="clang",
+              compilerVersion="8.0.1", flags="fastmath")
+    ) is not None
+
+
+def test_rule_n6_over_exclusion_guard_libpng_clang10_ofast_is_fine() -> None:
+    # clang 10+ uses glibc-version-guarded symbols — must NOT be excluded
+    assert is_known_bad_combo(
+        _meta(package="libpng", compilerFamily="clang",
+              compilerVersion="10.0.1", optimization="Ofast")
+    ) is None
+
+
+def test_rule_n6_over_exclusion_guard_libpng_clang8_no_fastmath_is_fine() -> None:
+    # clang7-9 WITHOUT Ofast/fastmath is fine (flag-specific, not compiler-wide)
+    assert is_known_bad_combo(
+        _meta(package="libpng", compilerFamily="clang",
+              compilerVersion="8.0.1", optimization="O2", flags="nopic")
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule N7: dav1d + gcc 4.<7 (C11 atomics) — with over-exclusion guards
+# ---------------------------------------------------------------------------
+
+def test_rule_n7_dav1d_gcc4_6_is_bad() -> None:
+    assert is_known_bad_combo(
+        _meta(package="dav1d", compilerFamily="gcc", compilerVersion="4.6.4")
+    ) is not None
+
+
+def test_rule_n7_over_exclusion_guard_dav1d_gcc4_8_is_fine() -> None:
+    # gcc4.8 builds dav1d (24 successes in run_073008) — must NOT be excluded
+    assert is_known_bad_combo(
+        _meta(package="dav1d", compilerFamily="gcc", compilerVersion="4.8.5")
+    ) is None
+
+
+def test_rule_n7_over_exclusion_guard_dav1d_gcc4_9_is_fine() -> None:
+    assert is_known_bad_combo(
+        _meta(package="dav1d", compilerFamily="gcc", compilerVersion="4.9.4")
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule N8: dav1d + san-undefined + clang — with over-exclusion guard (gcc ok)
+# ---------------------------------------------------------------------------
+
+def test_rule_n8_dav1d_san_undefined_clang20_is_bad() -> None:
+    assert is_known_bad_combo(
+        _meta(package="dav1d", compilerFamily="clang",
+              compilerVersion="20.1.0", sanitizer="san-undefined")
+    ) is not None
+
+
+def test_rule_n8_over_exclusion_guard_dav1d_san_undefined_gcc_is_fine() -> None:
+    # gcc links the ubsan runtime into the .so — gcc+ubsan dav1d SUCCEEDS
+    # (12/12 in run_073008); a compiler-agnostic rule would wrongly drop these
+    assert is_known_bad_combo(
+        _meta(package="dav1d", compilerFamily="gcc",
+              compilerVersion="14.2.0", sanitizer="san-undefined")
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule N9: nopic + san-undefined + gcc ≥ 13 — with over-exclusion guards
+# ---------------------------------------------------------------------------
+
+def test_rule_n9_nopic_san_undefined_gcc13_is_bad() -> None:
+    assert is_known_bad_combo(
+        _meta(package="pcre2", compilerFamily="gcc", compilerVersion="13.2.0",
+              flags="nopic", sanitizer="san-undefined")
+    ) is not None
+
+
+def test_rule_n9_over_exclusion_guard_nopic_san_off_gcc13_is_fine() -> None:
+    # nopic+san-OFF at gcc13 was never proven to fail — must NOT be excluded
+    # (N9 is scoped to san-undefined; N5's nopic threshold is gcc≥15)
+    assert is_known_bad_combo(
+        _meta(package="pcre2", compilerFamily="gcc", compilerVersion="13.2.0",
+              flags="nopic", sanitizer="san-off")
+    ) is None
+    # NB: gcc≤12 + san-undefined is already excluded by the pre-existing
+    # legacy-nixpkgs san-undefined-runtime rule, so N9's gcc≥13 floor only adds
+    # the gcc13/14+nopic gap (no clean below-floor "fine" case exists to assert).
 
 
 def test_rule_n6_near_miss_brotli_ofast_clang10_is_fine() -> None:

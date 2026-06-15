@@ -497,9 +497,11 @@ _NEW_PACKAGES: frozenset[str] = frozenset({
     "zstd", "brotli", "simdjson", "dav1d", "libpng", "pcre2",
 })
 
-# C++17-capable minimums (first release with full standard support).
+# C++17-capable minimums. clang 5's C++17 is incomplete (a default-member-
+# initializer DR fails simdjson's ``document() = default``); clang 6 is the
+# real floor (run_20260615_073008: simdjson clang5 0/14, clang6 14/14).
 _CXX17_MIN_GCC_MAJOR = 7
-_CXX17_MIN_CLANG_MAJOR = 5
+_CXX17_MIN_CLANG_MAJOR = 6
 
 
 def _conflict_new_pkgs_old_clang3_early(meta: dict) -> Optional[str]:
@@ -624,25 +626,28 @@ def _conflict_new_pkgs_nopic_modern_pie_toolchain(meta: dict) -> Optional[str]:
     return None
 
 
-_BROTLI_FASTMATH_CLANG_BAD_MAJORS: frozenset[int] = frozenset({7, 8, 9})
+_FASTMATH_FINITE_PACKAGES: frozenset[str] = frozenset({"brotli", "libpng"})
+_FASTMATH_FINITE_CLANG_BAD_MAJORS: frozenset[int] = frozenset({7, 8, 9})
 
 
-def _conflict_brotli_fastmath_clang7_9(meta: dict) -> Optional[str]:
-    """Rule N6: brotli + Ofast/fastmath + clang 7/8/9.
+def _conflict_fastmath_finite_clang7_9(meta: dict) -> Optional[str]:
+    """Rule N6: {brotli, libpng} + Ofast/fastmath + clang 7/8/9.
 
-    glibc ≥ 2.31 (2020) removed ``__log2_finite`` and the other
-    ``__*_finite`` finite-math aliases. clang 7–9 emits calls to those
-    symbols under ``-ffast-math`` / ``-Ofast`` (``-ffinite-math-only``
-    enables them). The link then fails with
-    ``undefined reference to '__log2_finite'``. clang 10+ uses the
-    correct glibc-version-guarded symbols.
+    glibc ≥ 2.31 (2020) removed ``__log2_finite`` / ``__pow_finite`` and the
+    other ``__*_finite`` finite-math aliases. clang 7–9 emits calls to those
+    symbols under ``-ffast-math`` / ``-Ofast`` (``-ffinite-math-only`` enables
+    them) → ``undefined reference to '__pow_finite'`` at link. brotli (log2)
+    and libpng (pow) both trip it; clang 10+ uses the glibc-version-guarded
+    symbols. Proven for libpng (run_20260615_073008: clang7-9+Ofast/fastmath
+    0 ok/10 fail; clang5/6 + clang10+ ok; non-fastmath clang7-9 ok). zstd's
+    paramgrill uses log() too but is parked pending a stock-build run.
     """
-    if meta.get("package") != "brotli":
+    if meta.get("package") not in _FASTMATH_FINITE_PACKAGES:
         return None
     if meta.get("compilerFamily") != "clang":
         return None
     major = _parse_compiler_major(meta.get("compilerVersion", ""))
-    if major not in _BROTLI_FASTMATH_CLANG_BAD_MAJORS:
+    if major not in _FASTMATH_FINITE_CLANG_BAD_MAJORS:
         return None
     opt = meta.get("optimization", "")
     flags = meta.get("flags", "")
@@ -650,8 +655,89 @@ def _conflict_brotli_fastmath_clang7_9(meta: dict) -> Optional[str]:
         return None
     trigger = "Ofast" if opt == "Ofast" else "fastmath"
     return (
-        f"brotli + {trigger} + clang {major}: glibc ≥ 2.31 removed "
-        f"__log2_finite; clang {major} emits calls to it under -ffast-math"
+        f"{meta.get('package')} + {trigger} + clang {major}: glibc ≥ 2.31 "
+        f"removed __*_finite; clang {major} emits calls under -ffast-math"
+    )
+
+
+def _conflict_dav1d_old_gcc_atomics(meta: dict) -> Optional[str]:
+    """Rule N7: dav1d + gcc 4.<7 — meson aborts "Atomics not supported".
+
+    dav1d 1.5 requires C11 atomics (``stdatomic.h``); gcc 4.4–4.6 lack it and
+    meson's GCC-style-atomics fallback check also fails. gcc 4.8/4.9 BUILD FINE
+    (run_20260615_073008: gcc4.4/4.5/4.6 = 0 ok/32 fail; gcc4.8/4.9 = 24/24 ok),
+    so the bound is strictly ``< 4.7``. gcc4.7 is absent from the sample → left
+    IN (not over-excluded).
+    """
+    if meta.get("package") != "dav1d":
+        return None
+    if meta.get("compilerFamily") != "gcc":
+        return None
+    major = _parse_compiler_major(meta.get("compilerVersion", ""))
+    if major != 4:
+        return None
+    minor = _parse_compiler_minor(meta.get("compilerVersion", ""))
+    if minor >= 7:
+        return None
+    return (
+        f"dav1d needs C11 atomics (stdatomic.h); gcc 4.{minor} lacks it → "
+        f"meson 'Atomics not supported' (gcc4.8+ build fine)"
+    )
+
+
+def _conflict_dav1d_san_undefined_clang(meta: dict) -> Optional[str]:
+    """Rule N8: dav1d + san-undefined + clang (ubsan runtime unlinked in .so).
+
+    dav1d builds ``libdav1d.so`` via meson ``shared_library``. Under clang +
+    ``-fsanitize=undefined`` meson instruments the objects but does NOT
+    auto-link the ubsan runtime into the shared library → many
+    ``undefined reference to '__ubsan_handle_*'`` at link. CLANG-ONLY: gcc +
+    dav1d + san-undefined (without nopic) SUCCEEDS — a compiler-agnostic rule
+    would wrongly drop those (run_20260615_073008: clang18-22 = 0 ok/28 fail;
+    gcc13-15 = 12/12 ok). clang<18 absent from the sample but the meson
+    behaviour is clang-wide.
+    """
+    if meta.get("package") != "dav1d":
+        return None
+    if meta.get("compilerFamily") != "clang":
+        return None
+    if meta.get("sanitizer") != "san-undefined":
+        return None
+    return (
+        "dav1d builds libdav1d.so; clang's meson shared_library does not "
+        "auto-link the ubsan runtime → undefined __ubsan_handle_* (gcc links it)"
+    )
+
+
+_NOPIC_SAN_UNDEFINED_MIN_GCC = 13
+
+
+def _conflict_nopic_san_undefined_modern_gcc(meta: dict) -> Optional[str]:
+    """Rule N9: nopic + san-undefined + gcc ≥ 13 for the new packages.
+
+    The ``nopic`` (-fno-PIC) × ``san-undefined`` combination fails to link
+    under gcc's modern PIE-default toolchain (run_20260615_073008:
+    nopic+san-undefined+gcc13/14 = 12 failures across the new packages;
+    nopic+san-off builds fine at gcc≤12). Distinct from N5 (nopic+gcc≥15 for
+    ANY sanitizer) — this catches the gcc13/14 case which N5's ≥15 threshold
+    misses. The proposed blanket "nopic+gcc≥13" was rejected: nopic+san-off at
+    gcc13/14 was never tested, so it stays unproven; this rule only excludes
+    the proven nopic×ubsan failure. gcc≤12 left IN (not over-excluded).
+    """
+    if meta.get("package") not in _NEW_PACKAGES:
+        return None
+    if meta.get("flags") != "nopic":
+        return None
+    if meta.get("sanitizer") != "san-undefined":
+        return None
+    if meta.get("compilerFamily") != "gcc":
+        return None
+    major = _parse_compiler_major(meta.get("compilerVersion", ""))
+    if major is None or major < _NOPIC_SAN_UNDEFINED_MIN_GCC:
+        return None
+    return (
+        f"{meta.get('package')} nopic + san-undefined + gcc {major}: nopic×ubsan "
+        f"under modern PIE-default gcc fails to link (gcc≤12 + nopic ok)"
     )
 
 
@@ -671,7 +757,10 @@ _FLAG_CONFLICTS = (
     _conflict_new_pkgs_staticpie,               # Rule N3: staticpie+shared-lib
     _conflict_new_pkgs_sandbox_sanitizers,      # Rule N4: san-address/thread/memory
     _conflict_new_pkgs_nopic_modern_pie_toolchain,  # Rule N5: nopic+modern-PIE
-    _conflict_brotli_fastmath_clang7_9,         # Rule N6: brotli+fastmath+clang7-9
+    _conflict_fastmath_finite_clang7_9,         # Rule N6: {brotli,libpng}+fastmath+clang7-9
+    _conflict_dav1d_old_gcc_atomics,            # Rule N7: dav1d+gcc4.<7 (C11 atomics)
+    _conflict_dav1d_san_undefined_clang,        # Rule N8: dav1d+san-undefined+clang
+    _conflict_nopic_san_undefined_modern_gcc,   # Rule N9: nopic+san-undefined+gcc≥13
 )
 
 

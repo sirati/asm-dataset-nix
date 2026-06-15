@@ -263,10 +263,6 @@ let
   # brotli + gcc4.x: brotli's C sources use C99 ``for``-loop initial declarations
   # (``for (int i = ...)``) which gcc rejects without an explicit -std flag when
   # the default is gnu89/c89. Inject -std=gnu99 only for gcc major == 4.
-  #
-  # zstd: the pzstd contrib tool (C++ multi-threaded compressor) fails to build
-  # with old compilers (gcc4.x, clang3.7-9, clang7-9). pzstd is a dev tool, not
-  # part of libzstd.so — disable it unconditionally for all zstd variants.
   basePkg' =
     if pkg.attr == "dash" then
       basePkg.overrideAttrs (_old: {
@@ -280,12 +276,6 @@ let
         NIX_CFLAGS_COMPILE = lib.concatStringsSep " " (
           builtins.filter (s: s != "") [ (old.NIX_CFLAGS_COMPILE or "") "-std=gnu99" ]
         );
-      })
-    else if pkg.attr == "zstd" then
-      basePkg.overrideAttrs (old: {
-        # pzstd contrib tool fails on old compilers; libzstd itself is unaffected.
-        # Disable contrib unconditionally — the library is what this dataset wants.
-        cmakeFlags = (old.cmakeFlags or [ ]) ++ [ "-DZSTD_BUILD_CONTRIB=OFF" ];
       })
     else
       basePkg;
