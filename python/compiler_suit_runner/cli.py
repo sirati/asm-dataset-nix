@@ -531,6 +531,26 @@ def build_parser() -> argparse.ArgumentParser:
             "safety assertion. Default OFF."
         ),
     )
+    # Dev-velocity: skip the matrix_eval phase when archives + sidecar
+    # JSON files from a prior run are already present on the shared FS.
+    # Requires --matrix-eval-out-dir to point at the directory holding the
+    # ``matrix-<binary>.drv.archive`` and ``matrix-<binary>.drv_map.json``
+    # files from the prior run.  Fail-closed: the dep_graph worker raises
+    # a clear error for any binary whose sidecar is absent.
+    p_submit.add_argument(
+        "--prestaged-matrix-eval",
+        dest="prestaged_matrix_eval",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the matrix_eval phase and go straight to"
+            " dependency_graph → build, reusing the archives +"
+            " per-binary drv_map sidecar JSON files written by a prior"
+            " run. Requires --matrix-eval-out-dir. Fail-closed: raises"
+            " a clear error if any binary's sidecar is absent."
+            " Default OFF."
+        ),
+    )
     _restore_framework_flag_defaults(p_submit)
 
     p_secondary = sub.add_parser(
@@ -732,6 +752,9 @@ def _config_from_args(
         # to restore the legacy substituter transport for common_deps. Only
         # takes effect when matrix_eval_out_dir is set (the archive root).
         common_deps_affine=getattr(args, "common_deps_affine", True),
+        # Dev-velocity: skip matrix_eval and go straight to dep_graph →
+        # build using pre-existing archives + sidecar JSON files.
+        prestaged_matrix_eval=getattr(args, "prestaged_matrix_eval", False),
     )
 
 

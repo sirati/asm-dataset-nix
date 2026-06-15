@@ -1145,6 +1145,35 @@ class SuitTaskConfig:
     # ``--no-substituters`` worker flag (see ``build_worker_command_args``).
     no_substituters: bool = False
 
+    # Dev-velocity flag: skip the matrix_eval phase and go straight to
+    # dependency_graph → build using pre-existing archives and sidecar
+    # JSON files written by a prior matrix_eval run.
+    #
+    # When True:
+    #
+    # * ``discover_items`` emits ZERO matrix_eval TaskInfos — the
+    #   framework sees the matrix_eval phase as having 0 tasks and
+    #   advances to the dependency_graph phase immediately.
+    # * The single dependency_graph TaskInfo is emitted with an EMPTY
+    #   ``task_depends_on`` tuple (no matrix_eval predecessors to wait for)
+    #   so the framework can dispatch it without waiting for tasks that
+    #   never existed.
+    # * The build_worker's dep_graph branch, on finding an empty
+    #   ``predecessor_outputs`` map, loads the binary → drv mapping from
+    #   the per-binary ``matrix-<binary>.drv_map.json`` sidecar files
+    #   written by the prior run's matrix_eval workers.
+    #
+    # REQUIREMENTS (fail-closed): ``matrix_eval_out_dir`` must be set AND
+    # every binary in ``per_binary_metadata`` must have a readable
+    # ``matrix-<binary>.drv_map.json`` in that directory.  A missing sidecar
+    # raises :class:`FileNotFoundError` from the dep_graph worker so the
+    # task fails loudly rather than silently planning an empty build graph.
+    #
+    # The full-run path (this flag = False) is UNCHANGED: the matrix_eval
+    # phase runs normally and the dep_graph task receives its drv map from
+    # the framework's ``predecessor_outputs`` mechanism.
+    prestaged_matrix_eval: bool = False
+
 
 # ---------------------------------------------------------------------------
 # SuitTask
@@ -1492,6 +1521,14 @@ class SuitTask:
           "dependency_graph"``) whose ``task_depends_on`` is the tuple
           of every matrix_eval task id in the run.
 
+        When ``config.prestaged_matrix_eval`` is True the matrix_eval
+        TaskInfos are skipped entirely and the dependency_graph TaskInfo
+        is emitted with an EMPTY ``task_depends_on`` — the framework can
+        dispatch it immediately without waiting for matrix_eval tasks that
+        never existed. The build_worker's dep_graph branch then loads the
+        binary → drv mapping from the per-binary sidecar JSON files
+        (``matrix-<binary>.drv_map.json``) written by the prior run.
+
         When ``per_binary_metadata`` is empty / ``None`` (e.g. the
         secondary-container config) this yields nothing.
         """
@@ -1504,8 +1541,59 @@ class SuitTask:
         # dependency_graph deps tuple are stable across runs.
         binaries = sorted(per_binary.keys())
 
-        matrix_eval_ids: list[str] = []
+        # Resolve the toolchain_aggregate_drv from the first plannable
+        # binary (shared across all binaries in one run).
         toolchain_aggregate_drv: Optional[str] = None
+        for binary in binaries:
+            meta = per_binary[binary]
+            if not isinstance(meta, dict):
+                continue
+            tc_agg = meta.get("toolchain_aggregate_drv")
+            if tc_agg:
+                toolchain_aggregate_drv = tc_agg
+                break
+
+        if self.config.prestaged_matrix_eval:
+            # Prestaged mode: emit ZERO matrix_eval tasks; emit the single
+            # dependency_graph task with no predecessors.  The dep_graph
+            # worker will load the drv map from per-binary sidecar JSONs.
+            if toolchain_aggregate_drv is None:
+                self._logger.warning(
+                    "_discover_matrix_eval_and_dep_graph_items:"
+                    " prestaged_matrix_eval=True but no binary has"
+                    " 'toolchain_aggregate_drv' in per_binary_metadata;"
+                    " skipping dependency_graph task",
+                )
+                return
+            self._logger.info(
+                "_discover_matrix_eval_and_dep_graph_items:"
+                " prestaged_matrix_eval=True — skipping %d matrix_eval"
+                " tasks; dep_graph will load drv map from sidecars in %s",
+                len(binaries),
+                self.config.matrix_eval_out_dir,
+            )
+            dep_graph_header = ManifestHeader(
+                item_class="dependency_graph",
+                name=DEPENDENCY_GRAPH_TASK_ID,
+                size=0,
+                payload={
+                    "sys": sys_name,
+                    "toolchain_aggregate_drv": toolchain_aggregate_drv,
+                    "toolchain_outpaths_map": self.config.toolchain_outpaths_map or {},
+                    "build_deps_local": self.config.build_deps_local,
+                    # Signal to the dep_graph worker that it must load the
+                    # drv map from sidecars (predecessor_outputs will be empty).
+                    "prestaged_matrix_eval": True,
+                },
+                task_id=DEPENDENCY_GRAPH_TASK_ID,
+                # No matrix_eval predecessors — the phase ran previously.
+                task_depends_on=(),
+            )
+            yield self._task_info_from_header(dep_graph_header)
+            return
+
+        matrix_eval_ids: list[str] = []
+        toolchain_aggregate_drv = None
         for binary in binaries:
             meta = per_binary[binary]
             if not isinstance(meta, dict):

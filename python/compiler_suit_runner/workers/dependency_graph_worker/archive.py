@@ -24,6 +24,7 @@ been retired, along with the legacy stdout-walking
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import pathlib
 import random
@@ -45,11 +46,23 @@ __all__ = [
     "is_path_locally_present",
     "binary_from_archive_name",
     "toolchain_archive_path",
+    "DRV_MAP_SIDECAR",
+    "write_drv_map_sidecar",
+    "read_drv_map_sidecar",
+    "load_drv_map_from_sidecars",
 ]
 
 
 _ARCHIVE_PREFIX = "matrix-"
 _ARCHIVE_SUFFIX = ".drv.archive"
+
+# Sidecar JSON written by the matrix_eval worker alongside each
+# ``matrix-<binary>.drv.archive``.  Persists the ``matrix_aggregate_drv``
+# path so a ``--prestaged-matrix-eval`` re-run can recover the
+# binary → drv mapping without re-running matrix_eval.  The file is
+# named to be clearly associated with its binary and not confused with an
+# archive or any other per-run artefact.
+DRV_MAP_SIDECAR = "matrix-{binary}.drv_map.json"
 
 # The shared toolchain archive (toolchain-dedup pre-flight artefact).
 # Named OUTSIDE the ``matrix-`` prefix so :func:`discover_archives`
@@ -82,6 +95,92 @@ def binary_from_archive_name(archive: pathlib.Path) -> str:
     if name.startswith(_ARCHIVE_PREFIX) and name.endswith(_ARCHIVE_SUFFIX):
         return name[len(_ARCHIVE_PREFIX):-len(_ARCHIVE_SUFFIX)]
     return name
+
+
+# ---------------------------------------------------------------------------
+# Per-binary matrix_aggregate_drv sidecar (``--prestaged-matrix-eval``)
+# ---------------------------------------------------------------------------
+
+
+def write_drv_map_sidecar(
+    out_dir: pathlib.Path,
+    binary: str,
+    matrix_aggregate_drv: str,
+) -> None:
+    """Write the per-binary drv-map sidecar JSON atomically.
+
+    Persists the ``{binary: matrix_aggregate_drv}`` pair so a subsequent
+    ``--prestaged-matrix-eval`` run can recover the drv map without
+    re-running the matrix_eval phase.  Written to
+    ``<out_dir>/matrix-<binary>.drv_map.json`` (alongside the
+    corresponding ``matrix-<binary>.drv.archive``).
+
+    Writes atomically (temp file → rename) so a reader never sees a
+    partial sidecar on a shared filesystem.  Raises :class:`OSError` on
+    write failure — the caller (``run_eval_task``) logs and continues so
+    a write failure here never fails the matrix_eval task itself.
+    """
+    sidecar_path = out_dir / DRV_MAP_SIDECAR.format(binary=binary)
+    payload = {"binary": binary, "matrix_aggregate_drv": matrix_aggregate_drv}
+    tmp = sidecar_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
+    tmp.replace(sidecar_path)
+
+
+def read_drv_map_sidecar(
+    out_dir: pathlib.Path,
+    binary: str,
+) -> Optional[str]:
+    """Read back the ``matrix_aggregate_drv`` for ``binary`` from its sidecar.
+
+    Returns the drv path string on success, or ``None`` when the sidecar
+    is absent, unreadable, or malformed — callers raise a clear error
+    when ``None`` is returned in prestaged mode.
+    """
+    sidecar_path = out_dir / DRV_MAP_SIDECAR.format(binary=binary)
+    try:
+        raw = sidecar_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    drv = data.get("matrix_aggregate_drv")
+    if not isinstance(drv, str) or not drv:
+        return None
+    return drv
+
+
+def load_drv_map_from_sidecars(
+    out_dir: pathlib.Path,
+    wanted_binaries: set[str],
+) -> dict[str, str]:
+    """Load the ``{binary: matrix_aggregate_drv}`` map from sidecar files.
+
+    Reads ``matrix-<binary>.drv_map.json`` for every binary in
+    ``wanted_binaries`` and returns the populated dict.  Raises
+    :class:`FileNotFoundError` (with a clear message) for any binary
+    whose sidecar is absent or unreadable — callers in prestaged mode
+    treat a missing sidecar as a fatal configuration error (the user
+    must have run matrix_eval at least once before using
+    ``--prestaged-matrix-eval``).
+    """
+    drv_map: dict[str, str] = {}
+    for binary in sorted(wanted_binaries):
+        drv = read_drv_map_sidecar(out_dir, binary)
+        if drv is None:
+            sidecar = out_dir / DRV_MAP_SIDECAR.format(binary=binary)
+            raise FileNotFoundError(
+                f"--prestaged-matrix-eval: sidecar missing or unreadable"
+                f" for binary {binary!r}: {sidecar}"
+                " — run matrix_eval at least once (without"
+                " --prestaged-matrix-eval) to populate the sidecars."
+            )
+        drv_map[binary] = drv
+    return drv_map
 
 
 logger = logging.getLogger("compiler_suit_runner.dependency_graph_worker")

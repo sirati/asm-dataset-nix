@@ -113,6 +113,9 @@ from typing import Any, Optional
 
 from dynamic_runner.worker import Task
 
+from compiler_suit_runner.workers.dependency_graph_worker.archive import (
+    write_drv_map_sidecar,
+)
 from compiler_suit_runner.workers.dependency_graph_worker.subproc import (
     resolve_tool,
 )
@@ -1159,6 +1162,28 @@ def run_eval_task(
     # task via predecessor_outputs[task_id]["matrix_aggregate_drv"],
     # replacing the prior per-binary JSON sidecar drop.
     task.publish_string("matrix_aggregate_drv", matrix_aggregate_drv)
+    # Step 5c: persist the drv path as a per-binary sidecar JSON so a
+    # subsequent ``--prestaged-matrix-eval`` run can recover the binary →
+    # drv mapping without re-running matrix_eval.  Written atomically
+    # alongside the archive.  A write failure here is non-fatal — the
+    # matrix_eval task already succeeded (archive + publish done); the
+    # sidecar is a dev-velocity convenience, not a correctness artefact.
+    # Skipped when ``out_dir`` is somehow absent (shouldn't happen in
+    # normal dispatch, but protects legacy test paths that never pass an
+    # out_dir).
+    try:
+        write_drv_map_sidecar(out_dir, binary, matrix_aggregate_drv)
+        _LOG.debug(
+            "matrix_eval binary=%s: wrote drv_map sidecar for"
+            " --prestaged-matrix-eval reuse",
+            binary,
+        )
+    except OSError as _sidecar_exc:
+        _LOG.warning(
+            "matrix_eval binary=%s: drv_map sidecar write failed"
+            " (--prestaged-matrix-eval reuse unavailable): %s",
+            binary, _sidecar_exc,
+        )
     _LOG.info(
         "matrix_eval DONE binary=%s: %d variants, matrix_aggregate=%s",
         binary, len(variants), matrix_aggregate_drv,
