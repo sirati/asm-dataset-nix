@@ -148,6 +148,33 @@ def test_build_phase_carries_validate_common_dep_variant_types(
         )
 
 
+def test_build_phase_is_non_barrier_for_dep_graph_overlap(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Framework #540: the ``build`` phase is declared ``barrier=False``
+    so BUILD tasks dispatch to idle workers WHILE ``dependency_graph`` is
+    still streaming them — gated only by each task's own per-task deps
+    (``_header_depends_on``: import gates + BUILD_COMPILERS toolchain
+    deps), not by the dep_graph phase completing. ``depends_on`` is kept
+    as ``(dependency_graph,)`` for ordering intent but is no longer a hard
+    barrier; the framework forces a barrier=False phase Blocked->Active at
+    pool init so its tasks overlap the in-progress upstream phase.
+
+    All OTHER phases keep the framework default ``barrier=True`` (full
+    upstream-completion barrier) — only BUILD is allowed to overlap.
+    """
+    task = SuitTask(_make_config(tmp_path))
+    phases = _phases(task)
+    # BUILD overlaps dep_graph.
+    assert phases["build"].barrier is False
+    # depends_on is retained (no edge removed); see
+    # test_build_depends_on_dependency_graph for the value.
+    assert phases["build"].depends_on == ("dependency_graph",)
+    # Every other phase keeps the default hard barrier.
+    for phase_id in ("build_compilers", "matrix_eval", "dependency_graph"):
+        assert phases[phase_id].barrier is True, phase_id
+
+
 def test_estimate_memory_returns_constant(tmp_path: pathlib.Path) -> None:
     """Memory budgeting is disabled: estimate_memory returns 1 byte
     for any item, so the framework's resource scheduler is effectively

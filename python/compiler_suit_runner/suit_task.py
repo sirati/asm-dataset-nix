@@ -614,6 +614,16 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
         PhaseSpec(
             phase_id=Phase.BUILD,
             depends_on=(Phase.DEPENDENCY_GRAPH,),
+            # Framework #540: barrier=False lets BUILD tasks dispatch to idle
+            # workers WHILE DEPENDENCY_GRAPH is still streaming them, gated
+            # only by their own per-task deps (import gates + BUILD_COMPILERS
+            # toolchain deps in _header_depends_on) — NOT by the dep_graph
+            # phase completing. depends_on is retained for documentation /
+            # ordering intent but is no longer a hard barrier: the framework's
+            # set_no_barrier_phases() flips this phase from Blocked straight to
+            # Active at pool init, so build tasks overlap the in-progress
+            # dep_graph phase. No dep_graph/per-task edge is introduced.
+            barrier=False,
             types=(
                 # Secondary-affine import gate: runs ONCE per secondary node,
                 # never dispatched to a worker subprocess. ``worker_module``
