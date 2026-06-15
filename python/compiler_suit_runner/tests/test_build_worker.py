@@ -1127,6 +1127,9 @@ def _run_build_worker_main_with_capture(
     class FakeNonRecoverable(Exception):
         pass
 
+    class FakeRecoverable(Exception):
+        pass
+
     class FakePublishError(Exception):
         pass
 
@@ -1134,6 +1137,7 @@ def _run_build_worker_main_with_capture(
     fake_worker.Task = FakeTask
     fake_worker.WorkerOutput = FakeWorkerOutput
     fake_worker.NonRecoverableError = FakeNonRecoverable
+    fake_worker.RecoverableError = FakeRecoverable
     fake_worker.PublishError = FakePublishError
     fake_worker.run = run_mock
 
@@ -2638,3 +2642,325 @@ def test_ensure_build_deps_archive_imported_import_failure_raises(monkeypatch, t
     )
     with pytest.raises(RuntimeError, match="failed to import"):
         bw.ensure_build_deps_archive_imported(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Substituter-free pre-build safety assertion
+# ---------------------------------------------------------------------------
+
+
+class _ArgvRunner:
+    """argv-dispatched run_subprocess for the dry-run + build sequence.
+
+    In substituter-free mode the build worker first issues a
+    ``nix build --dry-run`` (the assertion) and then a real ``nix build``.
+    This runner inspects each argv and returns the matching canned
+    response so a single test can drive both calls distinctly.
+    ``dry_run`` is returned for any argv containing ``--dry-run``;
+    everything else gets ``build``.
+    """
+
+    def __init__(
+        self,
+        *,
+        dry_run: tuple[bytes, bytes, int] = (b"", b"", 0),
+        build: tuple[bytes, bytes, int] = (b"", b"", 0),
+    ) -> None:
+        self.calls: list[list[str]] = []
+        self._dry_run = dry_run
+        self._build = build
+
+    def __call__(self, argv: list[str]) -> tuple[bytes, bytes, int]:
+        self.calls.append(list(argv))
+        if "--dry-run" in argv:
+            return self._dry_run
+        return self._build
+
+
+# --- _parse_dry_run_paths --------------------------------------------------
+
+
+def test_parse_dry_run_paths_splits_build_and_fetch():
+    stderr = (
+        b"these 2 derivations will be built:\n"
+        b"  /nix/store/aaa-foo.drv\n"
+        b"  /nix/store/bbb-bar.drv\n"
+        b"these 1 paths will be fetched (1.0 MiB download):\n"
+        b"  /nix/store/ccc-baz\n"
+    )
+    to_build, to_fetch = bw._parse_dry_run_paths(stderr)
+    assert to_build == ["/nix/store/aaa-foo.drv", "/nix/store/bbb-bar.drv"]
+    assert to_fetch == ["/nix/store/ccc-baz"]
+
+
+def test_parse_dry_run_paths_empty_when_nothing_to_do():
+    # Nix prints nothing to stderr when everything is already realised.
+    to_build, to_fetch = bw._parse_dry_run_paths(b"")
+    assert to_build == []
+    assert to_fetch == []
+
+
+def test_parse_dry_run_paths_singular_header_wording():
+    stderr = (
+        b"this derivation will be built:\n"
+        b"  /nix/store/aaa-foo.drv\n"
+    )
+    to_build, to_fetch = bw._parse_dry_run_paths(stderr)
+    assert to_build == ["/nix/store/aaa-foo.drv"]
+    assert to_fetch == []
+
+
+# --- assert_no_substitute --------------------------------------------------
+
+
+def _no_sub_env(runner) -> BuildWorkerEnv:
+    return BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=pathlib.Path("/tmp/unused"),
+        run_subprocess=runner,
+        no_substituters=True,
+    )
+
+
+def test_assert_no_substitute_passes_when_only_variant_builds():
+    """Clean: nix would build ONLY the variant drv, fetch nothing."""
+    runner = _ArgvRunner(
+        dry_run=(
+            b"",
+            b"these 1 derivations will be built:\n"
+            b"  /nix/store/vvv-hello-variant.drv\n",
+            0,
+        ),
+    )
+    payload = {
+        "drv": "/nix/store/vvv-hello-elf-folder.drv",
+        "toolchain_outpath": "/nix/store/tc-out",
+        "input_outpaths": {
+            "/nix/store/glibc.drv": "/nix/store/glibc-out",
+        },
+    }
+    # No required path appears in to-build, to-fetch is empty → no raise.
+    bw.assert_no_substitute(
+        payload["drv"], ITEM_CLASS_BUILD_VARIANT, payload, _no_sub_env(runner),
+    )
+    # Exactly one dry-run invocation, pinned-empty substituters.
+    assert len(runner.calls) == 1
+    argv = runner.calls[0]
+    assert "--dry-run" in argv
+    assert "--option" in argv
+    i = argv.index("--option")
+    assert argv[i:i + 3] == ["--option", "substituters", ""]
+
+
+def test_assert_no_substitute_raises_when_toolchain_in_to_build():
+    """A toolchain outpath in the to-build set is a recoverable violation."""
+    runner = _ArgvRunner(
+        dry_run=(
+            b"",
+            b"these 2 derivations will be built:\n"
+            b"  /nix/store/vvv-hello-variant.drv\n"
+            b"  /nix/store/tc-out\n",
+            0,
+        ),
+    )
+    payload = {
+        "drv": "/nix/store/vvv-hello-elf-folder.drv",
+        "toolchain_outpath": "/nix/store/tc-out",
+    }
+    with pytest.raises(bw.NoSubstituteViolation) as exc:
+        bw.assert_no_substitute(
+            payload["drv"], ITEM_CLASS_BUILD_VARIANT, payload,
+            _no_sub_env(runner),
+        )
+    assert "/nix/store/tc-out" in exc.value.offenders
+    assert "affine import gate" in str(exc.value)
+
+
+def test_assert_no_substitute_raises_when_common_dep_in_to_fetch():
+    """A declared build-input output in the to-fetch set is a violation."""
+    runner = _ArgvRunner(
+        dry_run=(
+            b"",
+            b"these paths will be fetched (2.0 MiB download):\n"
+            b"  /nix/store/cd-out\n",
+            0,
+        ),
+    )
+    payload = {
+        "drv": "/nix/store/vvv-elf.drv",
+        "input_outpaths": {"/nix/store/cd.drv": "/nix/store/cd-out"},
+    }
+    with pytest.raises(bw.NoSubstituteViolation) as exc:
+        bw.assert_no_substitute(
+            payload["drv"], ITEM_CLASS_BUILD_VARIANT, payload,
+            _no_sub_env(runner),
+        )
+    assert "/nix/store/cd-out" in exc.value.offenders
+
+
+def test_assert_no_substitute_any_fetch_is_a_violation():
+    """In substituter-free mode ANY to-fetch entry fails closed, even if
+    it is not one of the declared required paths (zero-substituter-fetch
+    is the decisive invariant)."""
+    runner = _ArgvRunner(
+        dry_run=(
+            b"",
+            b"these paths will be fetched (5.0 MiB download):\n"
+            b"  /nix/store/unexpected-path\n",
+            0,
+        ),
+    )
+    payload = {"drv": "/nix/store/vvv-elf.drv"}
+    with pytest.raises(bw.NoSubstituteViolation) as exc:
+        bw.assert_no_substitute(
+            payload["drv"], ITEM_CLASS_BUILD_VARIANT, payload,
+            _no_sub_env(runner),
+        )
+    assert "/nix/store/unexpected-path" in exc.value.offenders
+
+
+def test_assert_no_substitute_dry_run_failure_raises_violation():
+    """A non-zero dry-run (drv not resident) is the same recoverable gap."""
+    runner = _ArgvRunner(
+        dry_run=(b"", b"error: path '/nix/store/x.drv' is not valid\n", 1),
+    )
+    payload = {"drv": "/nix/store/vvv-elf.drv"}
+    with pytest.raises(bw.NoSubstituteViolation):
+        bw.assert_no_substitute(
+            payload["drv"], ITEM_CLASS_BUILD_VARIANT, payload,
+            _no_sub_env(runner),
+        )
+
+
+# --- build_attr substituter pinning ---------------------------------------
+
+
+def test_build_attr_no_substituters_pins_empty_and_ignores_peer_file(tmp_path):
+    """In no-substituters mode build_attr pins empty substituters and does
+    NOT read the peer-substituter file."""
+    peer = _write_substituters_file(
+        tmp_path, ["--extra-substituters", "http://h:5000"]
+    )
+    runner = RecordingRunner(stdout=b"/nix/store/out\n")
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "dataset",
+        substituters_file=peer,
+        run_subprocess=runner,
+        no_substituters=True,
+    )
+    ok, _out, _err = build_attr("some-attr", env)
+    assert ok is True
+    argv = runner.calls[0]
+    # Pinned-empty substituters present.
+    i = argv.index("--option")
+    assert argv[i:i + 3] == ["--option", "substituters", ""]
+    # The peer file content must NOT have been spliced in.
+    assert "--extra-substituters" not in argv
+    assert "http://h:5000" not in argv
+
+
+# --- build_worker integration (recoverable classification) -----------------
+
+
+def test_build_worker_no_substituters_violation_is_recoverable(tmp_path):
+    """A pre-build assertion violation surfaces as recoverable=True; the
+    real build is NEVER invoked."""
+    manifest = _write_manifest(
+        tmp_path / "m.json",
+        item_class=ITEM_CLASS_BUILD_VARIANT,
+        name="hello__x86_64__gcc15__O2",
+        payload={
+            "drv": "/nix/store/vvv-elf.drv",
+            "variant_dir": "hello__x86_64__gcc15__O2",
+            "pkg": "hello",
+            "toolchain_outpath": "/nix/store/tc-out",
+        },
+    )
+    runner = _ArgvRunner(
+        dry_run=(
+            b"",
+            b"these derivations will be built:\n"
+            b"  /nix/store/tc-out\n",
+            0,
+        ),
+    )
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "dataset",
+        run_subprocess=runner,
+        no_substituters=True,
+    )
+    result = build_worker(manifest, env)
+    assert result.success is False
+    assert result.recoverable is True
+    assert "/nix/store/tc-out" in (result.error or "")
+    # Only the dry-run ran; the real ``nix build`` was never reached.
+    assert all("--dry-run" in c for c in runner.calls)
+
+
+def test_build_worker_no_substituters_clean_proceeds_to_build(tmp_path):
+    """A clean assertion lets the build proceed (dry-run THEN real build)."""
+    out_dir = tmp_path / "nix-out"
+    _make_elf_folder(out_dir, {"hello": b"elf-bytes"})
+    manifest = _write_manifest(
+        tmp_path / "m.json",
+        item_class=ITEM_CLASS_BUILD_VARIANT,
+        name="hello__x86_64__gcc15__O2",
+        payload={
+            "drv": "/nix/store/vvv-elf.drv",
+            "variant_dir": "hello__x86_64__gcc15__O2",
+            "pkg": "hello",
+            "toolchain_outpath": "/nix/store/tc-out",
+        },
+    )
+    runner = _ArgvRunner(
+        # Clean dry-run: only the variant's own derivation builds.
+        dry_run=(
+            b"",
+            b"these derivations will be built:\n"
+            b"  /nix/store/vvv-hello-variant.drv\n",
+            0,
+        ),
+        # Real build prints the realised out-path.
+        build=(f"{out_dir}\n".encode("utf-8"), b"", 0),
+    )
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "dataset",
+        run_subprocess=runner,
+        no_substituters=True,
+    )
+    result = build_worker(manifest, env)
+    assert result.success is True
+    # Both the dry-run and the real build ran, in that order.
+    assert "--dry-run" in runner.calls[0]
+    assert any("--dry-run" not in c for c in runner.calls)
+
+
+def test_build_worker_substituters_on_skips_assertion(tmp_path):
+    """Default (substituter-on) mode: the assertion is a no-op; no dry-run
+    is issued."""
+    out_dir = tmp_path / "nix-out"
+    _make_elf_folder(out_dir, {"hello": b"elf-bytes"})
+    manifest = _write_manifest(
+        tmp_path / "m.json",
+        item_class=ITEM_CLASS_BUILD_VARIANT,
+        name="v",
+        payload={
+            "drv": "/nix/store/vvv-elf.drv",
+            "variant_dir": "v",
+            "pkg": "hello",
+        },
+    )
+    runner = RecordingRunner(stdout=f"{out_dir}\n".encode("utf-8"))
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "dataset",
+        run_subprocess=runner,
+        no_substituters=False,
+    )
+    result = build_worker(manifest, env)
+    assert result.success is True
+    # No dry-run was ever issued.
+    assert all("--dry-run" not in c for c in runner.calls)

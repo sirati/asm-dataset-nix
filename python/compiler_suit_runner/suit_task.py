@@ -1127,6 +1127,21 @@ class SuitTaskConfig:
     # to fully restore the legacy substituter-as-transport behaviour.
     common_deps_affine: bool = True
 
+    # Substituter-free run mode (``--no-substituters``).  When True the run
+    # uses NO substituter as a build-input transport: (a) the submitter
+    # does NOT start harmonia (``enable_harmonia`` is forced False by the
+    # CLI), (b) every build worker pins ``--option substituters ""`` on its
+    # ``nix build`` and IGNORES the peer-substituter file, and (c) each
+    # build worker runs a pre-build dry-run safety assertion that fails
+    # RECOVERABLY if nix would (re)build/fetch any affine-imported
+    # dependency.  The CLI also forces ``build_deps_local=True`` in this
+    # mode so the full variant build-input closure is affine-imported (the
+    # only way the to-build set can legitimately reduce to the variant's
+    # own derivation + FOD source fetches).  Default FALSE = the existing
+    # substituter-on behaviour.  Threaded to build workers via the
+    # ``--no-substituters`` worker flag (see ``build_worker_command_args``).
+    no_substituters: bool = False
+
 
 # ---------------------------------------------------------------------------
 # SuitTask
@@ -1813,6 +1828,16 @@ class SuitTask:
                     "--matrix-eval-out-dir",
                     str(self.config.matrix_eval_out_dir),
                 ]
+            # Substituter-free build mode: the build worker pins
+            # ``--option substituters ""`` and runs the pre-build dry-run
+            # safety assertion. Only the build-shaped types consume it
+            # (variant / common_dep run nix builds + the assertion);
+            # threading it to eval / dep_graph is harmless (they ignore it)
+            # but unnecessary, so scope it to the build types.
+            if self.config.no_substituters and type_id in {
+                "variant", "common_dep",
+            }:
+                argv += ["--no-substituters"]
             return argv
         return common
 

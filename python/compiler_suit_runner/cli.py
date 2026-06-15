@@ -511,6 +511,26 @@ def build_parser() -> argparse.ArgumentParser:
             "affine OUTPUT-import gate. Default: affine gate ON."
         ),
     )
+    # Substituter-free run mode. A single switch for a run with NO
+    # harmonia and NO substituter passed to nix: (a) the submitter does
+    # NOT start harmonia (enable_harmonia forced False), (b) every build
+    # worker pins ``--option substituters ""`` + ignores the peer file,
+    # (c) build_deps_local is forced ON so the full variant build-input
+    # closure is affine-imported, and (d) the build worker runs the
+    # pre-build dry-run safety assertion (fails recoverably if any
+    # affine-imported dep would be (re)built/fetched). Default OFF.
+    p_submit.add_argument(
+        "--no-substituters",
+        dest="no_substituters",
+        action="store_true",
+        default=False,
+        help=(
+            "Substituter-free run: no harmonia, no --substituters to nix. "
+            "Forces build_deps_local ON, pins `--option substituters \"\"` on "
+            "every build worker, and enables the pre-build no-substitute "
+            "safety assertion. Default OFF."
+        ),
+    )
     _restore_framework_flag_defaults(p_submit)
 
     p_secondary = sub.add_parser(
@@ -578,13 +598,17 @@ def _resolve_jobs(args: argparse.Namespace) -> int:
 def _resolve_build_deps_local(args: argparse.Namespace) -> bool:
     """Resolve the build-deps-local feature flag (default OFF).
 
-    Precedence: the ``--build-deps-local`` submit flag wins (when the
+    Precedence: ``--no-substituters`` FORCES it ON (the substituter-free
+    mode is only sound when the full build-input closure is affine-
+    imported), then the ``--build-deps-local`` submit flag wins (when the
     operator explicitly passed it), then the ``CSR_BUILD_DEPS_LOCAL`` env
     override (``1`` / ``true`` / ``yes`` / ``on`` enable), then the
     default (OFF).  When ON the dep_graph worker exports the build-deps
     output closure archive and every build worker imports it before
     building.
     """
+    if getattr(args, "no_substituters", False):
+        return True
     if getattr(args, "build_deps_local", False):
         return True
     env = os.environ.get("CSR_BUILD_DEPS_LOCAL")
@@ -672,8 +696,15 @@ def _config_from_args(
         # Harmonia ON by default — it's the whole point of cluster
         # peer-cache federation. The on_run_start lifecycle hook
         # starts nix-daemon + harmonia + PeerListWatcher +
-        # PeerNixConfWatcher as a single unit.
-        enable_harmonia=True,
+        # PeerNixConfWatcher as a single unit. ``--no-substituters``
+        # forces it OFF: substituter-free mode runs with no harmonia and
+        # no --substituters to nix, relying entirely on the affine import
+        # gates for every pre-built dependency.
+        enable_harmonia=not getattr(args, "no_substituters", False),
+        # Substituter-free mode flag threaded to build workers via the
+        # ``--no-substituters`` worker flag (pins empty substituters +
+        # enables the pre-build no-substitute safety assertion).
+        no_substituters=getattr(args, "no_substituters", False),
         # Opt-in ssh-debug back-door. Off by default; the user
         # toggles via --enable-ssh-debug.
         enable_ssh_debug=getattr(args, "enable_ssh_debug", False),

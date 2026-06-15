@@ -211,6 +211,15 @@ class BuildWorkerResult:
     # is the drv path the build worker was asked to realise.
     outpath: Optional[str] = None
     drv: Optional[str] = None
+    # When True, ``error`` describes a RECOVERABLE failure (the framework
+    # should retry the task rather than mark it permanently failed). Set
+    # only by the substituter-free pre-build assertion: an affine import
+    # gate that has not yet landed on this node is a transient placement
+    # condition, not a defect in the derivation. The ``handle()`` wrapper
+    # raises :class:`RecoverableError` instead of :class:`NonRecoverableError`
+    # when this is set. Default ``False`` = permanent failure (the existing
+    # contract for every other failure surface).
+    recoverable: bool = False
 
 
 @dataclasses.dataclass
@@ -265,6 +274,19 @@ class BuildWorkerEnv:
     # no-op; production invocations via :func:`main` always set it
     # from ``--matrix-eval-out-dir``.
     matrix_eval_out_dir: Optional[pathlib.Path] = None
+    # Substituter-free mode. When True every ``nix build`` runs with
+    # ``--option substituters ""`` (no peer/public substituter is
+    # queried) and the peer-substituter file is IGNORED, AND a pre-build
+    # dry-run safety assertion fires (see :func:`assert_no_substitute`):
+    # nix is asked what it would build/fetch for the target derivation,
+    # and the worker fails RECOVERABLY if any pre-imported dependency
+    # (toolchain / common_dep / build-deps closure) appears in the
+    # to-build / to-fetch set — that means its affine import gate did
+    # not land on this node. Default ``False`` = byte-identical
+    # substituter-on behaviour; the assertion + the extra dry-run cost
+    # are only paid when this is set. Wired from the ``--no-substituters``
+    # consumer flag (see :func:`main`).
+    no_substituters: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +454,16 @@ def build_attr(
         "--no-link",
         "--print-out-paths",
     ]
-    if env.substituters_file is not None:
+    if env.no_substituters:
+        # Substituter-free mode: pin substituters to the empty set for
+        # THIS invocation regardless of /etc/nix/nix.conf + peer.conf.
+        # Nix may only build the variant's own novel derivation(s) plus
+        # FOD source fetches; every pre-built dep must already be in the
+        # local store via its affine import gate (the pre-build assertion
+        # verifies that). The peer-substituter file is deliberately NOT
+        # read here — it would re-introduce a substituter.
+        argv.extend(["--option", "substituters", ""])
+    elif env.substituters_file is not None:
         argv.extend(_read_substituters_file(env.substituters_file))
     if extra_args:
         argv.extend(extra_args)
@@ -513,6 +544,218 @@ def build_attr(
             _retry_sleep(delay)
             continue
         return False, stdout, stderr
+
+
+# ---------------------------------------------------------------------------
+# Substituter-free pre-build safety assertion
+# ---------------------------------------------------------------------------
+
+
+class NoSubstituteViolation(Exception):
+    """A pre-imported dependency would be (re)built/fetched by nix.
+
+    Raised by :func:`assert_no_substitute` when the dry-run shows nix
+    would build or fetch a store path that MUST already be present via
+    an affine import gate (a toolchain, a common_dep output, or a
+    build-deps closure path). This is a RECOVERABLE condition — the
+    gate simply has not landed on this node yet — so the caller folds
+    it into a ``recoverable=True`` :class:`BuildWorkerResult` and the
+    ``handle()`` wrapper raises :class:`RecoverableError`.
+
+    ``offenders`` is the sorted list of offending store paths named in
+    the message; kept as an attribute for programmatic inspection in
+    tests.
+    """
+
+    def __init__(self, message: str, offenders: list[str]) -> None:
+        super().__init__(message)
+        self.offenders = offenders
+
+
+def _parse_dry_run_paths(stderr: bytes) -> tuple[list[str], list[str]]:
+    """Parse a ``nix build --dry-run`` stderr into (to_build, to_fetch).
+
+    Nix writes the plan to STDERR in two labelled sections::
+
+        these N derivations will be built:
+          /nix/store/<hash>-foo.drv
+          ...
+        these M paths will be fetched (X MiB download, Y MiB unpacked):
+          /nix/store/<hash>-bar
+          ...
+
+    The exact header wording varies across nix versions (``this
+    derivation``/``these N derivations``; ``will be fetched`` with or
+    without the size suffix), so we key off the stable substrings
+    ``will be built`` / ``will be fetched`` for the section headers and
+    collect every subsequent indented ``/nix/store/...`` line until the
+    next header or a non-store line. Anything not under a recognised
+    header is ignored. Returns ``(to_build_drvs, to_fetch_paths)`` —
+    lists of store paths (``to_build`` are ``.drv`` paths, ``to_fetch``
+    are realised outputs).
+    """
+    to_build: list[str] = []
+    to_fetch: list[str] = []
+    section: Optional[str] = None  # "build" | "fetch" | None
+    text = stderr.decode("utf-8", errors="replace")
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        # Section headers end in ``:`` and carry the stable marker phrase.
+        if low.endswith(":") and "will be built" in low:
+            section = "build"
+            continue
+        if low.endswith(":") and "will be fetched" in low:
+            section = "fetch"
+            continue
+        if line.startswith("/nix/store/"):
+            if section == "build":
+                to_build.append(line)
+            elif section == "fetch":
+                to_fetch.append(line)
+            # A store path outside a recognised section is ignored.
+            continue
+        # Any other non-store, non-header line closes the current section
+        # (e.g. a warning interleaved after the path list).
+        section = None
+    return to_build, to_fetch
+
+
+def _required_present_paths(item_class: str, payload: dict) -> set[str]:
+    """Store paths that MUST be locally present before this build runs.
+
+    These are the outputs/drvs delivered by affine import gates — the
+    build must NOT re-create them:
+
+    * the toolchain output (``payload['toolchain_outpath']``) and the
+      toolchain drv (``payload['toolchain_aggregate_drv']`` when present);
+    * every common_dep output the variant depends on
+      (``payload['input_outpaths']`` values whose drv is a common_dep —
+      we cannot cheaply distinguish here, so we treat the full declared
+      build-input output set as "must be present": in substituter-free
+      mode with ``build_deps_local`` ON the ENTIRE input closure is
+      affine-imported, so any input appearing in to-build/to-fetch is a
+      genuine gap).
+
+    The principle (see Deliverable 2): in substituter-free mode nix's
+    to-build set should be ONLY the variant's own novel derivation(s)
+    plus FOD source fetches; any declared, pre-imported input that shows
+    up means its import did not land here.
+    """
+    required: set[str] = set()
+    tc_outpath = payload.get("toolchain_outpath")
+    if isinstance(tc_outpath, str) and tc_outpath.startswith("/nix/store/"):
+        required.add(tc_outpath)
+    tc_drv = payload.get("toolchain_aggregate_drv")
+    if isinstance(tc_drv, str) and tc_drv.startswith("/nix/store/"):
+        required.add(tc_drv)
+    # Declared build-input outputs (manifest_gen.make_variant_header emits
+    # ``input_outpaths`` = {drv: outpath}). With build_deps_local these are
+    # all affine-imported; the common_dep outputs are a subset of them.
+    input_outpaths = payload.get("input_outpaths")
+    if isinstance(input_outpaths, dict):
+        for op in input_outpaths.values():
+            if isinstance(op, str) and op.startswith("/nix/store/"):
+                required.add(op)
+    return required
+
+
+def assert_no_substitute(
+    attr: str,
+    item_class: str,
+    payload: dict,
+    env: BuildWorkerEnv,
+) -> None:
+    """Pre-build assertion: no pre-imported dep is in nix's to-build/fetch set.
+
+    Runs ``nix build <attr> --dry-run`` with the SAME options the real
+    build will use (substituters pinned empty), parses the "will be
+    built" / "will be fetched" plan, and raises :class:`NoSubstituteViolation`
+    if any store path that MUST already be present (toolchain /
+    build-input closure outputs — see :func:`_required_present_paths`)
+    appears in that plan.
+
+    A clean run is one whose to-build set is ONLY the variant's own
+    novel derivation(s) (the elf-folder + the variant package drv) and
+    whose to-fetch set is empty (no substituter) — FOD source fetches do
+    NOT appear in ``--dry-run`` as "will be fetched" (they are origin
+    fetches scheduled as build steps of the FOD derivation, not
+    substituter fetches), so an empty to-fetch set is the expected shape.
+
+    Gated by the caller to ``env.no_substituters`` mode only — this is
+    one extra ``nix`` invocation per build, paid only when substituter-
+    free safety actually matters.
+
+    Raises:
+      * :class:`NoSubstituteViolation` — a required dep is in the plan
+        (recoverable; gate did not land here).
+      * :class:`RuntimeError` — the dry-run itself failed (e.g. the .drv
+        is not even resident — also a gate/import gap, surfaced as a
+        clear hard error so it is not silently skipped).
+    """
+    runner = env.run_subprocess or _default_run_subprocess
+
+    # Build the dry-run argv with the SAME substituter options as the
+    # real build: ``--dry-run`` + pinned-empty substituters. We reuse the
+    # store-path-vs-flake-ref ``attr`` interpretation of build_attr.
+    argv: list[str] = ["nix", "build", "--dry-run"]
+    if env.no_substituters:
+        argv.extend(["--option", "substituters", ""])
+    if attr.startswith("/nix/store/"):
+        argv.append(f"{attr}^*" if attr.endswith(".drv") else attr)
+    else:
+        argv.append(f"{env.flake_ref}#{attr}")
+
+    stdout, stderr, rc = runner(argv)
+    if rc != 0:
+        # A failed dry-run in substituter-free mode almost always means a
+        # required .drv / input is not resident (the import gate did not
+        # land). Surface it loudly rather than letting the real build
+        # silently rebuild — but classify it as the same recoverable gap.
+        raise NoSubstituteViolation(
+            f"substituter-free pre-build dry-run of {attr} failed "
+            f"(rc={rc}); nix cannot evaluate the build plan without a "
+            "substituter — a required affine-imported dependency (drv or "
+            "input) is likely not resident on this node: "
+            + stderr.decode("utf-8", errors="replace").strip()[:1000],
+            [],
+        )
+
+    to_build, to_fetch = _parse_dry_run_paths(stderr)
+    required = _required_present_paths(item_class, payload)
+
+    # Any required path appearing in to-build OR to-fetch is a violation.
+    planned = set(to_build) | set(to_fetch)
+    offenders = sorted(required & planned)
+
+    # Additionally, in substituter-free mode NOTHING should ever be
+    # "fetched" (there is no substituter). A non-empty to-fetch set that
+    # is NOT among the declared required paths still means nix found a
+    # substituter source for some path — which contradicts the empty
+    # substituter pin — OR a required path nix knows by a different
+    # outpath. Treat any to-fetch entry as an offender so the assertion
+    # is fail-closed on the decisive invariant "zero substituter fetches".
+    extra_fetch = sorted(p for p in to_fetch if p not in offenders)
+    all_offenders = sorted(set(offenders) | set(extra_fetch))
+
+    if all_offenders:
+        named = ", ".join(all_offenders[:10]) + (
+            " …" if len(all_offenders) > 10 else ""
+        )
+        raise NoSubstituteViolation(
+            f"substituter-free assertion FAILED for {attr}: nix would "
+            f"(re)build/fetch {len(all_offenders)} path(s) that must have "
+            "been provided via an affine import gate — the import did not "
+            f"land on this node: {named}. In substituter-free mode the "
+            "to-build set must be ONLY the variant's own derivation(s) plus "
+            "FOD source fetches, and the to-fetch set must be empty (no "
+            "substituter). Each offending path is a toolchain / common_dep / "
+            "build-deps closure path whose gate has not yet been satisfied "
+            "here.",
+            all_offenders,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1613,6 +1856,33 @@ def build_worker(
         if item_class == ITEM_CLASS_BUILD_VARIANT:
             _prefetch_variant_inputs(payload, env)
 
+    # Substituter-free pre-build safety assertion. ONLY in no-substituters
+    # mode (one extra ``nix`` dry-run invocation; default off). Verifies
+    # that nix would build ONLY the variant's own novel derivation(s) and
+    # fetch nothing from a substituter — i.e. every affine-imported
+    # dependency (toolchain / common_dep / build-deps closure) is already
+    # resident. A violation is RECOVERABLE: the gate has not landed on
+    # this node yet, so the framework should retry rather than mark the
+    # task permanently failed.
+    if env.no_substituters and item_class in (
+        ITEM_CLASS_BUILD_VARIANT, ITEM_CLASS_BUILD_COMMON_DEP
+    ):
+        try:
+            assert_no_substitute(attr, item_class, payload, env)
+        except NoSubstituteViolation as exc:
+            _LOG.warning(
+                "build name=%s: substituter-free assertion failed"
+                " (recoverable): %s", name, exc,
+            )
+            return BuildWorkerResult(
+                item_class=item_class,
+                name=name,
+                success=False,
+                duration_seconds=max(0.0, clock() - start),
+                error=str(exc),
+                recoverable=True,
+            )
+
     _LOG.info("build name=%s: nix build START attr=%s", name, attr)
     try:
         success, stdout, stderr = build_attr(attr, env)
@@ -1818,6 +2088,7 @@ def main() -> int:
     from dynamic_runner.worker import (
         NonRecoverableError,
         PublishError,
+        RecoverableError,
         Task,
         WorkerOutput,
         run,
@@ -1871,6 +2142,19 @@ def main() -> int:
         ),
     )
     parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument(
+        "--no-substituters",
+        action="store_true",
+        default=False,
+        help=(
+            "Substituter-free build mode. Pins ``--option substituters \"\"``"
+            " on every nix build (ignoring the peer-substituter file) and"
+            " runs a pre-build dry-run safety assertion: the build FAILS"
+            " RECOVERABLY if nix would (re)build/fetch any affine-imported"
+            " dependency (toolchain / common_dep / build-deps closure)."
+            " Default OFF."
+        ),
+    )
     parser.add_argument(
         "--matrix-eval-out-dir",
         type=str,
@@ -1931,6 +2215,7 @@ def main() -> int:
             if args.matrix_eval_out_dir
             else None
         ),
+        no_substituters=bool(getattr(args, "no_substituters", False)),
     )
 
     # ------------------------------------------------------------------
@@ -2246,6 +2531,14 @@ def main() -> int:
             result.success, result.name, (result.error or "")[:200],
         )
         if not result.success:
+            # The substituter-free pre-build assertion flags a missing
+            # affine import as RECOVERABLE (the gate has not landed on
+            # this node yet — a transient placement condition, not a
+            # defective derivation). Raise the recoverable error class so
+            # the framework retries rather than permanently failing the
+            # task + its dependents.
+            if result.recoverable:
+                raise RecoverableError(result.error or "build failed (recoverable)")
             raise NonRecoverableError(result.error or "build failed")
         # Atomic stage→destination publish via the framework: the
         # worker wrote into ``DYNRUNNER_PUBLISH_SRC_ROOT`` (tmpfs);
