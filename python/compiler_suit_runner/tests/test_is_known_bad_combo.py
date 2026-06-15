@@ -564,3 +564,295 @@ def test_regression_bzip2_aarch64_clang3_9_not_excluded() -> None:
             arch="aarch64",
         )
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule N1: clang 3.4/3.5/3.6 + new packages
+# ---------------------------------------------------------------------------
+
+def test_rule_n1_zstd_clang3_4_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(package="zstd", compilerFamily="clang", compilerVersion="3.4.2")
+    )
+    assert reason is not None
+    assert "clang" in reason.lower() and "3.4" in reason
+
+
+def test_rule_n1_brotli_clang3_6_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(package="brotli", compilerFamily="clang", compilerVersion="3.6.0")
+    )
+    assert reason is not None
+
+
+def test_rule_n1_simdjson_clang3_5_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(package="simdjson", compilerFamily="clang", compilerVersion="3.5.0")
+    )
+    assert reason is not None
+
+
+def test_rule_n1_near_miss_zstd_clang3_7_is_fine() -> None:
+    # clang 3.7 is the first working version — must NOT be excluded
+    assert is_known_bad_combo(
+        _meta(package="zstd", compilerFamily="clang", compilerVersion="3.7.1")
+    ) is None
+
+
+def test_rule_n1_near_miss_hello_clang3_4_not_excluded() -> None:
+    # Rule N1 is scoped to the 6 new packages only; hello is unaffected
+    assert is_known_bad_combo(
+        _meta(package="hello", compilerFamily="clang", compilerVersion="3.4.2")
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule N2: simdjson C++17 minimum (gcc < 7, clang < 5)
+# ---------------------------------------------------------------------------
+
+def test_rule_n2_simdjson_gcc4_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(package="simdjson", compilerFamily="gcc", compilerVersion="4.9.4")
+    )
+    assert reason is not None
+    assert "C++17" in reason or "cxx17" in reason.lower() or "simdjson" in reason.lower()
+
+
+def test_rule_n2_simdjson_gcc6_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(package="simdjson", compilerFamily="gcc", compilerVersion="6.5.0")
+    )
+    assert reason is not None
+
+
+def test_rule_n2_simdjson_clang4_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(package="simdjson", compilerFamily="clang", compilerVersion="4.0.1")
+    )
+    assert reason is not None
+
+
+def test_rule_n2_near_miss_simdjson_gcc7_is_fine() -> None:
+    # gcc 7 is the first C++17-capable release
+    assert is_known_bad_combo(
+        _meta(package="simdjson", compilerFamily="gcc", compilerVersion="7.5.0")
+    ) is None
+
+
+def test_rule_n2_near_miss_simdjson_clang5_is_fine() -> None:
+    # clang 5 is the first C++17-capable release
+    assert is_known_bad_combo(
+        _meta(package="simdjson", compilerFamily="clang", compilerVersion="5.0.2")
+    ) is None
+
+
+def test_rule_n2_near_miss_pcre2_gcc4_not_excluded() -> None:
+    # pcre2 is C (not C++17) — gcc4 exclusion is simdjson-only
+    assert is_known_bad_combo(
+        _meta(package="pcre2", compilerFamily="gcc", compilerVersion="4.9.4")
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule N3: staticpie + new packages
+# ---------------------------------------------------------------------------
+
+def test_rule_n3_zstd_staticpie_is_bad() -> None:
+    reason = is_known_bad_combo(_meta(package="zstd", flags="staticpie"))
+    assert reason is not None
+    assert "staticpie" in reason.lower() or "static" in reason.lower() or "main" in reason.lower()
+
+
+def test_rule_n3_libpng_staticpie_is_bad() -> None:
+    assert is_known_bad_combo(_meta(package="libpng", flags="staticpie")) is not None
+
+
+def test_rule_n3_near_miss_zlib_staticpie_not_excluded() -> None:
+    # zlib is NOT in the 6 new packages; N3 does not apply
+    assert is_known_bad_combo(_meta(package="zlib", flags="staticpie")) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule N4: san-address/san-thread/san-memory + new packages
+# ---------------------------------------------------------------------------
+
+def test_rule_n4_brotli_san_address_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(
+            package="brotli",
+            compilerFamily="clang",
+            compilerVersion="18.1.0",
+            sanitizer="san-address",
+            arch="x86_64",
+        )
+    )
+    assert reason is not None
+    assert "sandbox" in reason.lower() or "brotli" in reason.lower() or "san-address" in reason.lower()
+
+
+def test_rule_n4_dav1d_san_thread_is_bad() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            package="dav1d",
+            compilerFamily="gcc",
+            compilerVersion="15.2.0",
+            sanitizer="san-thread",
+            arch="x86_64",
+        )
+    ) is not None
+
+
+def test_rule_n4_pcre2_san_memory_is_bad() -> None:
+    assert is_known_bad_combo(
+        _meta(
+            package="pcre2",
+            compilerFamily="clang",
+            compilerVersion="18.1.0",
+            sanitizer="san-memory",
+            arch="x86_64",
+        )
+    ) is not None
+
+
+def test_rule_n4_zstd_san_undefined_is_fine() -> None:
+    # san-undefined is NOT excluded (conservative — passed in testing)
+    assert is_known_bad_combo(
+        _meta(
+            package="zstd",
+            compilerFamily="gcc",
+            compilerVersion="15.2.0",
+            sanitizer="san-undefined",
+            arch="x86_64",
+        )
+    ) is None
+
+
+def test_rule_n4_near_miss_zlib_san_address_not_excluded_by_n4() -> None:
+    # zlib is NOT in the 6 new packages; N4 does not apply to it
+    # (it may still be excluded by the legacy-compiler path for old compilers)
+    assert is_known_bad_combo(
+        _meta(
+            package="zlib",
+            compilerFamily="clang",
+            compilerVersion="18.1.0",
+            sanitizer="san-address",
+            arch="x86_64",
+        )
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule N5: nopic + clang ≥ 15 / gcc ≥ 15 + new packages
+# ---------------------------------------------------------------------------
+
+def test_rule_n5_libpng_nopic_clang15_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(package="libpng", flags="nopic", compilerFamily="clang", compilerVersion="15.0.7")
+    )
+    assert reason is not None
+    assert "nopic" in reason.lower() or "PIE" in reason or "libpng" in reason.lower()
+
+
+def test_rule_n5_dav1d_nopic_gcc15_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(package="dav1d", flags="nopic", compilerFamily="gcc", compilerVersion="15.1.0")
+    )
+    assert reason is not None
+
+
+def test_rule_n5_near_miss_zstd_nopic_clang14_is_fine() -> None:
+    # clang 14 is just below the threshold — nopic OK
+    assert is_known_bad_combo(
+        _meta(package="zstd", flags="nopic", compilerFamily="clang", compilerVersion="14.0.6")
+    ) is None
+
+
+def test_rule_n5_near_miss_zstd_nopic_gcc14_is_fine() -> None:
+    # gcc 14 is just below the threshold — nopic OK
+    assert is_known_bad_combo(
+        _meta(package="zstd", flags="nopic", compilerFamily="gcc", compilerVersion="14.2.0")
+    ) is None
+
+
+def test_rule_n5_near_miss_zlib_nopic_clang18_not_excluded_by_n5() -> None:
+    # zlib is NOT in the 6 new packages; N5 does not apply
+    assert is_known_bad_combo(
+        _meta(package="zlib", flags="nopic", compilerFamily="clang", compilerVersion="18.1.0")
+    ) is None
+
+
+# ---------------------------------------------------------------------------
+# Rule N6: brotli + Ofast/fastmath + clang 7/8/9
+# ---------------------------------------------------------------------------
+
+def test_rule_n6_brotli_ofast_clang7_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(
+            package="brotli",
+            compilerFamily="clang",
+            compilerVersion="7.0.1",
+            optimization="Ofast",
+        )
+    )
+    assert reason is not None
+    assert "brotli" in reason.lower() or "__log2_finite" in reason or "Ofast" in reason
+
+
+def test_rule_n6_brotli_fastmath_clang9_is_bad() -> None:
+    reason = is_known_bad_combo(
+        _meta(
+            package="brotli",
+            compilerFamily="clang",
+            compilerVersion="9.0.1",
+            flags="fastmath",
+        )
+    )
+    assert reason is not None
+
+
+def test_rule_n6_near_miss_brotli_ofast_clang6_is_fine() -> None:
+    # clang 6 is NOT in the bad set {7,8,9} — near miss
+    assert is_known_bad_combo(
+        _meta(
+            package="brotli",
+            compilerFamily="clang",
+            compilerVersion="6.0.1",
+            optimization="Ofast",
+        )
+    ) is None
+
+
+def test_rule_n6_near_miss_brotli_ofast_clang10_is_fine() -> None:
+    # clang 10 is past the bad window — near miss
+    assert is_known_bad_combo(
+        _meta(
+            package="brotli",
+            compilerFamily="clang",
+            compilerVersion="10.0.0",
+            optimization="Ofast",
+        )
+    ) is None
+
+
+def test_rule_n6_near_miss_zstd_ofast_clang8_not_excluded_by_n6() -> None:
+    # N6 is brotli-only; zstd with Ofast+clang8 is NOT excluded by N6
+    assert is_known_bad_combo(
+        _meta(
+            package="zstd",
+            compilerFamily="clang",
+            compilerVersion="8.0.1",
+            optimization="Ofast",
+        )
+    ) is None
+
+
+def test_rule_n6_near_miss_brotli_o3_clang8_not_excluded() -> None:
+    # -O3 does NOT imply -ffast-math; brotli+O3+clang8 is fine
+    assert is_known_bad_combo(
+        _meta(
+            package="brotli",
+            compilerFamily="clang",
+            compilerVersion="8.0.1",
+            optimization="O3",
+        )
+    ) is None

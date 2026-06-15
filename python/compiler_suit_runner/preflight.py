@@ -461,6 +461,200 @@ def _conflict_zerocallregs_clang_cross_arches(meta: dict) -> Optional[str]:
     )
 
 
+# ---------------------------------------------------------------------------
+# New-package exclusions (zstd, brotli, simdjson, dav1d, libpng, pcre2).
+#
+# Rule N1: old clang (3.4/3.5/3.6) for ALL 6 new packages.
+#   2014–2016 compilers are fundamentally incompatible with 2023 sources:
+#   linker-detection failures, GLIBC ABI gaps, build-system rejections.
+#   clang 3.7+ works. Min-clang-3.7 for these packages.
+#
+# Rule N2: simdjson requires C++17 → gcc < 7 and clang < 5 cannot compile it.
+#   gcc 7 and clang 5 are the first releases with full C++17 support.
+#
+# Rule N3: staticpie for ALL 6 new packages.
+#   All 6 output shared libraries (.so). ``-static-pie`` injects rcrt1.o
+#   startup which defines _start and requires ``main()``; linking rcrt1.o
+#   into a shared library fails with ``undefined reference to 'main'``.
+#
+# Rule N4: san-address, san-thread, san-memory for ALL 6 new packages.
+#   Instrumented conftest/helper binaries cannot execute in the nix build
+#   sandbox (ASLR lockdown → ``cannot run C compiled programs``).
+#   san-undefined is left in (conservative — it passed or was inconclusive).
+#
+# Rule N5: nopic + clang ≥ 15 or gcc ≥ 15 for ALL 6 new packages.
+#   Modern toolchains default to PIE; ``-fno-PIC`` objects under default-PIE
+#   linker emit ``relocation R_X86_64_32 can not be used when making a PIE
+#   object``. Gate nopic OFF for clang ≥ 15 / gcc ≥ 15 for these packages.
+#
+# Rule N6: brotli + Ofast/fastmath + clang 7/8/9.
+#   glibc ≥ 2.31 removed ``__log2_finite`` and friends (finite-math aliases).
+#   clang 7–9 emits calls to those removed symbols under -ffast-math /
+#   -Ofast → ``undefined reference to '__log2_finite'`` at link time.
+# ---------------------------------------------------------------------------
+
+_NEW_PACKAGES: frozenset[str] = frozenset({
+    "zstd", "brotli", "simdjson", "dav1d", "libpng", "pcre2",
+})
+
+# C++17-capable minimums (first release with full standard support).
+_CXX17_MIN_GCC_MAJOR = 7
+_CXX17_MIN_CLANG_MAJOR = 5
+
+
+def _conflict_new_pkgs_old_clang3_early(meta: dict) -> Optional[str]:
+    """Rule N1: clang 3.4/3.5/3.6 + any of the 6 new packages.
+
+    2014–2016 compilers are fundamentally incompatible with 2023 C/C++ sources:
+    linker-detection routines, GLIBC ABI expectations, and build-system probes
+    all break. clang 3.7+ works for these packages.
+    """
+    if meta.get("package") not in _NEW_PACKAGES:
+        return None
+    if meta.get("compilerFamily") != "clang":
+        return None
+    major = _parse_compiler_major(meta.get("compilerVersion", ""))
+    if major != 3:
+        return None
+    minor = _parse_compiler_minor(meta.get("compilerVersion", ""))
+    if minor >= 7:
+        return None
+    return (
+        f"clang 3.{minor} (2014–2016) is fundamentally incompatible with "
+        f"{meta.get('package')} (2023 source): linker detection, GLIBC ABI, "
+        f"build-system probes all fail; clang 3.7+ works"
+    )
+
+
+def _conflict_simdjson_pre_cxx17_compiler(meta: dict) -> Optional[str]:
+    """Rule N2: simdjson requires C++17 → gcc < 7 or clang < 5.
+
+    simdjson uses C++17 features (structured bindings, ``if constexpr``,
+    ``std::string_view``, etc.) unconditionally. gcc 7 and clang 5 are the
+    first releases with full C++17 support; anything older aborts at the
+    first C++17 construct.
+    """
+    if meta.get("package") != "simdjson":
+        return None
+    family = meta.get("compilerFamily", "")
+    major = _parse_compiler_major(meta.get("compilerVersion", ""))
+    if major is None:
+        return None
+    if family == "gcc" and major < _CXX17_MIN_GCC_MAJOR:
+        return (
+            f"simdjson requires C++17; gcc {major} predates full C++17 support "
+            f"(minimum: gcc {_CXX17_MIN_GCC_MAJOR})"
+        )
+    if family == "clang" and major < _CXX17_MIN_CLANG_MAJOR:
+        return (
+            f"simdjson requires C++17; clang {major} predates full C++17 support "
+            f"(minimum: clang {_CXX17_MIN_CLANG_MAJOR})"
+        )
+    return None
+
+
+def _conflict_new_pkgs_staticpie(meta: dict) -> Optional[str]:
+    """Rule N3: staticpie + any of the 6 new packages (all output shared libs).
+
+    -static-pie injects rcrt1.o (the static-PIE CRT startup) which pulls in
+    ``_start`` and requires ``main()``. Linking rcrt1.o into a shared library
+    fails with ``undefined reference to 'main'`` — structurally impossible.
+    """
+    if meta.get("package") not in _NEW_PACKAGES:
+        return None
+    if meta.get("flags") != "staticpie":
+        return None
+    return (
+        f"{meta.get('package')} builds a shared library; -static-pie (rcrt1.o) "
+        f"requires main() and cannot link into a .so"
+    )
+
+
+def _conflict_new_pkgs_sandbox_sanitizers(meta: dict) -> Optional[str]:
+    """Rule N4: san-address/san-thread/san-memory + any of the 6 new packages.
+
+    The nix build sandbox locks down ASLR; instrumented conftest/helper
+    binaries (``AC_TRY_RUN``, cmake ``try_run``) cannot execute and the build
+    aborts with ``Executables created by c compiler are not runnable`` or
+    ``cannot run C compiled programs``.  san-undefined is left in (conservative
+    — it does not require execute-at-configure-time and passed in testing).
+    """
+    if meta.get("package") not in _NEW_PACKAGES:
+        return None
+    san = meta.get("sanitizer", "san-off")
+    if san not in ("san-address", "san-thread", "san-memory"):
+        return None
+    return (
+        f"{meta.get('package')} + {san}: instrumented binaries cannot execute "
+        f"in the nix build sandbox (ASLR lockdown); configure probe fails"
+    )
+
+
+_NOPIC_MIN_MODERN_GCC = 15
+_NOPIC_MIN_MODERN_CLANG = 15
+
+
+def _conflict_new_pkgs_nopic_modern_pie_toolchain(meta: dict) -> Optional[str]:
+    """Rule N5: nopic + clang ≥ 15 / gcc ≥ 15 + any of the 6 new packages.
+
+    Modern toolchains (clang 15+, gcc 15+) enable PIE by default and the
+    linker enforces it for executable components. ``-fno-PIC`` objects under
+    a PIE-default linker produce ``relocation R_X86_64_32 can not be used
+    when making a PIE object``. These packages have executable components;
+    nopic is safe only on older toolchains that don't default to PIE.
+    """
+    if meta.get("package") not in _NEW_PACKAGES:
+        return None
+    if meta.get("flags") != "nopic":
+        return None
+    family = meta.get("compilerFamily", "")
+    major = _parse_compiler_major(meta.get("compilerVersion", ""))
+    if major is None:
+        return None
+    if family == "gcc" and major >= _NOPIC_MIN_MODERN_GCC:
+        return (
+            f"{meta.get('package')} nopic + gcc {major}: modern PIE-default "
+            f"linker rejects R_X86_64_32 relocations in PIE output"
+        )
+    if family == "clang" and major >= _NOPIC_MIN_MODERN_CLANG:
+        return (
+            f"{meta.get('package')} nopic + clang {major}: modern PIE-default "
+            f"linker rejects R_X86_64_32 relocations in PIE output"
+        )
+    return None
+
+
+_BROTLI_FASTMATH_CLANG_BAD_MAJORS: frozenset[int] = frozenset({7, 8, 9})
+
+
+def _conflict_brotli_fastmath_clang7_9(meta: dict) -> Optional[str]:
+    """Rule N6: brotli + Ofast/fastmath + clang 7/8/9.
+
+    glibc ≥ 2.31 (2020) removed ``__log2_finite`` and the other
+    ``__*_finite`` finite-math aliases. clang 7–9 emits calls to those
+    symbols under ``-ffast-math`` / ``-Ofast`` (``-ffinite-math-only``
+    enables them). The link then fails with
+    ``undefined reference to '__log2_finite'``. clang 10+ uses the
+    correct glibc-version-guarded symbols.
+    """
+    if meta.get("package") != "brotli":
+        return None
+    if meta.get("compilerFamily") != "clang":
+        return None
+    major = _parse_compiler_major(meta.get("compilerVersion", ""))
+    if major not in _BROTLI_FASTMATH_CLANG_BAD_MAJORS:
+        return None
+    opt = meta.get("optimization", "")
+    flags = meta.get("flags", "")
+    if opt != "Ofast" and flags != "fastmath":
+        return None
+    trigger = "Ofast" if opt == "Ofast" else "fastmath"
+    return (
+        f"brotli + {trigger} + clang {major}: glibc ≥ 2.31 removed "
+        f"__log2_finite; clang {major} emits calls to it under -ffast-math"
+    )
+
+
 _FLAG_CONFLICTS = (
     _conflict_sanitizer_o0,
     _conflict_fastmath_san_undefined,
@@ -471,6 +665,13 @@ _FLAG_CONFLICTS = (
     # Arch-structural cross-toolchain failures:
     _conflict_staticpie_cross_sysroot_arches,   # Rule D2/E (i686 excluded)
     _conflict_zerocallregs_clang_cross_arches,  # Rule D3 (clang-only)
+    # New-package exclusions (zstd, brotli, simdjson, dav1d, libpng, pcre2):
+    _conflict_new_pkgs_old_clang3_early,        # Rule N1: clang 3.4/3.5/3.6
+    _conflict_simdjson_pre_cxx17_compiler,      # Rule N2: simdjson C++17 min
+    _conflict_new_pkgs_staticpie,               # Rule N3: staticpie+shared-lib
+    _conflict_new_pkgs_sandbox_sanitizers,      # Rule N4: san-address/thread/memory
+    _conflict_new_pkgs_nopic_modern_pie_toolchain,  # Rule N5: nopic+modern-PIE
+    _conflict_brotli_fastmath_clang7_9,         # Rule N6: brotli+fastmath+clang7-9
 )
 
 
