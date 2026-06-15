@@ -251,18 +251,41 @@ let
 
   # Per-package compatibility shims applied BEFORE the variant overrideAttrs.
   # These resolve deep ABI mismatches between nixpkgs-unstable deps and old
-  # compiler stdenvs (old clang brings old glibc; some deps require newer glibc).
+  # compiler stdenvs (old clang brings old glibc; some deps require newer glibc),
+  # and per-package build-system flag fixes.
   #
   # dash: nixpkgs-unstable libedit-20251016-3.1 requires GLIBC_2.38 and GLIBC_2.42
   # versioned symbols. Old clang stdenvs (clang5-17) bring glibc 2.35/2.38/2.39 —
   # all below 2.42 — so AC_CHECK_LIB(-ledit) fails and configure aborts. Strip
   # libedit support entirely: dash is never used interactively in this dataset, and
   # the resulting binaries are fully valid POSIX shell executables.
+  #
+  # brotli + gcc4.x: brotli's C sources use C99 ``for``-loop initial declarations
+  # (``for (int i = ...)``) which gcc rejects without an explicit -std flag when
+  # the default is gnu89/c89. Inject -std=gnu99 only for gcc major == 4.
+  #
+  # zstd: the pzstd contrib tool (C++ multi-threaded compressor) fails to build
+  # with old compilers (gcc4.x, clang3.7-9, clang7-9). pzstd is a dev tool, not
+  # part of libzstd.so — disable it unconditionally for all zstd variants.
   basePkg' =
     if pkg.attr == "dash" then
       basePkg.overrideAttrs (_old: {
         buildInputs = [ ];
         configureFlags = [ ];
+      })
+    else if pkg.attr == "brotli" && compiler.family == "gcc" && gccMajor == 4 then
+      basePkg.overrideAttrs (old: {
+        # Brotli's C99 for-loop init declarations require -std=gnu99 on gcc4.x
+        # (default is gnu89; gcc5+ defaults to gnu11 and needs no override).
+        NIX_CFLAGS_COMPILE = lib.concatStringsSep " " (
+          builtins.filter (s: s != "") [ (old.NIX_CFLAGS_COMPILE or "") "-std=gnu99" ]
+        );
+      })
+    else if pkg.attr == "zstd" then
+      basePkg.overrideAttrs (old: {
+        # pzstd contrib tool fails on old compilers; libzstd itself is unaffected.
+        # Disable contrib unconditionally — the library is what this dataset wants.
+        cmakeFlags = (old.cmakeFlags or [ ]) ++ [ "-DZSTD_BUILD_CONTRIB=OFF" ];
       })
     else
       basePkg;
