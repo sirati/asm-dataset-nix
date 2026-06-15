@@ -427,3 +427,143 @@ def test_discover_items_ignores_stale_matrix_eval_json(
     # Only the in-memory binaries (bare-binary task ids) — the stale
     # "ghost" JSON is ignored.
     assert matrix_eval_ids == {"hello", "busybox"}
+
+
+# ---------------------------------------------------------------------------
+# --prestaged-matrix-eval: sidecar helpers + discover_items integration
+# ---------------------------------------------------------------------------
+
+
+def test_write_and_read_drv_map_sidecar_roundtrip(
+    tmp_path: pathlib.Path,
+) -> None:
+    """write_drv_map_sidecar / read_drv_map_sidecar are a lossless roundtrip."""
+    from compiler_suit_runner.workers.dependency_graph_worker.archive import (
+        write_drv_map_sidecar,
+        read_drv_map_sidecar,
+        DRV_MAP_SIDECAR,
+    )
+
+    drv = "/nix/store/aaabbb-matrix-hello.drv"
+    write_drv_map_sidecar(tmp_path, "hello", drv)
+
+    # File is present with the expected name.
+    assert (tmp_path / DRV_MAP_SIDECAR.format(binary="hello")).is_file()
+
+    # Round-trip recovers the exact drv path.
+    recovered = read_drv_map_sidecar(tmp_path, "hello")
+    assert recovered == drv
+
+
+def test_read_drv_map_sidecar_returns_none_when_absent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """read_drv_map_sidecar returns None when the sidecar file is missing."""
+    from compiler_suit_runner.workers.dependency_graph_worker.archive import (
+        read_drv_map_sidecar,
+    )
+
+    result = read_drv_map_sidecar(tmp_path, "no-such-binary")
+    assert result is None
+
+
+def test_load_drv_map_from_sidecars_happy(
+    tmp_path: pathlib.Path,
+) -> None:
+    """load_drv_map_from_sidecars returns the correct {binary: drv} map
+    when sidecars are present for every requested binary."""
+    from compiler_suit_runner.workers.dependency_graph_worker.archive import (
+        write_drv_map_sidecar,
+        load_drv_map_from_sidecars,
+    )
+
+    drv_hello = "/nix/store/aaaa-matrix-hello.drv"
+    drv_busybox = "/nix/store/bbbb-matrix-busybox.drv"
+    write_drv_map_sidecar(tmp_path, "hello", drv_hello)
+    write_drv_map_sidecar(tmp_path, "busybox", drv_busybox)
+
+    result = load_drv_map_from_sidecars(tmp_path, {"hello", "busybox"})
+    assert result == {"hello": drv_hello, "busybox": drv_busybox}
+
+
+def test_load_drv_map_from_sidecars_raises_on_missing(
+    tmp_path: pathlib.Path,
+) -> None:
+    """load_drv_map_from_sidecars raises FileNotFoundError with a clear
+    message when a sidecar is absent for a requested binary."""
+    import pytest
+    from compiler_suit_runner.workers.dependency_graph_worker.archive import (
+        write_drv_map_sidecar,
+        load_drv_map_from_sidecars,
+    )
+
+    write_drv_map_sidecar(tmp_path, "hello", "/nix/store/x-hello.drv")
+    # "busybox" sidecar is NOT written.
+
+    with pytest.raises(FileNotFoundError, match="prestaged-matrix-eval"):
+        load_drv_map_from_sidecars(tmp_path, {"hello", "busybox"})
+
+
+def test_discover_items_prestaged_skips_matrix_eval_emits_dep_graph(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With prestaged_matrix_eval=True discover_items emits ZERO matrix_eval
+    TaskInfos and exactly ONE dependency_graph TaskInfo with empty
+    task_depends_on (no predecessor matrix_eval tasks)."""
+    config = dataclasses.replace(
+        _make_config(tmp_path, per_binary_metadata=_per_binary_metadata()),
+        prestaged_matrix_eval=True,
+        matrix_eval_out_dir=tmp_path / "me_out",
+    )
+    items = list(SuitTask(config).discover_items())
+
+    matrix_eval = [i for i in items if i.phase_id == "matrix_eval"]
+    assert matrix_eval == [], (
+        "prestaged mode must emit ZERO matrix_eval tasks"
+    )
+
+    dep_graphs = [i for i in items if i.phase_id == "dependency_graph"]
+    assert len(dep_graphs) == 1
+    dg = dep_graphs[0]
+    assert dg.task_id == "dependency_graph"
+    assert dg.type_id == "dep_graph"
+    # No matrix_eval predecessors — the dep_graph task has no cross-phase
+    # deps so the framework can dispatch it immediately.
+    assert dg.task_depends_on == (), (
+        "prestaged dep_graph must have empty task_depends_on"
+    )
+    # Payload signals the dep_graph worker to load from sidecars.
+    assert dg.payload["payload"]["prestaged_matrix_eval"] is True
+    assert dg.payload["payload"]["toolchain_aggregate_drv"] == _TC_AGG
+
+
+def test_discover_items_prestaged_dep_graph_drv_map_from_sidecars(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Integration: the drv map recovered from sidecars matches what the
+    dep_graph worker would receive via predecessor_outputs on a normal run.
+
+    We simulate the worker reading predecessor_outputs by calling
+    load_drv_map_from_sidecars with the expected binary set and verifying
+    the map is byte-identical to what write_drv_map_sidecar persisted.
+    """
+    from compiler_suit_runner.workers.dependency_graph_worker.archive import (
+        write_drv_map_sidecar,
+        load_drv_map_from_sidecars,
+    )
+
+    me_out = tmp_path / "me_out"
+    me_out.mkdir()
+
+    expected = {
+        "hello": "/nix/store/aaaa-matrix-hello.drv",
+        "busybox": "/nix/store/bbbb-matrix-busybox.drv",
+    }
+    for binary, drv in expected.items():
+        write_drv_map_sidecar(me_out, binary, drv)
+
+    recovered = load_drv_map_from_sidecars(me_out, set(expected))
+    assert recovered == expected, (
+        "drv map recovered from sidecars must be byte-identical to what"
+        " the prior matrix_eval run published via task.publish_string"
+    )

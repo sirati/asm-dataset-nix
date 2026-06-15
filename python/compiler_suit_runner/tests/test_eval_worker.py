@@ -804,18 +804,18 @@ def test_run_eval_task_happy_path(
     # Legacy per-binary manifest.json marker is NOT emitted (hard cutover).
     assert not (tmp_path / "hello" / "manifest.json").exists()
     assert not (tmp_path / "hello").exists()
-    # The on-disk JSON sidecar is gone: the matrix_aggregate drv is now
-    # threaded to the dependency_graph successor via the framework's
-    # keyed-outputs API (``Task.publish_string``). On the shared mount
-    # (out_dir) the worker now writes ONLY the per-binary diff archive
-    # (the toolchains.drv.archive present here was placed by the
-    # submitter-upload fake in setup, NOT written by the eval worker).
+    # The eval worker writes the per-binary diff archive AND the drv_map
+    # sidecar JSON (``matrix-<binary>.drv_map.json``) for
+    # ``--prestaged-matrix-eval`` reuse.  The toolchains.drv.archive
+    # present here was placed by the submitter-upload fake in setup, NOT
+    # written by the eval worker.
     siblings = sorted(
         p.name for p in tmp_path.iterdir()
         if p.is_file()
     )
     assert siblings == [
         "matrix-hello.drv.archive",
+        "matrix-hello.drv_map.json",
         "toolchains.drv.archive",
     ], siblings
     # Step 6b: publish_string was called exactly once with the wrapper

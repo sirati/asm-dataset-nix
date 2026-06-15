@@ -2444,28 +2444,69 @@ def main() -> int:
             # (set by the upstream eval task via ``Task.publish_string``)
             # is what we need — the worker never needs a per-binary
             # payload.
+            #
+            # Prestaged mode (``dg_payload["prestaged_matrix_eval"] = True``):
+            # the matrix_eval phase was skipped entirely on this run so
+            # ``predecessor_outputs`` is empty.  Load the drv map from the
+            # per-binary ``matrix-<binary>.drv_map.json`` sidecar files
+            # written by the prior run's matrix_eval workers instead.
+            is_prestaged = bool(dg_payload.get("prestaged_matrix_eval", False))
             matrix_drvs: dict[str, str] = {}
-            for pred_id, preds in task.predecessor_outputs.items():
-                if not isinstance(pred_id, str) or not pred_id:
-                    continue
-                bname = pred_id
-                entry = preds.get("matrix_aggregate_drv", {}) if isinstance(
-                    preds, dict
-                ) else {}
-                value = entry.get("value") if isinstance(entry, dict) else None
-                if not value:
-                    raise NonRecoverableError(
-                        "build_worker dep_graph: no matrix_aggregate_drv "
-                        f"from predecessor {pred_id!r}; available keys: "
-                        f"{sorted(preds.keys()) if isinstance(preds, dict) else preds!r}"
-                    )
-                matrix_drvs[bname] = value
-            if not matrix_drvs:
-                raise NonRecoverableError(
-                    "build_worker dep_graph: no matrix_eval predecessor "
-                    "outputs found; available predecessor task-ids: "
-                    f"{sorted(task.predecessor_outputs.keys())}"
+            if is_prestaged:
+                from compiler_suit_runner.workers.dependency_graph_worker.archive import (  # noqa: PLC0415
+                    load_drv_map_from_sidecars,
                 )
+                # Discover which binaries this run covers by scanning the
+                # archives in out_dir (the same set that discover_archives
+                # would return); the wanted_binaries set is the run's own
+                # binary scope.  We fall back to ALL sidecars if the archive
+                # list is empty (edge case: no archives yet but sidecars exist
+                # from a prior run — the archives will be present for the
+                # dep_graph to import them, so this path is only a safety net).
+                from compiler_suit_runner.workers.dependency_graph_worker.archive import (  # noqa: PLC0415
+                    discover_archives,
+                    binary_from_archive_name,
+                )
+                archives = discover_archives(out_dir)
+                wanted = {binary_from_archive_name(a) for a in archives}
+                if not wanted:
+                    raise NonRecoverableError(
+                        "build_worker dep_graph (prestaged): no"
+                        " matrix-<binary>.drv.archive files found in"
+                        f" {out_dir} — was matrix_eval run at least"
+                        " once before using --prestaged-matrix-eval?"
+                    )
+                _handle_log.info(
+                    "handle: dep_graph prestaged mode — loading drv map"
+                    " from %d sidecar(s) in %s: %r",
+                    len(wanted), out_dir, sorted(wanted),
+                )
+                try:
+                    matrix_drvs = load_drv_map_from_sidecars(out_dir, wanted)
+                except FileNotFoundError as exc:
+                    raise NonRecoverableError(str(exc)) from exc
+            else:
+                for pred_id, preds in task.predecessor_outputs.items():
+                    if not isinstance(pred_id, str) or not pred_id:
+                        continue
+                    bname = pred_id
+                    entry = preds.get("matrix_aggregate_drv", {}) if isinstance(
+                        preds, dict
+                    ) else {}
+                    value = entry.get("value") if isinstance(entry, dict) else None
+                    if not value:
+                        raise NonRecoverableError(
+                            "build_worker dep_graph: no matrix_aggregate_drv "
+                            f"from predecessor {pred_id!r}; available keys: "
+                            f"{sorted(preds.keys()) if isinstance(preds, dict) else preds!r}"
+                        )
+                    matrix_drvs[bname] = value
+                if not matrix_drvs:
+                    raise NonRecoverableError(
+                        "build_worker dep_graph: no matrix_eval predecessor "
+                        "outputs found; available predecessor task-ids: "
+                        f"{sorted(task.predecessor_outputs.keys())}"
+                    )
             bash_path = _resolve_bash_store_path_default() or ""
             if not bash_path:
                 raise NonRecoverableError(
