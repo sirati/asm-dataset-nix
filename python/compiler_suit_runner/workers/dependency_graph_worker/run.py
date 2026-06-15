@@ -178,7 +178,15 @@ def run_dependency_graph_task(
     clock_fn = clock or time.monotonic
     start = clock_fn()
 
-    archives = _archive.discover_archives(matrix_eval_out_dir)
+    # Scope discovery to THIS run's own binaries. ``out/_matrix_eval/``
+    # persists across runs, so a more-packages run submitted into an
+    # existing dataset's shared FS sees prior runs' STALE archives too —
+    # exported by a different image, their cross-image ``nix-store
+    # --import`` fails. ``drv_by_binary`` came from this task's
+    # matrix_eval predecessor outputs, so it is exactly our own set.
+    archives = _archive.discover_archives(
+        matrix_eval_out_dir, wanted_binaries=set(drv_by_binary),
+    )
     if not archives:
         return _empty_result(
             task=task,

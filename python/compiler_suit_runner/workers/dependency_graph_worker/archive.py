@@ -147,13 +147,27 @@ def _is_transient_stderr(stderr: bytes) -> bool:
     return any(marker in low for marker in _TRANSIENT_STDERR_MARKERS)
 
 
-def discover_archives(matrix_eval_out_dir: pathlib.Path) -> list[pathlib.Path]:
-    """Return every ``matrix-<binary>.drv.archive`` under ``matrix_eval_out_dir``.
+def discover_archives(
+    matrix_eval_out_dir: pathlib.Path,
+    *,
+    wanted_binaries: Optional[set[str]] = None,
+) -> list[pathlib.Path]:
+    """Return ``matrix-<binary>.drv.archive`` files under ``matrix_eval_out_dir``.
 
     Sorted by filename for deterministic processing order so the
-    resulting plan and any operator log line is stable across runs. The ``matrix-<binary>.drv.archive`` filename
-    mirrors the matrix-aggregate drv's storename so the archive is
-    self-identifying without out-of-band metadata.
+    resulting plan and any operator log line is stable across runs. The
+    ``matrix-<binary>.drv.archive`` filename mirrors the matrix-aggregate
+    drv's storename so the archive is self-identifying without
+    out-of-band metadata.
+
+    ``wanted_binaries`` scopes the result to a run's OWN binaries. The
+    ``out/_matrix_eval/`` directory persists across runs (a more-packages
+    run submitted into an existing dataset's shared FS reuses it), so it
+    can hold STALE archives from prior runs — exported by a different
+    image whose cross-image ``nix-store --import`` fails — that this run
+    neither needs nor can import. Passing the run's binary set drops them
+    before the import step. ``None`` (the default) returns every archive,
+    for ad-hoc / single-run callers whose directory holds only their own.
     """
     if not matrix_eval_out_dir.is_dir():
         return []
@@ -166,6 +180,8 @@ def discover_archives(matrix_eval_out_dir: pathlib.Path) -> list[pathlib.Path]:
         if p.is_file()
         and p.name.startswith("matrix-")
         and p.name.endswith(".drv.archive")
+        and (wanted_binaries is None
+             or binary_from_archive_name(p) in wanted_binaries)
     )
 
 

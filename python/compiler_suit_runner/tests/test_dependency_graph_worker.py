@@ -147,6 +147,29 @@ class TestDiscoverArchives:
             dgw.binary_from_archive_name(p) for p in out
         ] == ["alpha", "hello", "zebra"]
 
+    def test_wanted_binaries_scopes_out_stale(self, tmp_path: pathlib.Path):
+        # out/_matrix_eval/ persists across runs: a more-packages run
+        # submitted into an existing dataset's shared FS sees prior runs'
+        # archives too. Only this run's own binaries must be returned —
+        # the stale ones were exported by a different image and their
+        # cross-image import fails (the bc-import abort).
+        for b in ("zstd", "brotli", "bc", "zlib"):
+            (tmp_path / f"matrix-{b}.drv.archive").write_bytes(b"x")
+        out = dgw.discover_archives(
+            tmp_path, wanted_binaries={"zstd", "brotli"},
+        )
+        assert [dgw.binary_from_archive_name(p) for p in out] == [
+            "brotli", "zstd",
+        ]
+
+    def test_wanted_binaries_none_returns_all(self, tmp_path: pathlib.Path):
+        # Default (ad-hoc / single-run callers) is unchanged: every
+        # archive in the directory is returned.
+        for b in ("zstd", "bc"):
+            (tmp_path / f"matrix-{b}.drv.archive").write_bytes(b"x")
+        out = dgw.discover_archives(tmp_path, wanted_binaries=None)
+        assert [dgw.binary_from_archive_name(p) for p in out] == ["bc", "zstd"]
+
 
 # ---------------------------------------------------------------------------
 # Variant-lookup derivation from a matrix aggregate drv
