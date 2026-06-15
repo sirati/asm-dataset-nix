@@ -64,6 +64,7 @@ __all__ = [
     "ensure_common_archive_imported",
     "ensure_toolchain_out_archive_imported",
     "ensure_build_deps_archive_imported",
+    "ensure_common_dep_out_archive_imported",
 ]
 
 
@@ -1206,6 +1207,180 @@ def ensure_toolchain_out_archive_imported(
     )
 
 
+# Per-process set of common-dep ids whose published OUTPUT archive has
+# already been imported on this worker.  Keyed by cd_id (the drv-ident
+# store-hash) so a node imports each shared dep's closure exactly once.
+_imported_common_dep_out_ids: set[str] = set()
+
+
+def ensure_common_dep_out_archive_imported(
+    cd_id: Optional[str],
+    matrix_eval_out_dir: Optional[pathlib.Path],
+    *,
+    expected_outpath: Optional[str] = None,
+    run_subprocess: Optional[Callable[..., tuple[bytes, bytes, int]]] = None,
+) -> None:
+    """Import a published common-dep OUTPUT closure once per (cd_id, process).
+
+    Each ``build_common_dep`` task publishes its realised output closure
+    as ``<matrix_eval_out_dir>/<COMMON_DEPS_SUBDIR>/common-<cd_id>.out.archive``
+    (see :func:`_publish_common_dep_archive`).  The per-machine affine
+    import gate ``import_common_dep_<cd_id>`` invokes this helper so every
+    dependent ``build_variant`` finds the shared dep's output already in
+    the local store — NO peer substituter query for that path.
+
+    PUBLISHER-SKIP (the producing-node short-circuit): the secondary that
+    BUILT and published this common_dep already has the output in its local
+    store.  This helper is a verified NO-OP on that node — when
+    ``expected_outpath`` is supplied and ``is_path_locally_present`` reports
+    it valid, the import is skipped (we never re-import our own product,
+    and never block on importing it).  See the FRAMEWORK API GAP note in the
+    module docstring: there is no framework primitive to mark a specific
+    affine-gate INSTANCE already-satisfied on the producing node, so this
+    path-presence probe is the consumer-side approximation.
+
+    HARD FAIL on a genuine miss: a missing, zero-byte, or un-importable
+    archive (when the path is NOT already present) raises
+    :class:`RuntimeError`.  There is intentionally NO substituter fallback
+    for the common-dep closure — that fallback is exactly what this feature
+    obsoletes.
+
+    ``cd_id`` or ``matrix_eval_out_dir`` being ``None`` / empty (legacy
+    manifests, tests that don't wire the gate) is a no-op.
+    """
+    if not cd_id or matrix_eval_out_dir is None:
+        return
+    if cd_id in _imported_common_dep_out_ids:
+        return
+    # Publisher-skip: the path is already valid locally (we built it, or
+    # a prior task on this node already imported it).  Mark seen + return.
+    if expected_outpath:
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            archive as _archive,
+        )
+        if _archive.is_path_locally_present(
+            expected_outpath, run_subprocess=run_subprocess,
+        ):
+            _imported_common_dep_out_ids.add(cd_id)
+            return
+    _imported_common_dep_out_ids.add(cd_id)
+    from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
+    archive_name = _preflight.common_dep_archive_name(cd_id)
+    archive_path = (
+        matrix_eval_out_dir / _preflight.COMMON_DEPS_SUBDIR / archive_name
+    )
+    _import_archive_hard(
+        archive_path, archive_name, run_subprocess=run_subprocess,
+    )
+
+
+def _publish_common_dep_archive(
+    ident: str,
+    outpath: str,
+    matrix_eval_out_dir: Optional[pathlib.Path],
+    *,
+    run_subprocess: Optional[Callable[[list[str]], tuple[bytes, bytes, int]]] = None,
+) -> None:
+    """Export a built common-dep's OUTPUT closure to the shared FS.
+
+    Mirrors the toolchain split publish: walk the closure of ``outpath``
+    via ``nix-store --query --requisites`` and pipe it through
+    ``nix-store --export`` into
+    ``<matrix_eval_out_dir>/<COMMON_DEPS_SUBDIR>/common-<id>.out.archive``,
+    writing a ``.sha256`` sidecar and SKIPPING the export when the existing
+    sidecar already matches (skip-if-unchanged — the content-addressed
+    archive is byte-identical across re-runs with the same inputs, so a
+    matching sidecar means the shared FS already carries it).
+
+    ``<id>`` is derived from the drv ``ident`` (NOT the realised
+    ``outpath``) so the same id the per-machine affine gate
+    ``import_common_dep_<id>`` was wired with selects this file — see
+    :func:`compiler_suit_runner.preflight.common_dep_id_for_ident`.
+
+    Best-effort: any failure is logged and swallowed.  The downstream
+    affine gate HARD-FAILS if the archive is genuinely missing, so a
+    publish failure surfaces there (on the consuming node) rather than
+    failing the producing node's otherwise-successful build.  ``ident`` /
+    ``outpath`` empty, or ``matrix_eval_out_dir`` ``None`` (legacy / tests),
+    is a no-op.
+    """
+    if not ident or not outpath or matrix_eval_out_dir is None:
+        return
+    try:
+        from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
+        from compiler_suit_runner.workers.build_compilers_worker import (  # noqa: PLC0415
+            export_closure,
+        )
+
+        try:
+            archive_name = _preflight.common_dep_archive_name(ident)
+        except ValueError:
+            _LOG.warning(
+                "common_dep publish: cannot derive archive id from ident %r;"
+                " skipping export",
+                ident,
+            )
+            return
+        out_subdir = matrix_eval_out_dir / _preflight.COMMON_DEPS_SUBDIR
+        archive_path = out_subdir / archive_name
+        sidecar_path = out_subdir / f"{archive_name}.sha256"
+
+        # Skip-if-unchanged: a present sidecar AND a present archive mean a
+        # prior task (this run or a same-inputs prior run) already published
+        # the byte-identical closure.  The archive is content-addressed, so
+        # we trust the sidecar's existence next to a non-empty archive.
+        try:
+            if (
+                sidecar_path.is_file()
+                and archive_path.is_file()
+                and archive_path.stat().st_size > 0
+            ):
+                _LOG.info(
+                    "common_dep publish: %s already present (sidecar match);"
+                    " skipping export",
+                    archive_name,
+                )
+                return
+        except OSError:
+            pass  # fall through and (re-)export
+
+        ok, req_stderr, exp_stderr = export_closure(
+            archive_path, [outpath], run_subprocess=run_subprocess,
+        )
+        if not ok:
+            _LOG.warning(
+                "common_dep publish: export of %s closure (%s) failed:"
+                " requisites=%s export=%s",
+                ident, outpath,
+                req_stderr.decode("utf-8", errors="replace").strip(),
+                exp_stderr.decode("utf-8", errors="replace").strip(),
+            )
+            return
+        # Sidecar AFTER a successful export so a partial export never leaves
+        # a matching sidecar that would suppress a re-publish.
+        try:
+            import hashlib  # noqa: PLC0415
+            h = hashlib.sha256()
+            with open(archive_path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            sidecar_path.write_text(h.hexdigest() + "\n", encoding="utf-8")
+        except OSError as exc:
+            _LOG.warning(
+                "common_dep publish: sidecar write for %s failed: %s",
+                archive_name, exc,
+            )
+        _LOG.info(
+            "common_dep publish: exported %s (closure of %s)",
+            archive_name, outpath,
+        )
+    except Exception as exc:  # noqa: BLE001 — publish is best-effort
+        _LOG.warning(
+            "common_dep publish: unexpected error exporting %r closure: %s",
+            ident, exc,
+        )
+
+
 def _run_import_prelude(
     item_class: str,
     payload: dict,
@@ -1587,6 +1762,25 @@ def build_worker(
         _maybe_record_self_has(
             env, success_outpath, drv_str, "common_dep",
         )
+        # Publish the realised output closure to the shared FS so the
+        # per-machine affine import gate (import_common_dep_<id>) can
+        # import it on every other node — obsoleting the peer substituter
+        # as the transport for this shared dep.  Keyed on the drv ``ident``
+        # (matches the gate id the wiring side derived).  Best-effort:
+        # a publish failure surfaces on the consuming node's hard-failing
+        # gate, not here on the producing node's successful build.
+        cd_ident = (
+            payload.get("ident")
+            if isinstance(payload.get("ident"), str)
+            else None
+        )
+        if cd_ident:
+            _publish_common_dep_archive(
+                cd_ident,
+                success_outpath,
+                env.matrix_eval_out_dir,
+                run_subprocess=env.run_subprocess,
+            )
 
     _LOG.info("build DONE common_dep=%s outpath=%s", name, success_outpath)
     return BuildWorkerResult(

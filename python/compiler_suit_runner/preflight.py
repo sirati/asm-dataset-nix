@@ -1146,6 +1146,63 @@ def toolchain_delta_archive_name(outpath: str) -> str:
     return f"toolchains.{toolchain_id_for_outpath(outpath)}.out.archive"
 
 
+# Subdirectory under ``matrix_eval_out_dir`` where ``build_common_dep``
+# tasks publish their realised OUTPUT closure archive
+# (``common-<id>.out.archive``).  Kept in its OWN subdir so the
+# per-binary ``discover_archives`` matrix glob (``matrix-*.drv.archive``
+# at the top level) never picks these up, and so an operator can
+# ``ls _matrix_eval/_common_deps/`` to see every shared-dep archive.
+COMMON_DEPS_SUBDIR = "_common_deps"
+
+
+def common_dep_id_for_ident(ident_str: str) -> str:
+    """Derive a stable, filesystem-safe id for a common-dep ident.
+
+    A ``build_common_dep`` descriptor is keyed on the drv ident
+    ``"<hash>-<name>"`` (the streaming planner's
+    :func:`dependency_graph_planner._ident_to_str` shape).  The Nix
+    store-hash is the first ``-``-delimited token; it is content-
+    addressed (stable across re-runs with the same inputs), always
+    filesystem-safe (``[a-z0-9]``), and short enough to compose cleanly
+    into an archive filename and a gate task_id.
+
+    The id is derivable on BOTH sides of the affine-gate handoff:
+
+    * the spawn/wiring side knows the ``build_common_dep__<ident_str>``
+      task_id (so it can strip the prefix and call this), and
+    * the build worker knows ``payload["ident"]`` (the same
+      ``ident_str``) when it publishes the archive after the build.
+
+    Deriving from the drv ident (NOT the realised output path) is what
+    keeps the two sides in agreement: the worker does not know the gate
+    id at wire-time, and the wiring side does not know the realised
+    output hash — only the drv ident is common to both.
+
+    Raises :class:`ValueError` for an ident with no extractable hash
+    (empty string, or a leading-dash form).
+    """
+    # Tolerate a bare ``.drv`` suffix on the ident name half; the hash
+    # token (before the first dash) is unaffected by it.
+    head = ident_str.split("-", 1)[0]
+    if not head:
+        raise ValueError(
+            f"common_dep_id_for_ident: cannot extract store hash from "
+            f"{ident_str!r}"
+        )
+    return head
+
+
+def common_dep_archive_name(ident_str: str) -> str:
+    """Return the published archive filename for a common-dep ident.
+
+    Format: ``common-<id>.out.archive`` where ``<id>`` is derived via
+    :func:`common_dep_id_for_ident`.  The build worker writes this under
+    ``<matrix_eval_out_dir>/<COMMON_DEPS_SUBDIR>/<name>``; the per-machine
+    affine import gate reads it from the same location.
+    """
+    return f"common-{common_dep_id_for_ident(ident_str)}.out.archive"
+
+
 @dataclasses.dataclass
 class ToolchainSplit:
     """Result of :func:`compute_toolchain_split`.

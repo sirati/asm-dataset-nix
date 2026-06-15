@@ -1194,6 +1194,52 @@ def test_toolchain_delta_archive_name() -> None:
 
 
 # ---------------------------------------------------------------------------
+# common_dep_id_for_ident / common_dep_archive_name (affine common_dep gate)
+# ---------------------------------------------------------------------------
+
+
+def test_common_dep_id_for_ident_extracts_hash() -> None:
+    """The leading store-hash token of a ``<hash>-<name>`` ident is the id."""
+    from compiler_suit_runner.preflight import common_dep_id_for_ident  # noqa: PLC0415
+
+    assert common_dep_id_for_ident("abc123xyz-flex-2.6.4") == "abc123xyz"
+
+
+def test_common_dep_id_for_ident_tolerates_drv_suffix() -> None:
+    """A ``.drv`` suffix on the name half does not change the hash token."""
+    from compiler_suit_runner.preflight import common_dep_id_for_ident  # noqa: PLC0415
+
+    assert common_dep_id_for_ident("hash0000-flex.drv") == "hash0000"
+
+
+def test_common_dep_id_for_ident_idempotent_on_bare_hash() -> None:
+    """A bare hash (no dash) round-trips to itself — the import action passes
+    the already-stripped hash back through this helper."""
+    from compiler_suit_runner.preflight import common_dep_id_for_ident  # noqa: PLC0415
+
+    assert common_dep_id_for_ident("abc123xyz") == "abc123xyz"
+
+
+def test_common_dep_id_for_ident_raises_for_leading_dash() -> None:
+    """An ident with no extractable hash (leading dash / empty) raises."""
+    from compiler_suit_runner.preflight import common_dep_id_for_ident  # noqa: PLC0415
+
+    with pytest.raises(ValueError):
+        common_dep_id_for_ident("-flex-2.6.4")
+    with pytest.raises(ValueError):
+        common_dep_id_for_ident("")
+
+
+def test_common_dep_archive_name() -> None:
+    """Archive name is ``common-<hash>.out.archive``."""
+    from compiler_suit_runner.preflight import common_dep_archive_name  # noqa: PLC0415
+
+    assert common_dep_archive_name("abc123xyz-flex-2.6.4") == "common-abc123xyz.out.archive"
+    # Derivable from the already-stripped hash too (import-action side).
+    assert common_dep_archive_name("abc123xyz") == "common-abc123xyz.out.archive"
+
+
+# ---------------------------------------------------------------------------
 # compute_toolchain_split
 # ---------------------------------------------------------------------------
 

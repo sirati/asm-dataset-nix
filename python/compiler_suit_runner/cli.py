@@ -494,6 +494,23 @@ def build_parser() -> argparse.ArgumentParser:
             "Also via env CSR_BUILD_DEPS_LOCAL=1."
         ),
     )
+    # Per-common_dep affine OUTPUT-import gate. ON by default: each
+    # build_common_dep publishes its realised output closure to the shared
+    # FS and a per-machine affine gate imports it, so build_variants gate on
+    # that import instead of pulling the output via a peer substituter
+    # (harmonia). ``--no-common-deps-affine`` restores the legacy
+    # substituter-as-transport path for common_deps.
+    p_submit.add_argument(
+        "--no-common-deps-affine",
+        dest="common_deps_affine",
+        action="store_false",
+        default=True,
+        help=(
+            "Restore the legacy peer-substituter (harmonia) transport for "
+            "dependency-graph shared deps instead of the per-common_dep "
+            "affine OUTPUT-import gate. Default: affine gate ON."
+        ),
+    )
     _restore_framework_flag_defaults(p_submit)
 
     p_secondary = sub.add_parser(
@@ -680,6 +697,10 @@ def _config_from_args(
         # build_deps_local: OFF by default; caller resolves via
         # _resolve_build_deps_local when building the submit config.
         build_deps_local=getattr(args, "_build_deps_local_resolved", False),
+        # common_deps_affine: ON by default; --no-common-deps-affine flips it
+        # to restore the legacy substituter transport for common_deps. Only
+        # takes effect when matrix_eval_out_dir is set (the archive root).
+        common_deps_affine=getattr(args, "common_deps_affine", True),
     )
 
 

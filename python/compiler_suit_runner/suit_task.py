@@ -224,6 +224,73 @@ def _import_matrix_drv_task_id(binary: str) -> str:
     return f"import_matrix_drv_{binary}"
 
 
+# Prefix for the per-common_dep secondary-affine OUTPUT-import gate.
+# One gate per distinct shared dep (keyed on the drv-ident hash); created
+# DYNAMICALLY during the dependency_graph phase (common_deps are discovered
+# at plan time, not pre-flight), and depended on by every build_variant /
+# build_common_dep that needs that shared dep — so no node ever queries a
+# peer substituter for a common_dep output.
+IMPORT_COMMON_DEP_TASK_PREFIX = "import_common_dep_"
+
+
+def _import_common_dep_task_id(ident_str: str) -> str:
+    """Return the per-common_dep OUTPUT-import gate task_id for an ident.
+
+    Derives a stable, filesystem-safe id from the common-dep drv ident
+    (``"<hash>-<name>"``) via
+    :func:`~compiler_suit_runner.preflight.common_dep_id_for_ident` and
+    returns ``"import_common_dep_<hash>"``.  The same id selects the
+    published archive ``common-<hash>.out.archive`` — so the gate, the
+    build worker's publish step, and the import action all agree without
+    any out-of-band map.
+
+    Raises :class:`ValueError` when the ident has no extractable hash
+    (propagated from ``common_dep_id_for_ident``); callers that derive the
+    ident from a ``build_common_dep__<ident>`` task_id catch + skip.
+    """
+    from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
+    return f"{IMPORT_COMMON_DEP_TASK_PREFIX}{_preflight.common_dep_id_for_ident(ident_str)}"
+
+
+def _ident_from_common_dep_task_id(task_id: str) -> Optional[str]:
+    """Recover the drv ``ident_str`` from a ``build_common_dep`` task_id.
+
+    The dependency-graph planner mints common-dep task_ids in two shapes
+    (see :mod:`compiler_suit_runner.dependency_graph_planner.descriptors`
+    and ``.plan_meta``):
+
+    * ``build_common_dep__<ident_str>``                  (per-cell)
+    * ``build_common_dep__arch_indep__<binary>__<ident_str>``
+    * ``build_common_dep__cross_arch__<ident_str>``      (meta)
+    * ``build_common_dep__family__<family>__<ident_str>`` (meta)
+
+    The ``<ident_str>`` is ALWAYS the trailing ``"<hash>-<name>"`` token.
+    This helper returns it (the substring after the last structural
+    ``"__"`` separator), or ``None`` if ``task_id`` is not a
+    ``build_common_dep`` id.  The id is only ever used to derive the gate
+    hash via :func:`common_dep_id_for_ident`, which takes the leading hash
+    token — so a slightly over-greedy split (e.g. an ident name half that
+    itself contains ``__``) still yields the correct hash.
+    """
+    prefix = "build_common_dep__"
+    if not task_id.startswith(prefix):
+        return None
+    rest = task_id[len(prefix):]
+    # Strip the known structural infixes so only ``<ident_str>`` remains.
+    for infix in ("arch_indep__", "cross_arch__", "family__"):
+        if rest.startswith(infix):
+            rest = rest[len(infix):]
+            # arch_indep/family carry an extra ``<binary>__`` / ``<family>__``
+            # segment before the ident; take everything after the FIRST
+            # remaining ``__`` (the ident is the trailing token).
+            if infix in ("arch_indep__", "family__"):
+                _seg, sep, tail = rest.partition("__")
+                if sep:
+                    rest = tail
+            break
+    return rest or None
+
+
 def _import_tc_task_id(toolchain_outpath: str) -> str:
     """Return the import gate task_id for a realized toolchain outpath.
 
@@ -741,11 +808,43 @@ class _PeerLifecycleListener:
 # ---------------------------------------------------------------------------
 
 
+def _common_dep_gate_deps(header: ManifestHeader) -> list[str]:
+    """Per-common_dep affine OUTPUT-import gate deps for a build header.
+
+    A ``build_variant`` (or a ``build_common_dep`` with transitive shared
+    deps) lists its shared-dep prerequisites as ``build_common_dep__<ident>``
+    bare-string entries in ``header.task_depends_on``.  For EACH of those we
+    add the matching ``import_common_dep_<id>`` gate so the realised output
+    closure of that shared dep is IMPORTED on this machine (from the
+    producer's published archive) rather than pulled via a peer substituter.
+
+    The build_common_dep task ITSELF stays in ``task_depends_on`` (the build
+    of the shared dep must finish before the variant builds); the gate is an
+    ADDITIONAL intra-phase dep that guarantees the OUTPUT is locally present
+    without substitution.  Deduped + sorted for stable diffs.  Idents whose
+    hash can't be derived are skipped (defensive — never strand a variant on
+    an unparseable legacy id).
+    """
+    gate_ids: set[str] = set()
+    for dep in header.task_depends_on:
+        if not isinstance(dep, str):
+            continue
+        ident_str = _ident_from_common_dep_task_id(dep)
+        if not ident_str:
+            continue
+        try:
+            gate_ids.add(_import_common_dep_task_id(ident_str))
+        except ValueError:
+            continue  # undecodable ident — skip rather than strand
+    return sorted(gate_ids)
+
+
 def _header_depends_on(
     header: ManifestHeader,
     *,
     build_deps_local: bool = False,
     matrix_eval_gates: bool = False,
+    common_dep_gates: bool = False,
 ) -> tuple:
     """Assemble a header's full ``task_depends_on`` tuple.
 
@@ -777,6 +876,11 @@ def _header_depends_on(
       ``header.payload["pkg"]`` when ``matrix_eval_gates`` is True (the
       per-binary matrix-drv-graph archive import gate).  Silently skipped
       when ``pkg`` is absent from the payload (legacy fixtures).
+    * ``build_common_dep`` / ``build_variant`` → ``import_common_dep_<id>``
+      for EACH ``build_common_dep__<ident>`` in ``task_depends_on`` when
+      ``common_dep_gates`` is True (the per-shared-dep OUTPUT-closure import
+      gate — the affine transport that obsoletes the peer substituter for
+      common_deps).  See :func:`_common_dep_gate_deps`.
     """
     toolchain_deps = tuple(
         _make_task_dep(tc_id, phase_id=Phase.BUILD_COMPILERS)
@@ -790,6 +894,8 @@ def _header_depends_on(
             import_deps.append(IMPORT_BUILD_DEPS_TASK_ID)
         if matrix_eval_gates:
             import_deps.append(IMPORT_TOOLCHAIN_DRV_TASK_ID)
+        if common_dep_gates:
+            import_deps.extend(_common_dep_gate_deps(header))
     if header.item_class == "build_variant":
         toolchain_outpath = header.payload.get("toolchain_outpath") or ""
         if toolchain_outpath:
@@ -804,7 +910,7 @@ def _header_depends_on(
     return tuple(header.task_depends_on) + tuple(import_deps) + toolchain_deps
 
 
-def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = False, build_deps_local: bool = False, matrix_eval_gates: bool = False):
+def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = False, build_deps_local: bool = False, matrix_eval_gates: bool = False, common_dep_gates: bool = False):
     """Convert one :class:`ManifestHeader` directly into a framework
     ``TaskInfo``. Mirrors the call shape used by
     :func:`_make_task_info` (the disk-round-trip path used by
@@ -854,7 +960,7 @@ def _header_to_task_info(header: ManifestHeader, *, disable_task_deps: bool = Fa
         affinity_id=affinity_id,
         payload=header_dict,
         task_id=header.task_id or "",
-        task_depends_on=() if disable_task_deps else _header_depends_on(header, build_deps_local=build_deps_local, matrix_eval_gates=matrix_eval_gates),
+        task_depends_on=() if disable_task_deps else _header_depends_on(header, build_deps_local=build_deps_local, matrix_eval_gates=matrix_eval_gates, common_dep_gates=common_dep_gates),
     )
 
 
@@ -1005,6 +1111,22 @@ class SuitTaskConfig:
     # task fires.  Default FALSE = byte-identical current behaviour.
     build_deps_local: bool = False
 
+    # Feature flag: obsolete the peer substituter (harmonia) as the
+    # transport for dependency-graph shared deps (``build_common_dep``).
+    # When True AND ``matrix_eval_out_dir`` is set, each build_common_dep
+    # task PUBLISHES its realised output closure to
+    # ``<matrix_eval_out_dir>/_common_deps/common-<id>.out.archive`` and a
+    # per-shared-dep secondary-affine gate (``import_common_dep_<id>``,
+    # spawned dynamically alongside the dep_graph descriptors) IMPORTS it
+    # once per machine.  Every dependent build_variant / build_common_dep
+    # gates on that import instead of substituting the output — so no node
+    # ever queries a peer substituter for a common_dep.  The producing node
+    # short-circuits its own gate via an ``is_path_locally_present`` probe
+    # (the path is already valid there).  Default TRUE: the substituter is
+    # a defensive fallback only, never the intended transport.  Set FALSE
+    # to fully restore the legacy substituter-as-transport behaviour.
+    common_deps_affine: bool = True
+
 
 # ---------------------------------------------------------------------------
 # SuitTask
@@ -1089,6 +1211,15 @@ class SuitTask:
         self._streamed_expected_total: Optional[int] = None
         self._streamed_summary_counters: Optional[dict] = None
         self._streamed_summary_batches: Optional[int] = None
+        # Per-run set of per-common_dep affine gate task_ids already
+        # spawned dynamically during the dependency_graph stream. These
+        # gates are EXTRA tasks the primary synthesises (one per distinct
+        # shared dep, ``is_secondary_affine=True``) — NOT descriptors the
+        # worker emitted — so they are tracked SEPARATELY and never counted
+        # toward ``_streamed_spawned_count`` (which the on_phase_end barrier
+        # reconciles against the worker's descriptor total). Reset per run in
+        # ``on_phase_start`` so a restream doesn't double-spawn or stale-dedup.
+        self._spawned_common_dep_gate_ids: set[str] = set()
         self._setup_done: bool = False
         self._setup_lock = threading.Lock()
 
@@ -1137,6 +1268,7 @@ class SuitTask:
         * ``import_toolchain_drv``       → :func:`ensure_toolchain_archive_imported`
         * ``import_matrix_drv_<binary>`` → :func:`ensure_binary_archive_imported`
         * ``import_tc_<hash>``           → :func:`ensure_toolchain_out_archive_imported`
+        * ``import_common_dep_<id>``     → :func:`ensure_common_dep_out_archive_imported`
 
         When ``config.matrix_eval_out_dir`` is ``None`` (legacy / test
         flows) this property returns ``None`` and the framework never fires
@@ -1159,6 +1291,20 @@ class SuitTask:
                 ensure_build_deps_archive_imported(out_dir)
             elif task_id == IMPORT_TOOLCHAIN_DRV_TASK_ID:
                 ensure_toolchain_archive_imported(out_dir)
+            elif task_id.startswith(IMPORT_COMMON_DEP_TASK_PREFIX):
+                # Per-common_dep OUTPUT-import gate. The trailing token is
+                # the cd_id (the drv-ident hash). The import is idempotent:
+                # on the PRODUCING node the closure is already valid in the
+                # local store, so ``nix-store --import`` skips every path
+                # (no substituter query, no rebuild) — the consumer-side
+                # publisher-skip approximation. See the FRAMEWORK API GAP
+                # note: a per-instance "already-satisfied on producer"
+                # primitive would let us skip reading the archive entirely.
+                from compiler_suit_runner.workers.build_worker import (  # noqa: PLC0415
+                    ensure_common_dep_out_archive_imported,
+                )
+                cd_id = task_id[len(IMPORT_COMMON_DEP_TASK_PREFIX):]
+                ensure_common_dep_out_archive_imported(cd_id, out_dir)
             elif task_id.startswith("import_matrix_drv_"):
                 binary = task_id[len("import_matrix_drv_"):]
                 ensure_binary_archive_imported(binary, out_dir)
@@ -1558,6 +1704,21 @@ class SuitTask:
             header,
             build_deps_local=self.config.build_deps_local,
             matrix_eval_gates=(self.config.matrix_eval_out_dir is not None),
+            common_dep_gates=self._common_dep_gates_enabled,
+        )
+
+    @property
+    def _common_dep_gates_enabled(self) -> bool:
+        """True when per-common_dep affine OUTPUT-import gates are active.
+
+        Requires both the ``common_deps_affine`` flag (default True) AND a
+        shared archive root (``matrix_eval_out_dir``) for the published
+        ``common-<id>.out.archive`` files to live in.  When False the
+        legacy peer-substituter transport carries common_dep outputs.
+        """
+        return (
+            self.config.common_deps_affine
+            and self.config.matrix_eval_out_dir is not None
         )
 
     # ── Memory estimator (disabled) ───────────────────────────────────
@@ -2650,6 +2811,7 @@ class SuitTask:
             self._streamed_expected_total = None
             self._streamed_summary_counters = None
             self._streamed_summary_batches = None
+            self._spawned_common_dep_gate_ids = set()
 
     def on_phase_end(
         self,
@@ -2830,23 +2992,94 @@ class SuitTask:
                 f" spawn_batch seq={msg['seq']} from {origin}"
             )
         headers = headers_from_descriptors(msg["descriptors"])
+        common_dep_gates = self._common_dep_gates_enabled
         task_infos = [
             _header_to_task_info(
                 header,
                 disable_task_deps=self.config.disable_task_deps,
                 build_deps_local=self.config.build_deps_local,
                 matrix_eval_gates=(self.config.matrix_eval_out_dir is not None),
+                common_dep_gates=common_dep_gates,
             )
             for header in headers
         ]
+        # Synthesise + spawn the per-common_dep affine OUTPUT-import gates
+        # for every NEW build_common_dep in this batch. The gate is an
+        # EXTRA task (not a worker descriptor): it depends on the
+        # build_common_dep task that publishes the archive, so other nodes
+        # only fire it after the archive exists. Each gate's task_id is
+        # unique per shared dep, so re-streaming a batch (failover replay)
+        # re-presents the same id and ``spawn_tasks`` drops the duplicate
+        # idempotently — but we also dedup locally to avoid re-listing.
+        gate_infos: list[Any] = []
+        if common_dep_gates and not self.config.disable_task_deps:
+            gate_infos = self._build_common_dep_gate_infos(headers)
+        all_infos = task_infos + gate_infos
         self._logger.info(
             "custom_message_handler: spawn_batch seq=%d from %s;"
-            " spawning %d task(s)",
-            msg["seq"], origin, len(task_infos),
+            " spawning %d descriptor task(s) + %d common_dep gate(s)",
+            msg["seq"], origin, len(task_infos), len(gate_infos),
         )
-        errors = primary_handle.spawn_tasks(task_infos) or []
+        errors = primary_handle.spawn_tasks(all_infos) or []
+        # Error indices map onto ``all_infos``; the per-error logger uses
+        # ``headers`` only for the descriptor prefix, so gate-index errors
+        # fall through to the generic branch (offending=None) — acceptable
+        # for the rare gate spawn error.
         self._log_spawn_errors(errors, headers)
+        # Only descriptor tasks count toward the reconciliation total; the
+        # gates are primary-synthesised extras the worker never enumerated.
         self._streamed_spawned_count += len(task_infos)
+
+    def _build_common_dep_gate_infos(self, headers: list[ManifestHeader]) -> list[Any]:
+        """Synthesise per-common_dep affine OUTPUT-import gate TaskInfos.
+
+        For every ``build_common_dep`` header in this batch NOT yet gated
+        this run, build one ``is_secondary_affine=True`` gate
+        (``import_common_dep_<id>``) that depends on the build_common_dep
+        task. Returns the new gate TaskInfos (already recorded in
+        ``self._spawned_common_dep_gate_ids`` so a later batch / replay
+        doesn't re-emit them). Gates are deduped by task_id across the run.
+        """
+        new_gates: list[Any] = []
+        for header in headers:
+            if header.item_class != "build_common_dep":
+                continue
+            ident_str = _ident_from_common_dep_task_id(header.task_id or "")
+            if not ident_str:
+                continue
+            try:
+                gate_id = _import_common_dep_task_id(ident_str)
+            except ValueError:
+                continue
+            if gate_id in self._spawned_common_dep_gate_ids:
+                continue
+            self._spawned_common_dep_gate_ids.add(gate_id)
+            new_gates.append(
+                _make_task_info(
+                    pathlib.Path(f"{gate_id}.json"),
+                    0,
+                    phase_id=Phase.BUILD,
+                    type_id="toolchain_import",
+                    affinity_id=None,
+                    payload={
+                        "item_class": "toolchain_import",
+                        "task_id": gate_id,
+                        # ``ident`` lets the import action / a future
+                        # payload-driven path recover the shared-dep id
+                        # without re-parsing the task_id.
+                        "ident": ident_str,
+                    },
+                    # The gate depends on the build_common_dep task that
+                    # PUBLISHES the archive (intra-phase bare string), so on
+                    # every OTHER node the gate only fires once the archive
+                    # exists. The producing node short-circuits via the
+                    # import action's is_path_locally_present probe.
+                    task_id=gate_id,
+                    task_depends_on=(header.task_id,) if header.task_id else (),
+                    is_secondary_affine=True,
+                )
+            )
+        return new_gates
 
     def _handle_streamed_summary(self, origin: str, msg: dict) -> None:
         """Record (or reconcile a redelivery of) the terminal summary."""

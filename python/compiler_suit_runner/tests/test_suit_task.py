@@ -2343,3 +2343,240 @@ def test_header_task_depends_on_includes_drv_gates_when_matrix_eval_out_dir(
     bare = [d for d in deps if isinstance(d, str)]
     assert IMPORT_TOOLCHAIN_DRV_TASK_ID in bare
     assert _import_matrix_drv_task_id("hello") in bare
+
+
+# ---------------------------------------------------------------------------
+# Per-common_dep affine OUTPUT-import gate (obsoletes harmonia for common_deps)
+# ---------------------------------------------------------------------------
+
+
+def test_import_common_dep_task_id_derives_from_ident() -> None:
+    """The gate id is ``import_common_dep_<hash>`` for a ``<hash>-<name>``
+    ident, derivable on both the wiring and worker sides."""
+    from compiler_suit_runner.suit_task import _import_common_dep_task_id  # noqa: PLC0415
+
+    assert (
+        _import_common_dep_task_id("abc123-flex-2.6.4")
+        == "import_common_dep_abc123"
+    )
+
+
+def test_ident_from_common_dep_task_id_all_shapes() -> None:
+    """Every planner-minted build_common_dep task_id shape yields the trailing
+    ``<ident_str>`` whose hash the gate id is derived from."""
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        _ident_from_common_dep_task_id,
+        _import_common_dep_task_id,
+    )
+
+    cases = {
+        # per-cell
+        "build_common_dep__abc123-flex.drv": "abc123-flex.drv",
+        # arch-indep (binary segment in the middle)
+        "build_common_dep__arch_indep__hello__def456-zlib.drv": "def456-zlib.drv",
+        # meta cross_arch
+        "build_common_dep__cross_arch__ghi789-glibc.drv": "ghi789-glibc.drv",
+        # meta family
+        "build_common_dep__family__gcc__jkl012-libgcc.drv": "jkl012-libgcc.drv",
+    }
+    for task_id, expected_ident in cases.items():
+        assert _ident_from_common_dep_task_id(task_id) == expected_ident
+        # And each yields a stable, hash-keyed gate id.
+        gate = _import_common_dep_task_id(_ident_from_common_dep_task_id(task_id))
+        assert gate.startswith("import_common_dep_")
+
+    # A non-common_dep id returns None (not a common_dep edge).
+    assert _ident_from_common_dep_task_id("build_variant__x__y__z") is None
+    assert _ident_from_common_dep_task_id("import_common") is None
+
+
+def test_header_depends_on_variant_includes_common_dep_gate() -> None:
+    """A build_variant depending on ``build_common_dep__<ident>`` also gets the
+    matching ``import_common_dep_<hash>`` affine gate when common_dep_gates on."""
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        _header_depends_on,
+        _import_common_dep_task_id,
+    )
+
+    header = ManifestHeader(
+        item_class="build_variant",
+        name="hello-x86_64-gcc15-O0",
+        size=0,
+        payload={"sys": _SYS, "pkg": "hello", "arch": "x86_64"},
+        task_id="build_variant__x86_64-linux__hello__gcc15-O0",
+        task_depends_on=("build_common_dep__abc123-flex.drv",),
+    )
+    deps = _header_depends_on(header, common_dep_gates=True)
+    bare = [d for d in deps if isinstance(d, str)]
+    # The build_common_dep task stays a dep AND the affine gate is added.
+    assert "build_common_dep__abc123-flex.drv" in bare
+    assert _import_common_dep_task_id("abc123-flex.drv") in bare
+
+
+def test_header_depends_on_variant_no_common_dep_gate_when_disabled() -> None:
+    """With common_dep_gates off, no import_common_dep_* gate is added (legacy
+    substituter transport)."""
+    from compiler_suit_runner.suit_task import _header_depends_on  # noqa: PLC0415
+
+    header = ManifestHeader(
+        item_class="build_variant",
+        name="hello-x86_64-gcc15-O0",
+        size=0,
+        payload={"sys": _SYS, "pkg": "hello", "arch": "x86_64"},
+        task_id="build_variant__x86_64-linux__hello__gcc15-O0",
+        task_depends_on=("build_common_dep__abc123-flex.drv",),
+    )
+    deps = _header_depends_on(header, common_dep_gates=False)
+    bare = [d for d in deps if isinstance(d, str)]
+    assert not any(d.startswith("import_common_dep_") for d in bare)
+
+
+def test_header_depends_on_common_dep_with_transitive_dep_gets_gate() -> None:
+    """A build_common_dep that itself depends on another common_dep gets that
+    sibling's affine gate too (transitive shared deps)."""
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        _header_depends_on,
+        _import_common_dep_task_id,
+    )
+
+    header = ManifestHeader(
+        item_class="build_common_dep",
+        name="common_dep__cross",
+        size=0,
+        payload={"ident": "top000-cross.drv"},
+        task_id="build_common_dep__top000-cross.drv",
+        task_depends_on=("build_common_dep__sub111-base.drv",),
+    )
+    deps = _header_depends_on(header, common_dep_gates=True)
+    bare = [d for d in deps if isinstance(d, str)]
+    assert _import_common_dep_task_id("sub111-base.drv") in bare
+
+
+def test_common_dep_gates_enabled_property(tmp_path: pathlib.Path) -> None:
+    """The gates are on only when common_deps_affine AND matrix_eval_out_dir."""
+    import dataclasses as _dc  # noqa: PLC0415
+
+    # Default flag True, but no archive dir → off.
+    base = _make_config(tmp_path)
+    assert SuitTask(base)._common_dep_gates_enabled is False
+    # Archive dir set, flag default True → on.
+    with_dir = _dc.replace(base, matrix_eval_out_dir=tmp_path / "out")
+    assert SuitTask(with_dir)._common_dep_gates_enabled is True
+    # Explicitly disabled → off even with the archive dir.
+    disabled = _dc.replace(with_dir, common_deps_affine=False)
+    assert SuitTask(disabled)._common_dep_gates_enabled is False
+
+
+def test_streamed_spawn_emits_common_dep_affine_gate(tmp_path: pathlib.Path) -> None:
+    """A streamed build_common_dep descriptor spawns its is_secondary_affine
+    import gate (depending on the build_common_dep task) AND the gate is NOT
+    counted toward the reconciliation total."""
+    import dataclasses as _dc  # noqa: PLC0415
+    from compiler_suit_runner.suit_task import _import_common_dep_task_id  # noqa: PLC0415
+
+    task = _streamed_task(tmp_path, matrix_eval_out_dir=tmp_path / "out")
+    handle = task._primary_handle
+    common = Phase4Descriptor(
+        kind="build_common_dep",
+        task_id="build_common_dep__abc123-flex.drv",
+        name="common_dep__flex",
+        payload={"drv": "/nix/store/abc123-flex.drv", "ident": "abc123-flex.drv"},
+        depends_on=(),
+    )
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC, _batch_bytes([common]), True, handle,
+    )
+    (spawned,) = handle.calls
+    by_id = {ti.task_id: ti for ti in spawned}
+    gate_id = _import_common_dep_task_id("abc123-flex.drv")
+    # The common_dep task AND its affine gate were both spawned.
+    assert "build_common_dep__abc123-flex.drv" in by_id
+    assert gate_id in by_id
+    gate = by_id[gate_id]
+    assert getattr(gate, "is_secondary_affine", None) is True
+    # Gate depends on the build_common_dep task that publishes the archive.
+    assert "build_common_dep__abc123-flex.drv" in gate.task_depends_on
+    # Only the descriptor task (1) counts toward reconciliation, not the gate.
+    assert task._streamed_spawned_count == 1
+
+
+def test_streamed_spawn_common_dep_gate_deduped_across_batches(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The same shared dep streamed across two batches spawns its gate ONCE."""
+    from compiler_suit_runner.suit_task import _import_common_dep_task_id  # noqa: PLC0415
+
+    task = _streamed_task(tmp_path, matrix_eval_out_dir=tmp_path / "out")
+    handle = task._primary_handle
+    common = Phase4Descriptor(
+        kind="build_common_dep",
+        task_id="build_common_dep__abc123-flex.drv",
+        name="common_dep__flex",
+        payload={"drv": "/nix/store/abc123-flex.drv", "ident": "abc123-flex.drv"},
+        depends_on=(),
+    )
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC, _batch_bytes([common]), True, handle,
+    )
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC, _batch_bytes([common]), True, handle,
+    )
+    gate_id = _import_common_dep_task_id("abc123-flex.drv")
+    gate_spawns = sum(
+        1
+        for batch in handle.calls
+        for ti in batch
+        if ti.task_id == gate_id
+    )
+    assert gate_spawns == 1
+
+
+def test_streamed_spawn_no_common_dep_gate_when_disabled(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With common_deps_affine=False the streamed path spawns no affine gate."""
+    task = _streamed_task(
+        tmp_path, matrix_eval_out_dir=tmp_path / "out", common_deps_affine=False,
+    )
+    handle = task._primary_handle
+    common = Phase4Descriptor(
+        kind="build_common_dep",
+        task_id="build_common_dep__abc123-flex.drv",
+        name="common_dep__flex",
+        payload={"drv": "/nix/store/abc123-flex.drv", "ident": "abc123-flex.drv"},
+        depends_on=(),
+    )
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC, _batch_bytes([common]), True, handle,
+    )
+    (spawned,) = handle.calls
+    assert not any(
+        ti.task_id.startswith("import_common_dep_") for ti in spawned
+    )
+
+
+def test_import_action_dispatches_common_dep_gate(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """import_action('import_common_dep_<hash>') calls
+    ensure_common_dep_out_archive_imported with the stripped cd_id."""
+    import dataclasses as _dc  # noqa: PLC0415
+
+    config = _dc.replace(_make_config(tmp_path), matrix_eval_out_dir=tmp_path / "out")
+    (tmp_path / "out").mkdir()
+    calls: list[tuple] = []
+
+    def _fake_ensure(cd_id, out_dir, *, run_subprocess=None):
+        calls.append((cd_id, out_dir))
+
+    monkeypatch.setattr(
+        "compiler_suit_runner.workers.build_worker.ensure_common_dep_out_archive_imported",
+        _fake_ensure,
+    )
+
+    task = SuitTask(config)
+    action = task.import_action
+    assert action is not None
+    action("import_common_dep_abc123", None)
+    assert calls == [("abc123", tmp_path / "out")]

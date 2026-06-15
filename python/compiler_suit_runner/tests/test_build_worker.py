@@ -2150,6 +2150,195 @@ def test_ensure_toolchain_out_archive_imported_none_dir_is_noop(
     assert bw._imported_toolchain_out_paths == set()
 
 
+# ---------------------------------------------------------------------------
+# ensure_common_dep_out_archive_imported (per-common_dep affine OUTPUT gate)
+# ---------------------------------------------------------------------------
+
+
+def _reset_common_dep_out_imported(monkeypatch) -> None:
+    monkeypatch.setattr(bw, "_imported_common_dep_out_ids", set())
+
+
+def _common_dep_archive(tmp_path, cd_id: str) -> pathlib.Path:
+    from compiler_suit_runner.preflight import (  # noqa: PLC0415
+        COMMON_DEPS_SUBDIR,
+        common_dep_archive_name,
+    )
+    subdir = tmp_path / COMMON_DEPS_SUBDIR
+    subdir.mkdir(parents=True, exist_ok=True)
+    path = subdir / common_dep_archive_name(cd_id)
+    path.write_bytes(b"NIX_EXPORT:common-dep")
+    return path
+
+
+def test_ensure_common_dep_out_archive_imported_happy(monkeypatch, tmp_path):
+    """A present common-dep OUTPUT archive is imported; cd_id added to set."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_common_dep_out_imported(monkeypatch)
+    cd_id = "abc123"
+    archive_path = _common_dep_archive(tmp_path, cd_id)
+    imported: list = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        imported.append(pathlib.Path(archive))
+        return True, b"", ["/nix/store/abc123-flex"]
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+    bw.ensure_common_dep_out_archive_imported(cd_id, tmp_path)
+    assert cd_id in bw._imported_common_dep_out_ids
+    assert imported == [archive_path]
+
+
+def test_ensure_common_dep_out_archive_imported_idempotent(monkeypatch, tmp_path):
+    """A second call for the same cd_id is a no-op."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_common_dep_out_imported(monkeypatch)
+    cd_id = "abc123"
+    _common_dep_archive(tmp_path, cd_id)
+    call_count: list = []
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: call_count.append(1) or (True, b"", []),
+    )
+    bw.ensure_common_dep_out_archive_imported(cd_id, tmp_path)
+    bw.ensure_common_dep_out_archive_imported(cd_id, tmp_path)
+    assert len(call_count) == 1
+
+
+def test_ensure_common_dep_out_archive_publisher_skip(monkeypatch, tmp_path):
+    """PUBLISHER-SKIP: when the expected output path is already valid locally
+    (the producing node built it), the import is skipped entirely — no
+    import_archive call, the gate is a verified no-op."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_common_dep_out_imported(monkeypatch)
+    cd_id = "abc123"
+    # Archive exists but must NOT be touched on the producing node.
+    _common_dep_archive(tmp_path, cd_id)
+    monkeypatch.setattr(
+        archive_mod, "is_path_locally_present",
+        lambda store_path, *, run_subprocess=None: True,
+    )
+    import_calls: list = []
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: import_calls.append(a) or (True, b"", []),
+    )
+    bw.ensure_common_dep_out_archive_imported(
+        cd_id, tmp_path, expected_outpath="/nix/store/abc123-flex",
+    )
+    # Marked seen, but the archive import was SKIPPED (publisher-skip).
+    assert cd_id in bw._imported_common_dep_out_ids
+    assert import_calls == []
+
+
+def test_ensure_common_dep_out_archive_imports_when_not_present(monkeypatch, tmp_path):
+    """When the expected output is NOT present locally (a consuming node),
+    the archive IS imported."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_common_dep_out_imported(monkeypatch)
+    cd_id = "abc123"
+    _common_dep_archive(tmp_path, cd_id)
+    monkeypatch.setattr(
+        archive_mod, "is_path_locally_present",
+        lambda store_path, *, run_subprocess=None: False,
+    )
+    import_calls: list = []
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: import_calls.append(a) or (True, b"", []),
+    )
+    bw.ensure_common_dep_out_archive_imported(
+        cd_id, tmp_path, expected_outpath="/nix/store/abc123-flex",
+    )
+    assert len(import_calls) == 1
+
+
+def test_ensure_common_dep_out_archive_none_args_noop(monkeypatch, tmp_path):
+    """A None cd_id or None dir (legacy / tests) is a safe no-op."""
+    _reset_common_dep_out_imported(monkeypatch)
+    bw.ensure_common_dep_out_archive_imported(None, tmp_path)
+    bw.ensure_common_dep_out_archive_imported("abc123", None)
+    assert bw._imported_common_dep_out_ids == set()
+
+
+def test_ensure_common_dep_out_archive_missing_hard_fails(monkeypatch, tmp_path):
+    """A genuinely missing archive (NOT present locally) hard-fails — there is
+    NO substituter fallback for the common-dep closure."""
+    _reset_common_dep_out_imported(monkeypatch)
+    # No archive written; expected_outpath omitted so no publisher-skip.
+    with pytest.raises(RuntimeError):
+        bw.ensure_common_dep_out_archive_imported("deadbeef", tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# _publish_common_dep_archive (export step in the common_dep success branch)
+# ---------------------------------------------------------------------------
+
+
+def test_publish_common_dep_archive_exports_with_sidecar(tmp_path):
+    """The publish step walks the closure and writes
+    ``_common_deps/common-<id>.out.archive`` + a .sha256 sidecar."""
+    from compiler_suit_runner.preflight import (  # noqa: PLC0415
+        COMMON_DEPS_SUBDIR,
+        common_dep_archive_name,
+    )
+    ident = "abc123xyz-flex-2.6.4"
+    outpath = "/nix/store/realhash-flex-2.6.4"
+    # export_closure runs `nix-store --query --requisites` then
+    # `nix-store --export`; the recording runner returns the requisites on
+    # the first call and the archive bytes on the second. We return a single
+    # canned stdout for both — enough for the helper to write a non-empty file.
+    runner = RecordingRunner(stdout=outpath.encode() + b"\n")
+    bw._publish_common_dep_archive(ident, outpath, tmp_path, run_subprocess=runner)
+
+    archive_name = common_dep_archive_name(ident)
+    archive_path = tmp_path / COMMON_DEPS_SUBDIR / archive_name
+    sidecar = tmp_path / COMMON_DEPS_SUBDIR / f"{archive_name}.sha256"
+    assert archive_path.is_file()
+    assert archive_path.stat().st_size > 0
+    assert sidecar.is_file()
+    # The requisites query + export were both invoked.
+    assert any("--requisites" in c for c in runner.calls)
+    assert any("--export" in c for c in runner.calls)
+
+
+def test_publish_common_dep_archive_skips_when_sidecar_present(tmp_path):
+    """Skip-if-unchanged: a present archive + sidecar suppress re-export."""
+    from compiler_suit_runner.preflight import (  # noqa: PLC0415
+        COMMON_DEPS_SUBDIR,
+        common_dep_archive_name,
+    )
+    ident = "abc123xyz-flex-2.6.4"
+    archive_name = common_dep_archive_name(ident)
+    subdir = tmp_path / COMMON_DEPS_SUBDIR
+    subdir.mkdir(parents=True)
+    (subdir / archive_name).write_bytes(b"already-here")
+    (subdir / f"{archive_name}.sha256").write_text("deadbeef\n")
+    runner = RecordingRunner(stdout=b"/nix/store/x\n")
+    bw._publish_common_dep_archive(
+        ident, "/nix/store/realhash-flex", tmp_path, run_subprocess=runner,
+    )
+    # No nix-store invocation at all — the existing pair short-circuited.
+    assert runner.calls == []
+
+
+def test_publish_common_dep_archive_noop_without_out_dir(tmp_path):
+    """A None matrix_eval_out_dir (legacy / tests) is a no-op."""
+    runner = RecordingRunner(stdout=b"x")
+    bw._publish_common_dep_archive(
+        "abc-flex", "/nix/store/x-flex", None, run_subprocess=runner,
+    )
+    assert runner.calls == []
+
+
 def test_ensure_toolchain_out_archive_imported_common_once_then_per_toolchain(
     monkeypatch, tmp_path,
 ):
