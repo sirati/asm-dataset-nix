@@ -386,7 +386,7 @@ class TestArchIndepDepEmission:
         ``.tar.gz.drv`` are both source-terminal-roled and must NOT
         emit tasks; a plain ``<binary>-helper.drv`` is a regular
         arch-indep dep and must emit one
-        ``build_common_dep__arch_indep__hello__<ident>`` task."""
+        ``build_common_dep__arch_indep__<ident>`` task."""
         indep = [
             ("srch", "hello-2.12-source.drv"),
             ("tarh", "hello-2.12.tar.gz.drv"),
@@ -403,7 +403,7 @@ class TestArchIndepDepEmission:
         assert len(arch_indep) == 1, [d.task_id for d in arch_indep]
         helper = arch_indep[0]
         assert helper.task_id == (
-            "build_common_dep__arch_indep__hello__helph-hello-helper.drv"
+            "build_common_dep__arch_indep__helph-hello-helper.drv"
         )
         assert helper.payload["binary"] == "hello"
         assert helper.payload["arch"] == "arch_indep"

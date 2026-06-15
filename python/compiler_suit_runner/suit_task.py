@@ -260,7 +260,8 @@ def _ident_from_common_dep_task_id(task_id: str) -> Optional[str]:
     and ``.plan_meta``):
 
     * ``build_common_dep__<ident_str>``                  (per-cell)
-    * ``build_common_dep__arch_indep__<binary>__<ident_str>``
+    * ``build_common_dep__arch_indep__<ident_str>``       (arch-indep,
+      ident-keyed cross-binary)
     * ``build_common_dep__cross_arch__<ident_str>``      (meta)
     * ``build_common_dep__family__<family>__<ident_str>`` (meta)
 
@@ -277,13 +278,15 @@ def _ident_from_common_dep_task_id(task_id: str) -> Optional[str]:
         return None
     rest = task_id[len(prefix):]
     # Strip the known structural infixes so only ``<ident_str>`` remains.
+    # ``arch_indep`` / ``cross_arch`` carry only the trailing ident after
+    # their marker; ``family`` carries an extra ``<family>__`` segment
+    # before the ident.
     for infix in ("arch_indep__", "cross_arch__", "family__"):
         if rest.startswith(infix):
             rest = rest[len(infix):]
-            # arch_indep/family carry an extra ``<binary>__`` / ``<family>__``
-            # segment before the ident; take everything after the FIRST
-            # remaining ``__`` (the ident is the trailing token).
-            if infix in ("arch_indep__", "family__"):
+            if infix == "family__":
+                # family carries ``<family>__`` before the ident; take
+                # everything after the FIRST remaining ``__``.
                 _seg, sep, tail = rest.partition("__")
                 if sep:
                     rest = tail

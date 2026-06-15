@@ -11,6 +11,7 @@ barrier only.
 
 from __future__ import annotations
 
+import collections
 import dataclasses as _dataclasses
 import logging
 import pathlib
@@ -2372,8 +2373,8 @@ def test_ident_from_common_dep_task_id_all_shapes() -> None:
     cases = {
         # per-cell
         "build_common_dep__abc123-flex.drv": "abc123-flex.drv",
-        # arch-indep (binary segment in the middle)
-        "build_common_dep__arch_indep__hello__def456-zlib.drv": "def456-zlib.drv",
+        # arch-indep (ident-keyed cross-binary; no binary segment)
+        "build_common_dep__arch_indep__def456-zlib.drv": "def456-zlib.drv",
         # meta cross_arch
         "build_common_dep__cross_arch__ghi789-glibc.drv": "ghi789-glibc.drv",
         # meta family
@@ -2580,3 +2581,212 @@ def test_import_action_dispatches_common_dep_gate(
     assert action is not None
     action("import_common_dep_abc123", None)
     assert calls == [("abc123", tmp_path / "out")]
+
+
+# ---------------------------------------------------------------------------
+# Affine-import STRUCTURE: one import-dependency per UNIQUE drv, shared
+# across binaries. Regression for run_20260615_145147 — the build phase
+# spawned the same arch-independent shared dep once PER BINARY (a
+# per-(binary, drv) build_common_dep task_id) instead of once per unique
+# drv, so a dep shared by N binaries (cacert / find-xml-catalogs-hook /
+# python3.13-mako / root.key) became N separate build tasks the
+# cross-binary dedup never collapsed. The fix keys the arch_indep
+# build_common_dep task_id on the ident alone (drop the binary segment),
+# so it collapses to one task every binary's variants depend on.
+# ---------------------------------------------------------------------------
+
+
+def _structure_binary_input(binary: str, shared_hook_ident: tuple[str, str]):
+    """A one-cell, two-variant BinaryPlanInput that touches one
+    arch-independent shared dep (``shared_hook_ident``, identical across
+    binaries) plus a per-cell common_dep node."""
+    from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
+        BinaryPlanInput,
+    )
+
+    tail = "-baseline-default-san-off-march-default-elf-folder.drv"
+    template = {
+        "nodes": [
+            {"name": f"{binary}-root", "child_ids": [1], "is_toolchain": False},
+            {"name": "zlib-node", "child_ids": [], "is_toolchain": False},
+        ],
+        "name_to_id": {f"{binary}-root": 0, "zlib-node": 1},
+        "root_id": 0,
+        "template_built_from": [],
+    }
+    # node 1 = a per-cell common_dep with the SAME ident across binaries
+    # (shared sub-drv) so it also exercises cross-binary collapse.
+    arr = {
+        "template_id": 0,
+        "arch": "x86_64",
+        "variants": ["gcc15-O0", "gcc15-O2"],
+        "hashes": [
+            [(f"rh{binary}", f"{binary}.drv"), ("cafe0001", "zlib.drv")],
+            [(f"rh{binary}", f"{binary}.drv"), ("cafe0001", "zlib.drv")],
+        ],
+    }
+    streaming = {
+        "templates": [template],
+        "variant_arrays": {(0, "x86_64"): arr},
+        "common_deps_per_arch_template": {
+            (0, "x86_64"): {0: "variant_specific", 1: "common_dep"},
+        },
+        "toolchain_drvs": set(),
+        # The shared arch-independent dep — SAME ident under both binaries.
+        "arch_indep_deps": {binary: {shared_hook_ident}},
+    }
+
+    def _spec(label: str) -> dict:
+        return {
+            "label": label, "pkg": binary, "arch": "x86_64",
+            "drv": f"/nix/store/aaaa-{binary}-x86_64-{label}{tail}",
+            "variant_dir": f"{label}_dir", "metadata_name": f"{label}.json",
+            "compiler_id": label.rsplit("-", 1)[0],
+            "compiler_family": "gcc", "compiler_version": "15",
+            "optimization": label.rsplit("-", 1)[1],
+            "flag_set": "baseline", "hardening": "default",
+            "sanitizer": "off", "march": "default", "tier": 1,
+            "toolchain_outpath":
+                "/nix/store/tcaaaa1111111111111111111111111-toolchain-gcc15",
+        }
+
+    lookup = {
+        ("x86_64", "gcc15-O0"): _spec("gcc15-O0"),
+        ("x86_64", "gcc15-O2"): _spec("gcc15-O2"),
+    }
+    return BinaryPlanInput(
+        binary=binary, streaming_result=streaming,
+        variant_lookup=lookup, toolchain_task_ids={},
+    )
+
+
+def test_affine_import_structure_shared_dep_single_task(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Two binaries sharing one arch-independent dep + a toolchain must
+    yield, after the REAL planner + streamed spawn + discover-time gates:
+
+      (a) NO duplicate (phase_id, task_id) across the full spawned set,
+      (b) the shared arch_indep dep = EXACTLY ONE build_common_dep task,
+      (c) every dependent (both binaries' variants + the import gate)
+          depends on that one shared id, and
+      (d) no build_variant names an affine import id that was never
+          spawned (no dangling dependency).
+
+    Pre-fix the arch_indep task_id carried a per-binary segment, so the
+    shared dep produced TWO build_common_dep tasks → assertion (b) fails.
+    """
+    from compiler_suit_runner.dependency_graph_planner import (  # noqa: PLC0415
+        plan_phase4_from_graph,
+    )
+    from compiler_suit_runner.dependency_graph_planner.descriptors import (  # noqa: PLC0415
+        _arch_indep_task_id,
+    )
+    from compiler_suit_runner.manifest_gen import Phase  # noqa: PLC0415
+    from compiler_suit_runner.suit_task import (  # noqa: PLC0415
+        _import_common_dep_task_id,
+        _import_matrix_drv_task_id,
+        _import_tc_task_id,
+    )
+
+    shared_hook = ("deadbeef", "find-xml-catalogs-hook.drv")
+    shared_ident = "deadbeef-find-xml-catalogs-hook.drv"
+    inputs = [
+        _structure_binary_input("brotli", shared_hook),
+        _structure_binary_input("zstd", shared_hook),
+    ]
+    descriptors = plan_phase4_from_graph(inputs, sys_name=_SYS)
+
+    # ── Drive the REAL spawn path: planner descriptors → spawn handler. ──
+    tc_outpath = "/nix/store/tcaaaa1111111111111111111111111-toolchain-gcc15"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    task = _streamed_task(
+        tmp_path,
+        matrix_eval_out_dir=out_dir,
+        toolchain_outpaths_map={"gcc15": tc_outpath},
+        per_binary_metadata={"brotli": {}, "zstd": {}},
+    )
+    handle = task._primary_handle
+    task.on_phase_start(Phase.DEPENDENCY_GRAPH)
+
+    common = [d for d in descriptors if d.kind == "build_common_dep"]
+    variants = [d for d in descriptors if d.kind == "build_variant"]
+    # Stream common_deps and variants in separate batches (production
+    # streams hundreds of batches; the gate dedup must hold ACROSS them).
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC, _batch_bytes(common), True, handle,
+    )
+    task.custom_message_handler(
+        "secondary-1", SPAWN_TOPIC, _batch_bytes(variants), True, handle,
+    )
+    # Discover-time affine gates (toolchain + matrix_drv import tasks).
+    discovered = list(task._discover_import_gate_tasks())
+
+    spawned = [ti for call in handle.calls for ti in call] + discovered
+    spawned_keys = [(ti.phase_id, ti.task_id) for ti in spawned]
+
+    # (a) No duplicate (phase_id, task_id) across the FULL spawned set.
+    dupes = [k for k, n in collections.Counter(spawned_keys).items() if n > 1]
+    assert dupes == [], f"duplicate (phase_id, task_id): {dupes}"
+
+    spawned_build_ids = {tid for (_ph, tid) in spawned_keys}
+
+    # (b) The shared arch_indep dep = EXACTLY ONE build_common_dep task.
+    # Derived from the SPAWNED descriptors (not the task_id helper) so this
+    # assertion — not a signature change — is what catches the regression:
+    # pre-fix the per-binary segment yields one task per binary (here 2).
+    shared_tasks = [
+        ti for ti in spawned
+        if ti.task_id.startswith("build_common_dep__arch_indep__")
+        and ti.payload.get("payload", {}).get("ident") == shared_ident
+    ]
+    assert len(shared_tasks) == 1, (
+        "shared arch-indep dep must be ONE build_common_dep task, got "
+        + repr([ti.task_id for ti in shared_tasks])
+    )
+    shared_task_id = shared_tasks[0].task_id
+    assert shared_task_id == "build_common_dep__arch_indep__" + shared_ident
+    assert _arch_indep_task_id(shared_ident) == shared_task_id
+    assert shared_task_id in spawned_build_ids
+
+    # (c) Every dependent references the ONE shared id:
+    #   - both binaries' build_variant tasks depend on it directly, and
+    #   - exactly one import_common_dep_<hash> gate exists for it, whose
+    #     own dep resolves to the shared build task.
+    variant_tasks = [
+        ti for ti in spawned
+        if ti.payload.get("item_class") == "build_variant"
+    ]
+    assert len(variant_tasks) == 4  # 2 binaries × 2 variants
+    binaries_seen = set()
+    gate_id = _import_common_dep_task_id(shared_ident)
+    for ti in variant_tasks:
+        binaries_seen.add(ti.payload.get("payload", {}).get("pkg"))
+        bare = [d for d in ti.task_depends_on if isinstance(d, str)]
+        assert shared_task_id in bare, (ti.task_id, bare)
+        assert gate_id in bare, (ti.task_id, bare)
+    assert binaries_seen == {"brotli", "zstd"}
+
+    gates = [ti for ti in spawned if ti.task_id == gate_id]
+    assert len(gates) == 1, "exactly one shared-dep import gate"
+    assert getattr(gates[0], "is_secondary_affine", None) is True
+    for dep in gates[0].task_depends_on:
+        if isinstance(dep, str):
+            assert dep in spawned_build_ids, (gate_id, dep)
+
+    # Each variant also names its toolchain + matrix_drv affine imports,
+    # and those were spawned at discover time (no dangling).
+    assert _import_tc_task_id(tc_outpath) in spawned_build_ids
+    for binary in ("brotli", "zstd"):
+        assert _import_matrix_drv_task_id(binary) in spawned_build_ids
+
+    # (d) No build_variant names an UNSPAWNED affine import id.
+    for ti in variant_tasks:
+        for dep in ti.task_depends_on:
+            if not isinstance(dep, str):
+                continue  # cross-phase TaskDep (build_compilers) — separate phase
+            if dep.startswith(("import_", "build_common_dep__")):
+                assert dep in spawned_build_ids, (
+                    f"dangling affine dependency {dep!r} on {ti.task_id}"
+                )

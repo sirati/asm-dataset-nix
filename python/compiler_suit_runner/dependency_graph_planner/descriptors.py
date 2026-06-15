@@ -150,16 +150,23 @@ def _common_dep_task_id(ident_str: str) -> str:
     return f"build_common_dep__{ident_str}"
 
 
-def _arch_indep_task_id(binary: str, ident_str: str) -> str:
-    """Per-binary task id for an ``arch_indep_deps`` ident.
+def _arch_indep_task_id(ident_str: str) -> str:
+    """Stable cross-binary task id for an ``arch_indep_deps`` ident.
 
-    Arch-indep deps live one-level under the matrix wrapper and are
-    shared by every variant of a binary (across opt-levels) but differ
-    across binaries -- so the task_id retains a ``binary`` prefix. The
+    Arch-indep deps live one-level under the matrix wrapper. The ident
+    (``"<hash>-<name>"``) is a content-addressed nix-store prefix, so the
+    SAME arch-independent sub-drv observed under two different binaries'
+    matrix wrappers is one and the same /nix/store path -- it must build
+    ONCE and publish ONE ``common-<hash>.out.archive``. Keying the
+    task_id solely on the ident (no ``binary`` segment, like
+    :func:`_common_dep_task_id`) lets the cross-binary descriptor dedup
+    in :func:`plan_phase4_from_graph` collapse the duplicates onto one
+    ``build_common_dep`` task that every binary's variants depend on --
+    one import-dependency per UNIQUE drv, not one per (binary, drv). The
     arch axis is intentionally elided (the dep is arch-independent by
     construction).
     """
-    return f"build_common_dep__arch_indep__{binary}__{ident_str}"
+    return f"build_common_dep__arch_indep__{ident_str}"
 
 
 def _variant_task_id(binary: str, sys_name: str, label: str) -> str:
@@ -221,8 +228,16 @@ def _arch_indep_descriptor(
     fixed to ``"arch_indep"`` so the worker can branch its build
     invocation; the task_id encodes the same axis for spawn-log
     grepping.
+
+    The task_id is keyed on the ident alone (NOT the binary), so a dep
+    shared by several binaries collapses to one ``build_common_dep`` task
+    via the cross-binary dedup in :func:`plan_phase4_from_graph`. The
+    ``binary`` payload / name fields reflect whichever binary's
+    descriptor won that dedup; they are display-only -- the worker builds
+    from ``attr`` / ``ident`` (a content-addressed /nix/store drv), so
+    the build is binary-independent.
     """
-    task_id = _arch_indep_task_id(binary, ident_str)
+    task_id = _arch_indep_task_id(ident_str)
     return Phase4Descriptor(
         kind="build_common_dep",
         task_id=task_id,
