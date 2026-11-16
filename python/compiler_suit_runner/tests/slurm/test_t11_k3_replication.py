@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import collections
 import dataclasses
-import json
 import os
 import pathlib
 import re

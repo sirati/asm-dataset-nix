@@ -126,3 +126,49 @@ def test_real_table_md_parses(tmp_path: pathlib.Path) -> None:
         "riscv64",
     ):
         assert required in archs, f"{required} missing from table"
+
+
+def test_load_warns_when_file_missing(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A missing table disables the filter; that must not be silent."""
+    with caplog.at_level("WARNING", logger="compiler_suit_runner.support_table"):
+        assert load_support_table(tmp_path / "nope.md") == {}
+    assert "nope.md" in caplog.text
+    assert "filter is disabled" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "ref, expected",
+    [
+        (".", "."),
+        ("/app/flake", "/app/flake"),
+        ("path:/nix/store/abc-src/app/flake", "/nix/store/abc-src/app/flake"),
+        ("path:/x/flake#dataset", "/x/flake"),
+        ("git+file:///home/u/repo?ref=main", "/home/u/repo"),
+        ("github:owner/repo", None),
+    ],
+)
+def test_flake_root_from_ref(ref: str, expected) -> None:
+    from compiler_suit_runner.support_table import flake_root_from_ref
+
+    root = flake_root_from_ref(ref)
+    assert (str(root) if root is not None else None) == expected
+
+
+def test_load_for_flake_reads_the_flake_root_not_the_cwd(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In the container the cwd is /app but the flake is /app/flake.
+
+    The table must be read from the flake root the eval worker resolved
+    (a ``path:`` reference), not from the working directory.
+    """
+    from compiler_suit_runner.support_table import load_support_table_for_flake
+
+    flake = tmp_path / "app" / "flake"
+    flake.mkdir(parents=True)
+    _write_table(flake, _SAMPLE_TABLE)
+    monkeypatch.chdir(tmp_path / "app")
+    table = load_support_table_for_flake(f"path:{flake}")
+    assert table[("gcc5", "mips64el")] == "FAIL"

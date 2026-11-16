@@ -123,24 +123,6 @@ def _shape_signature(template: Template) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _binary_of(template: Template) -> str:
-    """Extract the binary name from a template's root role.
-
-    Variant-root role is ``<binary>-<arch>-<comp>-<opt>-...-elf-folder.drv``;
-    the binary is the first ``-``-delimited segment. Returns
-    ``"<unknown>"`` when the root role doesn't carry the elf-folder
-    suffix (e.g. singleton templates synthesised from non-variant trees
-    in tests).
-    """
-    root_name = template.nodes[template.root_id].name
-    if not root_name.endswith("-elf-folder.drv"):
-        return "<unknown>"
-    first_dash = root_name.find("-")
-    if first_dash <= 0:
-        return "<unknown>"
-    return root_name[:first_dash]
-
-
 def template_shape_histogram(
     source: Union["OutputState", Mapping[str, Any]],
 ) -> TemplateShapeHistogram:
@@ -171,10 +153,10 @@ def template_shape_histogram(
         templates = source.templates
     buckets: dict[str, dict[str, dict[str, int]]] = {}
     total = 0
-    for (tid, arch), _arr in variant_arrays.items():
+    for (tid, arch), arr in variant_arrays.items():
         template = templates[tid]
         sig = _shape_signature(template)
-        binary = _binary_of(template)
+        binary = arr.binary or "<unknown>"
         slot = buckets.setdefault(
             sig, {"per_arch": {}, "per_binary": {}},
         )

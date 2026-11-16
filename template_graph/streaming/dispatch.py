@@ -81,11 +81,11 @@ def _on_depth1(
     if _TOOLCHAINS_RE.match(drv_name):
         if planner._saw_matrix:
             raise TreeWalkError(
-                f"toolchains.drv appeared after a matrix opened. "
-                f"The streaming planner relies on toolchains being "
-                f"the first depth-1 child (highest refcount). "
-                f"Ensure sum_drv.nix's mkWrapper includes the "
-                f"toolchains wrapper as a ref in every matrix."
+                "toolchains.drv appeared after a matrix opened. "
+                "The streaming planner relies on toolchains being "
+                "the first depth-1 child (highest refcount). "
+                "Ensure sum_drv.nix's mkWrapper includes the "
+                "toolchains wrapper as a ref in every matrix."
             )
         planner.section = "toolchain"
         planner._saw_toolchain = True

@@ -6,6 +6,7 @@ import json
 import pathlib
 
 import pytest
+from .release_fixtures import release
 
 from compiler_suit_runner.incremental_cache import (
     IncrementalCache,
@@ -86,12 +87,14 @@ def _tc_agg(tmp_path: pathlib.Path) -> str:
 
 _VARIANTS = {
     "hello": {
+        **release(),
         "archs": ["aarch64", "x86_64"],
         "sample_size": 2,
         "sample_seed": "42",
         "tier": 1,
     },
     "zlib": {
+        **release("zlib", family="zlib"),
         "archs": ["x86_64"],
         "sample_size": 0,
         "sample_seed": "7",
@@ -294,7 +297,7 @@ def test_collect_input_hash_inputs_happy_path(tmp_path: pathlib.Path):
     assert all(cwd == tmp_path for _, cwd in calls)
     cmds = [cmd for cmd, _ in calls]
     assert ("git", "rev-parse", "HEAD") in cmds
-    assert ("git", "diff") in cmds
+    assert ("git", "diff", "HEAD") in cmds
 
 
 def test_collect_input_hash_inputs_subprocess_failure(tmp_path: pathlib.Path):
@@ -520,7 +523,7 @@ def test_lookup_rejects_wrong_version(
 ):
     cache = _cache(tmp_path)
     entry_dir = tmp_path / "cache" / "toolchains" / "k1"
-    for bad_version in (0, 2, "1", None):
+    for bad_version in (0, 999, "1", None):
         entry_dir.mkdir(parents=True, exist_ok=True)
         body = {
             "version": bad_version,
@@ -672,3 +675,41 @@ def test_clear_counts_and_removes(tmp_path: pathlib.Path):
 def test_clear_on_empty_cache(tmp_path: pathlib.Path):
     cache = IncrementalCache(tmp_path / "never-created")
     assert cache.clear() == 0
+
+
+def test_collect_input_hash_inputs_sees_staged_changes(tmp_path: pathlib.Path):
+    """A staged-only change changes the key inputs.
+
+    Git flakes evaluate staged content, so ``git add`` without a commit
+    must not reuse the HEAD cache entry. Plain ``git diff`` compares the
+    worktree with the index and returns nothing for a staged change.
+    """
+    import os
+    import subprocess
+
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            cwd=tmp_path, env=env, check=True, capture_output=True,
+        )
+
+    git("init", "-q")
+    (tmp_path / "flake.lock").write_text("{}")
+    (tmp_path / "a.nix").write_text("1\n")
+    git("add", ".")
+    git("commit", "-q", "-m", "init")
+    clean = collect_input_hash_inputs(tmp_path)
+
+    (tmp_path / "a.nix").write_text("2\n")
+    git("add", "a.nix")
+    staged = collect_input_hash_inputs(tmp_path)
+
+    assert clean.git_diff == b""
+    assert b"a.nix" in staged.git_diff
+    assert compute_input_hash(staged) != compute_input_hash(clean)

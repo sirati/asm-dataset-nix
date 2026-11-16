@@ -356,6 +356,32 @@ def test_peerlist_watcher_publishes_empty_file_when_no_peers(
     assert _read_substituters_file(watcher.substituters_path) == []
 
 
+def test_peerlist_watcher_skips_substituters_file_when_write_disabled(
+    shared_fs: pathlib.Path,
+) -> None:
+    """Substituter-free / secondary-affine mode: the watcher still tracks
+    the live peer set (the K=3 replication / placement plane needs it) but
+    must NOT publish ``peers/_substituters.<id>.txt`` — that file is the
+    per-node peer-substituter leak affine mode exists to avoid."""
+    watcher = PeerListWatcher(
+        shared_fs, exclude_id="self", tick_seconds=0.05,
+        write_substituters=False,
+    )
+    # Prime-on-init must NOT have created the substituters file.
+    assert not watcher.substituters_path.exists()
+    watcher.start()
+    try:
+        announce_self(shared_fs, _mk_peer(1))
+        # Peer discovery still works (replication plane depends on it)...
+        assert _wait_until(lambda: len(watcher.peers) == 1, timeout=2.0)
+        # ...but the substituters file is still never written.
+        time.sleep(0.3)
+        assert not watcher.substituters_path.exists()
+    finally:
+        watcher.stop()
+        watcher.join(timeout=2.0)
+
+
 # ---------------------------------------------------------------------------
 # Signing key generation
 # ---------------------------------------------------------------------------
@@ -365,7 +391,9 @@ _HAS_NIX = shutil.which("nix") is not None
 
 
 @pytest.mark.skipif(not _HAS_NIX, reason="nix CLI not available")
-def test_generate_signing_key_idempotent(shared_fs: pathlib.Path) -> None:
+def test_generate_signing_key_idempotent(
+    shared_fs: pathlib.Path, fake_nix_keygen,
+) -> None:
     key1 = generate_signing_key(shared_fs, run_id="testrun")
     assert key1.secret_path.exists()
     assert key1.public_path.exists()
@@ -1649,3 +1677,213 @@ def test_start_nix_daemon_passes_preexec_fn_to_popen(
         "preexec_fn not passed to daemon Popen"
     )
     assert callable(spawn_kwargs[0]["preexec_fn"])
+
+
+# ---------------------------------------------------------------------------
+# SubmitterPeer gateway file writes: stdin body, quoted paths (D19)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _local_ssh(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+    """Put a fake ``ssh`` on PATH that runs the remote command locally.
+
+    Like sshd, it hands the last argument to ``sh -c`` and passes stdin
+    through, so the test exercises the real remote shell command.
+    """
+    import sys
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "ssh"
+    fake.write_text(
+        f"#!{sys.executable}\n"
+        "import subprocess, sys\n"
+        "sys.exit(subprocess.run(['sh', '-c', sys.argv[-1]]).returncode)\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+
+def _submitter_with_run(slurm_root: pathlib.Path) -> "peer_cache.SubmitterPeer":
+    peer = peer_cache.SubmitterPeer(
+        gateway_url="ssh://user@gateway.example",
+        slurm_root=str(slurm_root),
+    )
+    peer._gateway_host = "gateway.example"  # type: ignore[attr-defined]
+    peer._gateway_user = "user"  # type: ignore[attr-defined]
+    peer._run_id = "run_1"  # type: ignore[attr-defined]
+    peer._public_key = "submitter-pub:AAAA"  # type: ignore[attr-defined]
+    return peer
+
+
+def test_publish_placements_sends_large_body_over_stdin(
+    tmp_path: pathlib.Path, _local_ssh,
+) -> None:
+    """Hundreds of placement records exceed the 128 KiB limit on one
+    shell argument; the body must go over stdin. The slurm root has a
+    space in it, so unquoted paths would split."""
+    root = tmp_path / "slurm root"
+    peer = _submitter_with_run(root)
+    placements = [
+        (f"/nix/store/{i:032d}-toolchain-{i}", f"/nix/store/{i:032d}-tc.drv", "tc")
+        for i in range(1500)
+    ]
+    assert peer.publish_placements(placements) is True
+    out = root / "log" / "run_1" / "peers" / "_paths_submitter.jsonl"
+    lines = out.read_text().splitlines()
+    assert len(lines) == 1500
+    assert out.stat().st_size > 128 * 1024
+    assert json.loads(lines[0])["outpath"] == placements[0][0]
+    assert not list(out.parent.glob("*.tmp.*"))
+
+
+def test_publish_peer_file_quotes_remote_path(
+    tmp_path: pathlib.Path, _local_ssh,
+) -> None:
+    root = tmp_path / "slurm root"
+    peer = _submitter_with_run(root)
+    peer._publish_peer_file()
+    written = root / "log" / "run_1" / "peers" / "submitter.json"
+    assert json.loads(written.read_text())["public_key"] == "submitter-pub:AAAA"
+    assert peer._list_run_ids() == {"run_1"}
+
+
+# ---------------------------------------------------------------------------
+# SubmitterPeer harmonia bind retry kills only its own orphan (D20)
+# ---------------------------------------------------------------------------
+
+
+def _fake_harmonia() -> subprocess.Popen:
+    """A process group whose cmdline contains ``harmonia-cache``."""
+    import sys
+
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", "harmonia-cache"],
+        start_new_session=True,
+    )
+
+
+def _dead_pid() -> int:
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
+
+
+@pytest.fixture
+def _harmonia_groups():
+    procs: list[subprocess.Popen] = []
+
+    def spawn() -> subprocess.Popen:
+        p = _fake_harmonia()
+        procs.append(p)
+        return p
+
+    yield spawn
+    for p in procs:
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+
+
+def _wait_dead(proc: subprocess.Popen, timeout: float = 5.0) -> bool:
+    try:
+        proc.wait(timeout=timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+def test_kill_orphan_harmonia_spares_other_dispatches(_harmonia_groups) -> None:
+    import logging
+
+    log = logging.getLogger("t")
+    orphan = _harmonia_groups()
+    other_dispatch = _harmonia_groups()
+    time.sleep(0.2)
+
+    # Live owner: another dispatch on the same port is never killed.
+    assert peer_cache._kill_orphan_harmonia((orphan.pid, os.getpid()), log) is False
+    assert orphan.poll() is None
+    # No record: nothing to kill.
+    assert peer_cache._kill_orphan_harmonia(None, log) is False
+
+    assert peer_cache._kill_orphan_harmonia((orphan.pid, _dead_pid()), log) is True
+    assert _wait_dead(orphan)
+    assert other_dispatch.poll() is None
+
+
+def test_kill_orphan_harmonia_ignores_recycled_non_harmonia_group() -> None:
+    import logging
+
+    proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        assert peer_cache._kill_orphan_harmonia(
+            (proc.pid, _dead_pid()), logging.getLogger("t"),
+        ) is False
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_start_bind_retry_kills_only_recorded_orphan(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, _harmonia_groups,
+) -> None:
+    """A bind failure clears the orphan recorded for this port, then retries.
+
+    The old code ran ``pkill -KILL -f harmonia-cache``, which also killed
+    every other dispatch's harmonia.
+    """
+    orphan = _harmonia_groups()
+    other_dispatch = _harmonia_groups()
+    time.sleep(0.2)
+    monkeypatch.setattr(peer_cache, "_SUBMITTER_KEY_DIR", tmp_path)
+    peer_cache._harmonia_owner_file(tmp_path, 5005).write_text(
+        f"{orphan.pid} {_dead_pid()}\n"
+    )
+    monkeypatch.setattr(
+        peer_cache, "_generate_submitter_signing_key",
+        lambda key_dir: (key_dir / "k.sec", "submitter-pub:AAAA"),
+    )
+    spawned: list[list[str]] = []
+
+    class _BindFails:
+        pid = 2**22 + 7
+
+        def __init__(self, cmd, *, stdout, **_kw) -> None:
+            spawned.append(cmd)
+            stdout.write(b"Error: AddrInUse\n")
+            stdout.flush()
+
+        def poll(self) -> int:
+            return 1
+
+    monkeypatch.setattr(peer_cache.subprocess, "Popen", _BindFails)
+    real_run = subprocess.run
+    pkill_calls: list = []
+
+    def _run(argv, *a, **kw):
+        if argv and argv[0] == "pkill":
+            # Never run a real pkill here: it would kill the developer's
+            # own harmonia processes.
+            pkill_calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        return real_run(argv, *a, **kw)
+
+    monkeypatch.setattr(peer_cache.subprocess, "run", _run)
+    peer = peer_cache.SubmitterPeer(
+        gateway_url="ssh://user@gateway.example", slurm_root="/srv/slurm",
+    )
+    monkeypatch.setattr(peer, "_list_run_ids", lambda: set())
+    try:
+        peer.start()
+    finally:
+        peer._stop_evt.set()
+        if peer._poll_thread is not None:
+            peer._poll_thread.join(timeout=5)
+
+    assert _wait_dead(orphan)
+    assert other_dispatch.poll() is None
+    assert len(spawned) == 2, "retried once after clearing the orphan"
+    assert pkill_calls == []

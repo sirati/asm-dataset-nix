@@ -1,0 +1,22 @@
+# Lint configuration for python/ and template_graph/. Checked by
+# checks.<system>.ruff (nix/lint.nix); run locally with
+#   ruff check python template_graph
+target-version = "py313"
+extend-exclude = [
+  # One-off exploration scripts, slated for deletion (review finding T3).
+  "template_graph/tests/fixtures/probe_*.py",
+]
+
+[lint.per-file-ignores]
+# Private names re-exported for the tests (review finding P26). Goes
+# away with the shim removal in plan step 3.
+"python/compiler_suit_runner/dependency_graph_planner/__init__.py" = ["F401"]
+# Files that the compiler-capture change and the multi-version branch
+# also edit. Their existing findings stay until those land so the merges
+# stay clean. Remove each entry when its file is fixed.
+"python/compiler_suit_runner/cli.py" = ["F401"]
+"python/compiler_suit_runner/preflight.py" = ["E741"]
+"python/compiler_suit_runner/suit_task.py" = ["F401"]
+"python/compiler_suit_runner/tests/test_cli.py" = ["F401"]
+"python/compiler_suit_runner/tests/test_eval_worker.py" = ["F401", "F811"]
+"python/compiler_suit_runner/tests/test_manifest_gen.py" = ["F401"]

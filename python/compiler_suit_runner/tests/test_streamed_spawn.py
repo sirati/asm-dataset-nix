@@ -31,6 +31,7 @@ import re
 
 import pytest
 
+from compiler_suit_runner.tests.fakes import FakePrimaryHandle
 from compiler_suit_runner.dependency_graph_planner import Phase4Descriptor
 from compiler_suit_runner.streamed_spawn import (
     DEFAULT_MAX_MESSAGE_BYTES,
@@ -478,17 +479,14 @@ class _FakeSecondaryHandle:
 
     def send_to_primary(
         self, topic: str, data: bytes, important: bool = False,
+        is_high_volume: bool = False,
     ) -> None:
+        # is_high_volume accepted to match the real SecondaryHandle (#583/#587);
+        # this test only asserts topic/data/important, so it is not recorded.
         self.sent.append((topic, data, important))
 
 
-class _FakePrimaryHandle:
-    def __init__(self) -> None:
-        self.calls: list[list] = []
-
-    def spawn_tasks(self, task_infos):
-        self.calls.append(list(task_infos))
-        return []
+_FakePrimaryHandle = FakePrimaryHandle
 
 
 class TestConsumerPipelineEndToEnd:

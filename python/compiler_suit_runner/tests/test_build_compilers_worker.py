@@ -19,7 +19,6 @@ Tests cover:
 from __future__ import annotations
 
 import pathlib
-from typing import Any, Optional
 
 import pytest
 
@@ -581,3 +580,53 @@ class TestDefaultRunnerResolvesTool:
         # direct streaming export resolved argv[0].
         assert [c[0] for c in calls] == ["/bin/nix-store", "/bin/nix-store"]
         assert calls[1][:2] == ["/bin/nix-store", "--export"]
+
+
+def test_main_handle_lets_system_exit_through(monkeypatch, tmp_path):
+    """SystemExit (the framework's SIGTERM signal path) must propagate out
+    of handle() so the framework reports the task as recoverable instead
+    of the NonRecoverableError that would cascade-fail its dependents."""
+    import sys as _sys
+    import types as _types
+    from unittest.mock import MagicMock
+
+    fake_worker = _types.ModuleType("dynamic_runner.worker")
+
+    class FakeTask:
+        def __init__(self, payload):
+            self.payload = payload
+
+    class FakeNonRecoverable(Exception):
+        pass
+
+    run_mock = MagicMock()
+    fake_worker.Task = FakeTask
+    fake_worker.WorkerOutput = object
+    fake_worker.NonRecoverableError = FakeNonRecoverable
+    fake_worker.run = run_mock
+    if "dynamic_runner" not in _sys.modules:
+        monkeypatch.setitem(
+            _sys.modules, "dynamic_runner", _types.ModuleType("dynamic_runner"),
+        )
+    monkeypatch.setitem(_sys.modules, "dynamic_runner.worker", fake_worker)
+    monkeypatch.setattr(_sys, "argv", [
+        "build_compilers_worker",
+        "--socket-path", str(tmp_path / "sock"),
+        "--flake-ref", ".",
+        "--out-network", str(tmp_path),
+        "--log-file", str(tmp_path / "w.log"),
+    ])
+    assert bcw.main() == 0
+    handle = run_mock.call_args.args[0]
+
+    def _exit(*_args, **_kwargs):
+        raise SystemExit("signal 15")
+
+    monkeypatch.setattr(bcw, "run_build_compilers_task", _exit)
+    task = FakeTask({
+        "item_class": bcw.ITEM_CLASS_BUILD_COMPILERS,
+        "name": "tc",
+        "payload": _payload(),
+    })
+    with pytest.raises(SystemExit):
+        handle(task)

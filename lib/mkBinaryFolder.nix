@@ -23,74 +23,78 @@
 }:
 
 let
-  # Collect ELFs from EVERY output of the variant, not just the default
+  # Collect programs from every ordinary output, not just the default
   # output. A package is ONE build (one .drv) split into multiple outputs;
   # multi-output packages put binaries in non-default outputs. e.g. lz4 has
   # outputs = [ dev lib man out ] with the DEFAULT output `dev` (headers,
   # no ELF) — the lz4 executable lives in `out`, liblz4.so in `lib`.
   # Searching only the default output silently drops them, and we cannot
-  # special-case per package. Referencing every output also makes them all
-  # runtime deps (the single build already produces them, so no extra cost).
-  outPaths = map (o: "${variantPkg.${o}}") variantPkg.outputs;
+  # special-case per package. Capture and debug outputs retain separate roles.
+  roles = variantPkg.datasetOutputRoles or {};
+  collector = builtins.toFile "capture-collect-elf.py" (builtins.readFile ./collect-elf.py);
+  outputRole = o: roles.${o} or (if o == "datasetCapture" then "compiler-capture" else if o == "debug" then "debug" else "package");
+  ordinaryOutputs = builtins.filter (o: !(builtins.elem (outputRole o) [ "compiler-capture" "debug" ])) variantPkg.outputs;
+  outPaths = map (o: "${variantPkg.${o}}") ordinaryOutputs;
+  auxiliaryOutputs = builtins.filter (o: builtins.elem (outputRole o) [ "compiler-capture" "debug" ]) variantPkg.outputs;
+  provenanceRequired = (meta.compilerCapture.publication_schema or 1) >= 2;
+  source = variantPkg.src or null;
+  provenance = {
+    schema = 1;
+    label = variantLabel;
+    package = {
+      label = meta.package or variantLabel;
+      pname = variantPkg.pname or null;
+      version = variantPkg.version or null;
+    };
+    build = {
+      # This is an identity, not a request for every build-time output reachable
+      # from the derivation. Keep the bytes without a deep drv string context.
+      package_drv = builtins.unsafeDiscardStringContext variantPkg.drvPath;
+      outputs = builtins.listToAttrs (map (name: {
+        inherit name;
+        value = { path = toString variantPkg.${name}; role = outputRole name; };
+      }) variantPkg.outputs);
+      source = {
+        path = if source == null then null else toString source;
+        revision = if builtins.isAttrs source then source.rev or null else null;
+      };
+      flake_lock_sha256 = builtins.hashFile "sha256" ../flake.lock;
+      debug_policy = {
+        separate_debug_info = true;
+        hook_compatibility = variantPkg.datasetSeparateDebugCompatibility or null;
+      };
+    };
+    toolchain = meta.expectedToolchain or null;
+  };
+  folderMeta = meta // {
+    # Provenance text. A drvPath string carries a deep Nix context that
+    # would otherwise realize every output in its bootstrap graph; the
+    # package outputs referenced below already carry the build dependencies.
+    packageDrv = builtins.unsafeDiscardStringContext variantPkg.drvPath;
+    packageOutputs = builtins.listToAttrs (map (o: { name = o; value = toString variantPkg.${o}; }) variantPkg.outputs);
+  } // lib.optionalAttrs provenanceRequired { captureProvenance = provenance; };
 in
 
 pkgs.runCommand "${variantLabel}-elf-folder"
   {
-    nativeBuildInputs = with pkgs; [
-      file
-      findutils
-      gawk
-    ];
+    nativeBuildInputs = import ./elfFolderBuildTools.nix { inherit pkgs; };
+    datasetMetadata = builtins.toJSON folderMeta;
     passthru = {
-      datasetMeta = meta;
+      datasetMeta = folderMeta;
     };
   }
-  ''
+  (''
     mkdir -p $out/elf
 
-    # Enumerate every ELF entry across ALL outputs — regular files AND
-    # symlinks that resolve to an ELF (packages expose several named
-    # binaries as symlinks to one executable, e.g. lz4cat, unlz4 -> lz4).
-    # One row per entry: <real-target> <TAB> <is-symlink 0|1> <TAB> <name>.
-    # `file -bL` types through the link; `readlink -f` canonicalises to the
-    # real ELF.
-    : > entries.tsv
-    for src in ${lib.concatStringsSep " " outPaths}; do
-      find "$src" \( -type f -o -type l \) -print0 | while IFS= read -r -d "" f; do
-        if file -bL "$f" 2>/dev/null | grep -q "^ELF"; then
-          real=$(readlink -f "$f")
-          if [ -L "$f" ]; then sym=1; else sym=0; fi
-          bn=$(basename "$f")
-          printf '%s\t%s\t%s\n' "$real" "$sym" "$bn" >> entries.tsv
-        fi
-      done
-    done
-
-    # Keep only UNIQUE ELFs (symlinks to the same target are the SAME
-    # binary). Per unique target choose ONE name: prefer a non-symlink
-    # entry; otherwise the natural (version) order last — the highest
-    # version (v10.0 after v9.0.1.2). Natural order already yields the
-    # "longest" for a plain version chain without mis-ranking a deeper but
-    # lower version. The sort puts the winner first per target group (k1);
-    # awk keeps the first row per group.
-    TAB="$(printf '\t')"
-    if [ -s entries.tsv ]; then
-      sort -t"$TAB" -k1,1 -k2,2n -k3,3Vr entries.tsv \
-        | awk -F"$TAB" '!seen[$1]++ { print $1 "\t" $3 }' \
-        | while IFS="$TAB" read -r real name; do
-            if [ -e "$out/elf/$name" ] || [ -L "$out/elf/$name" ]; then
-              h=$(printf '%s' "$real" | md5sum | cut -c1-8)
-              ln -s "$real" "$out/elf/''${h}_''${name}"
-            else
-              ln -s "$real" "$out/elf/$name"
-            fi
-          done
-    fi
-
-    count=$(find $out/elf -mindepth 1 -type l | wc -l)
-    echo "Linked $count unique ELF(s) for ${variantLabel}"
+    python3 ${collector} "$out/elf" ${lib.escapeShellArgs outPaths}
+    ${lib.optionalString (auxiliaryOutputs != []) ''mkdir -p "$out/auxiliary"''}
+    ${lib.concatMapStringsSep "\n" (o: ''ln -s ${lib.escapeShellArg (toString variantPkg.${o})} "$out/auxiliary/${o}"'') auxiliaryOutputs}
 
     cat > $out/meta.json <<'METAEOF'
-    ${builtins.toJSON meta}
+    ${builtins.toJSON folderMeta}
     METAEOF
-  ''
+  '' + lib.optionalString provenanceRequired ''
+      cat > "$out/provenance.json" <<'PROVENANCEEOF'
+      ${builtins.toJSON provenance}
+      PROVENANCEEOF
+  '')

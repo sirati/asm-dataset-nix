@@ -1,0 +1,17 @@
+{
+  "hello/aarch64/gcc15-O2-baseline-default-san-off-march-default": "/nix/store/a9k7vd8zjkyz700k73yhlzcxfp74m1zi-hello-aarch64-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv",
+  "hello/aarch64/gcc4_8-O2-baseline-bindnow-san-off-march-default": "/nix/store/k2f93bq5s69dphlyifnx57p6b0vm32mf-hello-aarch64-gcc4_8-O2-baseline-bindnow-san-off-march-default-elf-folder.drv",
+  "hello/armv7l-hf/gcc15-O2-baseline-default-san-off-march-default": "/nix/store/jamazwibkzj03lhx7vvqz341h14j5xvh-hello-armv7l-hf-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv",
+  "hello/armv7l-sf/gcc4_4-O2-baseline-bindnow-san-off-march-default": "/nix/store/kjjbk6n3v7gcsvp2473dnlgzh1w45s8f-hello-armv7l-sf-gcc4_4-O2-baseline-bindnow-san-off-march-default-elf-folder.drv",
+  "hello/i686/gcc15-O2-baseline-default-san-off-march-default": "/nix/store/6nijbx4rk3agfqq3w9nvbh9xydpqq50m-hello-i686-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv",
+  "hello/mips64el/gcc15-O2-baseline-default-san-off-march-default": "/nix/store/c7mfvqrmprqgic5yafg7bg4ybx9rp4sq-hello-mips64el-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv",
+  "hello/mipsel/gcc15-O2-baseline-default-san-off-march-default": "/nix/store/683q7myxi7w1yx3kdks4p4jpl3ng11g5-hello-mipsel-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv",
+  "hello/ppc32/gcc15-O2-baseline-default-san-off-march-default": "/nix/store/hpl5fl0pgh2h6paii3y2jrkrl8vzpash-hello-ppc32-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv",
+  "hello/ppc32/gcc4_4-O2-baseline-bindnow-san-off-march-default": "/nix/store/b754r1m5x81s1aiwmaa2im4bwkghfs76-hello-ppc32-gcc4_4-O2-baseline-bindnow-san-off-march-default-elf-folder.drv",
+  "hello/ppc64/gcc15-O2-baseline-default-san-off-march-default": "/nix/store/j4cckra4xc0snmc8ih2v56lp16rh58z6-hello-ppc64-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv",
+  "hello/riscv64/gcc15-O2-baseline-default-san-off-march-default": "/nix/store/bigwlw8n7zqkrjmg8816lgmy7bdbw6gi-hello-riscv64-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv",
+  "hello/x86_64/clang19-O2-baseline-default-san-off-march-default": "/nix/store/s9n3k7hvhyd0iy5q1xxgq4ycymajjm0m-hello-x86_64-clang19-O2-baseline-default-san-off-march-default-elf-folder.drv",
+  "hello/x86_64/clang6-O2-baseline-default-san-off-march-default": "/nix/store/n2lfhm08c0igi3wzji3g2ls10lxknfsa-hello-x86_64-clang6-O2-baseline-default-san-off-march-default-elf-folder.drv",
+  "hello/x86_64/gcc15-O2-baseline-default-san-off-march-default": "/nix/store/x7snjyg8307kkkm0aqvsmia2yj472jqv-hello-x86_64-gcc15-O2-baseline-default-san-off-march-default-elf-folder.drv",
+  "hello/x86_64/gcc4_4-O2-baseline-bindnow-san-off-march-default": "/nix/store/ccq1gqpgar5yk2735phifrgm31h7snj1-hello-x86_64-gcc4_4-O2-baseline-bindnow-san-off-march-default-elf-folder.drv"
+}

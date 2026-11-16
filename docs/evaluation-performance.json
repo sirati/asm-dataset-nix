@@ -1,0 +1,324 @@
+{
+  "baseline_commit": "5e968fc",
+  "benchmarks": {
+    "selected_variant": {
+      "after": [
+        {
+          "drv": "/nix/store/7vzbqqgf8rpmw5xdzpzpc0li18fpvrsp-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+          "max_rss_kib": 116228,
+          "seconds": 0.4302,
+          "stdout_bytes": 179
+        },
+        {
+          "drv": "/nix/store/7vzbqqgf8rpmw5xdzpzpc0li18fpvrsp-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+          "max_rss_kib": 116748,
+          "seconds": 0.4557,
+          "stdout_bytes": 179
+        },
+        {
+          "drv": "/nix/store/7vzbqqgf8rpmw5xdzpzpc0li18fpvrsp-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+          "max_rss_kib": 115928,
+          "seconds": 0.4335,
+          "stdout_bytes": 179
+        }
+      ],
+      "before": [
+        {
+          "drv": "/nix/store/7vzbqqgf8rpmw5xdzpzpc0li18fpvrsp-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+          "max_rss_kib": 599268,
+          "seconds": 4.6049,
+          "stdout_bytes": 116
+        },
+        {
+          "drv": "/nix/store/7vzbqqgf8rpmw5xdzpzpc0li18fpvrsp-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+          "max_rss_kib": 598468,
+          "seconds": 4.3729,
+          "stdout_bytes": 116
+        },
+        {
+          "drv": "/nix/store/7vzbqqgf8rpmw5xdzpzpc0li18fpvrsp-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+          "max_rss_kib": 599004,
+          "seconds": 4.6436,
+          "stdout_bytes": 116
+        }
+      ],
+      "median": {
+        "after": {
+          "max_rss_kib": 116228,
+          "seconds": 0.4335
+        },
+        "before": {
+          "max_rss_kib": 599004,
+          "seconds": 4.6049
+        }
+      }
+    },
+    "selection": {
+      "after": [
+        {
+          "max_rss_kib": 116136,
+          "seconds": 1.2452,
+          "stdout_bytes": 1097
+        },
+        {
+          "max_rss_kib": 116152,
+          "seconds": 1.2655,
+          "stdout_bytes": 1097
+        },
+        {
+          "max_rss_kib": 116072,
+          "seconds": 1.1806,
+          "stdout_bytes": 1097
+        }
+      ],
+      "before": [
+        {
+          "max_rss_kib": 633568,
+          "seconds": 4.6178,
+          "stdout_bytes": 968
+        },
+        {
+          "max_rss_kib": 632448,
+          "seconds": 4.444,
+          "stdout_bytes": 968
+        },
+        {
+          "max_rss_kib": 632920,
+          "seconds": 3.7848,
+          "stdout_bytes": 968
+        }
+      ],
+      "median": {
+        "after": {
+          "max_rss_kib": 116136,
+          "seconds": 1.2452
+        },
+        "before": {
+          "max_rss_kib": 632920,
+          "seconds": 4.444
+        }
+      }
+    }
+  },
+  "cleanup": {
+    "delete_returncode": 0,
+    "deleted": [
+      "/nix/store/1a38nnwhnbfsk6w9f52219khncwmdd5c-hello-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+      "/nix/store/6rsz59cr93qb2bf17052khdir7yjs67v-hello-variant-aarch64-unknown-linux-gnu-2.12.3",
+      "/nix/store/nrhkmlr85xxa1jr4wh8bw3mwihc4bxg4-hello--v2_12_1--r36c00d5ff653-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+      "/nix/store/qlxjxyn085z0fxv5yrzyhrh52p18sh66-hello-variant-aarch64-unknown-linux-gnu-2.12.1"
+    ],
+    "free_bytes": 477484806144,
+    "reserve_bytes": 107374182400,
+    "retained_by_references": [],
+    "retained_roots": {
+      "devshell": "/nix/store/5f9prpka149k9n1i3f1s5rjjgmk4ainb-nix-shell-env",
+      "devshell-1-link": "/nix/store/5f9prpka149k9n1i3f1s5rjjgmk4ainb-nix-shell-env",
+      "input-nixpkgs": "/nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source",
+      "input-nixpkgs-24_05": "/nix/store/wzx1ba5hqqfa23vfrvqmfmkpj25p37mr-source",
+      "pilot-hello--v2_12_1--r36c00d5ff653-x86_64": "/nix/store/g137jhhnvs22qkqwm08pvjz9idff6c0f-hello--v2_12_1--r36c00d5ff653-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+      "pilot-hello-x86_64": "/nix/store/jr8nsa4ngfcch5344ybl1inb8pl4g6br-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder"
+    },
+    "scratch_allocated_after": 589824,
+    "scratch_allocated_before": 22069248
+  },
+  "flow": {
+    "atomic_publication": true,
+    "common_dep_tasks": 9,
+    "graph": {
+      "binary_count": 2,
+      "common_deps_arch_indep": 0,
+      "common_deps_cross_arch": 1,
+      "common_deps_family": 0,
+      "common_deps_uni_arch": 8,
+      "descriptor_count": 13,
+      "duration_seconds": 0.4754905740264803,
+      "meta_templates": 2,
+      "output_path": "/home/sirati/.t3/worktrees/asm-dataset-nix/feat-multiversion-packa-7ee63ad6a6fa8acf/.multiversion-work/matrix/_dependency_graph_summary.txt",
+      "source_terminal_skipped": 10,
+      "stdenv_subtrees": 3,
+      "templates": 4,
+      "toolchain_wired": 4,
+      "variants": 4,
+      "violations": 0
+    },
+    "passed": true,
+    "results": [
+      {
+        "arch": "aarch64",
+        "drv": "/nix/store/72ax2qkcnxy2lj9c4g85jlwqr399hnbn-hello-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+        "machine": 183,
+        "output": "/nix/store/1a38nnwhnbfsk6w9f52219khncwmdd5c-hello-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+        "packageId": "hello",
+        "packageIdentity": "8a06cda2f31ea1c32e9e56d71cf92b296e3f17b7edcf80ae5c8c6d25ae2e8a37",
+        "recipeId": {
+          "adapterRevision": 1,
+          "attr": "hello",
+          "dependencyPolicy": "provider-pinned-with-selected-stdenv",
+          "kind": "nixpkgs",
+          "narHash": "sha256-pYEytCNic/czazbV9r3tbQ6BZzqRBg/41x2dIC5ymOo=",
+          "provider": "current",
+          "revision": "68a8af93ff4297686cb68880845e61e5e2e41d92"
+        },
+        "retained": false,
+        "sourceIdentity": {
+          "outputHash": "sha256-DV9gFUOC/uELEUocNOeF2LH0kgc64tOm97FHaHs2aqA=",
+          "outputHashAlgo": null,
+          "outputHashMode": "flat",
+          "revision": null,
+          "storePath": "/nix/store/wj7phsmi7ncidl8k00p489krqss7n9sd-hello-2.12.3.tar.gz",
+          "urls": [
+            "mirror://gnu/hello/hello-2.12.3.tar.gz"
+          ]
+        },
+        "version": "2.12.3",
+        "version_output": null
+      },
+      {
+        "arch": "x86_64",
+        "drv": "/nix/store/7vzbqqgf8rpmw5xdzpzpc0li18fpvrsp-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+        "machine": 62,
+        "output": "/nix/store/jr8nsa4ngfcch5344ybl1inb8pl4g6br-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+        "packageId": "hello",
+        "packageIdentity": "8a06cda2f31ea1c32e9e56d71cf92b296e3f17b7edcf80ae5c8c6d25ae2e8a37",
+        "recipeId": {
+          "adapterRevision": 1,
+          "attr": "hello",
+          "dependencyPolicy": "provider-pinned-with-selected-stdenv",
+          "kind": "nixpkgs",
+          "narHash": "sha256-pYEytCNic/czazbV9r3tbQ6BZzqRBg/41x2dIC5ymOo=",
+          "provider": "current",
+          "revision": "68a8af93ff4297686cb68880845e61e5e2e41d92"
+        },
+        "retained": true,
+        "sourceIdentity": {
+          "outputHash": "sha256-DV9gFUOC/uELEUocNOeF2LH0kgc64tOm97FHaHs2aqA=",
+          "outputHashAlgo": null,
+          "outputHashMode": "flat",
+          "revision": null,
+          "storePath": "/nix/store/wj7phsmi7ncidl8k00p489krqss7n9sd-hello-2.12.3.tar.gz",
+          "urls": [
+            "mirror://gnu/hello/hello-2.12.3.tar.gz"
+          ]
+        },
+        "version": "2.12.3",
+        "version_output": "hello (GNU Hello) 2.12.3"
+      },
+      {
+        "arch": "aarch64",
+        "drv": "/nix/store/1cd7zajr9swzkwhr4qkv9yv6ciz1q9d8-hello--v2_12_1--r36c00d5ff653-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+        "machine": 183,
+        "output": "/nix/store/nrhkmlr85xxa1jr4wh8bw3mwihc4bxg4-hello--v2_12_1--r36c00d5ff653-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+        "packageId": "hello--v2_12_1--r36c00d5ff653",
+        "packageIdentity": "aff49915c904c4826f8e16ccc39518817d2107d58f615f074399c20e147e5db3",
+        "recipeId": {
+          "adapterRevision": 0,
+          "attr": "hello",
+          "dependencyPolicy": "provider-pinned-with-selected-stdenv",
+          "kind": "nixpkgs",
+          "narHash": "sha256-vboIEwIQojofItm2xGCdZCzW96U85l9nDW3ifMuAIdM=",
+          "provider": "nixpkgs-24_05",
+          "revision": "63dacb46bf939521bdc93981b4cbb7ecb58427a0"
+        },
+        "retained": false,
+        "sourceIdentity": {
+          "outputHash": "sha256-jZkUKv2SV28wsM18tCqNxoCZmLxdYH2Idh9RLibH2yA=",
+          "outputHashAlgo": "sha256",
+          "outputHashMode": "flat",
+          "revision": null,
+          "storePath": "/nix/store/pa10z4ngm0g83kx9mssrqzz30s84vq7k-hello-2.12.1.tar.gz",
+          "urls": [
+            "mirror://gnu/hello/hello-2.12.1.tar.gz"
+          ]
+        },
+        "version": "2.12.1",
+        "version_output": null
+      },
+      {
+        "arch": "x86_64",
+        "drv": "/nix/store/d0hv1bzgz8xapi4lwp7djyjxakjiafv4-hello--v2_12_1--r36c00d5ff653-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+        "machine": 62,
+        "output": "/nix/store/g137jhhnvs22qkqwm08pvjz9idff6c0f-hello--v2_12_1--r36c00d5ff653-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+        "packageId": "hello--v2_12_1--r36c00d5ff653",
+        "packageIdentity": "aff49915c904c4826f8e16ccc39518817d2107d58f615f074399c20e147e5db3",
+        "recipeId": {
+          "adapterRevision": 0,
+          "attr": "hello",
+          "dependencyPolicy": "provider-pinned-with-selected-stdenv",
+          "kind": "nixpkgs",
+          "narHash": "sha256-vboIEwIQojofItm2xGCdZCzW96U85l9nDW3ifMuAIdM=",
+          "provider": "nixpkgs-24_05",
+          "revision": "63dacb46bf939521bdc93981b4cbb7ecb58427a0"
+        },
+        "retained": true,
+        "sourceIdentity": {
+          "outputHash": "sha256-jZkUKv2SV28wsM18tCqNxoCZmLxdYH2Idh9RLibH2yA=",
+          "outputHashAlgo": "sha256",
+          "outputHashMode": "flat",
+          "revision": null,
+          "storePath": "/nix/store/pa10z4ngm0g83kx9mssrqzz30s84vq7k-hello-2.12.1.tar.gz",
+          "urls": [
+            "mirror://gnu/hello/hello-2.12.1.tar.gz"
+          ]
+        },
+        "version": "2.12.1",
+        "version_output": "hello (GNU Hello) 2.12.1"
+      }
+    ],
+    "toolchain_ids": [
+      "x86_64-linux__aarch64__gcc15",
+      "x86_64-linux__x86_64__gcc15"
+    ]
+  },
+  "method": "Three interleaved runs of prior-commit and optimized working-tree source snapshots, same shared host and cached inputs. GNU time peak RSS. No evaluator or daemon changes.",
+  "nix_version": "nix (Nix) 2.34.9",
+  "pure_nix": {
+    "bakedSourceIdentity": true,
+    "candidateCountPreserved": true,
+    "checkedSelection": true,
+    "directLookupSkipsCompilerDiscovery": true,
+    "inputOverrideChangesIdentity": true,
+    "longestHardeningPrefix": true,
+    "nativeSelectionDoesNotForceUnusedProviders": true,
+    "schema": 1,
+    "staleSelection": true,
+    "unknownFlag": true,
+    "unknownTarget": true
+  },
+  "real_inventory_sampling": {
+    "groups": 269,
+    "json_bytes": 135604,
+    "sampled": 269,
+    "sampling_seconds": 1.3747098541352898,
+    "total_seconds": 3.558803387917578
+  },
+  "regressions": {
+    "deselected": 17,
+    "passed": 1601,
+    "seconds": 68.97,
+    "skipped": 7
+  },
+  "sampling_parity": {
+    "candidate_names": 2400,
+    "identical": true,
+    "seed_sample_cases": 8,
+    "supported_candidates": 2340
+  },
+  "schema": 1,
+  "shared_inventory_cache": {
+    "bytes": 236851,
+    "entries": 2,
+    "identity": "bce44626fd8fb5ae86ba44aa847af1a3818ad321effa7fb7c62964e7c7cd85db",
+    "targets": [
+      "aarch64",
+      "x86_64"
+    ]
+  },
+  "temporary_path_check": "Real nix-eval-jobs selector passed spaces, Unicode and literal interpolation in its filter path.",
+  "upstream_sources": [
+    "https://github.com/NixOS/nix/pull/13987",
+    "https://determinate.systems/blog/parallel-nix-eval/",
+    "https://docs.determinate.systems/determinate-nix/lazy-trees/",
+    "https://github.com/NixOS/nix-eval-jobs"
+  ]
+}

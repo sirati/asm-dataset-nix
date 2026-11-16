@@ -1,0 +1,496 @@
+{
+  "baseline_cpp_runtime_modes": {
+    "failed": 0,
+    "passed": 762
+  },
+  "compiler_count": 41,
+  "compilers": {
+    "clang10": {
+      "family": "clang",
+      "version": "10.0.1"
+    },
+    "clang11": {
+      "family": "clang",
+      "version": "11.1.0"
+    },
+    "clang12": {
+      "family": "clang",
+      "version": "12.0.1"
+    },
+    "clang13": {
+      "family": "clang",
+      "version": "13.0.1"
+    },
+    "clang14": {
+      "family": "clang",
+      "version": "14.0.6"
+    },
+    "clang15": {
+      "family": "clang",
+      "version": "15.0.7"
+    },
+    "clang16": {
+      "family": "clang",
+      "version": "16.0.6"
+    },
+    "clang17": {
+      "family": "clang",
+      "version": "17.0.6"
+    },
+    "clang18": {
+      "family": "clang",
+      "version": "18.1.8"
+    },
+    "clang19": {
+      "family": "clang",
+      "version": "19.1.7"
+    },
+    "clang20": {
+      "family": "clang",
+      "version": "20.1.8"
+    },
+    "clang21": {
+      "family": "clang",
+      "version": "21.1.8"
+    },
+    "clang22": {
+      "family": "clang",
+      "version": "22.1.5"
+    },
+    "clang3_4": {
+      "family": "clang",
+      "version": "3.4.2"
+    },
+    "clang3_5": {
+      "family": "clang",
+      "version": "3.5.2"
+    },
+    "clang3_6": {
+      "family": "clang",
+      "version": "3.6.2"
+    },
+    "clang3_7": {
+      "family": "clang",
+      "version": "3.7.1"
+    },
+    "clang3_8": {
+      "family": "clang",
+      "version": "3.8.1"
+    },
+    "clang3_9": {
+      "family": "clang",
+      "version": "3.9.1"
+    },
+    "clang4": {
+      "family": "clang",
+      "version": "4.0.1"
+    },
+    "clang5": {
+      "family": "clang",
+      "version": "5.0.2"
+    },
+    "clang6": {
+      "family": "clang",
+      "version": "6.0.1"
+    },
+    "clang7": {
+      "family": "clang",
+      "version": "7.1.0"
+    },
+    "clang8": {
+      "family": "clang",
+      "version": "8.0.1"
+    },
+    "clang9": {
+      "family": "clang",
+      "version": "9.0.1"
+    },
+    "gcc10": {
+      "family": "gcc",
+      "version": "10.4.0"
+    },
+    "gcc11": {
+      "family": "gcc",
+      "version": "11.3.0"
+    },
+    "gcc12": {
+      "family": "gcc",
+      "version": "12.2.0"
+    },
+    "gcc13": {
+      "family": "gcc",
+      "version": "13.4.0"
+    },
+    "gcc14": {
+      "family": "gcc",
+      "version": "14.3.0"
+    },
+    "gcc15": {
+      "family": "gcc",
+      "version": "15.2.0"
+    },
+    "gcc4_4": {
+      "family": "gcc",
+      "version": "4.4.7"
+    },
+    "gcc4_5": {
+      "family": "gcc",
+      "version": "4.5.4"
+    },
+    "gcc4_6": {
+      "family": "gcc",
+      "version": "4.6.4"
+    },
+    "gcc4_8": {
+      "family": "gcc",
+      "version": "4.8.5"
+    },
+    "gcc4_9": {
+      "family": "gcc",
+      "version": "4.9.4"
+    },
+    "gcc5": {
+      "family": "gcc",
+      "version": "5.5.0"
+    },
+    "gcc6": {
+      "family": "gcc",
+      "version": "6.5.0"
+    },
+    "gcc7": {
+      "family": "gcc",
+      "version": "7.5.0"
+    },
+    "gcc8": {
+      "family": "gcc",
+      "version": "8.5.0"
+    },
+    "gcc9": {
+      "family": "gcc",
+      "version": "9.5.0"
+    }
+  },
+  "coverage": {
+    "complete": true,
+    "corner_case_statuses": {
+      "baseline-unsupported": 241,
+      "passed": 12793
+    },
+    "errors": [],
+    "expected": 1079,
+    "failed": [],
+    "missing": [],
+    "passed": 1079,
+    "shapes": {
+      "corners": 317,
+      "lto": 284,
+      "smoke": 317,
+      "thinlto": 161
+    }
+  },
+  "evidence_sha256": {
+    ".capture-experiments/all-compilers-current/baseline-all.json": "c0c7ca771364fe38e22c893a734ad1113ce8e05c0d3361471c68b6faa2925986",
+    ".capture-experiments/all-compilers-current/coverage.json": "3601a93055e61403e86cb8bea6087fbde0e3653fde16f56a82cc274d92988356",
+    ".capture-experiments/all-compilers-current/final-adoption/example-result.json": "d78fc5b76c5dd19c01dfa3d3a91b816c74c56cb6b05c17fba81a36bb77e70b1e",
+    ".capture-experiments/all-compilers-current/native-checks/result.json": "0bcd16acda068f6921ac2d5930709fbcb7a49b22d4c09da4596a6f9aa15cf671",
+    ".capture-experiments/all-compilers-current/release-modes.json": "de8c3d89eac244aa8b2c6db9c159b21e45c84dfc607f3ee894d87789b4e3390a",
+    ".capture-experiments/all-compilers-current/release-prereq-retry.json": "725670e168961cbb83441b7fc36a8c8334293a128215be1fffc73f2232d05066",
+    ".capture-experiments/all-compilers-current/release-resume.json": "8cec4c5711e286c2a7a757c8eddc350f0fd1ea35d3c30fd1cf161d18d3e2580c"
+  },
+  "fixture_nixpkgs_revision": "1c3fe55ad329cbcb28471bb30f05c9827f724c76",
+  "public_example": {
+    "archive_bytes": 39198472,
+    "complete": true,
+    "inspection": {
+      "artifact_bytes": 35029619,
+      "artifact_count": 1249,
+      "artifact_references_by_role": {
+        "assembly": 273,
+        "command": 1105,
+        "link-map": 72,
+        "linked-output": 285,
+        "object": 471,
+        "preprocessing": 312
+      },
+      "associated_elf_count": 1,
+      "compilers": [
+        {
+          "backend": "gcc-trace",
+          "config_sha256": "432bb86d63ec63f3f89729de41eb0c36c4bed6d355d4c35af9643293fe7a927b",
+          "debug_policy": "required",
+          "driver": "g++",
+          "family": "gcc",
+          "target": "x86_64-unknown-linux-gnu",
+          "version": "15.2.0",
+          "wrapper": "/nix/store/qd70v8g0561vm8m33kmnp79z00cgyi5n-gcc-wrapper-15.2.0"
+        },
+        {
+          "backend": "gcc-trace",
+          "config_sha256": "4b677aa0a5714392b07894999c27e0c647c750b87fd7bdc64919771d81558eb1",
+          "debug_policy": "required",
+          "driver": "gcc",
+          "family": "gcc",
+          "target": "x86_64-unknown-linux-gnu",
+          "version": "15.2.0",
+          "wrapper": "/nix/store/qd70v8g0561vm8m33kmnp79z00cgyi5n-gcc-wrapper-15.2.0"
+        },
+        {
+          "backend": "tool-observe",
+          "config_sha256": "f5e6689303f84afc1e812a18acf523021d36038a10a928f4e17a197b0bfb945d",
+          "debug_policy": "required",
+          "driver": "ld",
+          "family": "linker",
+          "target": "x86_64-unknown-linux-gnu",
+          "version": "2.46",
+          "wrapper": "/nix/store/kfwagnh6i1mysf7vxq679rzh30z9zj3g-binutils-wrapper-2.46"
+        }
+      ],
+      "complete": true,
+      "contract": {
+        "backend": "gcc-trace",
+        "debug_policy": "required",
+        "policy": "required",
+        "required_elf_associations": true,
+        "required_wrapper_identity": true,
+        "schema": 1,
+        "wrapper_revision": 1
+      },
+      "errors": [],
+      "installed_elf_count": 1,
+      "invocation_count": 331,
+      "invocations_by_mode": {
+        "compile": 228,
+        "link": 79,
+        "preprocess": 16,
+        "query": 8
+      },
+      "kind": "dataset-folder",
+      "manifest_sha256": "cca67efcafa91782ae320628933a4729da665352ca58679a58627422e729eb8b",
+      "policy": "required",
+      "schema": 1,
+      "unique_invocations": 321
+    },
+    "memory_peak_bytes": 663920640,
+    "runtime_stdout": "Hello, world!\n"
+  },
+  "regression_checks": {
+    "clippy": "passed with warnings denied",
+    "optional_groups_skipped": 4,
+    "python_capture_tests": 183,
+    "runner_integration_tests": 240,
+    "rust_unit_tests": 15,
+    "rustfmt": "passed"
+  },
+  "schema": 1,
+  "scope": "All public GCC/Clang compiler and target pairs, for the measured smoke, corner and applicable LTO modes. Arbitrary options and full dataset builds are outside this result.",
+  "source_identity": {
+    "files": {
+      "develop.nix": "ea5bfaf2319304a8d13a8d3ff8ee5b9223d7afae14049b642797e4cce6d50334",
+      "flake.lock": "85902d826408ff80a15ba77f41cf2e1b1e0d9fa71ab54e8e7456a1e58e2fc40b",
+      "flake.nix": "1f6a89aeeec882b0d69e90ff8afdbfe32e0076f54970a7b55f53ec6c5ae252d4",
+      "lib/architectures.nix": "e546a1be82efa119920c7776777d244d44f8b6343f62dbc37cb4a1985c789943",
+      "lib/capture-bintools.nix": "4f04b0eadba2d5f0ae0a0a3d9fcfe23697699b23c2c004e7a10a16f005bc149a",
+      "lib/capture-overlay.nix": "ea5c190b4c8ca566966553c65c62d0a38d6a08120989d4b6e8d5a3a0ad637772",
+      "lib/capture-raw-compiler.nix": "193600d3ba8ea3e592260319250ac3787e64d28269a04579e9b933644b077278",
+      "lib/capture-stdenv.nix": "d06f7c4a80ea56d429db23ecd6c295c1cae0f102c1331dd71a4912e5719e1399",
+      "lib/clang-lto-linker.nix": "2519cb92b575f44ab6aad05f112e343bb66efabe849ba8ba0bfb817d51f8342d",
+      "lib/collect-elf.py": "e21d1a0591b9947ee809ba1f411ef682a883e49b71e527ece65ab4fbd84ba80c",
+      "lib/compiler-capture.nix": "89642c53fc962305c6d91d0811eb8ea46eeeda07f4af507934554b8259d4d72b",
+      "lib/compilers.nix": "a1d4c60aa680be92307c89dfe1a3b58def4472908220c6178d3b5ac4168e4fdb",
+      "lib/elfFolderBuildTools.nix": "e05a0a14be01eb187a491db2f7d207670967b141cdb3ea8cee184c3deb421b79",
+      "lib/flags.nix": "f65882043d439c52cb1553a53c516ed542c4f2c61ff3bdb0f948b3d4684359a9",
+      "lib/gcc-driver-compat.nix": "681cc8a6473091a68f451e6b10f1fbfa444f12739feda6dfda4c3db08bddb6ec",
+      "lib/legacy-clang-n32.nix": "ac7f861db70a7d100228837ff0de90124ef26b885e71745546e6055f3d69affc",
+      "lib/legacy-clang-response.nix": "b910675b15265dc06e15e93d11950ea4c644e3c46c1e926a94c9bfef906398db",
+      "lib/legacy-clang-stdlib.h": "5ba09d8bd575ecc88800bc8b27dfe749cda54a77a649b63d6c338008591c19ea",
+      "lib/legacy-clang-stdlib.sh": "4c04e4ffad8da6dbde72126b1cb0a116bc9788c9bf26868d1f8914a34b68a125",
+      "lib/legacy-response-quote.sh": "e27ecd37d0dfa95083315047b21ac1aa9776bca495c736309927a3853781356a",
+      "lib/llvm-gold.nix": "0a39292faec470e592700f4fc7366fad5f9cab90e559e3e02d89be9b15cb8deb",
+      "lib/manifest.nix": "d7eca15f6f81c6b8f93a1092269196ebd0fc3a38b853387946db5a66c2dd6b58",
+      "lib/matrix.nix": "d72babeb2d741a75e9c3780c8ed4d38b883af1fc401724c1740967c228e9f437",
+      "lib/mips-clang-overlay.nix": "51db2a3a2b1705ac0662cfcbdb7f5e35f968585d8372290331d73a0df2ab3418",
+      "lib/mkBinaryFolder.nix": "02a7e70a655ffa5a442a614f3f4ab451ed46f2106a17a779da55268c0305c225",
+      "lib/mkBinaryTarball.nix": "ad1e8718f131012255f2bb079acdf789bdb334f33aa30ba65ad16ea95f6fb56c",
+      "lib/mkVariant.nix": "4468bd133d6d657d6d5fe3d1a8e49bc6666a1b8f5c217f7fd6170bebe5d8d6cf",
+      "lib/old-compilers.nix": "ed10a4b3f58fc3fe56315308ab1c5312d9134ac179069ffe1e487abfa2e9a8c1",
+      "lib/old-gcc-cross.nix": "e9fffda6e26c025631e29ef9b1c6c6a964db04ca11199547ad89890a0e7fb924",
+      "lib/old-nixpkgs.nix": "a3efca487e22c7fda515b9b6908509c7e9038e16330410be0dabcec52607e77d",
+      "lib/packages.nix": "2fed848a2f3791d02d7d2dca6bc773d09a89ff50f462a48e8858e20902633f5f",
+      "lib/resolve-toolchain.nix": "bc3b8a5dbf962eff9ae99b21ffb752bd50c7fd68eec65a8e18fb77626fe17240",
+      "nix/capture-example.nix": "e097458b7c7587a08c085e2a05e95f27d5f44be9fc6db5efb8ba5f9b25bb805a",
+      "nix/capture-tools.nix": "187534c0ee727087c5b54ff5463ac4263e2f3cf1daf0559d2f6b6c42acffa052",
+      "nix/compiler-capture.nix": "08bc779e14eee3524c846ede104afdd9c96ac33500824d858ac4893ecf9393ee",
+      "python/compiler_suit_runner/__init__.py": "adccc0ed6b3854b215cef7720db98ed0879cfa012feed5b8f7097af89bf549ff",
+      "python/compiler_suit_runner/__main__.py": "73184d8dda8c91d63443c0f9324a7e417156f3ad8890a9fa989a6c1f87371133",
+      "python/compiler_suit_runner/_nix_eval_utils.py": "14eea888ca0894519c124e678b34dabbba5260e627687ec3ef7a6176311893ca",
+      "python/compiler_suit_runner/cachix_uploader.py": "e1d847ab1755433fcacc420e6550f268c4a674b1be4ff71ddf9c6d62747da16b",
+      "python/compiler_suit_runner/capture.py": "462cdb18b3139c992b77a3d459a6840e20124dc782076b0aaba926e9f6513477",
+      "python/compiler_suit_runner/capture_cli.py": "b589c43ebd15d69f22428292cd56f369bd068c708091ad080897a259216f4650",
+      "python/compiler_suit_runner/cli.py": "9d5c70873669616f6e9f255f84f9bd25ec63cb859f399d09ff02d8c076ee2e2f",
+      "python/compiler_suit_runner/compiler_flag_support.py": "77bf07ec9d8bc561c091572b955d5a908019693218dbc1c712acd445d679ba74",
+      "python/compiler_suit_runner/drv_graph.py": "050b3c60e11b01cfbb69e405aef7275ae15fe90af5c39edc842c16abe0966e07",
+      "python/compiler_suit_runner/holding_matcher.py": "770d6cc732530497f8b062b528eebe813f3f3a8aba58d9361dec5e09c3c7df30",
+      "python/compiler_suit_runner/incremental_cache.py": "9fb6a83b0e62162e25dfdc8fed7ffa8347f3a030b0ebe49dfd17102c936ef335",
+      "python/compiler_suit_runner/manifest_gen.py": "a0b08276c7600b7fac9808edb9b49120b97c428728261e396652ae2b6272d1cb",
+      "python/compiler_suit_runner/nix_drv_show.py": "9af117ff08170cf0f2c2fc930f112a8c808a324c204e318a13bd327dfa2ddce6",
+      "python/compiler_suit_runner/partition.py": "57b588ff93d68000184cce82a484e376a332c57882f6cfc6970197c41a1f26f6",
+      "python/compiler_suit_runner/peer_cache.py": "7df4b2ccd178512f8c2bd77db4a6b479e0ea388197b2ad9cc38d5e00f514efdb",
+      "python/compiler_suit_runner/peer_paths.py": "146bd2277ee694cdfc0f840bad87ee4d42ac225d3d4029394110ef8576f35ac3",
+      "python/compiler_suit_runner/peer_paths_fetch.py": "fc9184418fce9a8214017da1c8ef3f954d8bd65a8b2ea8e4539200e50e64d29a",
+      "python/compiler_suit_runner/peer_push.py": "8a27a7143e7f919c46c989480f2accd23b2cdab4eed758cd66fa75dd17dd0b62",
+      "python/compiler_suit_runner/peer_replication.py": "0f408e04898a8196c7f46255733739e50b4ee33c77a7b8ebbb1d0d954eaf52b1",
+      "python/compiler_suit_runner/prebuild.py": "e1305c37c3f796769dfaf11ad2082fa8492f8e8ffc8c48ef2c2afcf57630b3ef",
+      "python/compiler_suit_runner/preflight.py": "cd848444b5e99392ec22908e5dfae83b79ab109fd64c39efb3244113dad03567",
+      "python/compiler_suit_runner/ssh_debug.py": "87a8a6a8f2f1981f9b7138688e4473c0428e6cd5f539255b0c0d4beb5cd37aff",
+      "python/compiler_suit_runner/streamed_spawn.py": "d1393c875f0342756bf5d402f305fdd42f2c2ef0ac7b24f470c65484dd5e81e8",
+      "python/compiler_suit_runner/suit_task.py": "d46af0e8e6ff3218b9798b87e935f194b7503a6b23f0603b553fe351ea77fbd7",
+      "python/compiler_suit_runner/support_table.py": "3e67ed8f8ee5f8ff6ccdd84e002764634bd59fdbe09048c3bc10b5c90e0cc160",
+      "python/compiler_suit_runner/workers/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "python/compiler_suit_runner/workers/affine_import_worker.py": "8afd27b3c56e9fd8ed6c371ea383b6fbddecb5a978c74972eba4716acefeae11",
+      "python/compiler_suit_runner/workers/build_compilers_worker.py": "e98db7264c41f05b02e212d0d2a6102b48035d59a7a97c9cfc25c866b2b35f30",
+      "python/compiler_suit_runner/workers/build_worker.py": "b01aef3de3dfd7e996303d808d8ec711816a719fe1cd8665fb5de075f858f4ec",
+      "python/compiler_suit_runner/workers/eval_worker.py": "bd96345245216ee51a3ed9396cb048afbd8ec15b71b0e8f8dc3518ef57ab2766",
+      "rust/compiler-capture/Cargo.lock": "f522c90c9e80d1ade19a82e3e4fdd87ccea718d081e016d15ff12a8108273288",
+      "rust/compiler-capture/Cargo.toml": "83c73e2330ab7e07777b77f9fa7879eae56989f520f25c25a94510e426f0eeff",
+      "rust/compiler-capture/src/arguments.rs": "50702e15d892cd5fc3a9e6b176aaf67dc0cc3547013c43c3fd1c83ca6f5781ce",
+      "rust/compiler-capture/src/collect.rs": "8d39e21de93e780c839c5636b67c33a13d8969c29899973e31ea85a1bd7b2e31",
+      "rust/compiler-capture/src/config.rs": "a57d9e0b077f0296f5ca4e055bb03d3f1a767b7206f4534b75cde47b696ad279",
+      "rust/compiler-capture/src/gcc_options.rs": "f8a7602ac67a50349bf92553cc68fdfeda0debe2122caaad1fb7f49497befe65",
+      "rust/compiler-capture/src/isolate.rs": "5a264c9c23df1f7dc91a19c232c0c688316fcba9ea0592eb019413daa550531c",
+      "rust/compiler-capture/src/main.rs": "07d1c565419032db2727f3d91d8a9bf8fa508e7338f5001f614180cfaffe28ba",
+      "rust/compiler-capture/src/pch.rs": "f36e1e2e46b66a1c9c5232ae0240283432c02cd66c59f46bf701a45419579f29",
+      "rust/compiler-capture/src/process.rs": "f384698cfaedc8e67e10d565ed54800fb373704dc5510ef500b7a88997ad2627",
+      "rust/compiler-capture/src/response.rs": "21b4a20345c57c295a92a2e20b6ef501aba122c5bf2a4ab7a7652c2de9cd460d",
+      "rust/compiler-capture/src/signals.rs": "eab09882b7288b01c9c951e5379f56b267d119cd998386b8852aca5828c937cd",
+      "rust/compiler-capture/src/storage.rs": "7537fd874607420d5a696f423d64abd3ed7dd372c8fed042974f3eeeeb14204f",
+      "rust/compiler-capture/src/trace.rs": "d52348f516068873c29758b02eb7a3485e14b479358593bda1b582eb398c0407",
+      "tests/compiler-capture/archive_reports.py": "036a1c54531d0027256bf32873e8fa50915af3227421270604fbc1d8f396a5d8",
+      "tests/compiler-capture/baseline-matrix.nix": "8f49f5c16333316a07af93d1efebea89bd0e86c70ca50d30d23a652795ebfb2f",
+      "tests/compiler-capture/baseline_matrix.py": "c05aa45544ecffbe503056d6c24fa6b0baad7b5670c1009b05e96feb09788181",
+      "tests/compiler-capture/batch.py": "0487be3c0972feb6f49fb081b7877ab28ee3a21056cc48f3a1e94db42546f532",
+      "tests/compiler-capture/capabilities.py": "91e15d9f95478454bec875f39f9e7895d8f5ecdd04320575c5757c64a90f6764",
+      "tests/compiler-capture/encoding.py": "42fb9bc616ec7574fa4cfafd0671c16083b4a1d562af81c5b5d7203c982eeaee",
+      "tests/compiler-capture/fixtures.nix": "0a23cadebf211b7c206443ca22662a30cdca488ff0701c07216d763f8df9aaf4",
+      "tests/compiler-capture/framework_batch.py": "5dcf2e11523fc043cd0a22998a015bc55b12809f15179a9d236e687b80efb939",
+      "tests/compiler-capture/isolate.sh": "d7d7cd114065e442a40656caa1855fefbbea6bccf194f31016debbfaa6f5c94f",
+      "tests/compiler-capture/job_wrapper.py": "34503414e072d0cdbb36b2e6ee43a0239b77eda5b256dc41e06072fed73b9c13",
+      "tests/compiler-capture/matrix-fixtures.nix": "60e566c88d94a2bb4e05315d3c7b6e84b0196faa377be47fff18d2b48c20d66d",
+      "tests/compiler-capture/matrix_corners.py": "7d7521f3936d0d44b1dad659a55eb3c831a384a686eb6263c1872f36492ceb23",
+      "tests/compiler-capture/matrix_coverage.py": "ef9f000abcd9217704910e80bab889372df782f9ae63d555a035207f02990ae7",
+      "tests/compiler-capture/matrix_report.py": "baafe0ab9fa726d38253ca5cab214b08bdc51e1b25ebe4094e692fb1b4904668",
+      "tests/compiler-capture/offline_roundtrip.py": "58b5bde6979daa093c507be2f2c8781d53cc1f7c583359f4e7d472634364882a",
+      "tests/compiler-capture/ppc_debug.py": "0b34848bf8c0e7e892a55802c21b11a6e911b557f854a1eb814f5fb499153006",
+      "tests/compiler-capture/ptrace_probe.c": "821d14166bbaab5c41d4a331482b057d579e4d3c347c2d7617e73c01bf3dcde9",
+      "tests/compiler-capture/quota_probe.py": "2156e5703eb29bb208218ed0f158971e5fa2a8868602816bf7c72e19bf1986d1",
+      "tests/compiler-capture/rust-session.sh": "d8eb3d3da8300fed42a0cd19eb1482f122377a04829f926e7177246f0ea50201",
+      "tests/compiler-capture/sweep.py": "d7dc622da39d983866b2b1d26a0c5260cf0c71f3891ee7ee11f2cdc3651e5657",
+      "tests/compiler-capture/test_batch.py": "12b3492d897e8de19707fe92d62d60b7514f2a5b11bb0b359c982afc3e1d372b",
+      "tests/compiler-capture/test_capabilities.py": "d2c7bd893508a7d6879200b4f29636987ae8920dc3f611bf94663a548b9b79f0",
+      "tests/compiler-capture/test_capture_cli.py": "77d4232e34a4a94818f165f21f618b88f432a868c21a79dfb9bcb092a16bb5bd",
+      "tests/compiler-capture/test_elf_collector.py": "331ad5979403f27575e3bd61b2fe690f2e5586f382d765ea8fc3680530e6b998",
+      "tests/compiler-capture/test_encoding.py": "8cd4e7e1df74fee6c71d35d328b9d797013cf8093a38c17aff91b88ba9798e7a",
+      "tests/compiler-capture/test_forwarding.py": "a78710ce2d9fcfc32785e0842b7773e9cae72d49e135c10a72d9630b59533a0f",
+      "tests/compiler-capture/test_legacy_stdlib.py": "b0196aa3e24343a68a1e8811303fbe37b68c095dd0bc9985289dd7fcc3faaf44",
+      "tests/compiler-capture/test_matrix_coverage.py": "2b831b1eb6a06a017617dba427560142091f5733cb65a392992ddafdbfbb4f76",
+      "tests/compiler-capture/test_native.py": "5204d190cd439e971aab1de92fe21c7dc50e52d8f7cbbe818c0918ea7bb4b745",
+      "tests/compiler-capture/test_ppc_debug.py": "59ac065ec3714f76f609e816bee0176ab62c9c17a2127ce434202eaedf90ec29",
+      "tests/compiler-capture/test_response.py": "2bb136d6f75fa943e41e30bd2a3219720c3f3926e3558cc5142742ddc383e35b",
+      "tests/compiler-capture/test_stdout.py": "3f47242e46e1c7b8fa788e71281b0c0445413d7bcd9f34fc462cfd455eeb0712",
+      "tests/compiler-capture/test_storage.py": "b27a7b8f5df43ee17026a7f6ea785cd1387c3c43c1fc194c8f5beec6192379f1",
+      "tests/compiler-capture/test_validation.py": "cff76a228420d6c606e1c443ea1739256d3ce2f28641038a4e5deebfb5c1ef7d"
+    },
+    "sha256": "a351eb7b8c0eb8f07515555da0bab18648980161d08ec93088ab4c9313e3ebb5"
+  },
+  "supervisor_binary_sha256": "d45e5c3f207439794dee5efe6c8ab8e8273305dd4793b844afc2dc19ca3c7b60",
+  "targets": {
+    "aarch64": {
+      "compiler_pairs": 37,
+      "modes": {
+        "corners": 37,
+        "lto": 35,
+        "smoke": 37,
+        "thinlto": 20
+      }
+    },
+    "armv7l-hf": {
+      "compiler_pairs": 38,
+      "modes": {
+        "corners": 38,
+        "lto": 35,
+        "smoke": 38,
+        "thinlto": 20
+      }
+    },
+    "armv7l-sf": {
+      "compiler_pairs": 3,
+      "modes": {
+        "corners": 3,
+        "lto": 1,
+        "smoke": 3
+      }
+    },
+    "i686": {
+      "compiler_pairs": 41,
+      "modes": {
+        "corners": 41,
+        "lto": 36,
+        "smoke": 41,
+        "thinlto": 20
+      }
+    },
+    "mips64el": {
+      "compiler_pairs": 40,
+      "modes": {
+        "corners": 40,
+        "lto": 35,
+        "smoke": 40,
+        "thinlto": 20
+      }
+    },
+    "mipsel": {
+      "compiler_pairs": 41,
+      "modes": {
+        "corners": 41,
+        "lto": 36,
+        "smoke": 41,
+        "thinlto": 20
+      }
+    },
+    "ppc32": {
+      "compiler_pairs": 18,
+      "modes": {
+        "corners": 18,
+        "lto": 13,
+        "smoke": 18,
+        "thinlto": 7
+      }
+    },
+    "ppc64": {
+      "compiler_pairs": 35,
+      "modes": {
+        "corners": 35,
+        "lto": 34,
+        "smoke": 35,
+        "thinlto": 20
+      }
+    },
+    "riscv64": {
+      "compiler_pairs": 23,
+      "modes": {
+        "corners": 23,
+        "lto": 23,
+        "smoke": 23,
+        "thinlto": 14
+      }
+    },
+    "x86_64": {
+      "compiler_pairs": 41,
+      "modes": {
+        "corners": 41,
+        "lto": 36,
+        "smoke": 41,
+        "thinlto": 20
+      }
+    }
+  }
+}

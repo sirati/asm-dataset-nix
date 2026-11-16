@@ -11,7 +11,6 @@ import logging
 import threading
 import time
 
-import pytest
 
 from compiler_suit_runner.prebuild import (
     PrebuildResult,

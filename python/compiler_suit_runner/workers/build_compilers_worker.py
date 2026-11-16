@@ -843,7 +843,7 @@ def main() -> int:
         )
         try:
             result = run_build_compilers_task(inner, env, name=name)
-        except BaseException as exc:  # noqa: BLE001 - never bubble raw
+        except Exception as exc:  # noqa: BLE001 - SystemExit must pass
             handle_log.exception(
                 "handle: run_build_compilers_task raised unexpectedly"
             )

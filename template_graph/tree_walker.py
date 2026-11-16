@@ -146,7 +146,7 @@ _VARIANT_RE = re.compile(
     # / march never reach the caller — so the inner axes use ``.*?``
     # between ``-<flag_set>-`` and ``-san-`` to absorb the (possibly
     # multi-token) hardening value.
-    r"^(?P<rest>.+?-(?:O[0-9]|Os|Og|Oz|Ofast|Odefault))"
+    r"^(?P<rest>.+-(?:O[0-9]|Os|Og|Oz|Ofast|Odefault))"
     r"-(?P<flag_set>[A-Za-z0-9]+)"
     r"-(?P<hardening>.*?)"
     r"-san-(?P<sanitizer>[A-Za-z0-9_+]+)"

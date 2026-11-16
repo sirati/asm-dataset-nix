@@ -19,6 +19,7 @@ Coverage:
 """
 
 from __future__ import annotations
+import json
 
 import pathlib
 from typing import Optional
@@ -26,6 +27,9 @@ from typing import Optional
 import pytest
 
 from compiler_suit_runner.workers import dependency_graph_worker as dgw
+from compiler_suit_runner.workers.dependency_graph_worker import (
+    archive as dgw_archive,
+)
 from compiler_suit_runner.dependency_graph_planner import Phase4Descriptor
 
 
@@ -223,6 +227,8 @@ class _RefsStub:
         self.calls.append(list(argv))
         if argv[:3] == ["nix-store", "--query", "--references"]:
             return self.stdout, self.stderr, self.rc
+        if argv[:3] == ["nix", "derivation", "show"]:
+            return json.dumps({path: {"env": {}} for path in argv[3:]}).encode(), b"", 0
         raise AssertionError(f"unexpected argv to refs stub: {argv!r}")
 
 
@@ -290,7 +296,7 @@ class TestDeriveVariantLookupFromAggregate:
         assert lookup[("x86_64", h_label)]["variant_dir"]
         assert lookup[("x86_64", h_label)]["compiler_id"] == "gcc15"
         # The helper made exactly one nix-store call.
-        assert len(stub.calls) == 1
+        assert len(stub.calls) == 2
         assert stub.calls[0] == [
             "nix-store", "--query", "--references", self.AGG_DRV,
         ]
@@ -625,6 +631,133 @@ class TestImportArchive:
 
 
 # ---------------------------------------------------------------------------
+# import_archive node-local-disk staging (decouple nix-store --import from a
+# slow source FS by copying the archive to local disk first)
+# ---------------------------------------------------------------------------
+
+
+class TestImportArchiveLocalStaging:
+
+    def test_no_staging_when_dir_absent(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        monkeypatch.setenv(
+            "CSR_IMPORT_STAGING_DIR", str(tmp_path / "no-such-dir"),
+        )
+        archive = tmp_path / "matrix-x.drv.archive"
+        archive.write_bytes(b"bytes")
+        assert dgw_archive._stage_archive_to_local_disk(archive) is None
+
+    def test_no_staging_when_disabled(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        monkeypatch.setenv("CSR_IMPORT_STAGING_DIR", "")
+        archive = tmp_path / "matrix-x.drv.archive"
+        archive.write_bytes(b"bytes")
+        assert dgw_archive._stage_archive_to_local_disk(archive) is None
+
+    def test_no_staging_on_ram_fs(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        staging = tmp_path / "ram"
+        staging.mkdir()
+        monkeypatch.setenv("CSR_IMPORT_STAGING_DIR", str(staging))
+        monkeypatch.setattr(dgw_archive, "_mount_fstype", lambda p: "tmpfs")
+        archive = tmp_path / "matrix-x.drv.archive"
+        archive.write_bytes(b"bytes")
+        # RAM-backed scratch is refused (would burn RAM, no readahead win).
+        assert dgw_archive._stage_archive_to_local_disk(archive) is None
+
+    def test_no_staging_when_fstype_unknown(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        staging = tmp_path / "disk"
+        staging.mkdir()
+        monkeypatch.setenv("CSR_IMPORT_STAGING_DIR", str(staging))
+        monkeypatch.setattr(dgw_archive, "_mount_fstype", lambda p: None)
+        archive = tmp_path / "matrix-x.drv.archive"
+        archive.write_bytes(b"bytes")
+        # Undeterminable fs → conservatively do not stage.
+        assert dgw_archive._stage_archive_to_local_disk(archive) is None
+
+    def test_stages_to_disk_and_returns_exact_copy(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        staging = tmp_path / "disk"
+        staging.mkdir()
+        monkeypatch.setenv("CSR_IMPORT_STAGING_DIR", str(staging))
+        monkeypatch.setattr(dgw_archive, "_mount_fstype", lambda p: "ext4")
+        archive = tmp_path / "matrix-x.drv.archive"
+        payload = b"the-archive-bytes" * 64
+        archive.write_bytes(payload)
+        local = dgw_archive._stage_archive_to_local_disk(archive)
+        assert local is not None
+        assert local != archive
+        assert str(local).startswith(str(staging))
+        assert local.read_bytes() == payload  # byte-exact copy
+
+    def test_insufficient_space_skips_staging(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        import types  # noqa: PLC0415
+
+        staging = tmp_path / "disk"
+        staging.mkdir()
+        monkeypatch.setenv("CSR_IMPORT_STAGING_DIR", str(staging))
+        monkeypatch.setattr(dgw_archive, "_mount_fstype", lambda p: "ext4")
+        # Pretend the scratch fs has almost no free space.
+        monkeypatch.setattr(
+            dgw_archive.shutil, "disk_usage",
+            lambda p: types.SimpleNamespace(total=0, used=0, free=4),
+        )
+        archive = tmp_path / "matrix-x.drv.archive"
+        archive.write_bytes(b"x" * 4096)
+        assert dgw_archive._stage_archive_to_local_disk(archive) is None
+
+    def test_import_archive_stages_then_cleans_up(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        staging = tmp_path / "disk"
+        staging.mkdir()
+        monkeypatch.setenv("CSR_IMPORT_STAGING_DIR", str(staging))
+        monkeypatch.setattr(dgw_archive, "_mount_fstype", lambda p: "ext4")
+        archive = tmp_path / "matrix-x.drv.archive"
+        archive.write_bytes(b"fake-archive")
+        stub = _SubprocessStub()
+        stub.import_rc = 0
+        stub.import_stdout = (
+            b"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv\n"
+        )
+        ok, _err, imported = dgw.import_archive(archive, run_subprocess=stub)
+        assert ok is True
+        assert imported == [
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv",
+        ]
+        # The private staging subdir is removed after import (no leak).
+        assert list(staging.iterdir()) == []
+        # The source archive is left untouched.
+        assert archive.read_bytes() == b"fake-archive"
+
+    def test_import_archive_cleans_up_on_failure(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ):
+        staging = tmp_path / "disk"
+        staging.mkdir()
+        monkeypatch.setenv("CSR_IMPORT_STAGING_DIR", str(staging))
+        monkeypatch.setattr(dgw_archive, "_mount_fstype", lambda p: "ext4")
+        archive = tmp_path / "matrix-x.drv.archive"
+        archive.write_bytes(b"junk")
+        stub = _SubprocessStub()
+        stub.import_rc = 1
+        stub.import_stderr = b"corrupt archive"
+        ok, err, _imported = dgw.import_archive(archive, run_subprocess=stub)
+        assert ok is False
+        assert b"corrupt" in err
+        # Cleanup runs even on a permanent import failure.
+        assert list(staging.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
 # import_archive transient-failure retry (EAGAIN respawn-loop fix)
 #
 # Production evidence: under fork/pids pressure spawning
@@ -682,6 +815,30 @@ class TestImportArchiveRetry:
         )
         assert ok is True
         assert len(self.sleeps) == 1
+
+    def test_nix_daemon_not_ready_stderr_retries(
+        self, tmp_path: pathlib.Path,
+    ):
+        # nix-daemon startup race: socket not yet created when the first
+        # import fires. Transient — must retry, not fail permanently.
+        archive = tmp_path / "toolchains.common.archive"
+        archive.write_bytes(b"x")
+        stub = _SubprocessStub()
+        stub.import_rc_queue = [1, 1, 0]
+        stub.import_stderr = (
+            b"error: cannot connect to socket at "
+            b"'/nix/var/nix/daemon-socket/socket': "
+            b"No such file or directory"
+        )
+        stub.import_stdout = b"/nix/store/aaa-x.drv\n"
+        ok, _err, imported = dgw.import_archive(archive, run_subprocess=stub)
+        assert ok is True
+        assert imported == ["/nix/store/aaa-x.drv"]
+        import_calls = [
+            c for c in stub.calls if c[:2] == ["nix-store", "--import"]
+        ]
+        assert len(import_calls) == 3  # two daemon-not-ready, then success
+        assert len(self.sleeps) == 2
 
     def test_permanent_rc_failure_does_not_retry(
         self, tmp_path: pathlib.Path,
@@ -747,11 +904,15 @@ class TestImportArchiveRetry:
         import_calls = [
             c for c in stub.calls if c[:2] == ["nix-store", "--import"]
         ]
-        # 1 initial attempt + 5 retries.
-        assert len(import_calls) == 6
-        # Backoff schedule 1/2/4/8/16s, each plus up to 25% jitter.
-        assert len(self.sleeps) == 5
-        for base, actual in zip((1.0, 2.0, 4.0, 8.0, 16.0), self.sleeps):
+        # 1 initial attempt + 7 retries (sized to outlast a nix-daemon
+        # startup race).
+        assert len(import_calls) == 8
+        # Backoff schedule 1/2/4/8/16s, then capped at 16s, each plus up
+        # to 25% jitter.
+        assert len(self.sleeps) == 7
+        for base, actual in zip(
+            (1.0, 2.0, 4.0, 8.0, 16.0, 16.0, 16.0), self.sleeps,
+        ):
             assert base <= actual <= base * 1.25
 
     def test_transient_oserror_direct_branch_retries_then_succeeds(
@@ -2795,27 +2956,34 @@ class TestStreamedSpawnHandoff:
 class _BuildDepsSubprocessStub:
     """Configurable stub for _produce_build_deps_archive's subprocess calls.
 
-    Handles the full sequence of nix-store calls the function makes:
-      1. ``--query --references <variant.drv>``  → input drv list
-      2. ``--query --outputs <input.drv>``        → output outpaths (reads .drv)
-      3. ``--realise <outpath…>``                 → realise/substitute outputs
-      4. ``--query --requisites <outpath…>``      → full closure for export
+    Handles the new call sequence the fixed implementation makes:
+      1. ``--query --outputs <seed.drv>``                     → seed output paths (build products)
+      2. ``--query --requisites --include-outputs <seed.drv>``→ full build-time closure
+      3. ``--realise <tc_outpath…>``                          → realise toolchain outpaths
+      4. ``--query --requisites <tc_outpath>``                → toolchain closure (per outpath)
+      5. ``--realise <input_outpath…>``                       → realise build inputs
+      6. ``--query --requisites <input_outpath…>``            → closure for export
     """
 
     def __init__(
         self,
         *,
-        references_map: "dict[str, list[str]] | None" = None,
         outputs_map: "dict[str, list[str]] | None" = None,
+        requisites_include_outputs_map: "dict[str, list[str]] | None" = None,
         requisites_map: "dict[tuple, list[str]] | None" = None,
         realise_rc: int = 0,
         realise_stderr: bytes = b"",
     ) -> None:
-        # variant.drv → list of input .drv references
-        self.references_map: dict[str, list[str]] = references_map or {}
-        # input.drv → list of output outpaths; None means .drv not in store (rc=1)
+        # seed.drv OR input.drv → list of output outpaths;
+        # None means .drv not in store (rc=1)
         self.outputs_map: dict[str, list[str]] = outputs_map or {}
+        # seed.drv → list of paths from ``--query --requisites --include-outputs``
+        # (mixes .drv paths and outpaths; the implementation filters to non-.drv)
+        self.requisites_include_outputs_map: dict[str, list[str]] = (
+            requisites_include_outputs_map or {}
+        )
         # (seed,) → requisites list (keyed by tuple of all argv seeds)
+        # used for toolchain closure and compute_build_deps_closure
         self.requisites_map: dict[tuple, list[str]] = requisites_map or {}
         # return code and stderr for ``nix-store --realise`` calls
         self.realise_rc: int = realise_rc
@@ -2824,10 +2992,6 @@ class _BuildDepsSubprocessStub:
 
     def __call__(self, argv: list[str]) -> "tuple[bytes, bytes, int]":
         self.calls.append(list(argv))
-        if argv[:3] == ["nix-store", "--query", "--references"]:
-            key = argv[3]
-            refs = self.references_map.get(key, [])
-            return ("\n".join(refs) + "\n").encode(), b"", 0
         if argv[:3] == ["nix-store", "--query", "--outputs"]:
             key = argv[3]
             out = self.outputs_map.get(key)
@@ -2835,6 +2999,10 @@ class _BuildDepsSubprocessStub:
                 # The .drv itself is not in the local store (import failed).
                 return b"", b"path not known\n", 1
             return ("\n".join(out) + "\n").encode(), b"", 0
+        if argv[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]:
+            key = argv[4]
+            paths = self.requisites_include_outputs_map.get(key, [])
+            return ("\n".join(paths) + "\n").encode(), b"", 0
         if argv[:2] == ["nix-store", "--realise"]:
             # Realise/substitute the listed output paths.
             outpaths = argv[2:]
@@ -2850,13 +3018,27 @@ class _BuildDepsSubprocessStub:
 
 def _make_build_deps_descriptors(
     drv: str, kind: str = "build_variant",
+    *, ident: "str | None" = None,
 ) -> list:
-    """Return a list containing one Phase4Descriptor with the given drv."""
+    """Return a list containing one Phase4Descriptor with the given drv.
+
+    For ``build_variant`` descriptors, ``drv`` is placed in the payload.
+    For ``build_common_dep`` descriptors, ``ident`` (``<hash>-<name>``)
+    is placed in the payload — the drv path is reconstructed from it as
+    ``/nix/store/<ident>.drv``.
+    """
+    if kind == "build_common_dep":
+        payload = {
+            "ident": ident or drv.rsplit("/", 1)[-1].removesuffix(".drv"),
+            "arch": "x86_64",
+        }
+    else:
+        payload = {"drv": drv, "pkg": "hello", "arch": "x86_64"}
     return [Phase4Descriptor(
         kind=kind,
         task_id=f"{kind}__0",
         name=f"{kind}__0",
-        payload={"drv": drv, "pkg": "hello", "arch": "x86_64"},
+        payload=payload,
         depends_on=(),
     )]
 
@@ -2864,10 +3046,34 @@ def _make_build_deps_descriptors(
 class TestProduceBuildDepsArchive:
     """Tests for ``_produce_build_deps_archive`` in the dep_graph worker."""
 
+    # Seed drvs the build phase builds.
     _VARIANT_DRV = "/nix/store/" + "v" * 32 + "-hello-elf-folder.drv"
-    _INPUT_DRV = "/nix/store/" + "i" * 32 + "-glibc.drv"
+    # Seed output (build product — must be excluded from export set).
+    _VARIANT_OUT = "/nix/store/" + "e" * 32 + "-hello-elf-folder"
+    # A genuine build-time input (e.g. glibc) that appears in the closure.
     _INPUT_OUTPATH = "/nix/store/" + "o" * 32 + "-glibc"
+    # Toolchain outpath from the variant spec.
     _TC_OUTPATH = "/nix/store/" + "t" * 32 + "-gcc15"
+
+    def _make_default_runner(self) -> "_BuildDepsSubprocessStub":
+        """Minimal happy-path stub for a single variant drv."""
+        return _BuildDepsSubprocessStub(
+            # seed.drv → its own output (build product to exclude)
+            outputs_map={self._VARIANT_DRV: [self._VARIANT_OUT]},
+            # seed.drv → full build-time closure (seed output + build input)
+            requisites_include_outputs_map={
+                self._VARIANT_DRV: [
+                    self._VARIANT_DRV,   # the .drv itself (filtered out)
+                    self._VARIANT_OUT,   # seed output (excluded as build product)
+                    self._INPUT_OUTPATH, # genuine build input (kept)
+                ],
+            },
+            # toolchain requisites + build-input requisites for compute_closure
+            requisites_map={
+                (self._TC_OUTPATH,): [self._TC_OUTPATH],
+                (self._INPUT_OUTPATH,): [self._INPUT_OUTPATH],
+            },
+        )
 
     def _run(
         self,
@@ -2897,18 +3103,7 @@ class TestProduceBuildDepsArchive:
                 },
             }
         if runner is None:
-            runner = _BuildDepsSubprocessStub(
-                references_map={
-                    self._VARIANT_DRV: [self._INPUT_DRV],
-                },
-                outputs_map={
-                    self._INPUT_DRV: [self._INPUT_OUTPATH],
-                },
-                requisites_map={
-                    (self._INPUT_OUTPATH,): [self._INPUT_OUTPATH],
-                    (self._TC_OUTPATH,): [self._TC_OUTPATH],
-                },
-            )
+            runner = self._make_default_runner()
 
         captured: list = []
 
@@ -2932,79 +3127,57 @@ class TestProduceBuildDepsArchive:
     def test_happy_path_exports_input_outpath(
         self, tmp_path: pathlib.Path, monkeypatch,
     ) -> None:
-        """Happy path: variant drv → input drv → output path → exported."""
+        """Happy path: variant drv → build-time closure → input exported."""
         exported: list = []
         self._run(tmp_path, monkeypatch, export_paths_out=exported)
-        # The input outpath (after toolchain subtraction) should be exported.
+        # The build-input outpath (after toolchain subtraction) is exported.
         assert self._INPUT_OUTPATH in exported
+        # The seed's own output (build product) must NOT be exported.
+        assert self._VARIANT_OUT not in exported
 
-    def test_variant_pkg_drv_excluded_from_realise(
+    def test_seed_output_excluded_from_export(
         self, tmp_path: pathlib.Path, monkeypatch,
     ) -> None:
-        """The variant PACKAGE drv (``-variant-``) must not enter the build-deps
-        set. mkBinaryFolder.nix interpolates the variant package's outputs into
-        the elf-folder build script, so the variant package drv is an inputDrv
-        of the elf-folder drv we query via ``--references``. Its OUTPUT is what
-        the build phase PRODUCES (not pre-fetchable) — including it caused the
-        #61 ``nix-store --realise`` hard gap. Regression for that filter.
-        """
-        variant_pkg_drv = "/nix/store/" + "p" * 32 + "-hello-variant-x86_64-1.0.drv"
-        variant_pkg_out = "/nix/store/" + "q" * 32 + "-hello-variant-x86_64-1.0"
-        runner = _BuildDepsSubprocessStub(
-            references_map={
-                # The elf-folder drv references the variant pkg drv AND a real
-                # build input (glibc).
-                self._VARIANT_DRV: [variant_pkg_drv, self._INPUT_DRV],
-            },
-            outputs_map={
-                variant_pkg_drv: [variant_pkg_out],
-                self._INPUT_DRV: [self._INPUT_OUTPATH],
-            },
-            requisites_map={
-                (self._INPUT_OUTPATH,): [self._INPUT_OUTPATH],
-                (self._TC_OUTPATH,): [self._TC_OUTPATH],
-            },
-        )
-        exported: list = []
-        self._run(tmp_path, monkeypatch, runner=runner, export_paths_out=exported)
+        """The seed drv's own outputs (build products) must be excluded.
 
-        # The variant package drv must be filtered BEFORE output resolution —
-        # its ``--query --outputs`` must never be called.
-        assert [
-            "nix-store", "--query", "--outputs", variant_pkg_drv,
-        ] not in runner.calls
-        # …so its output is never realised nor exported.
-        realised = {
-            p
-            for c in runner.calls
-            if c[:2] == ["nix-store", "--realise"]
-            for p in c[2:]
-        }
-        assert variant_pkg_out not in realised, (
-            f"variant package output {variant_pkg_out!r} must not be realised — "
-            f"it is what the build phase produces. realised={realised!r}"
-        )
-        assert variant_pkg_out not in exported
-        # The legitimate glibc input is still exported.
+        ``nix-store --query --requisites --include-outputs <seed.drv>``
+        returns both the seed's own output AND its transitive build inputs.
+        The seed's own output is what the build phase PRODUCES — it is not
+        pre-fetchable and must never be in the realise/export set.
+        """
+        exported: list = []
+        self._run(tmp_path, monkeypatch, export_paths_out=exported)
+        # Seed output is excluded — it is a build product, not an input.
+        assert self._VARIANT_OUT not in exported
+        # The genuine input IS exported.
         assert self._INPUT_OUTPATH in exported
 
     def test_toolchain_outpath_subtracted(
         self, tmp_path: pathlib.Path, monkeypatch,
     ) -> None:
         """Toolchain outpath from variant_lookups is subtracted from export list."""
-        # Include TC_OUTPATH in the input's requisites closure so it would appear
-        # without subtraction.
+        # Include TC_OUTPATH in the build-input closure so it would appear
+        # in the export without subtraction.
         from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
             _produce_build_deps_archive,
         )
         from compiler_suit_runner import preflight as _pf  # noqa: PLC0415
 
         runner = _BuildDepsSubprocessStub(
-            references_map={self._VARIANT_DRV: [self._INPUT_DRV]},
-            outputs_map={self._INPUT_DRV: [self._INPUT_OUTPATH]},
+            outputs_map={self._VARIANT_DRV: [self._VARIANT_OUT]},
+            requisites_include_outputs_map={
+                self._VARIANT_DRV: [
+                    self._VARIANT_OUT,
+                    self._INPUT_OUTPATH,
+                    self._TC_OUTPATH,  # toolchain appears in closure
+                ],
+            },
             requisites_map={
-                (self._INPUT_OUTPATH,): [self._INPUT_OUTPATH, self._TC_OUTPATH],
                 (self._TC_OUTPATH,): [self._TC_OUTPATH],
+                # compute_build_deps_closure sees both input + tc paths
+                (self._INPUT_OUTPATH, self._TC_OUTPATH): [
+                    self._INPUT_OUTPATH, self._TC_OUTPATH,
+                ],
             },
         )
         variant_lookups = {
@@ -3039,21 +3212,22 @@ class TestProduceBuildDepsArchive:
     def test_completeness_gate_raises_on_uncovered_outpath(
         self, tmp_path: pathlib.Path, monkeypatch,
     ) -> None:
-        """If an input outpath is not in the requisites result, the completeness
-        gate raises RuntimeError naming the offending path."""
+        """If a build-input outpath is not in the requisites result, the
+        completeness gate raises RuntimeError naming the offending path."""
         from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
             _produce_build_deps_archive,
         )
-        from compiler_suit_runner import preflight as _pf  # noqa: PLC0415
 
         uncovered = "/nix/store/" + "x" * 32 + "-missing"
         runner = _BuildDepsSubprocessStub(
-            references_map={self._VARIANT_DRV: [self._INPUT_DRV]},
-            outputs_map={self._INPUT_DRV: [uncovered]},
+            outputs_map={self._VARIANT_DRV: [self._VARIANT_OUT]},
+            requisites_include_outputs_map={
+                self._VARIANT_DRV: [self._VARIANT_OUT, uncovered],
+            },
             # Requisites does NOT include uncovered → completeness gate fails.
             requisites_map={
-                (uncovered,): [],
                 (self._TC_OUTPATH,): [self._TC_OUTPATH],
+                (uncovered,): [],  # uncovered absent from store requisites
             },
         )
 
@@ -3102,22 +3276,45 @@ class TestProduceBuildDepsArchive:
         assert export_calls == [], "should not export when no variant drvs found"
         assert any("no variant drvs" in r.message for r in caplog.records)
 
-    def test_references_failure_raises_runtime_error(
+    def test_outputs_query_failure_raises_runtime_error(
         self, tmp_path: pathlib.Path, monkeypatch,
     ) -> None:
-        """A non-zero rc from nix-store --query --references raises RuntimeError."""
+        """A non-zero rc from ``nix-store --query --outputs`` for a seed drv
+        raises RuntimeError (the .drv is not resident — import failure)."""
         from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
             _produce_build_deps_archive,
         )
 
         def _failing_runner(argv):
-            if argv[:3] == ["nix-store", "--query", "--references"]:
-                return b"", b"derivation not found\n", 1
-            if argv[:3] == ["nix-store", "--query", "--requisites"]:
-                return b"", b"", 0
+            if argv[:3] == ["nix-store", "--query", "--outputs"]:
+                return b"", b"path not known\n", 1
             raise AssertionError(f"unexpected: {argv!r}")
 
-        with pytest.raises(RuntimeError, match="--query --references"):
+        with pytest.raises(RuntimeError, match="--query --outputs"):
+            _produce_build_deps_archive(
+                descriptors=_make_build_deps_descriptors(self._VARIANT_DRV),
+                variant_lookups={},
+                matrix_eval_out_dir=tmp_path,
+                runner=_failing_runner,
+            )
+
+    def test_requisites_include_outputs_failure_raises_runtime_error(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        """A non-zero rc from ``--query --requisites --include-outputs`` raises."""
+        from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
+            _produce_build_deps_archive,
+        )
+
+        def _failing_runner(argv):
+            if argv[:3] == ["nix-store", "--query", "--outputs"]:
+                # outputs query succeeds (seed output)
+                return (self._VARIANT_OUT + "\n").encode(), b"", 0
+            if argv[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]:
+                return b"", b"nix daemon unreachable\n", 1
+            raise AssertionError(f"unexpected: {argv!r}")
+
+        with pytest.raises(RuntimeError, match="--requisites"):
             _produce_build_deps_archive(
                 descriptors=_make_build_deps_descriptors(self._VARIANT_DRV),
                 variant_lookups={},
@@ -3128,30 +3325,23 @@ class TestProduceBuildDepsArchive:
     def test_realise_invoked_on_input_outpaths_before_requisites(
         self, tmp_path: pathlib.Path, monkeypatch,
     ) -> None:
-        """``nix-store --realise`` must be called on the resolved input
-        output paths BEFORE ``nix-store --query --requisites``.
+        """``nix-store --realise`` must be called on the build-input outpaths
+        BEFORE the final ``nix-store --query --requisites`` (for closure export).
 
         The dep_graph worker only holds the drv graph (imported archives),
         not the built outputs.  Without realisation the --requisites and
         export calls fail on the unrealised majority.  This test asserts:
 
-        1. A ``--realise`` call appears in the stub's call list.
-        2. The ``--realise`` call lists the input outpaths (not the drvs).
-        3. The ``--realise`` call precedes any ``--query --requisites`` call.
+        1. A ``--realise`` call for the build inputs appears in the stub.
+        2. That ``--realise`` call lists the build-input outpaths (not drvs).
+        3. That ``--realise`` call precedes the final ``--query --requisites``.
         """
         from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
             _produce_build_deps_archive,
         )
         from compiler_suit_runner import preflight as _pf  # noqa: PLC0415
 
-        runner = _BuildDepsSubprocessStub(
-            references_map={self._VARIANT_DRV: [self._INPUT_DRV]},
-            outputs_map={self._INPUT_DRV: [self._INPUT_OUTPATH]},
-            requisites_map={
-                (self._INPUT_OUTPATH,): [self._INPUT_OUTPATH],
-                (self._TC_OUTPATH,): [self._TC_OUTPATH],
-            },
-        )
+        runner = self._make_default_runner()
 
         captured_export: list = []
 
@@ -3177,41 +3367,40 @@ class TestProduceBuildDepsArchive:
             runner=runner,
         )
 
-        # Collect the positions of --realise and --query --requisites calls.
-        realise_positions = [
-            i for i, c in enumerate(runner.calls)
-            if c[:2] == ["nix-store", "--realise"]
+        # Find the build-inputs realise call (the one listing INPUT_OUTPATH).
+        build_input_realise_calls = [
+            (i, c) for i, c in enumerate(runner.calls)
+            if c[:2] == ["nix-store", "--realise"] and self._INPUT_OUTPATH in c
         ]
-        requisites_positions = [
-            i for i, c in enumerate(runner.calls)
-            if c[:3] == ["nix-store", "--query", "--requisites"]
-        ]
-
-        assert realise_positions, (
-            "expected at least one 'nix-store --realise' call; "
+        assert build_input_realise_calls, (
+            "expected a 'nix-store --realise' call listing INPUT_OUTPATH; "
             f"got calls: {runner.calls!r}"
         )
-        # The --realise call must list the input outpath (not the drv).
-        realise_argv = runner.calls[realise_positions[0]]
-        assert self._INPUT_OUTPATH in realise_argv, (
-            f"--realise argv must include {self._INPUT_OUTPATH!r}; "
-            f"got: {realise_argv!r}"
+        realise_pos = build_input_realise_calls[0][0]
+
+        # The build-input realise must precede the final --query --requisites.
+        # (The toolchain realise call comes before this one; both are before
+        # the final compute_build_deps_closure requisites query.)
+        final_requisites_calls = [
+            i for i, c in enumerate(runner.calls)
+            if (c[:3] == ["nix-store", "--query", "--requisites"]
+                and "--include-outputs" not in c
+                and self._INPUT_OUTPATH in c)
+        ]
+        assert final_requisites_calls, (
+            "expected a '--query --requisites' call with INPUT_OUTPATH"
         )
-        # --realise must precede --query --requisites.
-        assert requisites_positions, (
-            "expected at least one '--query --requisites' call"
-        )
-        assert realise_positions[0] < requisites_positions[0], (
-            "--realise must be called before --query --requisites; "
-            f"realise pos={realise_positions[0]}, "
-            f"requisites pos={requisites_positions[0]}"
+        assert realise_pos < final_requisites_calls[0], (
+            "--realise (build inputs) must precede the final --query --requisites; "
+            f"realise pos={realise_pos}, "
+            f"requisites pos={final_requisites_calls[0]}"
         )
 
     def test_realise_failure_raises_runtime_error(
         self, tmp_path: pathlib.Path, monkeypatch,
     ) -> None:
-        """A non-zero rc from ``nix-store --realise`` raises RuntimeError
-        naming the unrealisable paths.
+        """A non-zero rc from the build-inputs ``nix-store --realise`` raises
+        RuntimeError naming the unrealisable paths.
 
         A build input that cannot be realised (neither in the store nor
         substitutable) is a hard gap; the feature must fail loud rather
@@ -3221,12 +3410,27 @@ class TestProduceBuildDepsArchive:
             _produce_build_deps_archive,
         )
 
-        runner = _BuildDepsSubprocessStub(
-            references_map={self._VARIANT_DRV: [self._INPUT_DRV]},
-            outputs_map={self._INPUT_DRV: [self._INPUT_OUTPATH]},
-            realise_rc=1,
-            realise_stderr=b"error: cannot substitute /nix/store/oo...-glibc",
-        )
+        # Toolchain realise succeeds but build-input realise fails.
+        realise_calls: list[list[str]] = []
+
+        def _stub_runner(argv):
+            if argv[:3] == ["nix-store", "--query", "--outputs"]:
+                return (self._VARIANT_OUT + "\n").encode(), b"", 0
+            if argv[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]:
+                return (
+                    self._VARIANT_OUT + "\n" + self._INPUT_OUTPATH + "\n"
+                ).encode(), b"", 0
+            if argv[:2] == ["nix-store", "--realise"]:
+                realise_calls.append(argv)
+                if self._TC_OUTPATH in argv:
+                    # toolchain realise succeeds
+                    return ("\n".join(argv[2:]) + "\n").encode(), b"", 0
+                # build-input realise fails
+                return b"", b"error: cannot substitute /nix/store/oo...-glibc", 1
+            if argv[:3] == ["nix-store", "--query", "--requisites"]:
+                # toolchain closure query
+                return (self._TC_OUTPATH + "\n").encode(), b"", 0
+            raise AssertionError(f"unexpected: {argv!r}")
 
         with pytest.raises(RuntimeError, match="--realise failed"):
             _produce_build_deps_archive(
@@ -3240,5 +3444,308 @@ class TestProduceBuildDepsArchive:
                     },
                 },
                 matrix_eval_out_dir=tmp_path,
-                runner=runner,
+                runner=_stub_runner,
             )
+
+    # =========================================================================
+    # NEW TESTS: correctness-critical coverage for the fixed implementation
+    # =========================================================================
+
+    def test_common_dep_drvs_seeded_into_closure(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        """``build_common_dep`` descriptors must be seeded into the build-time
+        closure, not just ``build_variant`` drvs.
+
+        The ROOT BUG was that common_dep drvs (e.g. zlib, libpng-apng,
+        pkg-config-wrapper) were never included in the seed set → their
+        build-time inputs (stdenv bootstrap, FODs) were absent from the
+        archive → offline build failed with "Cannot build … dependency failed".
+
+        This test verifies that a ``build_common_dep`` descriptor's drv
+        (reconstructed from ``payload["ident"]``) is queried for its
+        build-time closure, and the resulting build inputs are exported.
+        """
+        from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
+            _produce_build_deps_archive,
+        )
+        from compiler_suit_runner import preflight as _pf  # noqa: PLC0415
+
+        # Common dep drv (e.g. zlib built from source)
+        _ZLIB_HASH = "z" * 32
+        zlib_ident = f"{_ZLIB_HASH}-zlib-1.3.2"
+        zlib_drv = f"/nix/store/{zlib_ident}.drv"
+        zlib_out = f"/nix/store/{_ZLIB_HASH}-zlib-1.3.2"
+        # A bootstrap input only reachable from zlib's build-time closure
+        bootstrap_out = "/nix/store/" + "b" * 32 + "-bootstrap-tools"
+        # The variant drv's own build-time closure (does NOT include bootstrap)
+        variant_input = "/nix/store/" + "i" * 32 + "-glibc"
+
+        runner = _BuildDepsSubprocessStub(
+            # Seed output queries
+            outputs_map={
+                self._VARIANT_DRV: [self._VARIANT_OUT],
+                zlib_drv: [zlib_out],
+            },
+            # Build-time closures
+            requisites_include_outputs_map={
+                self._VARIANT_DRV: [
+                    self._VARIANT_DRV,   # .drv filtered out
+                    self._VARIANT_OUT,   # seed output (excluded)
+                    variant_input,       # genuine build input
+                ],
+                zlib_drv: [
+                    zlib_drv,            # .drv filtered out
+                    zlib_out,            # seed output (excluded — build product)
+                    bootstrap_out,       # bootstrap input (must be included!)
+                    variant_input,       # shared input (already seen, dedup'd)
+                ],
+            },
+            # compute_build_deps_closure and toolchain subtraction
+            requisites_map={
+                (self._TC_OUTPATH,): [self._TC_OUTPATH],
+                # Both build inputs appear after dedup
+                (variant_input, bootstrap_out): [variant_input, bootstrap_out],
+            },
+        )
+
+        common_dep_descriptor = Phase4Descriptor(
+            kind="build_common_dep",
+            task_id="build_common_dep__0",
+            name="build_common_dep__0",
+            payload={"ident": zlib_ident, "arch": "x86_64"},
+            depends_on=(),
+        )
+        variant_descriptor = _make_build_deps_descriptors(self._VARIANT_DRV)[0]
+
+        exported: list = []
+
+        def _fake_export(paths, out_dir, *, run_subprocess=None):
+            exported.extend(paths)
+            p = out_dir / _pf.BUILD_DEPS_ARCHIVE_NAME
+            p.write_bytes(b"x")
+            return p
+
+        monkeypatch.setattr(_pf, "export_build_deps_archive", _fake_export)
+
+        _produce_build_deps_archive(
+            descriptors=[variant_descriptor, common_dep_descriptor],
+            variant_lookups={
+                "hello": {
+                    ("x86_64", "lbl"): {
+                        "drv": self._VARIANT_DRV,
+                        "toolchain_outpath": self._TC_OUTPATH,
+                    },
+                },
+            },
+            matrix_eval_out_dir=tmp_path,
+            runner=runner,
+        )
+
+        # The bootstrap input (reachable only via the common_dep drv's closure)
+        # must be in the export set — this was the root-cause missing piece.
+        assert bootstrap_out in exported, (
+            f"bootstrap_out {bootstrap_out!r} must be exported — it is a "
+            f"build-time input of the common_dep drv and was missing from "
+            f"the old implementation"
+        )
+        # The variant's build input is also present.
+        assert variant_input in exported
+        # Build products (seed outputs) must not be exported.
+        assert self._VARIANT_OUT not in exported
+        assert zlib_out not in exported
+
+        # The zlib_drv must have been queried for its build-time closure.
+        closure_queries = [
+            c for c in runner.calls
+            if c[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]
+        ]
+        queried_seeds = {c[4] for c in closure_queries}
+        assert zlib_drv in queried_seeds, (
+            f"zlib_drv {zlib_drv!r} must be queried for its build-time closure; "
+            f"queried seeds: {queried_seeds!r}"
+        )
+
+    def test_build_time_closure_includes_transitive_inputs(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        """The build-time closure via ``--include-outputs`` covers transitive
+        bootstrap inputs (linux-headers, perl, openssl, etc.) that are NOT
+        in the runtime requisites of pre-realised variant inputs.
+
+        This simulates a from-source build's full closure: the elf-folder
+        drv pulls in both a direct outpath AND a deep bootstrap chain.
+        """
+        from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
+            _produce_build_deps_archive,
+        )
+        from compiler_suit_runner import preflight as _pf  # noqa: PLC0415
+
+        linux_headers = "/nix/store/" + "l" * 32 + "-linux-headers"
+        perl = "/nix/store/" + "p" * 32 + "-perl"
+        direct_input = "/nix/store/" + "d" * 32 + "-direct-dep"
+
+        runner = _BuildDepsSubprocessStub(
+            outputs_map={self._VARIANT_DRV: [self._VARIANT_OUT]},
+            requisites_include_outputs_map={
+                self._VARIANT_DRV: [
+                    # The full build-time closure includes bootstrap inputs that
+                    # would NOT appear in the runtime requisites of direct_input.
+                    linux_headers,
+                    perl,
+                    direct_input,
+                    self._VARIANT_OUT,  # seed output (excluded)
+                ],
+            },
+            requisites_map={
+                (self._TC_OUTPATH,): [self._TC_OUTPATH],
+                (linux_headers, perl, direct_input): [
+                    linux_headers, perl, direct_input,
+                ],
+            },
+        )
+
+        exported: list = []
+
+        def _fake_export(paths, out_dir, *, run_subprocess=None):
+            exported.extend(paths)
+            p = out_dir / _pf.BUILD_DEPS_ARCHIVE_NAME
+            p.write_bytes(b"x")
+            return p
+
+        monkeypatch.setattr(_pf, "export_build_deps_archive", _fake_export)
+
+        _produce_build_deps_archive(
+            descriptors=_make_build_deps_descriptors(self._VARIANT_DRV),
+            variant_lookups={
+                "hello": {
+                    ("x86_64", "lbl"): {
+                        "drv": self._VARIANT_DRV,
+                        "toolchain_outpath": self._TC_OUTPATH,
+                    },
+                },
+            },
+            matrix_eval_out_dir=tmp_path,
+            runner=runner,
+        )
+
+        # All transitive build-time inputs must be exported.
+        assert linux_headers in exported
+        assert perl in exported
+        assert direct_input in exported
+        # Seed output excluded.
+        assert self._VARIANT_OUT not in exported
+
+    def test_toolchain_realised_before_subtraction(
+        self, tmp_path: pathlib.Path, monkeypatch,
+    ) -> None:
+        """Toolchain outpaths must be realised BEFORE computing their closure.
+
+        The previous implementation called ``collect_toolchain_archive_paths``
+        directly on unrealised toolchain outpaths — because the dep_graph node
+        only has drv archives (not the realised outputs), ``--query --requisites``
+        returned 0 paths ("toolchain closure has 0 paths"), making the subtraction
+        a no-op and causing toolchain paths to be duplicated in the archive.
+
+        This test asserts that a ``nix-store --realise`` call for the toolchain
+        outpath appears BEFORE the toolchain's ``--query --requisites`` call.
+        """
+        from compiler_suit_runner.workers.dependency_graph_worker.run import (  # noqa: PLC0415
+            _produce_build_deps_archive,
+        )
+        from compiler_suit_runner import preflight as _pf  # noqa: PLC0415
+
+        runner = self._make_default_runner()
+
+        def _fake_export(paths, out_dir, *, run_subprocess=None):
+            p = out_dir / _pf.BUILD_DEPS_ARCHIVE_NAME
+            p.write_bytes(b"x")
+            return p
+
+        monkeypatch.setattr(_pf, "export_build_deps_archive", _fake_export)
+
+        _produce_build_deps_archive(
+            descriptors=_make_build_deps_descriptors(self._VARIANT_DRV),
+            variant_lookups={
+                "hello": {
+                    ("x86_64", "lbl"): {
+                        "drv": self._VARIANT_DRV,
+                        "toolchain_outpath": self._TC_OUTPATH,
+                    },
+                },
+            },
+            matrix_eval_out_dir=tmp_path,
+            runner=runner,
+        )
+
+        # Find the toolchain realise call (lists the TC outpath).
+        tc_realise_calls = [
+            (i, c) for i, c in enumerate(runner.calls)
+            if c[:2] == ["nix-store", "--realise"] and self._TC_OUTPATH in c
+        ]
+        assert tc_realise_calls, (
+            "expected a 'nix-store --realise' call for the toolchain outpath"
+        )
+        tc_realise_pos = tc_realise_calls[0][0]
+
+        # Find the toolchain requisites call (collect_toolchain_archive_paths).
+        tc_req_calls = [
+            (i, c) for i, c in enumerate(runner.calls)
+            if (c[:3] == ["nix-store", "--query", "--requisites"]
+                and "--include-outputs" not in c
+                and self._TC_OUTPATH in c
+                # single-outpath form used by collect_toolchain_archive_paths
+                and len(c) == 4)
+        ]
+        assert tc_req_calls, (
+            "expected a '--query --requisites <tc_outpath>' call for toolchain subtraction"
+        )
+        tc_req_pos = tc_req_calls[0][0]
+
+        assert tc_realise_pos < tc_req_pos, (
+            f"toolchain --realise (pos={tc_realise_pos}) must precede "
+            f"toolchain --query --requisites (pos={tc_req_pos})"
+        )
+
+
+def test_group_templates_by_binary_keeps_dashed_binaries_apart():
+    """``c-ares`` and ``zlib-ng`` own their templates; they are not
+    attributed to ``c`` / ``zlib`` by splitting the drv name at the
+    first dash (review finding T2)."""
+    from template_graph.streaming import StreamPlanner
+    from template_graph.tests.test_streaming.fixtures import (
+        Node,
+        feed,
+        make_hash,
+        render_tree,
+        simple_variant,
+    )
+
+    from compiler_suit_runner.workers.dependency_graph_worker.slice import (
+        _group_templates_by_binary,
+    )
+
+    binaries = ("zlib", "zlib-ng", "c-ares")
+    matrices = [
+        Node(
+            hash=make_hash(10 + i), name=f"matrix-{b}.drv",
+            children=[
+                simple_variant(b, "x86_64", seed_base=100 * (i + 1) + off, opt=opt)
+                for off, opt in ((0, "O0"), (10, "O2"))
+            ],
+        )
+        for i, b in enumerate(binaries)
+    ]
+    root = Node(
+        hash=make_hash(0), name="sum-root.drv",
+        children=[Node(hash=make_hash(1), name="toolchains.drv"), *matrices],
+    )
+    planner = StreamPlanner(archs=("x86_64",))
+    feed(planner, render_tree(root))
+    result = planner.finalize()
+
+    grouped = _group_templates_by_binary(result["variant_arrays"])
+    assert set(grouped) == set(binaries)
+    owned = [grouped[b] for b in binaries]
+    assert all(len(ids) == 1 for ids in owned)
+    assert len(set().union(*owned)) == 3

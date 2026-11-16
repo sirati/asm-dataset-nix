@@ -150,9 +150,48 @@
             inherit oldNixpkgsSets;
           };
 
+          evaluationIdentity = import ./lib/evaluation-identity.nix {
+            inherit lib system;
+            root = ./.;
+            # Actual resolved inputs also cover --override-input without a
+            # lockfile write. This forces source identities, not package sets.
+            inputs = builtins.mapAttrs (_: input: {
+              revision = input.rev or null;
+              narHash = input.narHash or null;
+              source = builtins.unsafeDiscardStringContext (toString input);
+            }) { inherit nixpkgs nixpkgs-15_09 nixpkgs-18_03 nixpkgs-22_11 nixpkgs-23_11 nixpkgs-24_05 dynamic-runner nix-docker-layered-image; };
+          };
+          packageProviders = {
+            current = {
+              path = nixpkgs;
+              revision = nixpkgs.rev;
+              narHash = nixpkgs.narHash;
+            };
+            nixpkgs-24_05 = {
+              path = nixpkgs-24_05;
+              revision = nixpkgs-24_05.rev;
+              narHash = nixpkgs-24_05.narHash;
+            };
+          };
           matrix = import ./lib/matrix.nix {
-            inherit pkgs lib;
+            inherit pkgs lib packageProviders evaluationIdentity;
             extraCompilers = oldCompilers;
+          };
+          # Opt-in compiler-capture matrix: the same package catalog and
+          # variant axes as `matrix`, built with capturing toolchains.
+          capturedMatrix = import ./lib/matrix.nix {
+            inherit pkgs lib packageProviders evaluationIdentity;
+            extraCompilers = oldCompilers;
+            capture = { policy = "required"; };
+          };
+          capturedDataset = lib.mapAttrs (_: archs:
+            lib.mapAttrs (_: variants: lib.mapAttrs (_: v: v.elfFolder) variants) archs
+          ) capturedMatrix.nestedMatrix;
+          captureTool = cleanPkgs.buildPackages.callPackage ./nix/compiler-capture.nix {};
+          captureTools = import ./nix/capture-tools.nix { pkgs = cleanPkgs; };
+          captureExample = import ./nix/capture-example.nix {
+            pkgs = cleanPkgs;
+            inherit captureTool;
           };
           # Dev shell stays fully on `cleanPkgs` so the binary cache
           # serves mcp-nixos / language-server / transitive python
@@ -205,13 +244,18 @@
               src = ./.;
               filter = path: type:
                 let base = baseNameOf path; in
-                !(base == ".git"
+                !(base == ".capture-experiments"
+                  || base == "target"
+                  || base == "result"
+                  || base == ".git"
                   || base == ".claude"
                   || base == ".docker-layer-cache.json"
                   || base == "dataset"
                   || base == "docs"
                   || base == "result"
                   || base == "__pycache__"
+                  || base == ".multiversion-work"
+                  || base == ".pytest_cache"
                   || runnerPkgs.lib.hasPrefix ".direnv" base
                   || runnerPkgs.lib.hasSuffix ".pyc" base);
             };
@@ -272,7 +316,12 @@
         {
           packages = {
             inherit dockerImage sshDebugImage;
+            compiler-capture = captureTool;
+            capture-inspect = captureTools.inspector;
+            capture-example = captureExample;
           };
+
+          checks.compiler-capture-validation = captureTools.validation;
 
           # Expose dockerImage at top-level too so `.#dockerImage` works
           # without `.packages.x86_64-linux.dockerImage`. Mirrors the
@@ -280,6 +329,10 @@
           inherit dockerImage sshDebugImage;
 
           apps = {
+            capture-inspect = {
+              type = "app";
+              program = "${captureTools.inspector}/bin/capture-inspect";
+            };
             generate-manifest = {
               type = "app";
               program = toString generateManifestScript;
@@ -292,6 +345,19 @@
 
           # Nested dataset (the main output — derivations, lazy)
           dataset = datasetNested;
+          datasetCaptured = capturedDataset;
+          _capturedMeta = capturedMatrix.metaMatrix;
+          _capturedCrossToolchainMap = capturedMatrix.crossToolchainMap;
+          _capturedSelectDataset = capturedMatrix.selectDataset;
+          _packageCatalog = matrix.packageCatalog;
+          _evaluationIdentity = evaluationIdentity;
+          _variantAxes = matrix.variantAxes;
+          _variantCounts = matrix.variantCounts;
+          _selectDataset = matrix.selectDataset;
+          _packageVariantCounts = matrix.packageVariantCounts;
+          _rawPackages = lib.mapAttrs (_: archs:
+            lib.mapAttrs (_: variants: lib.mapAttrs (_: v: v.rawPkg) variants) archs
+          ) matrix.nestedMatrix;
 
           # Pure metadata — no derivations, instant eval
           _meta = matrix.metaMatrix;
@@ -335,6 +401,7 @@
               };
             targets = builtins.attrNames (import ./lib/architectures.nix { }).targets;
             matrixSize = matrix.matrixSize;
+            curatedMatrixSize = matrix.curatedMatrixSize;
           };
 
           # ── Cross-toolchains (pre-build for cache population) ─────────────
@@ -352,12 +419,56 @@
           crossToolchains = matrix.crossToolchains;
           _crossToolchainMap = matrix.crossToolchainMap;
           _crossToolchainsMeta = matrix.crossToolchainsMeta;
+          # The native std-compiler stdenv — its build closure is present on
+          # every build node via the image baseline. The submitter subtracts
+          # this closure from each cross toolchain's build closure so only the
+          # cross-specific delta ships (toolchain-archive shrink, STEP 2).
+          _baselineStdenv = pkgs.stdenv;
+          # Build-host tools the elf-folder wrapper runs (file/find/awk). The
+          # substituter-free submitter force-ships this closure into
+          # import_common — every cross variant's elf-folder build needs them
+          # on the build host, and they are in no toolchain/stdenv closure.
+          # Same list as lib/mkBinaryFolder.nix (shared, cannot drift).
+          #
+          # Reference EVERY output of each tool (out + dev + man + …): the
+          # multiple-outputs setup hook propagates a nativeBuildInput's `dev`
+          # output, so the elf-folder build actually needs e.g. file-5.45-DEV,
+          # not just `out`. We map over each tool's own ``outputs`` list so the
+          # closure carries them all regardless of which the build references.
+          _buildHostTools = pkgs.symlinkJoin {
+            name = "csr-build-host-tools";
+            paths = builtins.concatMap
+              (p: map (o: p.${o}) p.outputs)
+              (import ./lib/elfFolderBuildTools.nix { inherit pkgs; });
+          };
         }
       );
+
+      # Derivation-path snapshot of a few cells (nix/drv-snapshot.nix).
+      drvSnapshot = nixpkgs.lib.mapAttrs (
+        system: s:
+        import ./nix/drv-snapshot.nix {
+          inherit (nixpkgs) lib;
+          inherit (nixpkgs.legacyPackages.${system}) runCommand;
+          inherit system;
+          inherit (s) dataset;
+        }
+      ) perSystem;
 
     in
     {
       dataset = nixpkgs.lib.mapAttrs (_: s: s.dataset) perSystem;
+      datasetCaptured = nixpkgs.lib.mapAttrs (_: s: s.datasetCaptured) perSystem;
+      _capturedMeta = nixpkgs.lib.mapAttrs (_: s: s._capturedMeta) perSystem;
+      _capturedCrossToolchainMap = nixpkgs.lib.mapAttrs (_: s: s._capturedCrossToolchainMap) perSystem;
+      _capturedSelectDataset = nixpkgs.lib.mapAttrs (_: s: s._capturedSelectDataset) perSystem;
+      _packageCatalog = nixpkgs.lib.mapAttrs (_: s: s._packageCatalog) perSystem;
+      _evaluationIdentity = nixpkgs.lib.mapAttrs (_: s: s._evaluationIdentity) perSystem;
+      _variantAxes = nixpkgs.lib.mapAttrs (_: s: s._variantAxes) perSystem;
+      _variantCounts = nixpkgs.lib.mapAttrs (_: s: s._variantCounts) perSystem;
+      _selectDataset = nixpkgs.lib.mapAttrs (_: s: s._selectDataset) perSystem;
+      _packageVariantCounts = nixpkgs.lib.mapAttrs (_: s: s._packageVariantCounts) perSystem;
+      _rawPackages = nixpkgs.lib.mapAttrs (_: s: s._rawPackages) perSystem;
       apps = nixpkgs.lib.mapAttrs (_: s: s.apps) perSystem;
       devShells = nixpkgs.lib.mapAttrs (_: s: s.devShells) perSystem;
       packages = nixpkgs.lib.mapAttrs (_: s: s.packages) perSystem;
@@ -369,11 +480,38 @@
       crossToolchains = nixpkgs.lib.mapAttrs (_: s: s.crossToolchains) perSystem;
       _crossToolchainMap = nixpkgs.lib.mapAttrs (_: s: s._crossToolchainMap) perSystem;
       _crossToolchainsMeta = nixpkgs.lib.mapAttrs (_: s: s._crossToolchainsMeta) perSystem;
+      _baselineStdenv = nixpkgs.lib.mapAttrs (_: s: s._baselineStdenv) perSystem;
+      _buildHostTools = nixpkgs.lib.mapAttrs (_: s: s._buildHostTools) perSystem;
+
+      # Hash-neutral refactors must leave these unchanged; see
+      # nix/drv-snapshot.nix.
+      _drvPathSnapshot = nixpkgs.lib.mapAttrs (_: d: d.actual) drvSnapshot;
+      checks = nixpkgs.lib.mapAttrs (
+        system: d:
+        perSystem.${system}.checks
+        // d.checks
+        // import ./nix/lint.nix {
+          inherit (nixpkgs) lib;
+          inherit (nixpkgs.legacyPackages.${system}) runCommand ruff;
+          root = ./.;
+        }
+      ) drvSnapshot;
 
       # Layered podman image for the compiler_suit_runner. Lives both
       # under packages.<sys>.dockerImage (so `nix build .#dockerImage`
       # works on the default system) and as a per-system attribute.
       dockerImage = nixpkgs.lib.mapAttrs (_: s: s.dockerImage) perSystem;
+
+      # The image's baked store-DB registration (closureInfo over the
+      # image rootfs). The submitter realises this and reads its
+      # registration file to obtain the EXACT set of store paths resident
+      # on every build node, then subtracts that set from each toolchain
+      # archive as the STEP-2 baseline. Authoritative because it is the
+      # very closure the deployed image ships (built with runnerPkgs), so
+      # it can never strand a path the way subtracting a separately
+      # evaluated stdenv closure can.
+      _imageStoreRegistration =
+        nixpkgs.lib.mapAttrs (_: s: s.dockerImage.storeDbRegistration) perSystem;
 
       # Layered podman image for the ssh_debug_runner — interactive
       # SSH-able debug containers. Same exposure pattern as dockerImage.

@@ -1,0 +1,834 @@
+{
+ "discover_items": {
+  "manifests": [
+   {
+    "affinity_id": "gcc15-aarch64",
+    "binary_name": "build_compilers__aarch64__gcc15.json",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": false,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "build_compilers__aarch64__gcc15.json",
+    "payload": {
+     "item_class": "build_compilers",
+     "name": "build_compilers__aarch64__gcc15",
+     "payload": {
+      "arch": "aarch64",
+      "attr": "_crossToolchainMap.x86_64-linux.aarch64.gcc15",
+      "compiler_label": "gcc15",
+      "sys": "x86_64-linux"
+     },
+     "size": 0
+    },
+    "phase_id": "build_compilers",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [],
+    "task_id": "x86_64-linux__aarch64__gcc15",
+    "type_id": "build_compilers",
+    "version": "0"
+   },
+   {
+    "affinity_id": null,
+    "binary_name": "common_dep__glibc.json",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": false,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "common_dep__glibc.json",
+    "payload": {
+     "item_class": "build_common_dep",
+     "name": "common_dep__glibc",
+     "payload": {
+      "attr": "/nix/store/3333333333333333333333333333333d-glibc.drv",
+      "drv": "/nix/store/3333333333333333333333333333333d-glibc.drv",
+      "label": "glibc"
+     },
+     "size": 0
+    },
+    "phase_id": "build",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [
+     "import_common"
+    ],
+    "task_id": "build_common_dep__3333333333333333333333333333333d-glibc.drv",
+    "type_id": "common_dep",
+    "version": "0"
+   },
+   {
+    "affinity_id": "gcc15-aarch64",
+    "binary_name": "hello-aarch64-gcc15-O2.json",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": false,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "hello-aarch64-gcc15-O2.json",
+    "payload": {
+     "item_class": "build_variant",
+     "name": "hello-aarch64-gcc15-O2",
+     "payload": {
+      "arch": "aarch64",
+      "attr": "dataset.x86_64-linux.hello.aarch64.hello-aarch64-gcc15-O2",
+      "compiler_family": "gcc",
+      "compiler_id": "gcc15",
+      "compiler_version": "15.2.0",
+      "drv": "/nix/store/hello-aarch64-gcc15-O2.drv",
+      "flag_set": "baseline",
+      "hardening": "default",
+      "label": "hello-aarch64-gcc15-O2",
+      "march": "march-default",
+      "metadata_name": "hello-aarch64-gcc15-O2.json",
+      "optimization": "O2",
+      "pkg": "hello",
+      "sanitizer": "san-off",
+      "sys": "x86_64-linux",
+      "tier": 1,
+      "variant_dir": "hello-aarch64-gcc15-O2"
+     },
+     "size": 0
+    },
+    "phase_id": "build",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [
+     "import_common",
+     {
+      "inherit_outputs": false,
+      "phase_id": "build_compilers",
+      "task_id": "x86_64-linux__aarch64__gcc15"
+     }
+    ],
+    "task_id": "build_variant__x86_64-linux__hello__aarch64__hello-aarch64-gcc15-O2",
+    "type_id": "variant",
+    "version": "0"
+   }
+  ],
+  "streamed": [
+   {
+    "affinity_id": null,
+    "binary_name": "nix_daemon_up",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": true,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "nix_daemon_up",
+    "payload": {
+     "item_class": "affine_import",
+     "task_id": "nix_daemon_up"
+    },
+    "phase_id": "matrix_eval",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [],
+    "task_id": "nix_daemon_up",
+    "type_id": "affine_import",
+    "version": "0"
+   },
+   {
+    "affinity_id": "c-ares",
+    "binary_name": "c-ares.json",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": false,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "c-ares.json",
+    "payload": {
+     "item_class": "matrix_eval",
+     "name": "matrix_eval__c-ares",
+     "payload": {
+      "archs": [
+       "aarch64"
+      ],
+      "attr": "dataset.x86_64-linux.c-ares",
+      "binary": "c-ares",
+      "sys": "x86_64-linux",
+      "toolchain_aggregate_drv": "/nix/store/0000000000000000000000000000000a-toolchains.drv",
+      "toolchain_dedup": true,
+      "variant_sample": 2,
+      "variant_seed": "s-c-ares"
+     },
+     "size": 0
+    },
+    "phase_id": "matrix_eval",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [
+     "nix_daemon_up"
+    ],
+    "task_id": "c-ares",
+    "type_id": "eval",
+    "version": "0"
+   },
+   {
+    "affinity_id": "hello",
+    "binary_name": "hello.json",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": false,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "hello.json",
+    "payload": {
+     "item_class": "matrix_eval",
+     "name": "matrix_eval__hello",
+     "payload": {
+      "archs": [
+       "x86_64",
+       "aarch64"
+      ],
+      "attr": "dataset.x86_64-linux.hello",
+      "binary": "hello",
+      "sys": "x86_64-linux",
+      "toolchain_aggregate_drv": "/nix/store/0000000000000000000000000000000a-toolchains.drv",
+      "toolchain_dedup": true,
+      "variant_sample": 4,
+      "variant_seed": "s-hello"
+     },
+     "size": 0
+    },
+    "phase_id": "matrix_eval",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [
+     "nix_daemon_up"
+    ],
+    "task_id": "hello",
+    "type_id": "eval",
+    "version": "0"
+   },
+   {
+    "affinity_id": null,
+    "binary_name": "dependency_graph.json",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": false,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "dependency_graph.json",
+    "payload": {
+     "item_class": "dependency_graph",
+     "name": "dependency_graph",
+     "payload": {
+      "build_deps_local": true,
+      "sys": "x86_64-linux",
+      "toolchain_aggregate_drv": "/nix/store/0000000000000000000000000000000a-toolchains.drv",
+      "toolchain_outpaths_map": {
+       "aarch64/clang19": "/nix/store/2222222222222222222222222222222c-stdenv-linux",
+       "aarch64/gcc15": "/nix/store/1111111111111111111111111111111b-stdenv-linux"
+      }
+     },
+     "size": 0
+    },
+    "phase_id": "dependency_graph",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [
+     {
+      "inherit_outputs": false,
+      "phase_id": "matrix_eval",
+      "task_id": "c-ares"
+     },
+     {
+      "inherit_outputs": false,
+      "phase_id": "matrix_eval",
+      "task_id": "hello"
+     }
+    ],
+    "task_id": "dependency_graph",
+    "type_id": "dep_graph",
+    "version": "0"
+   },
+   {
+    "affinity_id": null,
+    "binary_name": "import_toolchain_drv",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": true,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "import_toolchain_drv",
+    "payload": {
+     "item_class": "affine_import",
+     "task_id": "import_toolchain_drv"
+    },
+    "phase_id": "build",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [],
+    "task_id": "import_toolchain_drv",
+    "type_id": "affine_import",
+    "version": "0"
+   },
+   {
+    "affinity_id": null,
+    "binary_name": "import_matrix_drv_c-ares",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": true,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "import_matrix_drv_c-ares",
+    "payload": {
+     "item_class": "affine_import",
+     "task_id": "import_matrix_drv_c-ares"
+    },
+    "phase_id": "build",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [],
+    "task_id": "import_matrix_drv_c-ares",
+    "type_id": "affine_import",
+    "version": "0"
+   },
+   {
+    "affinity_id": null,
+    "binary_name": "import_matrix_drv_hello",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": true,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "import_matrix_drv_hello",
+    "payload": {
+     "item_class": "affine_import",
+     "task_id": "import_matrix_drv_hello"
+    },
+    "phase_id": "build",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [],
+    "task_id": "import_matrix_drv_hello",
+    "type_id": "affine_import",
+    "version": "0"
+   },
+   {
+    "affinity_id": null,
+    "binary_name": "import_common",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": true,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "import_common",
+    "payload": {
+     "item_class": "affine_import",
+     "task_id": "import_common"
+    },
+    "phase_id": "build",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [],
+    "task_id": "import_common",
+    "type_id": "affine_import",
+    "version": "0"
+   },
+   {
+    "affinity_id": null,
+    "binary_name": "import_build_deps",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": true,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "import_build_deps",
+    "payload": {
+     "item_class": "affine_import",
+     "task_id": "import_build_deps"
+    },
+    "phase_id": "build",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [],
+    "task_id": "import_build_deps",
+    "type_id": "affine_import",
+    "version": "0"
+   },
+   {
+    "affinity_id": null,
+    "binary_name": "import_tc_1111111111111111111111111111111b",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": true,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "import_tc_1111111111111111111111111111111b",
+    "payload": {
+     "item_class": "affine_import",
+     "task_id": "import_tc_1111111111111111111111111111111b"
+    },
+    "phase_id": "build",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [],
+    "task_id": "import_tc_1111111111111111111111111111111b",
+    "type_id": "affine_import",
+    "version": "0"
+   },
+   {
+    "affinity_id": null,
+    "binary_name": "import_tc_2222222222222222222222222222222c",
+    "compiler": "manifest",
+    "files": [],
+    "is_secondary_affine": true,
+    "is_setup": false,
+    "opt_level": "manifest",
+    "path": "import_tc_2222222222222222222222222222222c",
+    "payload": {
+     "item_class": "affine_import",
+     "task_id": "import_tc_2222222222222222222222222222222c"
+    },
+    "phase_id": "build",
+    "platform": "manifest",
+    "setup_affinity": null,
+    "size": 0,
+    "task_depends_on": [],
+    "task_id": "import_tc_2222222222222222222222222222222c",
+    "type_id": "affine_import",
+    "version": "0"
+   }
+  ]
+ },
+ "gate_ids": [
+  "import_build_deps",
+  "import_common",
+  "import_matrix_drv_c-ares",
+  "import_matrix_drv_hello",
+  "import_tc_1111111111111111111111111111111b",
+  "import_tc_2222222222222222222222222222222c",
+  "import_toolchain_drv",
+  "nix_daemon_up"
+ ],
+ "streamed_spawn_order": [
+  {
+   "affinity_id": null,
+   "binary_name": "build_common_dep__4444444444444444444444444444444e-glibc.drv.json",
+   "compiler": "manifest",
+   "files": [],
+   "is_secondary_affine": false,
+   "is_setup": false,
+   "opt_level": "manifest",
+   "path": "build_common_dep__4444444444444444444444444444444e-glibc.drv.json",
+   "payload": {
+    "item_class": "build_common_dep",
+    "name": "common_dep__4444444444444444444444444444444e-glibc",
+    "payload": {
+     "attr": "/nix/store/4444444444444444444444444444444e-glibc.drv",
+     "drv": "/nix/store/4444444444444444444444444444444e-glibc.drv",
+     "label": "4444444444444444444444444444444e-glibc"
+    },
+    "size": 0
+   },
+   "phase_id": "build",
+   "platform": "manifest",
+   "setup_affinity": null,
+   "size": 0,
+   "task_depends_on": [
+    "import_common",
+    "import_build_deps",
+    "import_toolchain_drv"
+   ],
+   "task_id": "build_common_dep__4444444444444444444444444444444e-glibc.drv",
+   "type_id": "common_dep",
+   "version": "0"
+  },
+  {
+   "affinity_id": null,
+   "binary_name": "build_common_dep__5555555555555555555555555555555f-zlib.drv.json",
+   "compiler": "manifest",
+   "files": [],
+   "is_secondary_affine": false,
+   "is_setup": false,
+   "opt_level": "manifest",
+   "path": "build_common_dep__5555555555555555555555555555555f-zlib.drv.json",
+   "payload": {
+    "item_class": "build_common_dep",
+    "name": "common_dep__5555555555555555555555555555555f-zlib",
+    "payload": {
+     "attr": "/nix/store/5555555555555555555555555555555f-zlib.drv",
+     "drv": "/nix/store/5555555555555555555555555555555f-zlib.drv",
+     "label": "5555555555555555555555555555555f-zlib"
+    },
+    "size": 0
+   },
+   "phase_id": "build",
+   "platform": "manifest",
+   "setup_affinity": null,
+   "size": 0,
+   "task_depends_on": [
+    "build_common_dep__4444444444444444444444444444444e-glibc.drv",
+    "import_common",
+    "import_build_deps",
+    "import_toolchain_drv",
+    "import_common_dep_4444444444444444444444444444444e"
+   ],
+   "task_id": "build_common_dep__5555555555555555555555555555555f-zlib.drv",
+   "type_id": "common_dep",
+   "version": "0"
+  },
+  {
+   "affinity_id": null,
+   "binary_name": "import_common_dep_4444444444444444444444444444444e",
+   "compiler": "manifest",
+   "files": [],
+   "is_secondary_affine": true,
+   "is_setup": false,
+   "opt_level": "manifest",
+   "path": "import_common_dep_4444444444444444444444444444444e",
+   "payload": {
+    "ident": "4444444444444444444444444444444e-glibc.drv",
+    "item_class": "affine_import",
+    "task_id": "import_common_dep_4444444444444444444444444444444e"
+   },
+   "phase_id": "build",
+   "platform": "manifest",
+   "setup_affinity": null,
+   "size": 0,
+   "task_depends_on": [
+    "build_common_dep__4444444444444444444444444444444e-glibc.drv"
+   ],
+   "task_id": "import_common_dep_4444444444444444444444444444444e",
+   "type_id": "affine_import",
+   "version": "0"
+  },
+  {
+   "affinity_id": null,
+   "binary_name": "import_common_dep_5555555555555555555555555555555f",
+   "compiler": "manifest",
+   "files": [],
+   "is_secondary_affine": true,
+   "is_setup": false,
+   "opt_level": "manifest",
+   "path": "import_common_dep_5555555555555555555555555555555f",
+   "payload": {
+    "ident": "5555555555555555555555555555555f-zlib.drv",
+    "item_class": "affine_import",
+    "task_id": "import_common_dep_5555555555555555555555555555555f"
+   },
+   "phase_id": "build",
+   "platform": "manifest",
+   "setup_affinity": null,
+   "size": 0,
+   "task_depends_on": [
+    "build_common_dep__5555555555555555555555555555555f-zlib.drv"
+   ],
+   "task_id": "import_common_dep_5555555555555555555555555555555f",
+   "type_id": "affine_import",
+   "version": "0"
+  },
+  {
+   "affinity_id": "gcc15-aarch64",
+   "binary_name": "build_variant__x86_64-linux__hello__hello-aarch64-gcc15-O0.json",
+   "compiler": "manifest",
+   "files": [],
+   "is_secondary_affine": false,
+   "is_setup": false,
+   "opt_level": "manifest",
+   "path": "build_variant__x86_64-linux__hello__hello-aarch64-gcc15-O0.json",
+   "payload": {
+    "item_class": "build_variant",
+    "name": "hello-aarch64-gcc15-O0",
+    "payload": {
+     "arch": "aarch64",
+     "attr": "dataset.x86_64-linux.hello.aarch64.hello-aarch64-gcc15-O0",
+     "compiler_id": "gcc15",
+     "drv": "/nix/store/v-hello-aarch64-gcc15-O0.drv",
+     "label": "hello-aarch64-gcc15-O0",
+     "metadata_name": "hello-aarch64-gcc15-O0.json",
+     "pkg": "hello",
+     "sys": "x86_64-linux",
+     "variant_dir": "hello-aarch64-gcc15-O0"
+    },
+    "size": 0
+   },
+   "phase_id": "build",
+   "platform": "manifest",
+   "setup_affinity": null,
+   "size": 0,
+   "task_depends_on": [
+    "build_common_dep__4444444444444444444444444444444e-glibc.drv",
+    "import_common",
+    "import_build_deps",
+    "import_toolchain_drv",
+    "import_common_dep_4444444444444444444444444444444e",
+    "import_matrix_drv_hello",
+    {
+     "inherit_outputs": false,
+     "phase_id": "build_compilers",
+     "task_id": "x86_64-linux__aarch64__gcc15"
+    }
+   ],
+   "task_id": "build_variant__x86_64-linux__hello__hello-aarch64-gcc15-O0",
+   "type_id": "variant",
+   "version": "0"
+  },
+  {
+   "affinity_id": "gcc15-aarch64",
+   "binary_name": "build_variant__x86_64-linux__hello__hello-aarch64-gcc15-O2.json",
+   "compiler": "manifest",
+   "files": [],
+   "is_secondary_affine": false,
+   "is_setup": false,
+   "opt_level": "manifest",
+   "path": "build_variant__x86_64-linux__hello__hello-aarch64-gcc15-O2.json",
+   "payload": {
+    "item_class": "build_variant",
+    "name": "hello-aarch64-gcc15-O2",
+    "payload": {
+     "arch": "aarch64",
+     "attr": "dataset.x86_64-linux.hello.aarch64.hello-aarch64-gcc15-O2",
+     "compiler_id": "gcc15",
+     "drv": "/nix/store/v-hello-aarch64-gcc15-O2.drv",
+     "label": "hello-aarch64-gcc15-O2",
+     "metadata_name": "hello-aarch64-gcc15-O2.json",
+     "pkg": "hello",
+     "sys": "x86_64-linux",
+     "variant_dir": "hello-aarch64-gcc15-O2"
+    },
+    "size": 0
+   },
+   "phase_id": "build",
+   "platform": "manifest",
+   "setup_affinity": null,
+   "size": 0,
+   "task_depends_on": [
+    "build_common_dep__5555555555555555555555555555555f-zlib.drv",
+    "import_common",
+    "import_build_deps",
+    "import_toolchain_drv",
+    "import_common_dep_5555555555555555555555555555555f",
+    "import_matrix_drv_hello",
+    {
+     "inherit_outputs": false,
+     "phase_id": "build_compilers",
+     "task_id": "x86_64-linux__aarch64__gcc15"
+    }
+   ],
+   "task_id": "build_variant__x86_64-linux__hello__hello-aarch64-gcc15-O2",
+   "type_id": "variant",
+   "version": "0"
+  }
+ ],
+ "worker_argv": {
+  "no_substituters=False": {
+   "affine_import": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary"
+   ],
+   "build_compilers": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--substituters-file",
+    "<tmp>/peers/_substituters.primary.txt",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary"
+   ],
+   "common_dep": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--substituters-file",
+    "<tmp>/peers/_substituters.primary.txt",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval"
+   ],
+   "dep_graph": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--substituters-file",
+    "<tmp>/peers/_substituters.primary.txt",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval"
+   ],
+   "eval": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--substituters-file",
+    "<tmp>/peers/_substituters.primary.txt",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval"
+   ],
+   "toolchain_validate": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--substituters-file",
+    "<tmp>/peers/_substituters.primary.txt",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval"
+   ],
+   "variant": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--substituters-file",
+    "<tmp>/peers/_substituters.primary.txt",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval"
+   ]
+  },
+  "no_substituters=True": {
+   "affine_import": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary"
+   ],
+   "build_compilers": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary"
+   ],
+   "common_dep": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval",
+    "--no-substituters"
+   ],
+   "dep_graph": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval"
+   ],
+   "eval": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval"
+   ],
+   "toolchain_validate": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval"
+   ],
+   "variant": [
+    "--manifest-dir",
+    "<tmp>/manifests",
+    "--flake-ref",
+    ".",
+    "--dataset-output-dir",
+    "<tmp>/dataset",
+    "--shared-fs",
+    "<tmp>",
+    "--secondary-id",
+    "primary",
+    "--matrix-eval-out-dir",
+    "<tmp>/matrix_eval",
+    "--no-substituters"
+   ]
+  }
+ }
+}

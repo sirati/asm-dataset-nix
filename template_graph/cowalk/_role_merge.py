@@ -67,10 +67,11 @@ def collect_per_arch(
     expose ``variant_arrays``, ``templates``, and a per-cell
     classifications map under different attribute / key names.
 
-    Matches only on the ROOT node: a template "belongs to" ``binary``
-    iff its entry-point role starts with ``{binary}-`` and contains
-    ``-elf-folder``. Templates that merely *depend* on ``binary`` are
-    excluded.
+    A cell belongs to ``binary`` iff its variant array was built under
+    ``matrix-<binary>.drv`` (``VariantArray.binary``). Templates that
+    merely *depend* on ``binary`` are excluded. The binary is never
+    parsed from the root role: a prefix match would also pick up
+    ``zlib-ng`` cells for ``zlib``.
 
     Returns an empty dict when no matching cells exist (the caller
     decides whether that's an error or a no-op).
@@ -85,13 +86,9 @@ def collect_per_arch(
         classifications = source.classifications
     by_arch: ByArch = {}
     for (tid, arch), arr in variant_arrays.items():
-        tmpl = templates[tid]
-        root = tmpl.nodes[tmpl.root_id]
-        if not (
-            root.name.startswith(f"{binary}-")
-            and "-elf-folder" in root.name
-        ):
+        if arr.binary != binary:
             continue
+        tmpl = templates[tid]
         classes = classifications.get((tid, arch), {})
         by_arch[arch] = (tmpl, classes, arr)
     return by_arch

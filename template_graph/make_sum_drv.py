@@ -297,7 +297,7 @@ def _run_nix_instantiate(
             + ("\n...[truncated]" if len(expr) > 2000 else "")
         )
     out = proc.stdout.decode("utf-8", errors="replace").strip()
-    lines = [l for l in out.splitlines() if l.strip()]
+    lines = [line for line in out.splitlines() if line.strip()]
     if len(lines) != 1:
         raise RuntimeError(
             f"expected one drv path from nix-instantiate, got {len(lines)}:\n"

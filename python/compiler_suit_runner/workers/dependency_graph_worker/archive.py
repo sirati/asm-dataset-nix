@@ -26,9 +26,12 @@ from __future__ import annotations
 import errno
 import json
 import logging
+import os
 import pathlib
 import random
+import shutil
 import subprocess
+import tempfile
 import time
 from typing import Optional
 
@@ -106,6 +109,7 @@ def write_drv_map_sidecar(
     out_dir: pathlib.Path,
     binary: str,
     matrix_aggregate_drv: str,
+    package_metadata: Optional[dict] = None,
 ) -> None:
     """Write the per-binary drv-map sidecar JSON atomically.
 
@@ -122,6 +126,12 @@ def write_drv_map_sidecar(
     """
     sidecar_path = out_dir / DRV_MAP_SIDECAR.format(binary=binary)
     payload = {"binary": binary, "matrix_aggregate_drv": matrix_aggregate_drv}
+    if package_metadata is not None:
+        from compiler_suit_runner.package_selection import release_metadata, matrix_evaluation_identity
+        payload.update(release_metadata(package_metadata))
+        identity = matrix_evaluation_identity(package_metadata)
+        if identity is not None:
+            payload["matrixEvaluationIdentity"] = identity
     tmp = sidecar_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
     tmp.replace(sidecar_path)
@@ -130,6 +140,7 @@ def write_drv_map_sidecar(
 def read_drv_map_sidecar(
     out_dir: pathlib.Path,
     binary: str,
+    expected_package: Optional[dict] = None,
 ) -> Optional[str]:
     """Read back the ``matrix_aggregate_drv`` for ``binary`` from its sidecar.
 
@@ -148,6 +159,19 @@ def read_drv_map_sidecar(
         return None
     if not isinstance(data, dict):
         return None
+    if expected_package is not None:
+        from compiler_suit_runner.package_selection import RELEASE_FIELDS, validate_release
+        try:
+            validate_release(data)
+            validate_release(expected_package)
+        except ValueError:
+            return None
+        if any(data[key] != expected_package[key] for key in RELEASE_FIELDS):
+            return None
+        from compiler_suit_runner.package_selection import matrix_evaluation_identity
+        identity = matrix_evaluation_identity(expected_package)
+        if identity is not None and data.get("matrixEvaluationIdentity") != identity:
+            return None
     drv = data.get("matrix_aggregate_drv")
     if not isinstance(drv, str) or not drv:
         return None
@@ -157,6 +181,7 @@ def read_drv_map_sidecar(
 def load_drv_map_from_sidecars(
     out_dir: pathlib.Path,
     wanted_binaries: set[str],
+    package_metadata: Optional[dict[str, dict]] = None,
 ) -> dict[str, str]:
     """Load the ``{binary: matrix_aggregate_drv}`` map from sidecar files.
 
@@ -170,11 +195,14 @@ def load_drv_map_from_sidecars(
     """
     drv_map: dict[str, str] = {}
     for binary in sorted(wanted_binaries):
-        drv = read_drv_map_sidecar(out_dir, binary)
+        if package_metadata is not None and binary not in package_metadata:
+            raise ValueError(f"missing release selection for prestaged matrix {binary}")
+        drv = read_drv_map_sidecar(out_dir, binary,
+                                  expected_package=package_metadata[binary] if package_metadata is not None else None)
         if drv is None:
             sidecar = out_dir / DRV_MAP_SIDECAR.format(binary=binary)
             raise FileNotFoundError(
-                f"--prestaged-matrix-eval: sidecar missing or unreadable"
+                f"--prestaged-matrix-eval: sidecar missing, stale, or unreadable"
                 f" for binary {binary!r}: {sidecar}"
                 " — run matrix_eval at least once (without"
                 " --prestaged-matrix-eval) to populate the sidecars."
@@ -203,9 +231,37 @@ logger = logging.getLogger("compiler_suit_runner.dependency_graph_worker")
 
 # 1 initial attempt + 5 retries; sleeps between attempts follow the
 # schedule below (plus up to 25% jitter), ~31s total worst case.
-_IMPORT_MAX_ATTEMPTS = 6
+# 8 attempts with the backoff below = ~63s of cumulative wait (sleeps of
+# 1,2,4,8,16,16,16s).  Sized to outlast a per-node nix-daemon STARTUP race
+# (the worker's first import racing ahead of the daemon's socket creation),
+# not just a brief fork/EAGAIN blip.
+_IMPORT_MAX_ATTEMPTS = 8
 _IMPORT_BACKOFF_SECONDS = (1.0, 2.0, 4.0, 8.0, 16.0)
 _IMPORT_JITTER_FRACTION = 0.25
+
+# Node-local DISK scratch for staging an archive before ``nix-store
+# --import``.  Reading a multi-GB archive straight off a (possibly
+# degraded) NFS share couples nix's CPU-bound store-write to synchronous
+# network reads, throttling the import to NFS speed.  Copying the archive
+# to node-local disk first (one bulk sequential read with full kernel
+# readahead) decouples them: the import then runs local-disk -> local-store
+# with no NFS in the read loop.
+#
+# Default ``/app/src-tmp`` is the dynamic_runner SLURM wrapper's per-job
+# node-local scratch bind-mount (host ``/tmp/<prefix>-<suffix>``, ext-disk
+# on the Krater nodes, auto-cleaned at job teardown).  Overridable via
+# ``CSR_IMPORT_STAGING_DIR``; set it to empty to disable staging entirely
+# (import directly from the archive's own path).
+_IMPORT_STAGING_DIR_ENV = "CSR_IMPORT_STAGING_DIR"
+_DEFAULT_IMPORT_STAGING_DIR = "/app/src-tmp"
+
+# RAM-backed fstypes: staging a multi-GB archive onto one would consume RAM
+# (OOM risk) and gives no disk-readahead decouple — NEVER stage onto these.
+_RAM_FSTYPES = frozenset({"tmpfs", "ramfs", "devtmpfs"})
+
+# Headroom multiplier: require this much free space (vs the archive size)
+# in the staging dir before copying, so a stage never fills the scratch fs.
+_STAGING_FREE_HEADROOM = 1.15
 
 # OSError errnos that indicate a transient spawn/read condition (fork
 # pressure, signal interruption, momentary memory pressure) rather than
@@ -222,12 +278,22 @@ _TRANSIENT_ERRNOS = frozenset({
 # inside the child instead of at spawn time. Deliberately narrow:
 # "does not exist" / corrupt-archive / any other nix error stays
 # permanent and fails fast.
+#
+# The ``cannot connect to socket`` / ``daemon-socket`` markers cover a
+# nix-DAEMON startup race: a worker's first import can fire before the
+# per-node nix-daemon has created its socket
+# (``error: cannot connect to socket at '/nix/var/nix/daemon-socket/socket':
+# No such file or directory``).  That is a transient startup-ordering
+# condition, not a defect — retrying lets the daemon finish coming up.
+# (A genuine daemon crash would persist past every retry and still fail.)
 _TRANSIENT_STDERR_MARKERS = (
     b"resource temporarily unavailable",
     b"cannot fork",
     b"unable to fork",
     b"cannot allocate memory",
     b"interrupted system call",
+    b"cannot connect to socket",
+    b"daemon-socket",
 )
 
 # Injectable sleep hook so tests can assert the backoff schedule without
@@ -244,6 +310,108 @@ def _is_transient_stderr(stderr: bytes) -> bool:
     """True iff a non-zero rc's stderr indicates a transient condition."""
     low = stderr.lower()
     return any(marker in low for marker in _TRANSIENT_STDERR_MARKERS)
+
+
+def _mount_fstype(path: str) -> Optional[str]:
+    """Return the fstype of the mount ``path`` lives on, via /proc/mounts.
+
+    Walks /proc/mounts and returns the fstype of the longest mountpoint
+    that is a path-prefix of ``path``.  ``None`` when it can't be
+    determined (no /proc/mounts, unreadable, or no match) — callers treat
+    "unknown" as "do not stage" so an undeterminable fs never gets a
+    multi-GB write.
+    """
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return None
+    best_mp = ""
+    best_fs: Optional[str] = None
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mp, fstype = parts[1], parts[2]
+                if real == mp or real.startswith(mp.rstrip("/") + "/"):
+                    if len(mp) >= len(best_mp):
+                        best_mp, best_fs = mp, fstype
+    except OSError:
+        return None
+    return best_fs
+
+
+def _stage_archive_to_local_disk(
+    archive: pathlib.Path,
+) -> Optional[pathlib.Path]:
+    """Copy ``archive`` to node-local DISK scratch; return the local copy.
+
+    Returns the staged copy's path, or ``None`` when staging is
+    unavailable/unsafe (the caller then imports directly from ``archive``).
+
+    Safe-by-default — returns ``None`` (no staging) UNLESS the scratch dir
+    exists, is DISK-backed (never tmpfs/ramfs — would burn RAM and gives no
+    readahead win), and has headroom for the archive.  Never raises: any
+    staging failure degrades to a direct import.
+
+    Rationale: ``nix-store --import`` reads its NAR stream sequentially but
+    interleaved with CPU-bound store writes; piping that read straight off a
+    degraded NFS share starves the read of full-readahead throughput.  A
+    bulk ``copyfile`` (Linux ``sendfile``, large kernel-side chunks) of the
+    archive to local disk first, then importing from local, removes the NFS
+    from the import's read loop.
+    """
+    root = os.environ.get(_IMPORT_STAGING_DIR_ENV, _DEFAULT_IMPORT_STAGING_DIR)
+    if not root:
+        return None  # staging explicitly disabled
+    try:
+        if not os.path.isdir(root):
+            return None
+        fstype = _mount_fstype(root)
+        if fstype is None or fstype in _RAM_FSTYPES:
+            if fstype in _RAM_FSTYPES:
+                logger.info(
+                    "import staging: scratch %s is %s (RAM-backed) — not"
+                    " staging %s; importing directly from source",
+                    root, fstype, archive.name,
+                )
+            return None
+        size = archive.stat().st_size
+        free = shutil.disk_usage(root).free
+        if free < int(size * _STAGING_FREE_HEADROOM):
+            logger.warning(
+                "import staging: %s has %d bytes free, archive %s needs"
+                " ~%d — importing directly from source",
+                root, free, archive.name, size,
+            )
+            return None
+        staging_subdir = tempfile.mkdtemp(prefix="csr-import-", dir=root)
+        local = pathlib.Path(staging_subdir) / archive.name
+        # One bulk sequential read of the source with full readahead.
+        shutil.copyfile(archive, local)
+        return local
+    except OSError as exc:
+        logger.warning(
+            "import staging: failed to stage %s into %s (%s) — importing"
+            " directly from source",
+            archive, root, exc,
+        )
+        return None
+
+
+def _cleanup_staged(local: Optional[pathlib.Path]) -> None:
+    """Best-effort removal of a staged copy + its private temp dir."""
+    if local is None:
+        return
+    try:
+        local.unlink()
+    except OSError:
+        pass
+    try:
+        local.parent.rmdir()
+    except OSError:
+        pass
 
 
 def discover_archives(
@@ -343,32 +511,47 @@ def import_archive(
     if not archive.is_file():
         return False, f"archive not found: {archive}".encode("utf-8"), []
 
-    for attempt in range(1, _IMPORT_MAX_ATTEMPTS + 1):
-        success, stderr, imported, transient = _import_archive_once(
-            archive, run_subprocess,
+    # Stage the archive to node-local disk ONCE (outside the retry loop, so a
+    # transient import failure replays from the local copy, never re-reading
+    # the source FS).  ``None`` = staging unavailable/unsafe → import from the
+    # source path directly (unchanged behaviour).
+    staged = _stage_archive_to_local_disk(archive)
+    if staged is not None:
+        logger.info(
+            "import staging: %s staged to node-local disk %s before "
+            "nix-store --import (decoupling the import from the source FS)",
+            archive.name, staged,
         )
-        if success or not transient:
-            return success, stderr, imported
-        if attempt == _IMPORT_MAX_ATTEMPTS:
-            logger.warning(
-                "import of %s still failing transiently after %d "
-                "attempts — giving up: %s",
-                archive, attempt,
-                stderr.decode("utf-8", errors="replace").strip(),
+    source = staged if staged is not None else archive
+    try:
+        for attempt in range(1, _IMPORT_MAX_ATTEMPTS + 1):
+            success, stderr, imported, transient = _import_archive_once(
+                source, run_subprocess,
             )
-            return success, stderr, imported
-        base = _IMPORT_BACKOFF_SECONDS[
-            min(attempt - 1, len(_IMPORT_BACKOFF_SECONDS) - 1)
-        ]
-        delay = base + random.uniform(0, base * _IMPORT_JITTER_FRACTION)
-        logger.warning(
-            "transient failure importing %s (attempt %d/%d): %s — "
-            "retrying in %.1fs",
-            archive, attempt, _IMPORT_MAX_ATTEMPTS,
-            stderr.decode("utf-8", errors="replace").strip(), delay,
-        )
-        _retry_sleep(delay)
-    raise AssertionError("unreachable: retry loop must return")
+            if success or not transient:
+                return success, stderr, imported
+            if attempt == _IMPORT_MAX_ATTEMPTS:
+                logger.warning(
+                    "import of %s still failing transiently after %d "
+                    "attempts — giving up: %s",
+                    archive, attempt,
+                    stderr.decode("utf-8", errors="replace").strip(),
+                )
+                return success, stderr, imported
+            base = _IMPORT_BACKOFF_SECONDS[
+                min(attempt - 1, len(_IMPORT_BACKOFF_SECONDS) - 1)
+            ]
+            delay = base + random.uniform(0, base * _IMPORT_JITTER_FRACTION)
+            logger.warning(
+                "transient failure importing %s (attempt %d/%d): %s — "
+                "retrying in %.1fs",
+                archive, attempt, _IMPORT_MAX_ATTEMPTS,
+                stderr.decode("utf-8", errors="replace").strip(), delay,
+            )
+            _retry_sleep(delay)
+        raise AssertionError("unreachable: retry loop must return")
+    finally:
+        _cleanup_staged(staged)
 
 
 def _import_archive_once(
@@ -448,8 +631,8 @@ def derive_variant_lookup_from_aggregate(
 ) -> dict[tuple[str, str], dict[str, str]]:
     """Enumerate variant leaves referenced by a ``matrix-<binary>`` drv.
 
-    Runs ONE local ``nix-store --query --references <aggregate>`` —
-    cheap, local-store-only, no flake re-evaluation. Filters to
+    Reads local aggregate references and their embedded derivation metadata,
+    without flake re-evaluation. Filters to
     ``*-elf-folder.drv`` leaves (the variant outputs), parses each
     via :func:`template_graph.tree_walker.parse_variant_path`, and
     composes the ``(arch, label)`` key the same way the streaming
@@ -508,6 +691,30 @@ def derive_variant_lookup_from_aggregate(
         if line
     ]
 
+    leaves = sorted(path for path in references if path.endswith(VARIANT_SUFFIX))
+    metadata_by_drv = {}
+    if leaves:
+        # Metadata is embedded in the archived derivation itself. No flake
+        # re-evaluation and no inference of release/family from a filename.
+        shown, errors, status = runner(["nix", "derivation", "show", *leaves])
+        if status:
+            raise RuntimeError("reading archived variant metadata failed: " + errors.decode(errors="replace"))
+        from compiler_suit_runner.nix_drv_show import _normalize_show_output
+        records = _normalize_show_output(json.loads(shown))
+        for path in leaves:
+            if path not in records:
+                raise ValueError(f"archived variant missing from derivation show: {path}")
+            record = records[path]
+            encoded = record.get("env", {}).get("datasetMetadata")
+            if encoded is None:
+                # Old archives can be planned, but carry no release proof.
+                # They cannot satisfy the new completion contract.
+                continue
+            from compiler_suit_runner.package_selection import validate_release
+            meta = json.loads(encoded)
+            validate_release(meta)
+            metadata_by_drv[path] = meta
+
     lookup: dict[tuple[str, str], dict[str, str]] = {}
     for path in references:
         if not path.endswith(VARIANT_SUFFIX):
@@ -547,6 +754,19 @@ def derive_variant_lookup_from_aggregate(
             suffix=suffix,
             toolchain_outpath=tc_outpath,
         )
+        if path in metadata_by_drv:
+            from compiler_suit_runner.package_selection import variant_metadata, variant_output_names
+            meta = metadata_by_drv[path]
+            if meta["packageId"] != binary or meta.get("arch") != arch:
+                raise ValueError(f"archived variant metadata disagrees with its name: {path}")
+            lookup[key].update(variant_metadata(meta))
+            lookup[key].update(variant_output_names(lookup[key]))
+            from compiler_suit_runner.preflight import _tier_from_pkg
+            lookup[key]["tier"] = _tier_from_pkg(meta["packageFamily"])
+            lookup[key]["outputPaths"] = {
+                name: output["path"] for name, output in records[path].get("outputs", {}).items()
+                if output.get("path")
+            }
     return lookup
 
 
@@ -586,10 +806,10 @@ def _variant_spec_from_parsed(
       (``toolchains.<hash>.out.archive``).  Empty string means the
       outpath wasn't supplied (older dispatch path or unresolved drv).
 
-    ``flag_set`` / ``hardening`` / ``sanitizer`` / ``march`` are not
-    recoverable from the drv basename (they collapse into ``suffix``);
-    they stay empty here and only feed the best-effort sidecar JSON,
-    never build correctness.
+    This parser supports legacy archives. For new archives the caller
+    replaces compiler/flag values with datasetMetadata from the actual
+    derivation and attaches full release provenance. Family and release
+    identity are never inferred from the package ID.
     """
     family = comp.rstrip("0123456789_")
     version = comp[len(family):].lstrip("-_").replace("_", ".")

@@ -15,6 +15,7 @@ import json
 import pathlib
 
 import pytest
+from .release_fixtures import catalog_entry, release
 
 import compiler_suit_runner.cli as cli_module
 from compiler_suit_runner.cli import (
@@ -24,6 +25,7 @@ from compiler_suit_runner.cli import (
     cmd_submit,
     main,
 )
+from compiler_suit_runner.cli import _parse_store_db_registration
 from compiler_suit_runner.incremental_cache import (
     IncrementalCache,
     InputHashInputs,
@@ -34,9 +36,51 @@ from compiler_suit_runner.incremental_cache import (
 from compiler_suit_runner.preflight import PreflightResult
 
 
+@pytest.fixture(autouse=True)
+def resolved_catalog_stub(monkeypatch):
+    # Scheduler/cache tests isolate Nix transport; selector behavior is tested
+    # separately against the canonical resolver and real pinned catalog.
+    def selected(*args, packages=None, **kwargs):
+        return {key: catalog_entry(key, family=key) for key in (packages or ["hello", "zlib"])}
+    monkeypatch.setattr(cli_module, "resolve_package_selection", selected)
+
+
 # ---------------------------------------------------------------------------
 # build_parser
 # ---------------------------------------------------------------------------
+
+
+def test_parse_store_db_registration_extracts_closure_paths():
+    # A nix-store --load-db registration interleaves store paths (the path
+    # itself + each reference) with deriver / narHash / narSize / ref-count
+    # lines. The parser must take the UNION of every store-path line and
+    # ignore the metadata lines.
+    reg = (
+        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.40\n"
+        "/nix/store/dddddddddddddddddddddddddddddddd-glibc-2.40.drv\n"
+        "sha256:deadbeef\n"
+        "1234567\n"
+        "1\n"
+        "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bash-5.2\n"
+        "/nix/store/cccccccccccccccccccccccccccccccc-coreutils-9.10\n"
+        "\n"
+        "0\n"
+    )
+    paths = _parse_store_db_registration(reg)
+    assert paths == frozenset({
+        "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-glibc-2.40",
+        "/nix/store/dddddddddddddddddddddddddddddddd-glibc-2.40.drv",
+        "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-bash-5.2",
+        "/nix/store/cccccccccccccccccccccccccccccccc-coreutils-9.10",
+    })
+    # Metadata lines never appear as paths.
+    assert "sha256:deadbeef" not in paths
+    assert "1234567" not in paths
+
+
+def test_parse_store_db_registration_empty_is_empty():
+    assert _parse_store_db_registration("") == frozenset()
+    assert _parse_store_db_registration("\n  \nsha256:x\n42\n") == frozenset()
 
 
 def test_build_parser_subcommands_exist():
@@ -330,7 +374,7 @@ def _stub_preflight(monkeypatch: pytest.MonkeyPatch, **overrides):
         calls.append((flake_ref, sys_name, packages, archs))
         return pre
 
-    monkeypatch.setattr(cli_module, "run_preflight", fake)
+    monkeypatch.setattr(cli_module, "enumerate_variants", lambda *a, **kw: {})
     return calls
 
 
@@ -350,14 +394,14 @@ def test_main_preflight_subcommand_exits_zero(
     assert rc == 0
     out = capsys.readouterr().out
     assert "variants" in out
-    assert "toolchains" in out
+    assert "estimated variants" in out
 
 
 def test_cmd_preflight_handles_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path):
     def boom(*a, **kw):
         raise RuntimeError("nix not found")
 
-    monkeypatch.setattr(cli_module, "run_preflight", boom)
+    monkeypatch.setattr(cli_module, "enumerate_variants", boom)
     args = argparse.Namespace(
         flake=".",
         shared_fs=tmp_path,
@@ -462,16 +506,20 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
         # return shape.
         return state["toolchain_return"]
 
+    monkeypatch.setattr(cli_module, "resolve_package_selection",
+                        lambda *a, **kw: {key: catalog_entry(key, family=key)
+                                         for key in (kw.get("packages") or state["variants_return"])})
+
     monkeypatch.setattr(
         cli_module, "enumerate_toolchains_only", fake_enumerate_toolchains_only,
     )
 
     def fake_enumerate_variants(
         flake_ref, sys_name, *, packages=None, archs=None,
-        sample_size=0, sample_seed="42", run_subprocess=None,
+        sample_size=0, sample_seed="42", run_subprocess=None, selected_catalog=None,
     ):
         state["variant_calls"].append((flake_ref, sys_name, packages, archs))
-        return state["variants_return"]
+        return {key: {**release(key, family=key), **value} for key, value in state["variants_return"].items()}
 
     monkeypatch.setattr(
         cli_module, "enumerate_variants", fake_enumerate_variants,
@@ -504,11 +552,20 @@ def stub_submit_helpers(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path)
         cli_module, "check_toolchains_locally", lambda drvs: frozenset(),
     )
     monkeypatch.setattr(
-        cli_module, "build_toolchains_locally", lambda drvs: None,
+        cli_module, "build_toolchains_locally", lambda drvs, **_kw: None,
     )
     monkeypatch.setattr(
         cli_module, "eval_drv_outpaths",
         lambda drvs: {d: f"{d}.out" for d in drvs},
+    )
+    # The build-host evals run real ``nix eval`` against the flake;
+    # unit tests must not.
+    monkeypatch.setattr(
+        cli_module, "eval_native_build_host_stdenvs",
+        lambda flake, sys_name, archs: ([], []),
+    )
+    monkeypatch.setattr(
+        cli_module, "eval_build_host_tools", lambda flake, sys_name: (None, None),
     )
 
     def fake_single_process(config, *, args=None, logger=None):
@@ -759,15 +816,18 @@ def test_cmd_submit_treats_corrupt_entry_as_miss_and_reheals(
     assert len(state["variant_calls"]) == 2
 
 
-def test_cmd_submit_hit_with_missing_toolchains_fails_like_miss(
+def test_cmd_submit_hit_with_missing_toolchains_builds_like_miss(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
     stub_submit_helpers: dict,
 ):
     """Stale-store safety: the local toolchain availability check runs
     on the UNIFIED path, so a cache hit whose drvs were GC'd since the
-    store behaves exactly like a miss would (abort before emission when
-    --build-compilers is off)."""
+    store behaves exactly like a miss would. Cross toolchains are the full
+    cross-stdenv (``overrideCC`` → custom store hash, not Hydra-cached), so
+    "missing locally" means "needs a local BUILD" on the producer, not an
+    abort: hit and miss both build the missing toolchains and proceed
+    identically (the affine split upload then ships the realised outputs)."""
     state = stub_submit_helpers
     # The aggregate drv must be a real file: lookup_toolchains verifies
     # its existence (GC-staleness guard) before returning a hit, and
@@ -790,20 +850,30 @@ def test_cmd_submit_hit_with_missing_toolchains_fails_like_miss(
     assert cmd_submit(_make_args(tmp_path)) == 0
     assert len(state["emit_calls"]) == 1
 
-    # The local store "loses" the toolchain outputs.
+    # The local store "loses" the toolchain outputs...
     monkeypatch.setattr(
         cli_module, "check_toolchains_locally", lambda drvs: frozenset(drvs),
     )
+    # ...and we record that the producer rebuilds them locally (instead of
+    # aborting) — cross-stdenvs are not cache-substitutable.
+    tc_builds: list = []
+    monkeypatch.setattr(
+        cli_module, "build_toolchains_locally",
+        lambda drvs, **_kw: tc_builds.append(frozenset(drvs)),
+    )
 
-    # Cache-hit invocation: aborts before emission/dispatch...
+    # Cache-hit invocation: builds the missing toolchains, then proceeds...
     rc_hit = cmd_submit(_make_args(tmp_path))
     assert len(state["preflight_calls"]) == 1  # enumeration was a hit
     # ...exactly like the forced-miss invocation does.
     rc_miss = cmd_submit(_make_args(tmp_path, no_cache=True))
     assert len(state["preflight_calls"]) == 2  # forced miss re-enumerated
-    assert rc_hit == rc_miss == 1
-    assert len(state["emit_calls"]) == 1
-    assert len(state["single_process_calls"]) == 1
+    assert rc_hit == rc_miss == 0
+    # Both invocations built the missing toolchains locally and proceeded
+    # to emission + dispatch (vs the first, present-toolchain submit).
+    assert len(tc_builds) == 2
+    assert len(state["emit_calls"]) == 3
+    assert len(state["single_process_calls"]) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1077,104 @@ def test_produce_and_upload_toolchain_archive_upload_failure_returns_1(
     assert state["gateway"].disconnected
 
 
+def test_produce_and_upload_toolchain_archive_retries_transient_oserror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+):
+    """A one-off transient OSError on the gateway copy is RETRIED via the
+    framework's retry_transient policy (transport faults map to OSError),
+    not fatal: the upload succeeds on the second attempt and rc is 0.
+
+    Regression for the rootless-podman test-env scp-stream-reset that
+    aborted the whole dispatch on one of N sequential archive copies.
+    """
+    import logging
+
+    state = _patch_gateway(monkeypatch)
+    attempts: list[int] = []
+
+    def fake_create(cfg):
+        gw = _FakeGateway(cfg)
+        real_upload = gw.upload_file
+
+        def _flaky(local, remote):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError("scp: lost connection")  # transient transport fault
+            real_upload(local, remote)
+
+        gw.upload_file = _flaky  # type: ignore[method-assign]
+        state["gateway"] = gw
+        return gw
+
+    monkeypatch.setattr(
+        "dynamic_runner.packaging.gateway.create_gateway", fake_create,
+    )
+    # Don't actually sleep through the backoff in the unit test.
+    monkeypatch.setattr(
+        "dynamic_runner.packaging.gateway.retry._BACKOFF_SECONDS", (0.0, 0.0),
+    )
+    args = _make_args(
+        tmp_path,
+        multi_computer="slurm",
+        gateway="ssh://kruppb@localhost:2222",
+        slurm_root_folder="/data/slurm/asm-dataset",
+        ssh_identity_file=None,
+        ssh_config=None,
+    )
+    rc = cli_module._produce_and_upload_toolchain_archive(
+        args, "/nix/store/tc-agg.drv", logging.getLogger("t"),
+    )
+    assert rc == 0
+    assert len(attempts) == 2  # failed once, retried, then succeeded
+    assert len(state["gateway"].uploads) == 1
+    assert state["gateway"].disconnected
+
+
+@pytest.mark.parametrize("outcome", ["ok", "export_fails", "upload_fails"])
+def test_produce_and_upload_toolchain_archive_removes_local_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, outcome: str,
+):
+    """The local temp dir holding the toolchain archive is removed on
+    every path, so a submit does not leave the closure archive in /tmp."""
+    import logging
+
+    state = _patch_gateway(monkeypatch)
+    if outcome == "export_fails":
+        def boom(tc_agg, out_dir, *, run_subprocess=None):
+            state["export_calls"].append((tc_agg, pathlib.Path(out_dir)))
+            raise RuntimeError("nix-store export failed")
+
+        monkeypatch.setattr(
+            "compiler_suit_runner.preflight.export_toolchain_archive", boom,
+        )
+    if outcome == "upload_fails":
+        def fake_create(cfg):
+            gw = _FakeGateway(cfg)
+            gw.upload_file = lambda local, remote: (_ for _ in ()).throw(
+                RuntimeError("scp refused")
+            )
+            return gw
+
+        monkeypatch.setattr(
+            "dynamic_runner.packaging.gateway.create_gateway", fake_create,
+        )
+    args = _make_args(
+        tmp_path,
+        multi_computer="slurm",
+        gateway="ssh://kruppb@localhost:2222",
+        slurm_root_folder="/data/slurm/asm-dataset",
+        ssh_identity_file=None,
+        ssh_config=None,
+    )
+    rc = cli_module._produce_and_upload_toolchain_archive(
+        args, "/nix/store/tc-agg.drv", logging.getLogger("t"),
+    )
+    assert rc == (0 if outcome == "ok" else 1)
+    local_dir = state["export_calls"][0][1]
+    assert local_dir.name.startswith("csr-toolchain-archive-")
+    assert not local_dir.exists()
+
+
 def test_cmd_submit_no_cache_flag_disables_memoization(
     tmp_path: pathlib.Path,
     stub_submit_helpers: dict,
@@ -1137,7 +1305,7 @@ def test_cmd_submit_populates_per_binary_toolchain_aggregate_drv(
     # submitter no longer exports it).
     assert "suffixes" not in pbm["hello"]
     assert "matrix_eval_out_dir" not in pbm["hello"]
-    assert set(pbm["hello"].keys()) == {
+    assert set(pbm["hello"].keys()) == {*release().keys(),
         "archs",
         "variant_sample",
         "variant_seed",
@@ -1190,12 +1358,13 @@ def _equivalence_stubs(
 
     def fake_var(
         flake_ref, sys_name, *, packages=None, archs=None,
-        sample_size=0, sample_seed="42", run_subprocess=None,
+        sample_size=0, sample_seed="42", run_subprocess=None, selected_catalog=None,
     ):
         state["variant_calls"] += 1
         pkgs = sorted(packages) if packages else ["hello", "zlib"]
         return {
             p: {
+                **release(p, family=p),
                 "archs": ["aarch64", "x86_64"],
                 "sample_size": int(sample_size or 0),
                 "sample_seed": sample_seed,
@@ -1219,10 +1388,19 @@ def _equivalence_stubs(
         cli_module, "check_toolchains_locally", lambda drvs: frozenset(),
     )
     monkeypatch.setattr(
-        cli_module, "build_toolchains_locally", lambda drvs: None,
+        cli_module, "build_toolchains_locally", lambda drvs, **_kw: None,
     )
     monkeypatch.setattr(cli_module, "eval_drv_outpaths", fake_eval)
     monkeypatch.setattr(cli_module, "run_single_process", fake_single_process)
+    # The build-host evals run real ``nix eval`` against the flake;
+    # unit tests must not.
+    monkeypatch.setattr(
+        cli_module, "eval_native_build_host_stdenvs",
+        lambda flake, sys_name, archs: ([], []),
+    )
+    monkeypatch.setattr(
+        cli_module, "eval_build_host_tools", lambda flake, sys_name: (None, None),
+    )
     monkeypatch.setattr(
         cli_module,
         "collect_input_hash_inputs",
@@ -1700,6 +1878,11 @@ def _patch_gateway_for_split(
         "gateway": None, "config": None,
         "compute_calls": [], "export_calls": [],
     }
+    # The image-registration baseline runs real ``nix eval``/``nix build``.
+    monkeypatch.setattr(
+        cli_module, "_compute_baseline_paths",
+        lambda args, log, **_kw: frozenset(),
+    )
 
     def fake_parse(url):
         cfg = GatewayConfig(
@@ -1893,3 +2076,281 @@ def test_produce_and_upload_split_archives_export_failure_hard_aborts(
     assert rc == 1
     assert gateway_created == []
     assert any("aborting dispatch" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Secondary-affine implies substituter-free (no harmonia, no --extra-substituters)
+# ---------------------------------------------------------------------------
+
+
+def _affine_args(**overrides) -> argparse.Namespace:
+    """Minimal namespace for the substituter-mode resolvers.
+
+    Defaults reflect the affine transport flags' own defaults:
+    common-deps-affine ON, build-deps-local OFF, no_substituters OFF.
+    """
+    defaults = dict(
+        no_substituters=False,
+        common_deps_affine=True,
+        build_deps_local=False,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def test_resolve_no_substituters_explicit_flag_wins(monkeypatch):
+    monkeypatch.delenv("CSR_BUILD_DEPS_LOCAL", raising=False)
+    args = _affine_args(no_substituters=True, common_deps_affine=False)
+    assert cli_module._resolve_no_substituters(args) is True
+
+
+def test_resolve_no_substituters_implied_by_secondary_affine(monkeypatch):
+    """common-deps-affine ON + build-deps-local ON => fully affine =>
+    substituter-free even without an explicit --no-substituters."""
+    monkeypatch.delenv("CSR_BUILD_DEPS_LOCAL", raising=False)
+    args = _affine_args(common_deps_affine=True, build_deps_local=True)
+    assert cli_module._resolve_no_substituters(args) is True
+
+
+def test_resolve_no_substituters_build_deps_local_via_env(monkeypatch):
+    monkeypatch.setenv("CSR_BUILD_DEPS_LOCAL", "1")
+    args = _affine_args(common_deps_affine=True, build_deps_local=False)
+    assert cli_module._resolve_no_substituters(args) is True
+
+
+def test_resolve_no_substituters_false_without_build_deps_local(monkeypatch):
+    """common-deps-affine alone (build-deps NOT affine) is not fully
+    secondary-affine: a substituter is still the build-deps transport."""
+    monkeypatch.delenv("CSR_BUILD_DEPS_LOCAL", raising=False)
+    args = _affine_args(common_deps_affine=True, build_deps_local=False)
+    assert cli_module._resolve_no_substituters(args) is False
+
+
+def test_resolve_no_substituters_false_when_common_deps_affine_off(monkeypatch):
+    """--no-common-deps-affine restores the substituter-as-transport
+    fallback for common_deps, so the run is NOT substituter-free even
+    with build-deps-local on (unless --no-substituters is explicit)."""
+    monkeypatch.delenv("CSR_BUILD_DEPS_LOCAL", raising=False)
+    args = _affine_args(common_deps_affine=False, build_deps_local=True)
+    assert cli_module._resolve_no_substituters(args) is False
+
+
+def test_config_from_args_secondary_affine_disables_harmonia(tmp_path):
+    """The implied substituter-free mode forces enable_harmonia OFF and
+    no_substituters ON in the SuitTaskConfig — even though the operator
+    never passed --no-substituters (only the affine transport flags)."""
+    args = _make_args(
+        tmp_path,
+        no_substituters=False,
+        common_deps_affine=True,
+        build_deps_local=True,
+    )
+    args._no_substituters_resolved = cli_module._resolve_no_substituters(args)
+    config = cli_module._config_from_args(
+        args, run_id="r1", secondary_id="primary",
+    )
+    assert config.enable_harmonia is False
+    assert config.no_substituters is True
+
+
+def test_config_from_args_non_affine_keeps_harmonia(tmp_path):
+    """A run that still needs a substituter (common-deps-affine OFF,
+    build-deps-local OFF, no explicit --no-substituters) keeps harmonia
+    ON and no_substituters OFF."""
+    args = _make_args(
+        tmp_path,
+        no_substituters=False,
+        common_deps_affine=False,
+        build_deps_local=False,
+    )
+    args._no_substituters_resolved = cli_module._resolve_no_substituters(args)
+    config = cli_module._config_from_args(
+        args, run_id="r1", secondary_id="primary",
+    )
+    assert config.enable_harmonia is True
+    assert config.no_substituters is False
+
+
+def test_resolve_no_substituters_via_csr_env(monkeypatch):
+    """CSR_NO_SUBSTITUTERS=1 (the submitter->secondary forward channel)
+    forces substituter-free ON even when the flags alone would be OFF —
+    so a secondary that only sees the env still resolves the same answer
+    the submitter computed."""
+    monkeypatch.delenv("CSR_BUILD_DEPS_LOCAL", raising=False)
+    monkeypatch.setenv("CSR_NO_SUBSTITUTERS", "1")
+    args = _affine_args(common_deps_affine=False, build_deps_local=False)
+    assert cli_module._resolve_no_substituters(args) is True
+
+
+# Representative framework-spawned secondary argv (framework flags only, no
+# subcommand verb) — mirrors how dynamic_runner invokes the image.
+_SECONDARY_SPAWN_ARGV = [
+    "--secondary", "tcp://127.0.0.1:9",
+    "--secondary-id", "secondary-1",
+    "--secondary-quic-port", "8443",
+    "--cores", "2",
+    "--max-memory", "4096",
+    "--full-log-dir", "/tmp/x",
+]
+
+
+def test_secondary_spawn_reads_no_substituters_env(monkeypatch):
+    """The framework rebuilds the secondary argv synthetically and drops
+    our --no-substituters flag, so the substituter-free decision crosses
+    the seam via CSR_NO_SUBSTITUTERS. With it set, the secondary namespace
+    must come out substituter-free on BOTH the raw flag and the resolved
+    bool (the latter is what _config_from_args reads to gate harmonia)."""
+    monkeypatch.delenv("CSR_BUILD_DEPS_LOCAL", raising=False)
+    monkeypatch.setenv("CSR_NO_SUBSTITUTERS", "1")
+    ns = cli_module._parse_framework_spawned_secondary(list(_SECONDARY_SPAWN_ARGV))
+    assert ns.no_substituters is True
+    assert getattr(ns, "_no_substituters_resolved") is True
+    # build_deps_local is DERIVED from no_substituters and MUST be resolved at
+    # this seam too — otherwise the in-cluster config.build_deps_local stays
+    # False and the import_build_deps affine gate is silently suppressed
+    # (orphaning the produced build_deps archive; fatal on cross arches).
+    assert getattr(ns, "_build_deps_local_resolved") is True
+    config = cli_module._config_from_args(ns, run_id="r1", secondary_id="secondary-1")
+    assert config.no_substituters is True
+    assert config.build_deps_local is True
+
+
+def test_secondary_spawn_no_substituters_env_absent(monkeypatch):
+    """Without CSR_NO_SUBSTITUTERS the secondary is NOT substituter-free —
+    harmonia + peer substituters stay enabled (the legacy default)."""
+    monkeypatch.delenv("CSR_NO_SUBSTITUTERS", raising=False)
+    monkeypatch.delenv("CSR_BUILD_DEPS_LOCAL", raising=False)
+    ns = cli_module._parse_framework_spawned_secondary(list(_SECONDARY_SPAWN_ARGV))
+    assert ns.no_substituters is False
+    assert getattr(ns, "_no_substituters_resolved") is False
+    assert getattr(ns, "_build_deps_local_resolved") is False
+
+
+# ---------------------------------------------------------------------------
+# cmd_submit aborts when a required pre-flight eval fails (P4)
+# ---------------------------------------------------------------------------
+
+
+def _gateway_submit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    state: dict,
+    *,
+    native_fails: bool = False,
+    **overrides,
+) -> int:
+    """Run cmd_submit on the gateway path with one toolchain."""
+    state["toolchain_return"] = (
+        (("aarch64", "gcc15"),),
+        {("aarch64", "gcc15"): "/nix/store/tc-gcc15.drv"},
+        "/nix/store/tc-agg.drv",
+    )
+
+    def fake_native(flake, sys_name, archs):
+        if native_fails:
+            raise RuntimeError("nix eval crossToolchains failed")
+        return [], []
+
+    monkeypatch.setattr(cli_module, "eval_native_build_host_stdenvs", fake_native)
+    monkeypatch.setattr(
+        cli_module, "eval_build_host_tools", lambda flake, sys_name: (None, None),
+    )
+    uploads: list = []
+    monkeypatch.setattr(
+        cli_module, "_produce_and_upload_toolchain_archive",
+        lambda *a, **kw: uploads.append("drv") or 0,
+    )
+    monkeypatch.setattr(
+        cli_module, "_produce_and_upload_toolchain_split_archives",
+        lambda *a, **kw: uploads.append("split") or 0,
+    )
+    state["uploads"] = uploads
+    # Never start a real dispatch or submitter peer (harmonia, ssh).
+    dispatched: list = []
+    monkeypatch.setattr(
+        "dynamic_runner.run", lambda *a, **kw: dispatched.append(a),
+    )
+    state["dispatched"] = dispatched
+    args = _make_args(
+        tmp_path,
+        multi_computer="slurm",
+        gateway="ssh://kruppb@localhost:2222",
+        slurm_root_folder="/data/slurm/asm-dataset",
+        submitter_peer=False,
+        **overrides,
+    )
+    return cmd_submit(args)
+
+
+def test_cmd_submit_aborts_when_toolchain_outpath_eval_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    stub_submit_helpers: dict,
+):
+    """The split archives are required on the gateway path. A failed
+    outpath eval used to become ``{}``, which silently skipped the
+    split upload; every build node then failed later."""
+    monkeypatch.setattr(cli_module, "eval_drv_outpaths", lambda drvs: {})
+    rc = _gateway_submit(monkeypatch, tmp_path, stub_submit_helpers)
+    assert rc == 1
+    assert stub_submit_helpers["emit_calls"] == []
+    assert stub_submit_helpers["uploads"] == []
+    assert stub_submit_helpers["dispatched"] == []
+
+
+def test_cmd_submit_aborts_when_build_host_eval_fails_substituter_free(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    stub_submit_helpers: dict,
+):
+    """Substituter-free nodes get the build-host stdenv only through
+    import_common, so its eval failing must abort the dispatch."""
+    rc = _gateway_submit(
+        monkeypatch, tmp_path, stub_submit_helpers,
+        native_fails=True, no_substituters=True,
+    )
+    assert rc == 1
+    assert stub_submit_helpers["emit_calls"] == []
+    assert stub_submit_helpers["dispatched"] == []
+
+
+def test_cmd_submit_gateway_path_proceeds_when_evals_succeed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    stub_submit_helpers: dict,
+):
+    """Control: with every eval resolved the gateway path uploads both
+    archive kinds and dispatches."""
+    rc = _gateway_submit(
+        monkeypatch, tmp_path, stub_submit_helpers, no_substituters=True,
+    )
+    assert rc == 0
+    assert stub_submit_helpers["uploads"] == ["drv", "split"]
+    assert len(stub_submit_helpers["dispatched"]) == 1
+
+
+def test_compute_baseline_paths_reads_image_registration(tmp_path: pathlib.Path):
+    """The baseline comes from the image registration; runs through the
+    injected runner, never the real nix."""
+    import logging
+
+    reg_out = tmp_path / "reg"
+    (reg_out / "nix-support").mkdir(parents=True)
+    (reg_out / "nix-support" / "registration").write_text(
+        "/nix/store/aaaa-glibc\nsha256:x\n123\n\n1\n/nix/store/bbbb-libgcc\n"
+    )
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(argv)
+        if argv[1] == "eval":
+            return str(reg_out).encode(), b"", 0
+        return b"", b"", 0
+
+    args = _make_args(tmp_path, flake="/flake")
+    got = cli_module._compute_baseline_paths(
+        args, logging.getLogger("t"), run_subprocess=runner,
+    )
+    assert got == {"/nix/store/aaaa-glibc", "/nix/store/bbbb-libgcc"}
+    assert [c[1] for c in calls] == ["eval", "build"]
+    assert calls[0][-1] == "/flake#_imageStoreRegistration.x86_64-linux.outPath"

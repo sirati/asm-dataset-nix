@@ -130,9 +130,9 @@ def cmd_debug(args: argparse.Namespace) -> int:
     # picks a calibration pair from the FIRST two variants of each
     # arch, so we order anchor(s) first and failing last.
     subset_labels = list(template_from) + [failing]
-    subset_drvs = [variants[l] for l in subset_labels]
+    subset_drvs = [variants[label] for label in subset_labels]
     binary = _derive_binary(
-        {l: variants[l] for l in subset_labels}, args.binary,
+        {label: variants[label] for label in subset_labels}, args.binary,
     )
 
     sum_drv = _build_sum_drv(

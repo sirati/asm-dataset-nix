@@ -350,6 +350,15 @@ def test_read_manifest_rejects_non_object_top_level(
         read_manifest(target)
 
 
+def test_read_manifest_rejects_data_after_legacy_padding(tmp_path: pathlib.Path):
+    h = make_build_common_dep_header("/nix/store/glibc.drv", "glibc")
+    target = write_manifest(tmp_path, h)
+    with target.open("ab") as file:
+        file.write(b"\0" * 70000 + b"unexpected data")
+    with pytest.raises(ValueError, match="non-NUL data"):
+        read_manifest(target)
+
+
 def test_read_manifest_rejects_missing_field(tmp_path: pathlib.Path):
     target = tmp_path / "bad.json"
     target.write_text(

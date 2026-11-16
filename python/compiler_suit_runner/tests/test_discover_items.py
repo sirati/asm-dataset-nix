@@ -15,6 +15,7 @@ import tempfile
 
 import pytest
 
+from compiler_suit_runner.tests.fakes import make_suit_config
 from compiler_suit_runner.manifest_gen import (
     make_build_common_dep_header,
     make_build_compilers_header,
@@ -86,18 +87,7 @@ def _make_config(
     *,
     per_binary_metadata: dict[str, dict] | None = None,
 ) -> SuitTaskConfig:
-    return SuitTaskConfig(
-        flake_ref=".",
-        sys_name="x86_64-linux",
-        shared_fs=tmp_path,
-        manifest_dir=tmp_path / "manifests",
-        dataset_dir=tmp_path / "dataset",
-        peers_dir=tmp_path / "peers",
-        run_id="r1",
-        secondary_id="primary",
-        hostname="host",
-        per_binary_metadata=per_binary_metadata,
-    )
+    return make_suit_config(tmp_path, per_binary_metadata=per_binary_metadata)
 
 
 _TC_AGG = "/nix/store/aaaa-toolchains.drv"
@@ -325,13 +315,33 @@ def test_discover_items_matrix_eval_one_per_binary_no_json(
     # it at all.
     items = list(SuitTask(config).discover_items())
 
-    matrix_eval = [i for i in items if i.phase_id == "matrix_eval"]
+    # The MATRIX_EVAL phase now also carries the per-secondary
+    # nix_daemon_up readiness gate; the real eval tasks are type "eval".
+    matrix_eval = [
+        i for i in items
+        if i.phase_id == "matrix_eval" and i.type_id == "eval"
+    ]
     # task_id is the bare binary (phase-local; the MATRIX_EVAL phase
     # disambiguates), NOT "matrix_eval__<binary>".
     assert {i.task_id for i in matrix_eval} == {"hello", "busybox"}
     assert all(i.type_id == "eval" for i in matrix_eval)
-    # No matrix_eval task carries a dep (build_compilers wiring is TODO).
-    assert all(i.task_depends_on == () for i in matrix_eval)
+    # Every matrix_eval gates on the per-secondary nix-daemon-up barrier
+    # (intra-phase bare-string dep) so the first nix command on a fresh
+    # secondary waits for the daemon socket.
+    assert all(
+        i.task_depends_on == ("nix_daemon_up",) for i in matrix_eval
+    )
+
+    # Exactly one nix_daemon_up gate: secondary-affine barrier in the
+    # MATRIX_EVAL phase, affine_import type, no deps of its own.
+    gates = [
+        i for i in items
+        if i.phase_id == "matrix_eval" and i.task_id == "nix_daemon_up"
+    ]
+    assert len(gates) == 1
+    assert gates[0].type_id == "affine_import"
+    assert gates[0].is_secondary_affine is True
+    assert gates[0].task_depends_on == ()
 
     # JSON-free: discover_items wrote nothing to the manifest dir.
     assert not config.manifest_dir.exists()
@@ -354,8 +364,12 @@ def test_discover_items_single_dependency_graph_depends_on_all_matrix_eval(
     assert dg.affinity_id is None
 
     matrix_eval_ids = {
-        i.task_id for i in items if i.phase_id == "matrix_eval"
+        i.task_id for i in items
+        if i.phase_id == "matrix_eval" and i.type_id == "eval"
     }
+    # dep_graph depends only on the real matrix_eval tasks, NOT the
+    # nix_daemon_up gate (the gate is a matrix_eval-phase barrier; dep_graph
+    # runs later when the daemon is already up).
     # The dependency_graph task's deps are CROSS-phase TaskDeps: each
     # names a matrix_eval prerequisite by its bare-binary task_id AND
     # its phase ("matrix_eval"), since it lives in a different phase. A
@@ -422,10 +436,12 @@ def test_discover_items_ignores_stale_matrix_eval_json(
     )
     items = list(SuitTask(config).discover_items())
     matrix_eval_ids = {
-        i.task_id for i in items if i.phase_id == "matrix_eval"
+        i.task_id for i in items
+        if i.phase_id == "matrix_eval" and i.type_id == "eval"
     }
     # Only the in-memory binaries (bare-binary task ids) — the stale
-    # "ghost" JSON is ignored.
+    # "ghost" JSON is ignored (and the nix_daemon_up gate is type
+    # affine_import, not eval, so it's excluded here).
     assert matrix_eval_ids == {"hello", "busybox"}
 
 

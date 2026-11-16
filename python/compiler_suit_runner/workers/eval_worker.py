@@ -73,10 +73,11 @@ The dynamic_runner framework distinguishes two failure types:
   -1 — explicitly NOT raised by this module today; that wiring
   belongs in the framework dispatch layer once Phase -1 is live).
 
-This worker raises ``RuntimeError`` on any transient failure. The
-framework's worker harness wraps that into an ``Errored`` task
-state, so eval failures correctly count against the retry-pass
-budget instead of the dispatch (Unfulfillable→Pending) budget.
+This worker raises ``RuntimeError`` on failure. The build-worker
+dispatcher (``build_worker.main``) re-raises it as
+``NonRecoverableError``, which the pinned framework treats as a
+permanent failure that cascades to dependents. See the error-mapping
+rule in ``build_worker.main``.
 
 Why one task per binary (not one per arch)
 ------------------------------------------
@@ -103,6 +104,7 @@ import json
 import logging
 import os
 import pathlib
+from compiler_suit_runner.package_selection import nix_attr_path, nix_string
 import random
 import re
 import subprocess
@@ -252,6 +254,8 @@ def parse_payload(payload: dict) -> dict[str, Any]:
     attr = payload.get("attr")
     if not isinstance(binary, str) or not binary:
         raise ValueError(f"matrix_eval payload: invalid 'binary' ({binary!r})")
+    from compiler_suit_runner.package_selection import validate_package_id
+    validate_package_id(binary)
     if not isinstance(sys_name, str) or not sys_name:
         raise ValueError(f"matrix_eval payload: invalid 'sys' ({sys_name!r})")
     if not isinstance(archs, list) or not all(isinstance(a, str) for a in archs):
@@ -312,7 +316,29 @@ def parse_payload(payload: dict) -> dict[str, Any]:
             f" ({toolchain_dedup_raw!r})"
         )
 
-    return {
+    capture = payload.get("compiler_capture", False)
+    if type(capture) is not bool:
+        raise ValueError("matrix_eval payload: compiler_capture must be boolean")
+    if capture and not attr.startswith("datasetCaptured."):
+        raise ValueError("captured matrix task selected the ordinary dataset")
+    inventory_schema = payload.get("variant_inventory_schema", 0)
+    if type(inventory_schema) is not int or inventory_schema not in (0, 1):
+        raise ValueError("unsupported variant inventory schema in matrix payload")
+    inventory_fields = {}
+    if inventory_schema:
+        namespace = "datasetCaptured." if capture else "dataset."
+        if not attr.startswith(namespace):
+            raise ValueError(
+                f"compact variant inventory requires the {namespace[:-1]} namespace"
+            )
+        identity = payload.get("variant_inventory_identity")
+        if not isinstance(identity, str) or re.fullmatch(r"[0-9a-f]{64}", identity) is None:
+            raise ValueError("invalid variant inventory identity in matrix payload")
+        inventory_fields = {"variant_inventory_schema": inventory_schema, "variant_inventory_identity": identity}
+    from compiler_suit_runner.package_selection import release_metadata
+    parsed = {
+        **release_metadata(payload),
+        **inventory_fields,
         "binary": binary,
         "sys": sys_name,
         "archs": list(archs),
@@ -323,6 +349,10 @@ def parse_payload(payload: dict) -> dict[str, Any]:
         "toolchain_aggregate_drv": toolchain_aggregate_drv,
         "toolchain_dedup": toolchain_dedup_raw,
     }
+    if capture:
+        parsed["compiler_capture"] = True
+    return parsed
+
 
 
 # ---------------------------------------------------------------------------
@@ -336,6 +366,8 @@ def _eval_jobs_for_binary(
     *,
     flake_ref: str,
     run_subprocess: RunSubprocess,
+    direct: bool = False,
+    evaluation_identity: Optional[str] = None,
 ) -> dict[tuple[str, str], str]:
     """Run ONE ``nix-eval-jobs`` invocation against ``<flake_ref>#<attr>``
     that intersects every requested ``(arch, suffix)`` pair in a single
@@ -416,7 +448,8 @@ def _eval_jobs_for_binary(
     # lambda reads it via builtins.readFile. ``--impure`` is required
     # because absolute-path reads are restricted in pure-eval mode
     # (which flake context enters by default).
-    payload_bytes = json.dumps(effective, sort_keys=True).encode("utf-8")
+    selection = {"identity": evaluation_identity, "selection": effective} if direct and evaluation_identity else effective
+    payload_bytes = json.dumps(selection, sort_keys=True).encode("utf-8")
     tmp = tempfile.NamedTemporaryFile(
         mode="wb",
         suffix=".json",
@@ -439,7 +472,7 @@ def _eval_jobs_for_binary(
     # don't contain those, but defence in depth is cheap here).
     select_expr = f"""\
 m: let
-  archMap = builtins.fromJSON (builtins.readFile {json.dumps(filter_path)});
+  archMap = builtins.fromJSON (builtins.readFile {nix_string(filter_path)});
   toSet  = lst: builtins.listToAttrs
     (builtins.map (s: {{ name = s; value = null; }}) lst);
   filter = builtins.mapAttrs (_: toSet) archMap;
@@ -448,6 +481,9 @@ in
     (a: v: builtins.intersectAttrs filter.${{a}} v)
     (builtins.intersectAttrs filter m)\
 """
+
+    if direct:
+        select_expr = f"f: f (builtins.fromJSON (builtins.readFile {nix_string(filter_path)}))"
 
     argv: list[str] = [
         "nix-eval-jobs",
@@ -513,6 +549,8 @@ def _eval_meta_for_arch(
     *,
     flake_ref: str,
     run_subprocess: RunSubprocess,
+    compiler_capture: bool = False,
+    selected_suffixes: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Read ``_meta.<sys>.<binary>.<arch>`` so we can re-apply the
     same deterministic sampling the submitter applied.
@@ -521,6 +559,7 @@ def _eval_meta_for_arch(
     On non-dict response or eval failure, raises :class:`RuntimeError`
     (transient — retry-pass eligible).
     """
+    meta_root="_capturedMeta" if compiler_capture else "_meta"
     argv: list[str] = [
         "nix",
         "eval",
@@ -532,8 +571,12 @@ def _eval_meta_for_arch(
         # for forward progress.
         "--no-eval-cache",
         "--json",
-        f"{flake_ref}#_meta.{sys_name}.{binary}.{arch}",
+        f"{flake_ref}#{nix_attr_path(meta_root, sys_name, binary, arch)}",
     ]
+    if selected_suffixes:
+        from compiler_suit_runner.package_selection import nix_string
+        keys = {suffix: None for suffix in sorted(set(selected_suffixes))}
+        argv.extend(["--apply", f"m: builtins.intersectAttrs (builtins.fromJSON {nix_string(json.dumps(keys))}) m"])
     stdout, stderr, rc = run_subprocess(argv)
     if rc != 0:
         decoded_err = stderr.decode("utf-8", errors="replace").strip()
@@ -683,7 +726,7 @@ def _publish_archive(
     from dynamic_runner.worker import PublishError  # noqa: PLC0415
 
     try:
-        task.publish(staged, dst=archive)
+        task.publish(staged, archive)
     except PublishError as exc:
         raise RuntimeError(
             f"publishing {staged!s} -> {archive!s} failed: {exc}"
@@ -881,6 +924,8 @@ def _resolve_flake_ref(flake_ref: str) -> str:
 
 def _as_installable(flake_ref: str) -> str:
     if flake_ref.startswith("/") and not flake_ref.startswith("path:"):
+        if (pathlib.Path(flake_ref) / ".git").exists():
+            return f"git+file://{flake_ref}"
         return f"path:{flake_ref}"
     return flake_ref
 
@@ -895,6 +940,9 @@ def _sample_per_arch(
     *,
     flake_ref: str,
     run_subprocess: RunSubprocess,
+    compiler_capture: bool = False,
+    package_metadata: Optional[dict] = None,
+    inventory_cache_dir: Optional[pathlib.Path] = None,
 ) -> dict[str, list[str]]:
     """Step 1: per-arch sampled-suffix map.
 
@@ -911,11 +959,22 @@ def _sample_per_arch(
     """
     from compiler_suit_runner.support_table import (  # noqa: PLC0415
         is_supported,
-        load_support_table,
+        load_support_table_for_flake,
     )
     from compiler_suit_runner.preflight import is_known_bad_combo  # noqa: PLC0415
 
-    support = load_support_table()
+    if package_metadata and package_metadata.get("variant_inventory_schema") == 1:
+        from compiler_suit_runner.variant_inventory import load_inventory, sample_inventory
+        return {arch: sample_inventory(
+            load_inventory(flake_ref, sys_name, arch,
+                           expected_identity=package_metadata["variant_inventory_identity"],
+                           cache_dir=inventory_cache_dir, run_subprocess=run_subprocess),
+            arch=arch, package_metadata=package_metadata,
+            sample_size=variant_sample, seed=variant_seed, ceiling=suffixes,
+            flake_ref=flake_ref,
+        ) for arch in archs}
+
+    support = load_support_table_for_flake(flake_ref)
     legacy_ceiling = set(suffixes) if suffixes else None
     sampled_by_arch: dict[str, list[str]] = {}
     for arch in archs:
@@ -923,6 +982,8 @@ def _sample_per_arch(
             sys_name, binary, arch,
             flake_ref=flake_ref,
             run_subprocess=run_subprocess,
+            **({"compiler_capture":True} if compiler_capture else {}),
+            **({"selected_suffixes": suffixes} if suffixes else {}),
         )
         filtered: dict[str, dict] = {}
         for suffix, meta_entry in meta.items():
@@ -930,6 +991,12 @@ def _sample_per_arch(
                 continue
             if not isinstance(meta_entry, dict):
                 continue
+            if package_metadata and "packageIdentity" in package_metadata:
+                # Source can be target-specific, but its pinned recipe and
+                # exact release must agree with preflight on every worker.
+                for key in ("packageCatalogSchema", "packageId", "packageFamily", "packageVersion", "recipeId", "releaseId"):
+                    if meta_entry.get(key) != package_metadata.get(key):
+                        raise ValueError(f"matrix release changed since preflight: {binary}/{arch}: {key}")
             if not is_supported(
                 support, meta_entry.get("compiler", ""), arch
             ):
@@ -1043,6 +1110,28 @@ def _export_matrix_archive(
     )
 
 
+def _validate_evaluated_release(drvs, expected, *, run_subprocess):
+    """Read authoritative local drv metadata after direct instantiation."""
+    from compiler_suit_runner.nix_drv_show import _normalize_show_output
+    from compiler_suit_runner.package_selection import validate_release
+    paths = sorted(set(drvs.values()))
+    stdout, stderr, code = run_subprocess(["nix", "derivation", "show", *paths])
+    if code:
+        raise RuntimeError("cannot validate instantiated release: " + stderr.decode(errors="replace"))
+    records = _normalize_show_output(json.loads(stdout))
+    for (arch, _suffix), path in drvs.items():
+        encoded = records.get(path, {}).get("env", {}).get("datasetMetadata")
+        if not isinstance(encoded, str):
+            raise ValueError(f"instantiated variant lacks authoritative release metadata: {path}")
+        meta = json.loads(encoded)
+        validate_release(meta)
+        for key in ("packageCatalogSchema", "packageId", "packageFamily", "packageVersion", "recipeId", "releaseId"):
+            if meta.get(key) != expected.get(key):
+                raise ValueError(f"instantiated release changed since preflight: {path}: {key}")
+        if meta.get("arch") != arch:
+            raise ValueError(f"instantiated release target differs from selection: {path}")
+
+
 def run_eval_task(
     payload: dict,
     out_dir: pathlib.Path,
@@ -1062,9 +1151,8 @@ def run_eval_task(
     failure restart (the cached on-disk archive cannot be trusted), and
     the framework publish step (stage → ``Task.publish(dst=...)``) re-
     delivers over any prior file atomically. Failure modes raise
-    :class:`RuntimeError`
-    so the harness surfaces ``ErrorType::Errored`` (retry-pass) — never
-    ``Unfulfillable`` (that belongs to toolchain-validate).
+    :class:`RuntimeError`; ``build_worker.main`` maps that to
+    ``NonRecoverableError`` (see its error-mapping rule).
     """
     clock = now or time.time
     runner = run_subprocess or _default_run_subprocess
@@ -1084,12 +1172,20 @@ def run_eval_task(
         parsed["variant_sample"], parsed["variant_seed"],
         sys_name, binary,
         flake_ref=flake_ref, run_subprocess=runner,
+        **({"compiler_capture":True} if parsed.get("compiler_capture") else {}),
+        package_metadata=parsed,
+        **({"inventory_cache_dir": out_dir} if parsed.get("variant_inventory_schema") else {}),
     )
     # Step 2: bulk nix-eval-jobs for every (arch, suffix) in one pass.
+    direct = parsed.get("variant_inventory_schema") == 1
+    select_root = "_capturedSelectDataset" if parsed.get("compiler_capture") else "_selectDataset"
+    attr = nix_attr_path(select_root, sys_name, binary) if direct else parsed["attr"]
     bulk_drvs = _eval_jobs_for_binary(
-        parsed["attr"], sampled_by_arch,
-        flake_ref=flake_ref, run_subprocess=runner,
+        attr, sampled_by_arch, flake_ref=flake_ref, run_subprocess=runner,
+        **({"direct": True, "evaluation_identity": parsed["variant_inventory_identity"]} if direct else {}),
     )
+    if direct and bulk_drvs:
+        _validate_evaluated_release(bulk_drvs, parsed, run_subprocess=runner)
     # Step 3: materialise the per-leaf summary list (sorted for stable
     # consumer ordering). The previous broadcast loop is gone — phase 4
     # imports the per-binary archive directly.
@@ -1172,7 +1268,7 @@ def run_eval_task(
     # normal dispatch, but protects legacy test paths that never pass an
     # out_dir).
     try:
-        write_drv_map_sidecar(out_dir, binary, matrix_aggregate_drv)
+        write_drv_map_sidecar(out_dir, binary, matrix_aggregate_drv, package_metadata=parsed)
         _LOG.debug(
             "matrix_eval binary=%s: wrote drv_map sidecar for"
             " --prestaged-matrix-eval reuse",

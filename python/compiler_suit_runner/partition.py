@@ -12,7 +12,7 @@ import json
 import os
 import pathlib
 from collections.abc import Iterable, Mapping
-from typing import TypedDict
+from typing import TypedDict, NotRequired
 
 
 PARTITION_VERSION = 1
@@ -45,6 +45,19 @@ class VariantSpec(TypedDict):
     tier: int
     pkg: str
     arch: str
+    compiler_capture: NotRequired[dict]
+    packageCatalogSchema: NotRequired[int]
+    packageFamily: NotRequired[str]
+    packageId: NotRequired[str]
+    packageVersion: NotRequired[str]
+    releaseId: NotRequired[str]
+    recipeId: NotRequired[dict]
+    sourceIdentity: NotRequired[dict]
+    packageIdentity: NotRequired[str]
+    isDefault: NotRequired[bool]
+    packageDrv: NotRequired[str]
+    packageOutputs: NotRequired[dict[str, str]]
+    outputPaths: NotRequired[dict[str, str]]
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +311,10 @@ _VARIANT_FIELDS = (
 
 def _variant_to_jsonable(variant: VariantSpec) -> dict[str, object]:
     """Project a ``VariantSpec`` to the partition.json schema fields."""
-    return {field: variant[field] for field in _VARIANT_FIELDS}
+    result = {field: variant[field] for field in _VARIANT_FIELDS}
+    if variant.get("compiler_capture") is not None:
+        result["compiler_capture"] = variant["compiler_capture"]
+    return result
 
 
 def write_partition_json(
@@ -390,6 +406,10 @@ def read_partition_json(source: pathlib.Path) -> Partition:
             "pkg": raw.get("pkg", "") if isinstance(raw.get("pkg", ""), str) else "",
             "arch": raw.get("arch", "") if isinstance(raw.get("arch", ""), str) else "",
         }
+        if raw.get("compiler_capture") is not None:
+            if not isinstance(raw["compiler_capture"], dict):
+                raise ValueError(f"{source}: invalid compiler capture contract")
+            variant["compiler_capture"] = raw["compiler_capture"]
         variants.append(variant)
 
     return Partition(

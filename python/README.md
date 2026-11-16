@@ -1,107 +1,160 @@
 # compiler_suit_runner
 
-Cluster-side runner that drives the [asm-dataset-nix][repo] matrix on SLURM
-via the [`dynamic-runner`][dynrunner] framework. A single
-SLURM submission orchestrates ~300K Nix derivations across three phases —
-partition, toolchains, variants — with peer-to-peer Nix store sharing and
-optional Cachix federation, so a fresh cluster cold-boot converges to a full
-dataset without per-worker rebuilds.
+The Python runner builds the [asm-dataset-nix](../README.md) ELF corpus
+locally or on SLURM through
+[dynamic-runner](https://github.com/sirati/dynamic-runner). It evaluates
+package matrices, shares prerequisite Nix closures, and publishes
+per-variant ELF files and JSON sidecars.
 
-[repo]: https://github.com/sirati/asm-dataset-nix
-[dynrunner]: https://github.com/sirati/dynamic-runner
+## Development environment
 
-## Status
+From the repository root:
 
-Alpha. Single-cluster tested. Smoke-tested locally in
-`--multi-computer single-process` mode. Expect rough edges around
-heterogeneous-cluster networking and Cachix throttling.
-
-## Architecture
-
-Three phases per submission, all coordinated by one `SuitTask`
-`TaskDefinition` and a single `dynamic_runner.run(...)` call:
-
-```
-                          one SLURM submission
-   ┌─────────────────────── primary host ────────────────────────┐
-   │  compiler-suit-runner submit                                 │
-   │   1. preflight: emit phase-1a manifests, hash inputs         │
-   │   2. dynamic_runner.run(SuitTask())                           │
-   │      └─ builds image, sbatch, primary loop                   │
-   └──────────────────────────────────────────────────────────────┘
-                                  │
-                                  ▼
-   ┌────────────────── compute node (one job, host net) ─────────┐
-   │  podman run … python -m compiler_suit_runner --secondary    │
-   │   ├── harmonia :5000 (serves /nix/store HTTP)               │
-   │   ├── peer-list watcher (peers/*.json on shared FS)         │
-   │   └── workers (memory-budgeted by Rust scheduler)           │
-   │        ├── partition_worker     (phase 1a)                  │
-   │        ├── merge_worker         (phase 1b)                  │
-   │        ├── barrier_worker       (phase 1a/1b/2 barriers)    │
-   │        └── build_worker         (phase 2 toolchains, then   │
-   │                                  phase 3 variants)          │
-   └─────────────────────────────────────────────────────────────┘
-
-   shared FS: peers/, partition/, flags/, dataset/
+```sh
+nix develop
+export PYTHONPATH="$PWD:$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+compiler-suit-runner submit --help
 ```
 
-* **Phase 1 — partition.** Pure-eval shards of the matrix run in parallel
-  (`partition_worker`), then a single-machine `merge_worker` produces a
-  global `partition.json`. A `barrier_worker` gates the next phase on a
-  sentinel file under `flags/`.
-* **Phase 2 — toolchains.** `build_worker` builds the unique
-  `(stdenv, host-deps)` set; results are pushed into the local Nix store
-  and announced to peers via harmonia + Cachix (if configured).
-* **Phase 3 — variants.** `build_worker` runs again, now keyed by the full
-  `(pkg, arch, compiler, opt, flags, hardening)` tuple. Variant tarballs
-  land in `<shared-fs>/dataset/`.
+The shell provides Python 3.13, pytest, and the dynamic-runner revision
+selected by `flake.lock`. The export adds the repository root for
+`template_graph` alongside the Python packages.
+Use this environment to keep the runner and framework versions aligned.
 
-## Installation
+For an editable installation outside Nix:
 
-Editable install, runtime only (single-process / local smoke):
-
-```
-pip install -e python/
+```sh
+pip install -e 'python/[test,slurm]'
 ```
 
-With the SLURM bridge (pulls `dynamic-runner` from its own flake):
+The `slurm` extra installs dynamic-runner from its Git repository rather
+than the flake pin. The base package has no declared runtime dependencies,
+but submitting runs requires dynamic-runner. Nix, `nix-eval-jobs`, and the
+transport/container tools are separate system dependencies. Optional
+Cachix uploads require the `cachix` executable; the `cachix` extra does
+not install it.
 
-```
-pip install -e 'python/[slurm]'
-```
+## Execution phases
 
-With test dependencies:
+One `SuitTask` declares four framework phases:
 
-```
-pip install -e 'python/[test]'
-```
+| Phase | Work |
+|-------|------|
+| `build_compilers` | Optional toolchain-build tasks, enabled by `--build-compilers` |
+| `matrix_eval` | One task per package evaluates selected architectures and publishes derivation archives and mappings |
+| `dependency_graph` | One primary-pinned task combines the package graphs and streams build descriptors |
+| `build` | Shared-dependency builds, variant builds, and per-node affine import gates |
 
-The `cachix` extra is a documentation placeholder — Cachix integration
-shells out to the `cachix` CLI, so just make sure that binary is on
-`$PATH` (the project's Nix dev shell already provides it).
+The build phase has no full-phase barrier. Tasks can run as the planner
+streams them, once their individual dependencies and import gates are
+satisfied. Matrix-evaluation and dependency-graph tasks are created in
+memory; build tasks are spawned at runtime. The old partition/merge
+workers remain in the source tree but do not describe this pipeline.
 
-## Quickstart — single-process (no cluster)
+Preflight runs on the submitter. It resolves and realizes toolchain
+prerequisites, retains build-time closures, and prepares common and
+per-toolchain archives. This can build missing toolchains locally even
+without `--build-compilers`. That flag enables additional in-cluster
+compiler-build tasks.
 
-Validates the entire pipeline on the local machine, no SLURM, no podman:
+## Local run
 
-```
+From the repository root, inside `nix develop`:
+
+```sh
 compiler-suit-runner submit \
   --flake . \
   --multi-computer single-process \
   --packages hello --archs x86_64 \
+  --variant-sample 1 \
+  --jobs 1 --cores 1 --build-max-concurrent 1 \
   --shared-fs /tmp/csr-smoke
 ```
 
-Expected output: a tiny `dataset/` tree under `/tmp/csr-smoke/` with one
-or two `.tar.zst` files, plus `flags/phase{1a,1b,2}_done` sentinels.
+This selects one sampled combination per compiler, architecture, and
+optimization group. It is not a one-build smoke test. The default
+`--variant-sample` is 2; `--variant-sample 0` disables sampling.
+`--variant-seed` controls deterministic sample selection. Use a direct
+`nix build` as shown in the root README to test only one variant.
+`--max-variants` is currently a deprecated no-op.
 
-## Quickstart — SLURM
+## Opt-in compiler capture
 
-Production mode. Submits a single SLURM job, packages the worker image
-with podman, federates Nix-store traffic over harmonia between peers:
+Add `--compiler-capture` to `submit` to select captured variants and their
+matching toolchain archives. Capture has separate cache and publication
+identities. Existing ELF-only results do not satisfy a captured request.
+Secondary workers inherit the selection from the submitter.
 
+First validate a single native build with the root README's
+[`capture-example` workflow](../README.md#compiler-artifact-capture).
+Adding `--compiler-capture` to a sampled runner command still considers every
+selected compiler and optimization group. Expand package, target and worker
+counts only after inspecting a small set of explicit captured variants.
+
+Published captured variants contain their ELFs, `auxiliary/datasetCapture/`,
+required separate debug output under `auxiliary/debug/`, selected build facts
+under `auxiliary/provenance/`, and `capture-complete.json`.
+Run `nix run .#capture-inspect -- /path/to/published/variant` from the repository
+to verify the completion record, file hashes, execute permissions, compiler
+contract, selected compiler/target identity, installed ELF associations, and
+debug information. A required capture failure blocks publication. Revision-2
+captured directories use `_capture-v2`, task IDs use `__capture_v2`, and matrix
+archives default to `_matrix_eval_capture_v2`. Revision-1 captures remain
+inspectable but cannot satisfy a new captured request. See the
+[compatibility contract](../docs/compiler-capture-compatibility.md) for supported
+modes and resource limits.
+List curated releases, then select both hello releases explicitly:
+
+```sh
+python -m compiler_suit_runner catalog --packages hello --json
+python -m compiler_suit_runner preflight \
+  --package-versions hello=2.12.1 hello=2.12.3 --archs x86_64 aarch64
+python -m compiler_suit_runner submit \
+  --flake . --multi-computer single-process \
+  --package-versions hello=2.12.1 hello=2.12.3 --archs x86_64 \
+  --variant-sample 1 --jobs 1 --cores 1 --build-max-concurrent 1 \
+  --shared-fs /tmp/csr-two-releases
 ```
+
+The two-release command still samples every supported compiler/optimization
+group. For the bounded GCC 15 native/AArch64 proof, use
+`nix develop -c python tests/multiversion-flow.py` from the repository root.
+It builds four small variants with one job and one core, mocks scheduler
+transport, and exercises real Nix evaluation, archives, graph planning,
+streamed descriptors, worker staging and resume.
+
+`--packages` names families and selects defaults unless version options are
+present. `--package-versions FAMILY=EXACT_VERSION` accepts multiple values
+and repeated options. Explicit versions replace that family's default and
+imply their family when no family filter is present. Other selected families
+keep their defaults. Unknown/conflicting selectors fail before toolchain
+work. Ambiguous versions list candidate recipes; use `--package-ids ID` to
+choose one. `--all-package-versions` selects the curated entries of the
+selected families. It never fetches a release inventory from the network.
+
+Both releases use identical sampled compiler/flag suffixes where their
+supported cells agree. Selection ordering, duplicates, and adding a second
+release do not change the first release's sample. Priority follows the
+explicit family metadata, including for versioned IDs.
+
+New matrix workers sample a compact, package-independent `_variantAxes`
+inventory, then call `_selectDataset` to instantiate the requested suffixes.
+They check the resulting derivations' authoritative release metadata before
+exporting archives. This preserves the legacy sampling choices and output
+derivations without serializing full per-variant provenance during sampling.
+Older flakes without the inventory capability retain the legacy worker path.
+
+Inventory files under `_matrix_eval/_variant_inventory/` are shared across
+release workers. Their identities cover the system, pins and evaluation code;
+the identity is equal in the submitter's checkout and the filtered worker
+image. Cached files have bounded size, schema/target checks and a checksum.
+Incomplete or corrupt files are regenerated. Source changes fail before
+instantiation and require fresh preflight. Worker queries disable Nix's
+shared SQLite eval cache to avoid concurrent write contention.
+
+## SLURM run
+
+```sh
 compiler-suit-runner submit \
   --flake . \
   --multi-computer slurm \
@@ -109,105 +162,167 @@ compiler-suit-runner submit \
   --gateway ssh://user@head \
   --slurm-root-folder /shared/slurm \
   --jobs 4 \
+  --build-max-concurrent 2 \
   --packages hello --archs x86_64 aarch64
 ```
 
-Add `--cachix-cache <name> --cachix-auth-token-file <path>` to enable
-toolchain federation across clusters (see below).
+The framework owns the gateway, packaging, SLURM resource, and retry
+arguments. Inspect `submit --help` for the options supported by the
+pinned framework. See the [SLURM runbook](../dynrunner/SLURM_RUNBOOK.md)
+and [operations notes](../dynrunner/LMU_OPERATIONS.md) for deployment.
+
+## Closure transport
+
+Toolchain archives and per-package matrix derivation archives use affine
+import gates. Each gate runs in a worker subprocess once per secondary
+node before dependent builds run there. Toolchain archives split common
+paths from compiler-specific paths to avoid repeatedly shipping the same
+closure. They include build-time prerequisites as well as runtime paths.
+
+* `--build-deps-local` also exports and imports the realized output closure
+  of variant build inputs. `CSR_BUILD_DEPS_LOCAL=1` enables it too.
+* Common-dependency output imports are affine by default.
+  `--no-common-deps-affine` restores peer-substituter transport for them.
+* `--no-substituters` forces build-dependency preloading and disables
+  harmonia and substitution for the variant/common-dependency build path.
+  Fully affine mode, with build-dependency preloading and common-dependency
+  affine imports enabled, implies this behavior too.
+* `--no-toolchain-dedup` restores full per-package archives instead of
+  subtracting the separately shipped toolchain closure.
+
+Substituter-free worker builds do not make preflight offline. The
+submitter can use public caches and build missing prerequisites while
+preparing archives. Variant/common-dependency workers check before
+building that imported prerequisites will not need rebuilding or fetching.
 
 ## Output layout
 
-For a run rooted at `<shared-fs>` (e.g. `/shared/slurm/<run-id>/`):
+A dataset derivation in the Nix store has this shape:
 
-```
-<shared-fs>/
-├── dataset/            # phase 3 output: <variant>.tar.zst per build
-├── partition/
-│   ├── raw/<shard>.json     # phase 1a per-shard partial results
-│   ├── partition.json       # phase 1b merged global partition
-│   └── cache.json           # incremental partition cache
-├── peers/
-│   ├── <secondary-id>.json  # one file per live secondary
-│   └── __signing-key        # cluster-wide Nix store signing key
-└── flags/              # barrier sentinels: phase1a_done, phase1b_done, phase2_done
+```text
+<store-output>/
+├── elf/<name>            symlink to a unique package ELF
+└── meta.json             Nix-side variant metadata
 ```
 
-## Cachix federation
+The worker dereferences each ELF into staging and returns explicit files
+for framework publication. The dataset output root contains:
 
-Optional. Use `--cachix-cache NAME` together with
-`--cachix-auth-token-file PATH` to push **toolchain** Nix store paths
-(phase 2 output) to a Cachix cache so other clusters can fetch instead
-of rebuild.
-
-Variant tarballs (phase 3 output) are intentionally **not** pushed —
-they're large, of mostly local interest, and may carry experiment-
-specific labels we'd rather not publish. See the Limitations section.
-
-## Incremental cache
-
-The runner keeps a per-user incremental cache at:
-
+```text
+<dataset-root>/
+├── <packageId>/
+│   ├── <variant-dir>/
+│   │   ├── <elf-name>    copied ELF bytes
+│   │   ├── metadata.json
+│   │   └── package-complete.json
+│   └── <variant-dir>.json
+└── _matrix_eval/         evaluation archives and intermediate metadata
 ```
+
+Local runs default to `<shared-fs>/dataset/`. Container workers publish
+through the framework's output mount, `/app/out-network`; the host output
+location follows the framework run configuration. New sidecars carry the
+Nix build's checked family, exact version, immutable release ID, recipe pin,
+source identity and canonical package identity, plus actual package/variant
+derivations, output paths and compiler axes. A metadata mismatch fails the
+worker. The framework publishes the ELF files, metadata and completion record
+as one atomic set. Completion verifies release/derivation identity and file
+hashes; partial, legacy, stale or damaged results rebuild.
+New variant directory hashes include the package identity and actual
+derivation. Updating a default alias therefore cannot mix old and new ELF
+file sets in one directory.
+
+Captured builds validate their provenance, compiler artifacts, preprocessing
+artifacts, and separate debug associations before publication. The captured
+variant path is a relative symlink to a complete generation. Its adjacent JSON
+sidecar links into that same generation. A retry transfers and validates a
+hidden generation before replacing the visible link, so removed files cannot
+survive from an earlier result. The publisher retains the current and previous
+generations. Resolve the variant link once before reading its indexed files.
+See the [publication format](../docs/compiler-capture-format.md) for the
+generation layout and split-DWARF companion lookup.
+
+Variant outputs are folders and sidecars. Old partition files and phase-sentinel
+paths are not the completion contract for this pipeline.
+
+## Incremental cache and evaluation reuse
+
+The submitter caches enumeration results under:
+
+```text
 ~/.cache/compiler_suit_runner/
+├── toolchains/<key>/entry.json
+└── variants/<key>/entry.json
 ```
 
-It memoizes the pre-flight partition+manifest emission step, keyed by a
-hash of the flake input + selected packages/archs/flags. A cache hit
-short-circuits the (expensive) `nix eval` walk of the matrix and prints
-`Cache hit: <input_hash>`. Delete the directory to force a recompute.
+Keys account for repository/input state, canonical selected package IDs and
+resolved catalog provenance. Changing a default release, source or recipe
+invalidates the entry even when its alias and CLI options stay unchanged.
+A hit reuses enumeration results; manifests, stage selection,
+and dispatch configuration are rebuilt for the current invocation.
+Unknown cache versions or malformed entries are treated as misses.
+Use `--no-cache` to bypass this cache or `--cache-root` to select another
+location.
+
+`--prestaged-matrix-eval` skips matrix evaluation and reuses archives and
+per-package derivation-map sidecars from a prior run. Its intended input
+is the prior evaluation output directory. Release provenance must match the
+resolved catalog; missing, legacy or stale sidecars fail and require fresh
+matrix evaluation. Only selected package IDs are reused. This is separate
+from the local enumeration cache.
+For compact-inventory runs, prestaged maps also check evaluation inputs,
+architectures, suffix limits, sample size/seed and the toolchain aggregate.
+
+## Cachix
+
+`--cachix-cache NAME --cachix-auth-token-file PATH` enables optional
+toolchain uploads. It requires the Cachix CLI. Published dataset ELF
+folders are not uploaded by this integration.
 
 ## Module map
 
-All paths relative to `python/compiler_suit_runner/`.
+Paths below are relative to `python/compiler_suit_runner/`.
 
-| Module                       | Responsibility |
-|------------------------------|----------------|
-| `cli.py`                     | argparse front-end; `compiler-suit-runner` entry point. |
-| `__main__.py`                | `python -m compiler_suit_runner` for secondaries inside the container. |
-| `preflight.py`               | input hashing + cache lookup before `dynamic_runner.run`. |
-| `suit_task.py`               | the single `TaskDefinition` orchestrator (rank-aware). |
-| `manifest_gen.py`            | emits queue-item manifest files with rank-encoded sizes. |
-| `partition.py`               | phase 1a/1b utilities used by partition/merge workers. |
-| `peer_cache.py`              | peer-list watcher, harmonia control, per-build env assembly. |
-| `cachix_uploader.py`         | optional cross-cluster cache federation. |
-| `incremental_cache.py`       | local pre-flight cache (`~/.cache/compiler_suit_runner/`). |
-| `workers/partition_worker.py`| phase 1a per-shard partitioner. |
-| `workers/merge_worker.py`    | phase 1b single-machine global merge. |
-| `workers/barrier_worker.py`  | sentinel-file barriers between phases. |
-| `workers/build_worker.py`    | phase 2 toolchain builds + phase 3 variant builds. |
+| Module | Responsibility |
+|--------|----------------|
+| `cli.py` | CLI, preflight, archive preparation, and framework dispatch |
+| `preflight.py` | Toolchain and variant enumeration, source/input identity |
+| `incremental_cache.py` | Versioned local enumeration caches |
+| `suit_task.py` | Phase topology, discovery, streamed spawn, and lifecycle hooks |
+| `manifest_gen.py` | Task identities, manifest payloads, and serialization |
+| `dependency_graph_planner/` | Shared dependency and variant planning |
+| `streamed_spawn.py` | Build-descriptor messages and reconciliation |
+| `workers/eval_worker.py` | Per-package matrix evaluation |
+| `workers/dependency_graph_worker/` | Combined graph planning and closure archives |
+| `workers/affine_import_worker.py` | Per-node archive imports |
+| `workers/build_compilers_worker.py` | Optional in-cluster toolchain builds |
+| `workers/build_worker.py` | Worker entry point, dependency/variant builds, and ELF staging |
+| `peer_cache.py`, `peer_paths*.py`, `peer_push.py`, `peer_replication.py` | Peer transport and placement tracking |
+| `cachix_uploader.py` | Optional toolchain uploads |
 
-## Limitations
+## Testing and limitations
 
-* **Worker pinning.** The current `dynamic_runner._native` scheduler does not
-  support hard worker-to-task-class pinning. Phase 2 and phase 3 share
-  one worker pool; we approximate pinning via the rank-in-size encoding
-  (see [`docs/dynamic_runner._native_pinning_requirements.md`][pinning]) but a
-  proper scheduler-side feature is still pending.
-* **OOM long tail.** A small fraction of variants get OOM-killed under
-  aggressive concurrency. Re-run with `--retry-oom` to retry just the
-  killed items at lower concurrency, instead of re-running the whole
-  matrix.
-* **Variant tarballs are NOT pushed to Cachix.** Only phase 2 (toolchain)
-  store paths are federated. This is a deliberate scope/privacy choice;
-  if you want shared variant outputs, sync `<shared-fs>/dataset/` out of
-  band.
-* **Single-cluster tested only.** The `--gateway` / multi-cluster
-  federation path exists in code but is not yet exercised end-to-end.
+From the repository root:
 
-[pinning]: ../docs/dynamic_runner._native_pinning_requirements.md
-
-## Testing
-
-```
-pytest python/compiler_suit_runner/tests/
+```sh
+nix develop -c env PYTHONPATH=.:python pytest -c python/pyproject.toml \
+  python/compiler_suit_runner/tests/ python/ssh_debug_runner/tests/
 ```
 
-The test suite is stdlib-only and runs in a few seconds. It covers
-size-encoding round-trips, memory tier classification, manifest filename
-regex round-trips, incremental-cache determinism, and per-worker unit
-behavior.
+The default pytest configuration excludes live Nix and SLURM tests.
+Add `-m nix` or `-m slurm_live` to select those checks with the required
+infrastructure. Both the repository root and `python/` must be importable;
+the command above sets those paths explicitly. Unit tests cover CLI behavior,
+cache handling, phase topology, streamed planning, closure import,
+publication, and failures. They do not establish cluster correctness or
+compiler compatibility on their own.
+
+The runner remains experimental. Large matrices can exhaust memory under
+aggressive concurrency. `--build-max-concurrent` caps build-heavy tasks;
+select resources and framework retry settings for the target cluster.
+Compiler/target compatibility constraints and known exclusions reduce
+expected failures, but do not guarantee every package variant builds.
 
 ## License
 
-MIT — same as the parent `asm-dataset-nix` repository. See the
-top-level `LICENSE` file.
+MIT. See the repository's [LICENSE](../LICENSE).

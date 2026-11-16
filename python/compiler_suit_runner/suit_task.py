@@ -79,9 +79,10 @@ import dataclasses
 import logging
 import os
 import pathlib
+from compiler_suit_runner.package_selection import release_metadata
 import threading
 from argparse import ArgumentParser, Namespace
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -133,10 +134,6 @@ from compiler_suit_runner import peer_paths_fetch
 from compiler_suit_runner.workers.build_worker import (
     BuildWorkerEnv,
     build_worker,
-    ensure_binary_archive_imported,
-    ensure_common_archive_imported,
-    ensure_toolchain_archive_imported,
-    ensure_toolchain_out_archive_imported,
 )
 
 
@@ -194,6 +191,15 @@ _BUILD_DISPATCH_CLASSES: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 # Secondary-affine import gate task identifiers
 # ---------------------------------------------------------------------------
+
+# Task-id for the per-secondary nix-daemon-readiness gate. A secondary-
+# affine barrier (NOT an import) emitted in the MATRIX_EVAL phase; every
+# matrix_eval task depends on it (intra-phase bare string) so the FIRST nix
+# command a freshly-connected secondary runs waits (bounded) for the
+# nix-daemon socket instead of racing a not-yet-started daemon. Handled by
+# build_worker._wait_for_nix_daemon via _run_affine_import. The literal must
+# match build_worker.NIX_DAEMON_UP_TASK_ID.
+NIX_DAEMON_UP_TASK_ID = "nix_daemon_up"
 
 # Task-id for the COMMON realized-toolchain archive import gate task.
 # One per run; wired as a dep on every build_common_dep and build_variant.
@@ -608,6 +614,12 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
                 TaskTypeSpec(
                     type_id="dep_graph",
                     worker_module="compiler_suit_runner.workers.build_worker",
+                    # #580: pin dep_graph to the primary's node. It must
+                    # never relocate to a secondary on a transient eviction
+                    # — a relocated dep_graph worker cannot resolve its bash
+                    # store path off-primary, which strands the run at the
+                    # build drain boundary.
+                    primary_pinned=True,
                 ),
             ),
         ),
@@ -625,15 +637,15 @@ def _phase_specs(*, build_max_concurrent: Optional[int]):
             # dep_graph phase. No dep_graph/per-task edge is introduced.
             barrier=False,
             types=(
-                # Secondary-affine import gate: runs ONCE per secondary node,
-                # never dispatched to a worker subprocess. ``worker_module``
-                # is required by the PhaseSpec API but the framework never
-                # actually launches a worker for secondary-affine tasks; the
-                # import action is invoked directly via the ``import_action``
-                # duck-typed off the task definition object.
+                # Secondary-affine import gate (#577): runs ONCE per secondary
+                # node in a WORKER SUBPROCESS (not the oploop thread).
+                # ``affine_import_worker`` receives the gate via the normal
+                # worker dispatch path; ``task.relative_path`` carries the
+                # gate_id.  The old ``import_action`` oploop-callback path
+                # is dropped.
                 TaskTypeSpec(
-                    type_id="toolchain_import",
-                    worker_module="compiler_suit_runner.workers.build_worker",
+                    type_id="affine_import",
+                    worker_module="compiler_suit_runner.workers.affine_import_worker",
                 ),
                 TaskTypeSpec(
                     type_id="toolchain_validate",
@@ -1183,6 +1195,7 @@ class SuitTaskConfig:
     # phase runs normally and the dep_graph task receives its drv map from
     # the framework's ``predecessor_outputs`` mechanism.
     prestaged_matrix_eval: bool = False
+    compiler_capture: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1293,89 +1306,6 @@ class SuitTask:
     # contracted public surface.
 
     @property
-    def import_action(self) -> Optional[Callable[[str], None]]:
-        """Secondary-affine import action for all archive gate tasks.
-
-        Duck-typed by the framework's ``run_secondary()`` /
-        ``RustSecondaryCoordinator`` via
-        ``getattr(task_definition, "import_action", None)``. When non-None,
-        the framework calls ``import_action(task_id, payload_json)`` ONCE per
-        secondary node for each secondary-affine gate task whose dependent
-        work tasks are assigned to that node (as of pin fed78773,
-        ``affine_action_bridge`` passes two positional args; ``payload_json``
-        is currently unused by the consumer but must be accepted).
-
-        Callable contract (from affine_action_bridge.rs):
-
-        * ``task_id: str`` — the gate task's id (e.g. ``"import_common"``,
-          ``"import_tc_<hash>"``, ``"import_toolchain_drv"``, or
-          ``"import_matrix_drv_<binary>"``).
-        * ``payload_json: object`` — the raw JSON payload for the gate task
-          (passed by the framework since fed78773; currently unused here).
-        * Return ``None`` on success.
-        * Raise ``OSError`` for transient failures (framework retries).
-        * Raise any other ``Exception`` for non-recoverable failures
-          (framework marks the gate and all dependent tasks permanently
-          failed).
-
-        Gate task IDs dispatched here:
-
-        * ``import_common``              → :func:`ensure_common_archive_imported`
-        * ``import_build_deps``          → :func:`ensure_build_deps_archive_imported`
-        * ``import_toolchain_drv``       → :func:`ensure_toolchain_archive_imported`
-        * ``import_matrix_drv_<binary>`` → :func:`ensure_binary_archive_imported`
-        * ``import_tc_<hash>``           → :func:`ensure_toolchain_out_archive_imported`
-        * ``import_common_dep_<id>``     → :func:`ensure_common_dep_out_archive_imported`
-
-        When ``config.matrix_eval_out_dir`` is ``None`` (legacy / test
-        flows) this property returns ``None`` and the framework never fires
-        the import hook.  All ``ensure_*`` helpers are no-ops when their
-        archive directory is ``None``, so legacy callers are unaffected.
-        """
-        if self.config.matrix_eval_out_dir is None:
-            return None
-        out_dir = self.config.matrix_eval_out_dir
-
-        # fed78773's affine_action_bridge calls (task_id, payload_json);
-        # payload_json is accepted for forward-compatibility but currently unused.
-        def _action(task_id: str, payload_json: object = None) -> None:
-            if task_id == IMPORT_COMMON_TASK_ID:
-                ensure_common_archive_imported(out_dir)
-            elif task_id == IMPORT_BUILD_DEPS_TASK_ID:
-                from compiler_suit_runner.workers.build_worker import (  # noqa: PLC0415
-                    ensure_build_deps_archive_imported,
-                )
-                ensure_build_deps_archive_imported(out_dir)
-            elif task_id == IMPORT_TOOLCHAIN_DRV_TASK_ID:
-                ensure_toolchain_archive_imported(out_dir)
-            elif task_id.startswith(IMPORT_COMMON_DEP_TASK_PREFIX):
-                # Per-common_dep OUTPUT-import gate. The trailing token is
-                # the cd_id (the drv-ident hash). The import is idempotent:
-                # on the PRODUCING node the closure is already valid in the
-                # local store, so ``nix-store --import`` skips every path
-                # (no substituter query, no rebuild) — the consumer-side
-                # publisher-skip approximation. See the FRAMEWORK API GAP
-                # note: a per-instance "already-satisfied on producer"
-                # primitive would let us skip reading the archive entirely.
-                from compiler_suit_runner.workers.build_worker import (  # noqa: PLC0415
-                    ensure_common_dep_out_archive_imported,
-                )
-                cd_id = task_id[len(IMPORT_COMMON_DEP_TASK_PREFIX):]
-                ensure_common_dep_out_archive_imported(cd_id, out_dir)
-            elif task_id.startswith("import_matrix_drv_"):
-                binary = task_id[len("import_matrix_drv_"):]
-                ensure_binary_archive_imported(binary, out_dir)
-            elif task_id.startswith("import_tc_"):
-                tc_id = task_id[len("import_tc_"):]
-                ensure_toolchain_out_archive_imported(tc_id, out_dir)
-            else:
-                raise RuntimeError(
-                    f"import_action: unknown gate task_id {task_id!r}"
-                )
-
-        return _action
-
-    @property
     def fulfillability_matcher(self) -> Optional[Callable[..., bool]]:
         return self._fulfillability_matcher
 
@@ -1390,6 +1320,20 @@ class SuitTask:
         return build_worker
 
     def _substituters_file_path(self) -> Optional[pathlib.Path]:
+        # Substituter-free / secondary-affine mode: there IS no peer
+        # substituters file (PeerListWatcher does not run, see
+        # on_run_start), and threading one into any worker would
+        # re-introduce ``--extra-substituters`` into nix invocations —
+        # exactly the leak affine mode exists to avoid. Single source of
+        # truth for "where is the substituters file" used by BOTH the
+        # SLURM ``--substituters-file`` argv threading and the in-process
+        # ``BuildWorkerEnv.substituters_file``, so gating here keeps
+        # EVERY dispatch path substituter-free. ``config.no_substituters``
+        # is set on every node (the submitter resolves it; secondaries
+        # read the forwarded ``CSR_NO_SUBSTITUTERS`` env in
+        # ``_parse_framework_spawned_secondary``).
+        if self.config.no_substituters:
+            return None
         if self.config.peers_dir is None:
             return None
         # Per-secondary substituters file so concurrent writers from
@@ -1594,6 +1538,11 @@ class SuitTask:
                     # Signal to the dep_graph worker that it must load the
                     # drv map from sidecars (predecessor_outputs will be empty).
                     "prestaged_matrix_eval": True,
+                    **({"compiler_capture":True} if self.config.compiler_capture else {}),
+                    "package_catalog": {key: {**release_metadata(value), "sys": sys_name,
+                                              **{field: value[field] for field in ("archs", "variant_sample", "variant_seed", "suffixes",
+                                                 "toolchain_aggregate_drv", "variant_inventory_schema", "variant_inventory_identity") if field in value}}
+                                        for key, value in per_binary.items()},
                 },
                 task_id=DEPENDENCY_GRAPH_TASK_ID,
                 # No matrix_eval predecessors — the phase ran previously.
@@ -1604,6 +1553,11 @@ class SuitTask:
 
         matrix_eval_ids: list[str] = []
         toolchain_aggregate_drv = None
+        # Per-secondary nix-daemon-readiness gate (MATRIX_EVAL phase). Each
+        # matrix_eval task below depends on it (intra-phase bare string) so
+        # the FIRST nix command on every node waits (bounded) for the daemon
+        # socket instead of racing a not-yet-started daemon.
+        yield self._nix_daemon_up_gate_task_info()
         for binary in binaries:
             meta = per_binary[binary]
             if not isinstance(meta, dict):
@@ -1632,6 +1586,14 @@ class SuitTask:
                 # Default ON when absent so legacy metadata (pre-dedup)
                 # behaves as full-dedup; the cli.py path always sets it.
                 toolchain_dedup=meta.get("toolchain_dedup", True),
+                **({"compiler_capture":True} if self.config.compiler_capture else {}),
+                package_metadata=meta,
+            )
+            # Gate every matrix_eval on the per-secondary nix-daemon-up
+            # barrier (intra-phase bare-string dep, same MATRIX_EVAL phase)
+            # so a fresh secondary waits for its daemon before nix eval.
+            header = dataclasses.replace(
+                header, task_depends_on=(NIX_DAEMON_UP_TASK_ID,),
             )
             matrix_eval_ids.append(header.task_id or matrix_eval_task_id(binary))
             yield self._task_info_from_header(header)
@@ -1658,6 +1620,7 @@ class SuitTask:
                 # can pre-load all variant build-input closures before
                 # ``nix build`` fires.  False = byte-identical behaviour.
                 "build_deps_local": self.config.build_deps_local,
+                **({"compiler_capture":True} if self.config.compiler_capture else {}),
             },
             task_id=DEPENDENCY_GRAPH_TASK_ID,
             # The matrix_eval prerequisites (task_id = bare binary) are
@@ -1672,6 +1635,33 @@ class SuitTask:
             ),
         )
         yield self._task_info_from_header(dep_graph_header)
+
+    def _nix_daemon_up_gate_task_info(self):
+        """The per-secondary nix-daemon-readiness gate TaskInfo.
+
+        A ``is_secondary_affine=True`` barrier in the MATRIX_EVAL phase
+        (the earliest phase) — NOT an import. matrix_eval tasks depend on
+        it via an intra-phase bare-string dep, so the framework runs it
+        ONCE per secondary, before that node's first nix command, where
+        the worker (``build_worker._run_affine_import`` →
+        ``_wait_for_nix_daemon``) blocks ≤30s for the daemon socket. Same
+        ``type_id="affine_import"`` routing as the import gates; the body
+        branches on the ``nix_daemon_up`` gate id.
+        """
+        return _make_task_info(
+            pathlib.Path(NIX_DAEMON_UP_TASK_ID),
+            0,
+            phase_id=Phase.MATRIX_EVAL,
+            type_id="affine_import",
+            affinity_id=None,
+            payload={
+                "item_class": "affine_import",
+                "task_id": NIX_DAEMON_UP_TASK_ID,
+            },
+            task_id=NIX_DAEMON_UP_TASK_ID,
+            task_depends_on=(),
+            is_secondary_affine=True,
+        )
 
     def _discover_import_gate_tasks(self) -> Iterable:
         """Yield the secondary-affine import gate TaskInfos for Phase.BUILD.
@@ -1705,17 +1695,20 @@ class SuitTask:
         if out_dir is None and not outpaths_map:
             return
 
-        # Synthetic zero-byte path; framework treats it as an opaque tag
-        # (SuitTask.uses_file_based_items = False).
+        # Synthetic opaque tag = the gate's bare task_id. NO ``.json`` sidecar:
+        # the affine task imports a derivation/closure archive (not a file), and
+        # #577's affine_import_worker reads relative_path AS the gate id — which
+        # must equal the id dependents reference, or the secondary cannot resolve
+        # the secondary-affine dep. (SuitTask.uses_file_based_items = False.)
         def _gate(task_id: str) -> object:
             return _make_task_info(
-                pathlib.Path(f"{task_id}.json"),
+                pathlib.Path(task_id),
                 0,
                 phase_id=Phase.BUILD,
-                type_id="toolchain_import",
+                type_id="affine_import",
                 affinity_id=None,
                 payload={
-                    "item_class": "toolchain_import",
+                    "item_class": "affine_import",
                     "task_id": task_id,
                 },
                 task_id=task_id,
@@ -1876,6 +1869,22 @@ class SuitTask:
             "--manifest-dir",
             str(self.config.manifest_dir),
         ]
+
+        # Affine-import worker: spawned for every secondary-affine gate task
+        # (#577).  It only needs the matrix-eval archive dir (REQUIRED),
+        # plus the shared-fs/secondary-id for log lines.  It does NOT need
+        # --flake-ref, --dataset-output-dir, or --substituters-file.
+        if type_id == "affine_import":
+            argv = common + [
+                "--matrix-eval-out-dir",
+                str(self.config.matrix_eval_out_dir),
+            ]
+            if self.config.shared_fs is not None:
+                argv += ["--shared-fs", str(self.config.shared_fs)]
+            if self.config.secondary_id:
+                argv += ["--secondary-id", self.config.secondary_id]
+            return argv
+
         if type_id in {
             "dep_graph",
             "eval", "build_compilers", "toolchain_validate",
@@ -1887,9 +1896,17 @@ class SuitTask:
                 "--dataset-output-dir",
                 str(self.config.dataset_dir),
             ]
-            substituters = self._substituters_file_path()
-            if substituters is not None:
-                argv += ["--substituters-file", str(substituters)]
+            # Peer-substituter file: NEVER threaded in substituter-free /
+            # secondary-affine mode. The build worker already ignores it
+            # there (it pins ``--option substituters ""``), but the eval /
+            # build_compilers workers splice it verbatim into their nix
+            # invocations — so passing it at all would leak
+            # ``--extra-substituters`` into those nix commands. Withholding
+            # it at the source keeps EVERY worker substituter-free.
+            if not self.config.no_substituters:
+                substituters = self._substituters_file_path()
+                if substituters is not None:
+                    argv += ["--substituters-file", str(substituters)]
             # Cluster placement-map plumbing. ``shared_fs`` + the
             # secondary identity let the build worker subprocess read
             # ``peers/_paths_*.jsonl`` directly (no in-process watcher
@@ -2020,11 +2037,23 @@ class SuitTask:
             # the typical announce → discover latency to one HTTP RTT,
             # leaving polling as a join-race / lost-packet safety net.
             push_enabled = bool(public_key)
+            # PeerListWatcher drives BOTH peer discovery for the K=3
+            # replication/placement plane (push-server transport, NOT
+            # harmonia) AND the ``peers/_substituters.<id>.txt`` publication.
+            # It must keep running in substituter-free / secondary-affine
+            # mode so replication is unaffected; the substituter LEAK is
+            # closed elsewhere — the per-node harmonia URL is withheld from
+            # the announce when ``enable_harmonia`` is False (so peers
+            # collect no substituter URLs → the file is empty), and
+            # ``_substituters_file_path`` returns None under
+            # ``no_substituters`` so the file is never threaded into any
+            # worker's nix invocation.
             try:
                 self._peer_watcher = PeerListWatcher(
                     shared_fs=self.config.shared_fs,
                     exclude_id=self.config.secondary_id,
                     tick_seconds=60.0 if push_enabled else 5.0,
+                    write_substituters=not self.config.no_substituters,
                 )
                 self._peer_watcher.start()
             except Exception:  # noqa: BLE001 — log + continue
@@ -2366,55 +2395,59 @@ class SuitTask:
                     )
                     self._cachix_uploader = None
 
-            # 5. Harmonia (optional). Requires nix-daemon (harmonia 3.x
-            # talks to the daemon over its socket for store queries).
-            if self.config.enable_harmonia and self._signing_key is not None:
-                # Land the per-secondary aux-process logs (nix-daemon,
-                # harmonia) INSIDE this secondary's own subdir alongside
-                # the framework's per-role logs
-                # (<log-network>/<id>/{primary,secondary,worker_0}.log),
-                # instead of at the top level with the id baked into the
-                # filename. The per-id DIRECTORY keeps each node's path
-                # unique (no shared inode across concurrent writers)
-                # without an id-scoped filename.
-                sec_log_dir = (
-                    pathlib.Path("/app/log-network")
-                    / self.config.secondary_id
+            # 5. nix-daemon (ALWAYS) + harmonia cache server (optional).
+            #
+            # The nix-daemon is required for EVERY nix operation (eval,
+            # build, import) regardless of substituters, so it MUST start
+            # even in substituter-free / secondary-affine mode
+            # (``enable_harmonia`` False). Only the harmonia BINARY CACHE
+            # SERVER below is gated on ``enable_harmonia``. (These were
+            # previously bundled under a single ``enable_harmonia`` guard,
+            # so the substituter-free path skipped the daemon and every nix
+            # command failed with "cannot connect to socket at
+            # '/nix/var/nix/daemon-socket/socket'".)
+            #
+            # Land the per-secondary aux-process logs (nix-daemon, harmonia)
+            # INSIDE this secondary's own subdir alongside the framework's
+            # per-role logs; the per-id DIRECTORY keeps each node's path
+            # unique (no shared inode across concurrent writers).
+            sec_log_dir = (
+                pathlib.Path("/app/log-network")
+                / self.config.secondary_id
+            )
+            try:
+                sec_log_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:  # noqa: BLE001 — best-effort; the framework
+                # already creates <id>/ for its own logs.
+                pass
+            try:
+                # Start nix-daemon. Idempotent — no-op if a daemon socket
+                # already exists. Container's nix.conf is single-user so no
+                # nixbld* group is needed. Log goes on the gateway-readable
+                # mount so worker connection-reset issues are diagnosable
+                # from the host after the container exits and its /tmp gets
+                # nuked.
+                from .peer_cache import (
+                    NixStoreRegistrationError,
+                    start_nix_daemon,
                 )
-                try:
-                    sec_log_dir.mkdir(parents=True, exist_ok=True)
-                except OSError:  # noqa: BLE001 — best-effort; the
-                    # framework already creates <id>/ for its own logs.
-                    pass
-                try:
-                    # Start nix-daemon FIRST. Idempotent — no-op if a
-                    # daemon socket already exists. Container's
-                    # nix.conf is in single-user mode so no nixbld*
-                    # group is needed. Log goes on the gateway-
-                    # readable mount alongside harmonia's so we can
-                    # diagnose worker connection-reset issues from
-                    # the host after the container exits and its
-                    # /tmp gets nuked.
-                    from .peer_cache import (
-                        NixStoreRegistrationError,
-                        start_nix_daemon,
-                    )
-                    daemon_log = sec_log_dir / "nix-daemon.log"
-                    start_nix_daemon(daemon_log)
-                except NixStoreRegistrationError:
-                    # LOUD by design: the image declares a baked
-                    # store-DB registration that failed to load.
-                    # Continuing would leave every rootfs store path
-                    # invalid in the nix DB, and the build phase's
-                    # first concurrent import storm would then
-                    # deletePath() live rootfs paths (glibc, nix,
-                    # python) out from under running processes.
-                    raise
-                except Exception:  # noqa: BLE001 — log + continue
-                    self._logger.exception(
-                        "on_run_start: nix-daemon start failed"
-                        " (harmonia will likely 500 on store queries)"
-                    )
+                daemon_log = sec_log_dir / "nix-daemon.log"
+                start_nix_daemon(daemon_log)
+            except NixStoreRegistrationError:
+                # LOUD by design: the image declares a baked store-DB
+                # registration that failed to load. Continuing would leave
+                # every rootfs store path invalid in the nix DB, and the
+                # build phase's first concurrent import storm would then
+                # deletePath() live rootfs paths (glibc, nix, python) out
+                # from under running processes.
+                raise
+            except Exception:  # noqa: BLE001 — log + continue
+                self._logger.exception(
+                    "on_run_start: nix-daemon start failed"
+                )
+            # Harmonia cache SERVER — only in substituter mode (it needs
+            # the signing key; the nix-daemon above is unconditional).
+            if self.config.enable_harmonia and self._signing_key is not None:
                 try:
                     # Log goes on the gateway-readable mount inside this
                     # secondary's subdir (operators read it from the
@@ -2447,7 +2480,18 @@ class SuitTask:
             # other secondary. Lets a worker's ``nix-store --realise``
             # transparently fetch built paths from peer harmonias
             # without per-build CLI flags.
-            if self._peer_watcher is not None:
+            #
+            # GATED on ``enable_harmonia``: in substituter-free /
+            # secondary-affine mode there are no peer harmonias to fetch
+            # from, and writing ``extra-substituters`` lines into
+            # peer.conf would re-introduce a substituter into EVERY nix
+            # invocation (not just the build worker's, which pins
+            # ``--option substituters ""``, but also eval / build_compilers
+            # / bare ``nix-store --realise``). That is exactly the leak
+            # the operator hit ("some nix commands were still invoked with
+            # --extra-substituters" on an affine run), so we never write
+            # peer.conf when harmonia is off.
+            if self.config.enable_harmonia and self._peer_watcher is not None:
                 try:
                     from .peer_cache import PeerNixConfWatcher
                     self._peer_nix_conf_watcher = PeerNixConfWatcher(
@@ -3036,7 +3080,15 @@ class SuitTask:
                 " (worker_id=%d, %d bytes)",
                 topic, worker_id, len(data),
             )
-            secondary_handle.send_to_primary(topic, data, important=True)
+            # #583/#587: dep_graph_spawn is high-volume (hundreds of batches
+            # per run) — route its narration to OBSERVER_TASK_TARGET so it
+            # does not flood ``--important-stdio-only``. The terminal SUMMARY
+            # is a single message and stays on the important channel (it is
+            # the reconciliation signal the primary's on_phase_end awaits).
+            secondary_handle.send_to_primary(
+                topic, data, important=True,
+                is_high_volume=(topic == SPAWN_TOPIC),
+            )
             return
         self._logger.debug(
             "worker_message_listener: ignoring topic %r"
@@ -3140,18 +3192,42 @@ class SuitTask:
         gate_infos: list[Any] = []
         if common_dep_gates and not self.config.disable_task_deps:
             gate_infos = self._build_common_dep_gate_infos(headers)
-        all_infos = task_infos + gate_infos
+        # TOPOLOGICAL order WITHIN the batch. spawn_tasks pre-validates each
+        # task's deps against the ledger AS IT INGESTS the list, so no task may
+        # precede a dep declared in the same batch (else the framework reports
+        # the dep "not present in ledger" and silently drops that edge). The
+        # build chain is THREE-deep:
+        #   build_common_dep  ←  import_common_dep gate  ←  build_variant
+        # The gate's task_depends_on is the build_common_dep that publishes the
+        # archive (so build_common_dep must come FIRST); build_variants declare
+        # depends_on the gate task_ids (so they come LAST). Hence:
+        #   build_common_dep descriptors -> gates -> all other descriptors.
+        # (build_common_dep headers are already minted in inter-dep order by the
+        # planner, so preserving their relative order is sufficient.)
+        # Each entry pairs a TaskInfo with the label spawn errors are
+        # reported under, so error indices (into ``all_infos``) map to the
+        # right task after the reorder.
+        ordered: list[tuple[str, Any]] = [
+            (h.name, ti) for h, ti in zip(headers, task_infos)
+            if h.item_class == "build_common_dep"
+        ]
+        ordered += [
+            (str(getattr(ti, "task_id", None) or "<gate>"), ti)
+            for ti in gate_infos
+        ]
+        ordered += [
+            (h.name, ti) for h, ti in zip(headers, task_infos)
+            if h.item_class != "build_common_dep"
+        ]
+        all_infos = [ti for _label, ti in ordered]
+        spawn_labels = [label for label, _ti in ordered]
         self._logger.info(
             "custom_message_handler: spawn_batch seq=%d from %s;"
             " spawning %d descriptor task(s) + %d common_dep gate(s)",
             msg["seq"], origin, len(task_infos), len(gate_infos),
         )
         errors = primary_handle.spawn_tasks(all_infos) or []
-        # Error indices map onto ``all_infos``; the per-error logger uses
-        # ``headers`` only for the descriptor prefix, so gate-index errors
-        # fall through to the generic branch (offending=None) — acceptable
-        # for the rare gate spawn error.
-        self._log_spawn_errors(errors, headers)
+        self._log_spawn_errors(errors, spawn_labels)
         # Only descriptor tasks count toward the reconciliation total; the
         # gates are primary-synthesised extras the worker never enumerated.
         self._streamed_spawned_count += len(task_infos)
@@ -3182,24 +3258,27 @@ class SuitTask:
             self._spawned_common_dep_gate_ids.add(gate_id)
             new_gates.append(
                 _make_task_info(
-                    pathlib.Path(f"{gate_id}.json"),
+                    # opaque tag = bare gate id, NO .json sidecar (see _gate above)
+                    pathlib.Path(gate_id),
                     0,
                     phase_id=Phase.BUILD,
-                    type_id="toolchain_import",
+                    type_id="affine_import",
                     affinity_id=None,
                     payload={
-                        "item_class": "toolchain_import",
+                        "item_class": "affine_import",
                         "task_id": gate_id,
-                        # ``ident`` lets the import action / a future
-                        # payload-driven path recover the shared-dep id
-                        # without re-parsing the task_id.
+                        # ``ident`` lets the worker / a future payload-driven
+                        # path recover the shared-dep id without re-parsing
+                        # the task_id (though task.relative_path is the
+                        # authoritative gate id in #577).
                         "ident": ident_str,
                     },
                     # The gate depends on the build_common_dep task that
                     # PUBLISHES the archive (intra-phase bare string), so on
                     # every OTHER node the gate only fires once the archive
                     # exists. The producing node short-circuits via the
-                    # import action's is_path_locally_present probe.
+                    # is_path_locally_present probe in
+                    # ensure_common_dep_out_archive_imported.
                     task_id=gate_id,
                     task_depends_on=(header.task_id,) if header.task_id else (),
                     is_secondary_affine=True,
@@ -3246,13 +3325,15 @@ class SuitTask:
         )
 
     def _log_spawn_errors(
-        self, errors: Iterable, headers: list[ManifestHeader],
+        self, errors: Iterable, labels: Sequence[str],
     ) -> None:
         """Port of the old watcher's per-error WARN diagnostics.
 
         ``primary_handle.spawn_tasks`` returns a list of
-        ``(idx, error_dict)`` pairs (empty = all spawned cleanly).
-        Each entry is logged at WARN with severity-specific context:
+        ``(idx, error_dict)`` pairs (empty = all spawned cleanly), where
+        ``idx`` indexes the list passed to ``spawn_tasks``; ``labels[idx]``
+        names that task. Each entry is logged at WARN with
+        severity-specific context:
 
         * ``duplicate_task_hash`` — the planner re-emitted a hash the
           framework already holds (the framework does NOT silently
@@ -3273,8 +3354,7 @@ class SuitTask:
                 continue
             kind = err.get("kind") if isinstance(err, dict) else ""
             task_hash = err.get("task_hash") if isinstance(err, dict) else ""
-            offending = headers[idx] if 0 <= idx < len(headers) else None
-            offending_name = offending.name if offending is not None else "?"
+            offending_name = labels[idx] if 0 <= idx < len(labels) else "?"
             if kind == "duplicate_task_hash":
                 self._logger.warning(
                     "spawn_tasks: duplicate task_hash for"

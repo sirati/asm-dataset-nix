@@ -12,6 +12,7 @@ import pathlib
 
 import pytest
 
+from compiler_suit_runner.tests.fakes import FakeRunner
 from compiler_suit_runner.workers import build_worker as bw
 from compiler_suit_runner.workers.build_worker import (
     ITEM_CLASS_BUILD_COMMON_DEP,
@@ -51,23 +52,11 @@ def _write_substituters_file(tmp_path, lines: list[str]):
     return target
 
 
-class RecordingRunner:
-    """Subprocess stub that records argv and returns programmable output."""
-
-    def __init__(
-        self,
-        stdout: bytes = b"",
-        stderr: bytes = b"",
-        returncode: int = 0,
-    ) -> None:
-        self.calls: list[list[str]] = []
-        self.stdout = stdout
-        self.stderr = stderr
-        self.returncode = returncode
-
-    def __call__(self, argv: list[str]) -> tuple[bytes, bytes, int]:
-        self.calls.append(list(argv))
-        return self.stdout, self.stderr, self.returncode
+def RecordingRunner(  # noqa: N802 - kept as the name the tests use
+    stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0,
+) -> FakeRunner:
+    """A runner that answers every argv the same way."""
+    return FakeRunner(default=(stdout, stderr, returncode))
 
 
 def _write_manifest(
@@ -1117,8 +1106,8 @@ def _run_build_worker_main_with_capture(
             self.resolved_path = resolved_path
             self.publish_calls: list[tuple] = []
 
-        def publish_all(self, *args):
-            self.publish_calls.append(args)
+        def publish_all(self, pairs):
+            self.publish_calls.append(list(pairs))
 
     class FakeWorkerOutput:
         def __init__(self) -> None:
@@ -1141,9 +1130,20 @@ def _run_build_worker_main_with_capture(
     fake_worker.PublishError = FakePublishError
     fake_worker.run = run_mock
 
+    # Provide a minimal dynamic_runner.worker.publish stub so the late
+    # import in main() resolves without the real package installed.
+    import pathlib as _pathlib
+    fake_publish = _types.ModuleType("dynamic_runner.worker.publish")
+    fake_publish.ENV_SRC_ROOT = "DYNRUNNER_PUBLISH_SRC_ROOT"
+    fake_publish.DEFAULT_SRC_ROOT = "/app/out-tmp"
+    fake_publish.dst_root = lambda: _pathlib.Path("/app/out-network")
+
     if "dynamic_runner" not in _sys.modules:
         _sys.modules["dynamic_runner"] = _types.ModuleType("dynamic_runner")
     monkeypatch.setitem(_sys.modules, "dynamic_runner.worker", fake_worker)
+    monkeypatch.setitem(
+        _sys.modules, "dynamic_runner.worker.publish", fake_publish
+    )
 
     monkeypatch.setattr(_sys, "argv", ["build_worker", *argv])
 
@@ -2037,25 +2037,6 @@ class TestDefaultRunnerResolvesTool:
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_common_archive_imported_happy(
-    monkeypatch, tmp_path,
-):
-    """A present archive is imported and the guard flips."""
-    from compiler_suit_runner.workers.dependency_graph_worker import (
-        archive as archive_mod,
-    )
-    _reset_common_imported(monkeypatch)
-    (tmp_path / "toolchains.common.archive").write_bytes(b"NIX_EXPORT:common")
-    imported: list = []
-
-    def _fake_import(archive, *, run_subprocess=None):
-        imported.append(pathlib.Path(archive))
-        return True, b"", ["/nix/store/glibc"]
-
-    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
-    bw.ensure_common_archive_imported(tmp_path)
-    assert bw._common_archive_imported is True
-    assert imported == [tmp_path / "toolchains.common.archive"]
 def test_ensure_common_archive_imported_idempotent(
     monkeypatch, tmp_path,
 ):
@@ -2113,6 +2094,53 @@ def test_ensure_toolchain_out_archive_imported_happy(
     bw.ensure_toolchain_out_archive_imported(tc_id, tmp_path)
     assert tc_id in bw._imported_toolchain_out_paths
     assert imported == [tmp_path / archive_name]
+
+
+def test_ensure_toolchain_out_archive_absent_but_output_resident_skips(
+    monkeypatch, tmp_path,
+):
+    """ALL-BASELINE TOLERANCE: an absent delta archive is tolerated (skipped,
+    not hard-failed) when the toolchain OUTPUT is already resident — the
+    split ships no delta for a toolchain whose closure is entirely in the
+    image baseline, so its output is present via the image."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_toolchain_out_imported(monkeypatch)
+    tc_id = "basebasebasebasebasebasebasebas"
+    # NO archive file written → absent.
+    imported: list = []
+    monkeypatch.setattr(
+        archive_mod, "import_archive",
+        lambda a, *, run_subprocess=None: imported.append(a) or (True, b"", []),
+    )
+    # Toolchain output IS resident.
+    monkeypatch.setattr(
+        archive_mod, "is_path_locally_present",
+        lambda p, *, run_subprocess=None: True,
+    )
+    # Must NOT raise and NOT import.
+    bw.ensure_toolchain_out_archive_imported(tc_id, tmp_path)
+    assert imported == []
+    assert tc_id in bw._imported_toolchain_out_paths
+
+
+def test_ensure_toolchain_out_archive_absent_and_not_resident_hard_fails(
+    monkeypatch, tmp_path,
+):
+    """A genuine missing upload (absent archive AND output NOT resident — a
+    non-baseline toolchain whose delta failed to upload) still HARD-FAILS."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    _reset_toolchain_out_imported(monkeypatch)
+    tc_id = "missingmissingmissingmissingmis"
+    monkeypatch.setattr(
+        archive_mod, "is_path_locally_present",
+        lambda p, *, run_subprocess=None: False,
+    )
+    with pytest.raises(RuntimeError, match="absent"):
+        bw.ensure_toolchain_out_archive_imported(tc_id, tmp_path)
 
 
 def test_ensure_toolchain_out_archive_imported_idempotent(
@@ -2438,7 +2466,15 @@ def test_ensure_common_archive_imported_import_failure_raises(monkeypatch, tmp_p
 
 def test_ensure_toolchain_out_archive_imported_absent_raises(monkeypatch, tmp_path):
     """A missing per-toolchain delta archive raises RuntimeError (HARD FAIL)."""
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
     _reset_common_imported(monkeypatch)
+    # The toolchain output is not resident, so the absence is a real miss.
+    monkeypatch.setattr(
+        archive_mod, "is_path_locally_present",
+        lambda path, *, run_subprocess=None: False,
+    )
     tc_id = "abc123hhhhhhhhhhhhhhhhhhhhhhhh"
     with pytest.raises(RuntimeError):
         bw.ensure_toolchain_out_archive_imported(tc_id, tmp_path)
@@ -2776,6 +2812,49 @@ def test_assert_no_substitute_raises_when_toolchain_in_to_build():
     assert "affine import gate" in str(exc.value)
 
 
+def test_assert_no_substitute_raises_on_transitive_toolchain_rebuild():
+    """REGRESSION (v9 cascade): a TRANSITIVE toolchain-closure path (a
+    bootstrap stdenv stage, NOT a declared required path) appearing in the
+    to-build set must be flagged so the build is cancelled rather than
+    re-deriving the whole cross-stdenv offline. The declared required set
+    only names top-level imports (toolchain output / aggregate drv /
+    declared inputs); transitive closure paths must be caught by the
+    'to-build = ONLY the variant's own derivations' invariant."""
+    runner = _ArgvRunner(
+        dry_run=(
+            b"",
+            b"these 4 derivations will be built:\n"
+            b"  /nix/store/vvv-zlib-variant-aarch64-1.3.2.drv\n"
+            b"  /nix/store/www-zlib-aarch64-clang11-O0-elf-folder.drv\n"
+            b"  /nix/store/1cl-bootstrap-stage2-stdenv-linux.drv\n"
+            b"  /nix/store/6hq-texinfo-7.2.drv\n",
+            0,
+        ),
+    )
+    # Note: toolchain_outpath / inputs are the TOP-LEVEL declared paths;
+    # the bootstrap stage + texinfo are TRANSITIVE closure paths NOT in
+    # the declared set, so the old required&planned check missed them.
+    payload = {
+        "drv": "/nix/store/www-zlib-aarch64-clang11-O0-elf-folder.drv",
+        "toolchain_outpath": "/nix/store/tc-stdenv-linux-out",
+        "input_outpaths": {"/nix/store/z.drv": "/nix/store/zlib-1.3.2-out"},
+    }
+    with pytest.raises(bw.NoSubstituteViolation) as exc:
+        bw.assert_no_substitute(
+            payload["drv"], ITEM_CLASS_BUILD_VARIANT, payload,
+            _no_sub_env(runner),
+        )
+    # The two transitive toolchain paths are flagged; the variant's own
+    # -variant- pkg and -elf-folder wrapper are NOT.
+    assert "/nix/store/1cl-bootstrap-stage2-stdenv-linux.drv" in exc.value.offenders
+    assert "/nix/store/6hq-texinfo-7.2.drv" in exc.value.offenders
+    assert "/nix/store/vvv-zlib-variant-aarch64-1.3.2.drv" not in exc.value.offenders
+    assert (
+        "/nix/store/www-zlib-aarch64-clang11-O0-elf-folder.drv"
+        not in exc.value.offenders
+    )
+
+
 def test_assert_no_substitute_raises_when_common_dep_in_to_fetch():
     """A declared build-input output in the to-fetch set is a violation."""
     runner = _ArgvRunner(
@@ -2964,3 +3043,226 @@ def test_build_worker_substituters_on_skips_assertion(tmp_path):
     assert result.success is True
     # No dry-run was ever issued.
     assert all("--dry-run" not in c for c in runner.calls)
+
+
+# ---------------------------------------------------------------------------
+# nix_daemon_up gate — per-secondary daemon-readiness barrier
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_nix_daemon_returns_when_socket_listening(tmp_path):
+    """A listening AF_UNIX socket means the daemon is up → returns."""
+    import socket as _socket
+
+    sock_path = str(tmp_path / "s")
+    srv = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        srv.bind(sock_path)
+    except OSError:
+        pytest.skip("AF_UNIX socket path too long on this filesystem")
+    srv.listen(1)
+    try:
+        # Must return (no raise) promptly.
+        bw._wait_for_nix_daemon(timeout=5.0, socket_path=sock_path)
+    finally:
+        srv.close()
+
+
+def test_wait_for_nix_daemon_times_out_when_absent():
+    """No socket within the timeout → OSError so the gate is retried."""
+    clock = {"t": 0.0}
+
+    def fake_mono() -> float:
+        return clock["t"]
+
+    def fake_sleep(dt: float) -> None:
+        clock["t"] += dt
+
+    with pytest.raises(OSError, match="not ready"):
+        bw._wait_for_nix_daemon(
+            timeout=3.0,
+            poll_interval=0.5,
+            socket_path="/nonexistent/no/such/nix/daemon-socket",
+            sleep=fake_sleep,
+            monotonic=fake_mono,
+        )
+
+
+def test_run_affine_import_nix_daemon_up_waits_then_returns(monkeypatch, tmp_path):
+    """The nix_daemon_up gate id routes to the daemon wait (no import)."""
+    called = {"waited": False}
+
+    def _fake_wait(*a, **k):
+        called["waited"] = True
+
+    monkeypatch.setattr(bw, "_wait_for_nix_daemon", _fake_wait)
+    bw._run_affine_import(bw.NIX_DAEMON_UP_TASK_ID, tmp_path)
+    assert called["waited"] is True
+
+
+# ---------------------------------------------------------------------------
+# Import-once guards record success only after the import succeeded (P1)
+# ---------------------------------------------------------------------------
+
+
+def _write_common(tmp_path):
+    (tmp_path / "toolchains.common.archive").write_bytes(b"NIX_EXPORT")
+
+
+def _write_build_deps(tmp_path):
+    (tmp_path / "build_deps.out.archive").write_bytes(b"NIX_EXPORT")
+
+
+def _write_tc(tmp_path):
+    (tmp_path / "toolchains.tcid.out.archive").write_bytes(b"NIX_EXPORT")
+
+
+def _write_common_dep(tmp_path):
+    _common_dep_archive(tmp_path, "cdid")
+
+
+@pytest.mark.parametrize(
+    "write_archive, ensure",
+    [
+        (_write_common, lambda d: bw.ensure_common_archive_imported(d)),
+        (_write_build_deps, lambda d: bw.ensure_build_deps_archive_imported(d)),
+        (_write_tc, lambda d: bw.ensure_toolchain_out_archive_imported("tcid", d)),
+        (
+            _write_common_dep,
+            lambda d: bw.ensure_common_dep_out_archive_imported("cdid", d),
+        ),
+    ],
+    ids=["common", "build_deps", "toolchain_out", "common_dep_out"],
+)
+def test_ensure_import_retries_after_failed_import(
+    monkeypatch, tmp_path, write_archive, ensure,
+):
+    """A failed import leaves the guard clear, so a retried gate imports again.
+
+    The affine gate maps a transient import error to RecoverableError and
+    the framework re-runs the gate on the same long-lived worker. If the
+    guard were set before the import, the retry would return early and
+    report success with nothing imported.
+    """
+    from compiler_suit_runner.workers.dependency_graph_worker import (
+        archive as archive_mod,
+    )
+    monkeypatch.setattr(bw, "_common_archive_imported", False)
+    monkeypatch.setattr(bw, "_build_deps_archive_imported", False)
+    monkeypatch.setattr(bw, "_imported_toolchain_out_paths", set())
+    monkeypatch.setattr(bw, "_imported_common_dep_out_ids", set())
+    write_archive(tmp_path)
+    results = iter([(False, b"daemon not ready", []), (True, b"", ["/nix/store/x"])])
+    calls: list = []
+
+    def _fake_import(archive, *, run_subprocess=None):
+        calls.append(archive)
+        return next(results)
+
+    monkeypatch.setattr(archive_mod, "import_archive", _fake_import)
+    with pytest.raises(RuntimeError, match="failed to import"):
+        ensure(tmp_path)
+    ensure(tmp_path)
+    assert len(calls) == 2
+    ensure(tmp_path)
+    assert len(calls) == 2, "a successful import is still recorded once"
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM-driven SystemExit passes through handle() unchanged (P5)
+# ---------------------------------------------------------------------------
+
+
+def _patch_branch_to_exit(monkeypatch, branch: str):
+    """Make ``branch``'s worker body raise SystemExit, as the framework's
+    SIGTERM handler does mid-task. Returns the task payload for it."""
+    def _exit(*_args, **_kwargs):
+        raise SystemExit("signal 15")
+
+    if branch == "matrix_eval":
+        from compiler_suit_runner.workers import eval_worker as ew
+        monkeypatch.setattr(ew, "run_eval_task", _exit)
+        return _matrix_eval_wrapper_payload(), {}
+    if branch == "dependency_graph":
+        from compiler_suit_runner.workers.dependency_graph_worker import (
+            run as dg_run,
+        )
+        monkeypatch.setattr(dg_run, "run_dependency_graph_task", _exit)
+        monkeypatch.setattr(
+            bw, "_resolve_bash_store_path_default",
+            lambda: "/nix/store/fake-bash",
+        )
+        preds = {"hello": {"matrix_aggregate_drv": {"value": "/nix/store/m.drv"}}}
+        return _dependency_graph_wrapper_payload(), preds
+    monkeypatch.setattr(bw, "build_worker", _exit)
+    return {
+        "item_class": ITEM_CLASS_BUILD_COMMON_DEP,
+        "name": "cd",
+        "payload": {"attr": "x.cd", "drv": "/nix/store/cd.drv"},
+    }, {}
+
+
+@pytest.mark.parametrize("branch", ["matrix_eval", "dependency_graph", "build"])
+def test_main_handle_lets_system_exit_through(monkeypatch, tmp_path, branch):
+    """The framework raises SystemExit on SIGTERM and reports the task as
+    recoverable. handle() must not turn a graceful drain into a
+    NonRecoverableError, which would cascade-fail every dependent."""
+    out_dir = tmp_path / "phase0"
+    out_dir.mkdir()
+    handle, _ = _run_build_worker_main_with_capture(
+        monkeypatch,
+        [
+            "--socket-path", str(tmp_path / "sock"),
+            "--flake-ref", ".",
+            "--dataset-output-dir", str(tmp_path / "dataset"),
+            "--shared-fs", str(tmp_path),
+            "--matrix-eval-out-dir", str(out_dir),
+        ],
+    )
+    payload, preds = _patch_branch_to_exit(monkeypatch, branch)
+
+    import sys as _sys
+    Task = _sys.modules["dynamic_runner.worker"].Task
+    task = Task(payload=payload, relative_path="m.json")
+    task.predecessor_outputs = preds
+    with pytest.raises(SystemExit):
+        handle(task)
+
+
+# ---------------------------------------------------------------------------
+# build-failures/ logs are keyed on the task id, not the header name (P10)
+# ---------------------------------------------------------------------------
+
+
+def test_build_failure_logs_do_not_overwrite_same_named_tasks(
+    tmp_path, monkeypatch,
+):
+    """Two failing tasks share a header name (two flex drvs do). The
+    framework hands each task ``<task_id>.json``; each failure must get
+    its own log in the shared build-failures directory."""
+    failures = tmp_path / "build-failures"
+    monkeypatch.setattr(bw, "_BUILD_FAILURES_DIR", failures)
+    runner = RecordingRunner(returncode=1, stderr=b"boom")
+    env = BuildWorkerEnv(
+        flake_ref=".",
+        dataset_output_dir=tmp_path / "dataset",
+        run_subprocess=runner,
+    )
+    for task_id, attr in (
+        ("build_common_dep__aaaa-flex-2.6.4.drv", "flex-a"),
+        ("build_common_dep__bbbb-flex-2.6.4.drv", "flex-b"),
+    ):
+        manifest = _write_manifest(
+            tmp_path / f"{task_id}.json",
+            item_class=ITEM_CLASS_BUILD_COMMON_DEP,
+            name="flex",
+            payload={"attr": attr},
+        )
+        assert build_worker(manifest, env).success is False
+    logs = sorted(p.name for p in failures.iterdir())
+    assert logs == [
+        "build_common_dep__aaaa-flex-2.6.4.drv.log",
+        "build_common_dep__bbbb-flex-2.6.4.drv.log",
+    ]
+    assert "flex-a" in (failures / logs[0]).read_text()
+    assert "flex-b" in (failures / logs[1]).read_text()

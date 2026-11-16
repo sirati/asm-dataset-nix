@@ -1,0 +1,1013 @@
+{
+  "capture_integration": {
+    "available": false,
+    "pending": [
+      "Resolve the pinned package before applying resolve-toolchain.nix and the capture output adapter.",
+      "Carry catalog entries, provenance, raw packages and all output roles through captured matrix namespaces.",
+      "Combine release provenance with capture contracts in cache axes, task identities, staging and completion.",
+      "Build both releases with GCC and Clang capture natively and with AArch64 capture; validate every ELF/capture association and stale-release/capture resume."
+    ],
+    "reason": "The separate root capture implementation is uncommitted and was not copied."
+  },
+  "cleanup": {
+    "allowance_bytes": 10737418240,
+    "base": "72dd7bec5f27e41e25f5eab31a12c81c36bc2034",
+    "budget_notes": {
+      "devshell_dry_run_download_mib": 547.5,
+      "devshell_dry_run_unpacked_gib": 2.6,
+      "global_growth_is_not_task_attribution": true,
+      "shared_store": true
+    },
+    "capture_integration": "pending: root capture changes remain uncommitted at baseline 72dd7bec",
+    "cleanup": "complete",
+    "deleted_paths": [
+      "/nix/store/nrhkmlr85xxa1jr4wh8bw3mwihc4bxg4-hello--v2_12_1--r36c00d5ff653-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+      "/nix/store/qlxjxyn085z0fxv5yrzyhrh52p18sh66-hello-variant-aarch64-unknown-linux-gnu-2.12.1",
+      "/nix/store/6rsz59cr93qb2bf17052khdir7yjs67v-hello-variant-aarch64-unknown-linux-gnu-2.12.3",
+      "/nix/store/5bfas6vhphh3h763sz30l48ri3vgrsbn-hello-aarch64-unknown-linux-gnu-2.12.1",
+      "/nix/store/6lfa77nlsrvmjd7ybpy6cv2pcvmbjmmb-hello-2.12.1",
+      "/nix/store/fvs3zhpvndbca8mppb829174ckdrdgcv-py-spy-0.4.0",
+      "/nix/store/l6sn7v1p3izsw6ajqxys964bgnzsjsvh-hello-2.12.3",
+      "/nix/store/1a38nnwhnbfsk6w9f52219khncwmdd5c-hello-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder"
+    ],
+    "elf_folder_nar_bytes": 8336,
+    "external_temporary_files": [
+      "/tmp/multiversion-devshell-dry.json"
+    ],
+    "free_after_cleanup_bytes": 562139631616,
+    "free_before_cleanup_bytes": 570326458368,
+    "global_free_space_change_bytes": 61744009216,
+    "initial_checkout_bytes": 4445550,
+    "initial_free_bytes": 623883640832,
+    "new_paths_in_development_build_closure": {
+      "count": 313,
+      "nar_bytes": 3389480760,
+      "notes": "Existing paths in the development environment build graph registered during this task. Shared acquisitions can overlap other active threads."
+    },
+    "new_paths_in_retained_prerequisite_and_result_closures": {
+      "count": 91,
+      "nar_bytes": 882709296,
+      "notes": "Registration time at or after task start; shared dependencies can overlap acquisitions by concurrent work."
+    },
+    "provider_sources_bytes": {
+      "nixpkgs": 184299872,
+      "nixpkgs-15_09": 54135441,
+      "nixpkgs-18_03": 51478576,
+      "nixpkgs-22_11": 123986034,
+      "nixpkgs-23_11": 141450859,
+      "nixpkgs-24_05": 160335676
+    },
+    "raw_pilot_results_bytes": 959446,
+    "reserve_bytes": 107374182400,
+    "retained_by_references": [],
+    "root_checkout_policy": "Read-only inspection; no content, index, lockfile, branch or uncommitted changes were moved or copied.",
+    "roots": {
+      "devshell": "/nix/store/5f9prpka149k9n1i3f1s5rjjgmk4ainb-nix-shell-env",
+      "devshell-1-link": "/nix/store/5f9prpka149k9n1i3f1s5rjjgmk4ainb-nix-shell-env",
+      "input-nixpkgs": "/nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source",
+      "input-nixpkgs-24_05": "/nix/store/wzx1ba5hqqfa23vfrvqmfmkpj25p37mr-source",
+      "pilot-hello--v2_12_1--r36c00d5ff653-x86_64": "/nix/store/g137jhhnvs22qkqwm08pvjz9idff6c0f-hello--v2_12_1--r36c00d5ff653-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+      "pilot-hello-x86_64": "/nix/store/jr8nsa4ngfcch5344ybl1inb8pl4g6br-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder"
+    },
+    "scratch": ".multiversion-work",
+    "scratch_after_cleanup_allocated_bytes": 262144,
+    "scratch_after_cleanup_bytes": 184121,
+    "scratch_allowance_bytes": 2147483648,
+    "scratch_before_cleanup_bytes": 9569417,
+    "targeted_delete_candidates": [
+      "/nix/store/1a38nnwhnbfsk6w9f52219khncwmdd5c-hello-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+      "/nix/store/5bfas6vhphh3h763sz30l48ri3vgrsbn-hello-aarch64-unknown-linux-gnu-2.12.1",
+      "/nix/store/6lfa77nlsrvmjd7ybpy6cv2pcvmbjmmb-hello-2.12.1",
+      "/nix/store/6rsz59cr93qb2bf17052khdir7yjs67v-hello-variant-aarch64-unknown-linux-gnu-2.12.3",
+      "/nix/store/fvs3zhpvndbca8mppb829174ckdrdgcv-py-spy-0.4.0",
+      "/nix/store/l6sn7v1p3izsw6ajqxys964bgnzsjsvh-hello-2.12.3",
+      "/nix/store/nrhkmlr85xxa1jr4wh8bw3mwihc4bxg4-hello--v2_12_1--r36c00d5ff653-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+      "/nix/store/qlxjxyn085z0fxv5yrzyhrh52p18sh66-hello-variant-aarch64-unknown-linux-gnu-2.12.1"
+    ],
+    "targeted_delete_returncode": 0
+  },
+  "core_implementation_commits": [
+    "cc8f3dd2b67723c5cb97751a88067b773ee82188",
+    "21fb46038da51349553a4b1be63a613a72a9c81e"
+  ],
+  "final_verification_changes": [
+    "Reject null as well as absent sources with an explicit missing-source reason.",
+    "Instantiate both pilot package derivations with Clang 21 natively and for AArch64."
+  ],
+  "flow": {
+    "atomic_publication": true,
+    "common_dep_tasks": 9,
+    "graph": {
+      "binary_count": 2,
+      "common_deps_arch_indep": 0,
+      "common_deps_cross_arch": 1,
+      "common_deps_family": 0,
+      "common_deps_uni_arch": 8,
+      "descriptor_count": 13,
+      "duration_seconds": 0.7754604071378708,
+      "meta_templates": 2,
+      "output_path": "/home/sirati/.t3/worktrees/asm-dataset-nix/feat-multiversion-packa-7ee63ad6a6fa8acf/.multiversion-work/matrix/_dependency_graph_summary.txt",
+      "source_terminal_skipped": 10,
+      "stdenv_subtrees": 3,
+      "templates": 4,
+      "toolchain_wired": 4,
+      "variants": 4,
+      "violations": 0
+    },
+    "passed": true,
+    "toolchain_ids": [
+      "x86_64-linux__aarch64__gcc15",
+      "x86_64-linux__x86_64__gcc15"
+    ]
+  },
+  "implementation_base": "72dd7bec5f27e41e25f5eab31a12c81c36bc2034",
+  "inventory": [
+    {
+      "name": "nixpkgs",
+      "outputs": [
+        "out"
+      ],
+      "overrideArgs": [
+        "callPackage",
+        "fetchurl",
+        "gnulib",
+        "hello",
+        "lib",
+        "nixos",
+        "stdenv",
+        "testers",
+        "versionCheckHook"
+      ],
+      "path": "/nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source",
+      "platforms": [
+        "i686-cygwin",
+        "x86_64-cygwin",
+        "x86_64-darwin",
+        "aarch64-darwin",
+        "i686-freebsd",
+        "x86_64-freebsd",
+        "aarch64-freebsd",
+        "aarch64-genode",
+        "i686-genode",
+        "x86_64-genode",
+        "x86_64-solaris",
+        "javascript-ghcjs",
+        "aarch64-linux",
+        "arc-linux",
+        "armv5tel-linux",
+        "armv6l-linux",
+        "armv7a-linux",
+        "armv7l-linux",
+        "i686-linux",
+        "loongarch64-linux",
+        "m68k-linux",
+        "sh4-linux",
+        "microblaze-linux",
+        "microblazeel-linux",
+        "mips-linux",
+        "mips64-linux",
+        "mips64el-linux",
+        "mipsel-linux",
+        "powerpc-linux",
+        "powerpc64-linux",
+        "powerpc64le-linux",
+        "riscv32-linux",
+        "riscv64-linux",
+        "s390-linux",
+        "s390x-linux",
+        "x86_64-linux",
+        "mmix-mmixware",
+        "aarch64-netbsd",
+        "armv6l-netbsd",
+        "armv7a-netbsd",
+        "armv7l-netbsd",
+        "i686-netbsd",
+        "m68k-netbsd",
+        "mipsel-netbsd",
+        "powerpc-netbsd",
+        "riscv32-netbsd",
+        "riscv64-netbsd",
+        "x86_64-netbsd",
+        "aarch64_be-none",
+        "aarch64-none",
+        "arm-none",
+        "armv6l-none",
+        "avr-none",
+        "i686-none",
+        "microblaze-none",
+        "microblazeel-none",
+        "mips-none",
+        "mips64-none",
+        "msp430-none",
+        "or1k-none",
+        "m68k-none",
+        "powerpc-none",
+        "powerpcle-none",
+        "riscv32-none",
+        "riscv64-none",
+        "rx-none",
+        "s390-none",
+        "s390x-none",
+        "vc4-none",
+        "x86_64-none",
+        "i686-openbsd",
+        "x86_64-openbsd",
+        "x86_64-redox",
+        "wasm64-wasi",
+        "wasm32-wasi",
+        "aarch64-windows",
+        "x86_64-windows",
+        "i686-windows",
+        "aarch64-uefi",
+        "x86_64-uefi"
+      ],
+      "recipe": "/nix/store/nhadsmcq0saqxjl8dpmvzqacdfgvjb3v-source/pkgs/by-name/he/hello/package.nix:52",
+      "revision": "68a8af93ff4297686cb68880845e61e5e2e41d92",
+      "source": {
+        "outputHash": "sha256-DV9gFUOC/uELEUocNOeF2LH0kgc64tOm97FHaHs2aqA=",
+        "outputHashAlgo": null,
+        "path": "/nix/store/wj7phsmi7ncidl8k00p489krqss7n9sd-hello-2.12.3.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.12.3.tar.gz"
+        ]
+      },
+      "version": "2.12.3"
+    },
+    {
+      "name": "nixpkgs-15_09",
+      "outputs": [
+        "out"
+      ],
+      "overrideArgs": [],
+      "path": "/nix/store/kgzvgz22hrj8jnrph2ifdwv58a7y0645-source",
+      "platforms": [
+        "i686-linux",
+        "x86_64-linux",
+        "armv5tel-linux",
+        "armv6l-linux",
+        "armv7l-linux",
+        "mips64el-linux",
+        "x86_64-darwin",
+        "i686-cygwin",
+        "x86_64-cygwin",
+        "i686-freebsd",
+        "x86_64-freebsd",
+        "i686-openbsd",
+        "x86_64-openbsd"
+      ],
+      "recipe": "/nix/store/kgzvgz22hrj8jnrph2ifdwv58a7y0645-source/pkgs/applications/misc/hello/default.nix:14",
+      "revision": "9c31c72cafe536e0c21238b2d47a23bfe7d1b033",
+      "source": {
+        "outputHash": "0ssi1wpaf7plaswqqjwigppsg5fyh99vdlb9kzl7c9lng89ndq1i",
+        "outputHashAlgo": "sha256",
+        "path": "/nix/store/3x7dwzq014bblazs7kq20p9hyzz0qh8g-hello-2.10.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.10.tar.gz"
+        ]
+      },
+      "version": "2.10"
+    },
+    {
+      "name": "nixpkgs-18_03",
+      "outputs": [
+        "out"
+      ],
+      "overrideArgs": [],
+      "path": "/nix/store/5r2r5lp2nxd7rncr54y8rcsdckpyqgwx-source",
+      "platforms": [
+        "aarch64-linux",
+        "armv5tel-linux",
+        "armv6l-linux",
+        "armv7l-linux",
+        "mipsel-linux",
+        "i686-cygwin",
+        "i686-freebsd",
+        "i686-linux",
+        "i686-netbsd",
+        "i686-openbsd",
+        "x86_64-cygwin",
+        "x86_64-darwin",
+        "x86_64-freebsd",
+        "x86_64-linux",
+        "x86_64-netbsd",
+        "x86_64-openbsd",
+        "x86_64-solaris"
+      ],
+      "recipe": "/nix/store/5r2r5lp2nxd7rncr54y8rcsdckpyqgwx-source/pkgs/applications/misc/hello/default.nix:14",
+      "revision": "120b013e0c082d58a5712cde0a7371ae8b25a601",
+      "source": {
+        "outputHash": "0ssi1wpaf7plaswqqjwigppsg5fyh99vdlb9kzl7c9lng89ndq1i",
+        "outputHashAlgo": "sha256",
+        "path": "/nix/store/3x7dwzq014bblazs7kq20p9hyzz0qh8g-hello-2.10.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.10.tar.gz"
+        ]
+      },
+      "version": "2.10"
+    },
+    {
+      "name": "nixpkgs-22_11",
+      "outputs": [
+        "out"
+      ],
+      "overrideArgs": [
+        "callPackage",
+        "fetchurl",
+        "hello",
+        "lib",
+        "nixos",
+        "stdenv",
+        "testers"
+      ],
+      "path": "/nix/store/nkhjmzkf9hky9h34yrfy0cgyd9pbh03v-source",
+      "platforms": [
+        "i686-cygwin",
+        "x86_64-cygwin",
+        "x86_64-darwin",
+        "i686-darwin",
+        "aarch64-darwin",
+        "armv7a-darwin",
+        "i686-freebsd13",
+        "x86_64-freebsd13",
+        "aarch64-genode",
+        "i686-genode",
+        "x86_64-genode",
+        "x86_64-solaris",
+        "js-ghcjs",
+        "aarch64-linux",
+        "armv5tel-linux",
+        "armv6l-linux",
+        "armv7a-linux",
+        "armv7l-linux",
+        "i686-linux",
+        "m68k-linux",
+        "microblaze-linux",
+        "microblazeel-linux",
+        "mipsel-linux",
+        "mips64el-linux",
+        "powerpc64-linux",
+        "powerpc64le-linux",
+        "riscv32-linux",
+        "riscv64-linux",
+        "s390-linux",
+        "s390x-linux",
+        "x86_64-linux",
+        "mmix-mmixware",
+        "aarch64-netbsd",
+        "armv6l-netbsd",
+        "armv7a-netbsd",
+        "armv7l-netbsd",
+        "i686-netbsd",
+        "m68k-netbsd",
+        "mipsel-netbsd",
+        "powerpc-netbsd",
+        "riscv32-netbsd",
+        "riscv64-netbsd",
+        "x86_64-netbsd",
+        "aarch64_be-none",
+        "aarch64-none",
+        "arm-none",
+        "armv6l-none",
+        "avr-none",
+        "i686-none",
+        "microblaze-none",
+        "microblazeel-none",
+        "msp430-none",
+        "or1k-none",
+        "m68k-none",
+        "powerpc-none",
+        "powerpcle-none",
+        "riscv32-none",
+        "riscv64-none",
+        "rx-none",
+        "s390-none",
+        "s390x-none",
+        "vc4-none",
+        "x86_64-none",
+        "i686-openbsd",
+        "x86_64-openbsd",
+        "x86_64-redox",
+        "wasm64-wasi",
+        "wasm32-wasi",
+        "x86_64-windows",
+        "i686-windows"
+      ],
+      "recipe": "/nix/store/nkhjmzkf9hky9h34yrfy0cgyd9pbh03v-source/pkgs/applications/misc/hello/default.nix:34",
+      "revision": "4d2b37a84fad1091b9de401eb450aae66f1a741e",
+      "source": {
+        "outputHash": "sha256-jZkUKv2SV28wsM18tCqNxoCZmLxdYH2Idh9RLibH2yA=",
+        "outputHashAlgo": "sha256",
+        "path": "/nix/store/pa10z4ngm0g83kx9mssrqzz30s84vq7k-hello-2.12.1.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.12.1.tar.gz"
+        ]
+      },
+      "version": "2.12.1"
+    },
+    {
+      "name": "nixpkgs-23_11",
+      "outputs": [
+        "out"
+      ],
+      "overrideArgs": [
+        "callPackage",
+        "fetchurl",
+        "hello",
+        "lib",
+        "nixos",
+        "stdenv",
+        "testers"
+      ],
+      "path": "/nix/store/j8han9cf3g8vba52yhiklaa6a500pcbv-source",
+      "platforms": [
+        "i686-cygwin",
+        "x86_64-cygwin",
+        "x86_64-darwin",
+        "i686-darwin",
+        "aarch64-darwin",
+        "armv7a-darwin",
+        "i686-freebsd13",
+        "x86_64-freebsd13",
+        "aarch64-genode",
+        "i686-genode",
+        "x86_64-genode",
+        "x86_64-solaris",
+        "javascript-ghcjs",
+        "aarch64-linux",
+        "armv5tel-linux",
+        "armv6l-linux",
+        "armv7a-linux",
+        "armv7l-linux",
+        "i686-linux",
+        "loongarch64-linux",
+        "m68k-linux",
+        "microblaze-linux",
+        "microblazeel-linux",
+        "mips-linux",
+        "mips64-linux",
+        "mips64el-linux",
+        "mipsel-linux",
+        "powerpc64-linux",
+        "powerpc64le-linux",
+        "riscv32-linux",
+        "riscv64-linux",
+        "s390-linux",
+        "s390x-linux",
+        "x86_64-linux",
+        "mmix-mmixware",
+        "aarch64-netbsd",
+        "armv6l-netbsd",
+        "armv7a-netbsd",
+        "armv7l-netbsd",
+        "i686-netbsd",
+        "m68k-netbsd",
+        "mipsel-netbsd",
+        "powerpc-netbsd",
+        "riscv32-netbsd",
+        "riscv64-netbsd",
+        "x86_64-netbsd",
+        "aarch64_be-none",
+        "aarch64-none",
+        "arm-none",
+        "armv6l-none",
+        "avr-none",
+        "i686-none",
+        "microblaze-none",
+        "microblazeel-none",
+        "mips-none",
+        "mips64-none",
+        "msp430-none",
+        "or1k-none",
+        "m68k-none",
+        "powerpc-none",
+        "powerpcle-none",
+        "riscv32-none",
+        "riscv64-none",
+        "rx-none",
+        "s390-none",
+        "s390x-none",
+        "vc4-none",
+        "x86_64-none",
+        "i686-openbsd",
+        "x86_64-openbsd",
+        "x86_64-redox",
+        "wasm64-wasi",
+        "wasm32-wasi",
+        "x86_64-windows",
+        "i686-windows"
+      ],
+      "recipe": "/nix/store/j8han9cf3g8vba52yhiklaa6a500pcbv-source/pkgs/by-name/he/hello/package.nix:34",
+      "revision": "057f9aecfb71c4437d2b27d3323df7f93c010b7e",
+      "source": {
+        "outputHash": "sha256-jZkUKv2SV28wsM18tCqNxoCZmLxdYH2Idh9RLibH2yA=",
+        "outputHashAlgo": "sha256",
+        "path": "/nix/store/pa10z4ngm0g83kx9mssrqzz30s84vq7k-hello-2.12.1.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.12.1.tar.gz"
+        ]
+      },
+      "version": "2.12.1"
+    },
+    {
+      "name": "nixpkgs-24_05",
+      "outputs": [
+        "out"
+      ],
+      "overrideArgs": [
+        "callPackage",
+        "fetchurl",
+        "hello",
+        "lib",
+        "nixos",
+        "stdenv",
+        "testers"
+      ],
+      "path": "/nix/store/wzx1ba5hqqfa23vfrvqmfmkpj25p37mr-source",
+      "platforms": [
+        "i686-cygwin",
+        "x86_64-cygwin",
+        "x86_64-darwin",
+        "i686-darwin",
+        "aarch64-darwin",
+        "armv7a-darwin",
+        "i686-freebsd",
+        "x86_64-freebsd",
+        "aarch64-genode",
+        "i686-genode",
+        "x86_64-genode",
+        "x86_64-solaris",
+        "javascript-ghcjs",
+        "aarch64-linux",
+        "armv5tel-linux",
+        "armv6l-linux",
+        "armv7a-linux",
+        "armv7l-linux",
+        "i686-linux",
+        "loongarch64-linux",
+        "m68k-linux",
+        "microblaze-linux",
+        "microblazeel-linux",
+        "mips-linux",
+        "mips64-linux",
+        "mips64el-linux",
+        "mipsel-linux",
+        "powerpc64-linux",
+        "powerpc64le-linux",
+        "riscv32-linux",
+        "riscv64-linux",
+        "s390-linux",
+        "s390x-linux",
+        "x86_64-linux",
+        "mmix-mmixware",
+        "aarch64-netbsd",
+        "armv6l-netbsd",
+        "armv7a-netbsd",
+        "armv7l-netbsd",
+        "i686-netbsd",
+        "m68k-netbsd",
+        "mipsel-netbsd",
+        "powerpc-netbsd",
+        "riscv32-netbsd",
+        "riscv64-netbsd",
+        "x86_64-netbsd",
+        "aarch64_be-none",
+        "aarch64-none",
+        "arm-none",
+        "armv6l-none",
+        "avr-none",
+        "i686-none",
+        "microblaze-none",
+        "microblazeel-none",
+        "mips-none",
+        "mips64-none",
+        "msp430-none",
+        "or1k-none",
+        "m68k-none",
+        "powerpc-none",
+        "powerpcle-none",
+        "riscv32-none",
+        "riscv64-none",
+        "rx-none",
+        "s390-none",
+        "s390x-none",
+        "vc4-none",
+        "x86_64-none",
+        "i686-openbsd",
+        "x86_64-openbsd",
+        "x86_64-redox",
+        "wasm64-wasi",
+        "wasm32-wasi",
+        "x86_64-windows",
+        "i686-windows"
+      ],
+      "recipe": "/nix/store/wzx1ba5hqqfa23vfrvqmfmkpj25p37mr-source/pkgs/by-name/he/hello/package.nix:41",
+      "revision": "63dacb46bf939521bdc93981b4cbb7ecb58427a0",
+      "source": {
+        "outputHash": "sha256-jZkUKv2SV28wsM18tCqNxoCZmLxdYH2Idh9RLibH2yA=",
+        "outputHashAlgo": "sha256",
+        "path": "/nix/store/pa10z4ngm0g83kx9mssrqzz30s84vq7k-hello-2.12.1.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.12.1.tar.gz"
+        ]
+      },
+      "version": "2.12.1"
+    }
+  ],
+  "measurements": {
+    "catalog": {
+      "hello": {
+        "entries": 2,
+        "json_bytes": 2626,
+        "seconds": 9.346
+      },
+      "index": {
+        "entries": 245,
+        "json_bytes": 18649,
+        "seconds": 0.444
+      }
+    },
+    "defaults": {
+      "available_native": 238,
+      "default_entries": 244,
+      "seconds": 6.999743907013908,
+      "skips": {
+        "capnproto": {
+          "x86_64": "incompatible-stdenv-override"
+        },
+        "chibi-scheme": {
+          "x86_64": "unknown-release-attribute"
+        },
+        "cln": {
+          "x86_64": "incompatible-stdenv-override"
+        },
+        "mbedtls": {
+          "x86_64": "incompatible-stdenv-override"
+        },
+        "pngquant": {
+          "x86_64": "incompatible-stdenv-override"
+        },
+        "wolfssl": {
+          "x86_64": "recipe-evaluation-failed"
+        }
+      }
+    }
+  },
+  "nix_checks": {
+    "crossCompiler": true,
+    "familyShim": true,
+    "historicalSourcePin": true,
+    "lazyCatalog": true,
+    "metaAgreement": true,
+    "missingNullSource": true,
+    "missingProvider": true,
+    "missingRelease": true,
+    "missingSource": true,
+    "missingTarget": true,
+    "nativeCompiler": true,
+    "noDeepMetadataContext": true,
+    "pureCatalog": {
+      "checks": [
+        "duplicate ids",
+        "duplicate families",
+        "reserved delimiters",
+        "unsafe keys",
+        "exact versions",
+        "default aliases",
+        "lazy enumeration"
+      ],
+      "passed": true
+    },
+    "sameVersionDifferentRecipe": true,
+    "secondCompiler": [
+      {
+        "cc": "/nix/store/g75wdmbgprvnj7xp3cdwfsdaqp6y4629-clang-wrapper-21.1.8.drv",
+        "drv": "/nix/store/hbskl28m33vqf14sxafqqv677a4vngl4-hello-variant-2.12.3.drv",
+        "id": "hello",
+        "source": "/nix/store/wj7phsmi7ncidl8k00p489krqss7n9sd-hello-2.12.3.tar.gz",
+        "version": "2.12.3"
+      },
+      {
+        "cc": "/nix/store/g75wdmbgprvnj7xp3cdwfsdaqp6y4629-clang-wrapper-21.1.8.drv",
+        "drv": "/nix/store/9vp69brpznl8mkmaja25r8rcfa7ipyya-hello-variant-2.12.1.drv",
+        "id": "hello--v2_12_1--r36c00d5ff653",
+        "source": "/nix/store/pa10z4ngm0g83kx9mssrqzz30s84vq7k-hello-2.12.1.tar.gz",
+        "version": "2.12.1"
+      }
+    ],
+    "secondCompilerCross": [
+      {
+        "cc": "/nix/store/23ix882lq815xp58v7ahwxrwy67fwq44-aarch64-unknown-linux-gnu-clang-wrapper-21.1.8.drv",
+        "drv": "/nix/store/ypazyx2lhb3sd94h1w1xr3bj8kfb6ywl-hello-variant-aarch64-unknown-linux-gnu-2.12.3.drv",
+        "id": "hello",
+        "source": "/nix/store/wj7phsmi7ncidl8k00p489krqss7n9sd-hello-2.12.3.tar.gz",
+        "version": "2.12.3"
+      },
+      {
+        "cc": "/nix/store/23ix882lq815xp58v7ahwxrwy67fwq44-aarch64-unknown-linux-gnu-clang-wrapper-21.1.8.drv",
+        "drv": "/nix/store/4nawh3xyz7gmbbbgp6xv1w2ig9c28f8q-hello-variant-aarch64-unknown-linux-gnu-2.12.1.drv",
+        "id": "hello--v2_12_1--r36c00d5ff653",
+        "source": "/nix/store/pa10z4ngm0g83kx9mssrqzz30s84vq7k-hello-2.12.1.tar.gz",
+        "version": "2.12.1"
+      }
+    ],
+    "sourcePin": true,
+    "unsupportedCompiler": true,
+    "wrongVersion": true
+  },
+  "pilot_catalog": {
+    "hello": {
+      "availability": {
+        "aarch64": {
+          "available": true,
+          "reason": null
+        },
+        "armv7l-hf": {
+          "available": true,
+          "reason": null
+        },
+        "armv7l-sf": {
+          "available": true,
+          "reason": null
+        },
+        "i686": {
+          "available": true,
+          "reason": null
+        },
+        "mips64el": {
+          "available": true,
+          "reason": null
+        },
+        "mipsel": {
+          "available": true,
+          "reason": null
+        },
+        "ppc32": {
+          "available": true,
+          "reason": null
+        },
+        "ppc64": {
+          "available": true,
+          "reason": null
+        },
+        "riscv64": {
+          "available": true,
+          "reason": null
+        },
+        "x86_64": {
+          "available": true,
+          "reason": null
+        }
+      },
+      "isDefault": true,
+      "packageCatalogSchema": 1,
+      "packageFamily": "hello",
+      "packageId": "hello",
+      "packageIdentity": "8a06cda2f31ea1c32e9e56d71cf92b296e3f17b7edcf80ae5c8c6d25ae2e8a37",
+      "packageVersion": "2.12.3",
+      "recipeId": {
+        "adapterRevision": 1,
+        "attr": "hello",
+        "dependencyPolicy": "provider-pinned-with-selected-stdenv",
+        "kind": "nixpkgs",
+        "narHash": "sha256-pYEytCNic/czazbV9r3tbQ6BZzqRBg/41x2dIC5ymOo=",
+        "provider": "current",
+        "revision": "68a8af93ff4297686cb68880845e61e5e2e41d92"
+      },
+      "releaseId": "hello@97ec1873fa2b5a6f200a717048897308038818be80aa9fa6359b523dc5bc1dc1",
+      "sourceIdentity": {
+        "outputHash": "sha256-DV9gFUOC/uELEUocNOeF2LH0kgc64tOm97FHaHs2aqA=",
+        "outputHashAlgo": null,
+        "outputHashMode": "flat",
+        "revision": null,
+        "storePath": "/nix/store/wj7phsmi7ncidl8k00p489krqss7n9sd-hello-2.12.3.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.12.3.tar.gz"
+        ]
+      }
+    },
+    "hello--v2_12_1--r36c00d5ff653": {
+      "availability": {
+        "aarch64": {
+          "available": true,
+          "reason": null
+        },
+        "armv7l-hf": {
+          "available": true,
+          "reason": null
+        },
+        "armv7l-sf": {
+          "available": true,
+          "reason": null
+        },
+        "i686": {
+          "available": true,
+          "reason": null
+        },
+        "mips64el": {
+          "available": true,
+          "reason": null
+        },
+        "mipsel": {
+          "available": true,
+          "reason": null
+        },
+        "ppc32": {
+          "available": false,
+          "reason": "unsupported-platform"
+        },
+        "ppc64": {
+          "available": true,
+          "reason": null
+        },
+        "riscv64": {
+          "available": true,
+          "reason": null
+        },
+        "x86_64": {
+          "available": true,
+          "reason": null
+        }
+      },
+      "isDefault": false,
+      "packageCatalogSchema": 1,
+      "packageFamily": "hello",
+      "packageId": "hello--v2_12_1--r36c00d5ff653",
+      "packageIdentity": "aff49915c904c4826f8e16ccc39518817d2107d58f615f074399c20e147e5db3",
+      "packageVersion": "2.12.1",
+      "recipeId": {
+        "adapterRevision": 0,
+        "attr": "hello",
+        "dependencyPolicy": "provider-pinned-with-selected-stdenv",
+        "kind": "nixpkgs",
+        "narHash": "sha256-vboIEwIQojofItm2xGCdZCzW96U85l9nDW3ifMuAIdM=",
+        "provider": "nixpkgs-24_05",
+        "revision": "63dacb46bf939521bdc93981b4cbb7ecb58427a0"
+      },
+      "releaseId": "hello@36c00d5ff65378420a1c23cb46f8d78181277c0217d20702ca40e56065dfc266",
+      "sourceIdentity": {
+        "outputHash": "sha256-jZkUKv2SV28wsM18tCqNxoCZmLxdYH2Idh9RLibH2yA=",
+        "outputHashAlgo": "sha256",
+        "outputHashMode": "flat",
+        "revision": null,
+        "storePath": "/nix/store/pa10z4ngm0g83kx9mssrqzz30s84vq7k-hello-2.12.1.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.12.1.tar.gz"
+        ]
+      }
+    }
+  },
+  "plan_sha256": "ae063b4fbc0c079c0b0ae52ec92870f757fea19b9be2d7cd729f5e1bd6a501d5",
+  "regressions": {
+    "deselected": 17,
+    "passed": 1581,
+    "seconds": 147.37,
+    "skipped": 7
+  },
+  "results": [
+    {
+      "arch": "aarch64",
+      "drv": "/nix/store/72ax2qkcnxy2lj9c4g85jlwqr399hnbn-hello-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+      "machine": 183,
+      "narSize": 2080,
+      "output": "/nix/store/1a38nnwhnbfsk6w9f52219khncwmdd5c-hello-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+      "packageDrv": "/nix/store/3d94h8x1ggvg7p6vfdnvabph72xq6whj-hello-variant-aarch64-unknown-linux-gnu-2.12.3.drv",
+      "packageId": "hello",
+      "packageIdentity": "8a06cda2f31ea1c32e9e56d71cf92b296e3f17b7edcf80ae5c8c6d25ae2e8a37",
+      "packageOutputs": {
+        "out": "/nix/store/6rsz59cr93qb2bf17052khdir7yjs67v-hello-variant-aarch64-unknown-linux-gnu-2.12.3"
+      },
+      "rawOutputBytes": 269218,
+      "recipeId": {
+        "adapterRevision": 1,
+        "attr": "hello",
+        "dependencyPolicy": "provider-pinned-with-selected-stdenv",
+        "kind": "nixpkgs",
+        "narHash": "sha256-pYEytCNic/czazbV9r3tbQ6BZzqRBg/41x2dIC5ymOo=",
+        "provider": "current",
+        "revision": "68a8af93ff4297686cb68880845e61e5e2e41d92"
+      },
+      "retained": false,
+      "sourceIdentity": {
+        "outputHash": "sha256-DV9gFUOC/uELEUocNOeF2LH0kgc64tOm97FHaHs2aqA=",
+        "outputHashAlgo": null,
+        "outputHashMode": "flat",
+        "revision": null,
+        "storePath": "/nix/store/wj7phsmi7ncidl8k00p489krqss7n9sd-hello-2.12.3.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.12.3.tar.gz"
+        ]
+      },
+      "version": "2.12.3",
+      "version_output": null
+    },
+    {
+      "arch": "x86_64",
+      "drv": "/nix/store/7vzbqqgf8rpmw5xdzpzpc0li18fpvrsp-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+      "machine": 62,
+      "narSize": 2000,
+      "output": "/nix/store/jr8nsa4ngfcch5344ybl1inb8pl4g6br-hello-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+      "packageDrv": "/nix/store/7lpgk7vsflm8lswwy6yc9lrk9ywqiwng-hello-variant-2.12.3.drv",
+      "packageId": "hello",
+      "packageIdentity": "8a06cda2f31ea1c32e9e56d71cf92b296e3f17b7edcf80ae5c8c6d25ae2e8a37",
+      "packageOutputs": {
+        "out": "/nix/store/l2ca4bgb2hgzf26874m501wfpl1z5dlp-hello-variant-2.12.3"
+      },
+      "rawOutputBytes": 254066,
+      "recipeId": {
+        "adapterRevision": 1,
+        "attr": "hello",
+        "dependencyPolicy": "provider-pinned-with-selected-stdenv",
+        "kind": "nixpkgs",
+        "narHash": "sha256-pYEytCNic/czazbV9r3tbQ6BZzqRBg/41x2dIC5ymOo=",
+        "provider": "current",
+        "revision": "68a8af93ff4297686cb68880845e61e5e2e41d92"
+      },
+      "retained": true,
+      "sourceIdentity": {
+        "outputHash": "sha256-DV9gFUOC/uELEUocNOeF2LH0kgc64tOm97FHaHs2aqA=",
+        "outputHashAlgo": null,
+        "outputHashMode": "flat",
+        "revision": null,
+        "storePath": "/nix/store/wj7phsmi7ncidl8k00p489krqss7n9sd-hello-2.12.3.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.12.3.tar.gz"
+        ]
+      },
+      "version": "2.12.3",
+      "version_output": "hello (GNU Hello) 2.12.3"
+    },
+    {
+      "arch": "aarch64",
+      "drv": "/nix/store/1cd7zajr9swzkwhr4qkv9yv6ciz1q9d8-hello--v2_12_1--r36c00d5ff653-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+      "machine": 183,
+      "narSize": 2168,
+      "output": "/nix/store/nrhkmlr85xxa1jr4wh8bw3mwihc4bxg4-hello--v2_12_1--r36c00d5ff653-aarch64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+      "packageDrv": "/nix/store/8wa060bgcszjb0rasv6avrjvsclg01dd-hello-variant-aarch64-unknown-linux-gnu-2.12.1.drv",
+      "packageId": "hello--v2_12_1--r36c00d5ff653",
+      "packageIdentity": "aff49915c904c4826f8e16ccc39518817d2107d58f615f074399c20e147e5db3",
+      "packageOutputs": {
+        "out": "/nix/store/qlxjxyn085z0fxv5yrzyhrh52p18sh66-hello-variant-aarch64-unknown-linux-gnu-2.12.1"
+      },
+      "rawOutputBytes": 225657,
+      "recipeId": {
+        "adapterRevision": 0,
+        "attr": "hello",
+        "dependencyPolicy": "provider-pinned-with-selected-stdenv",
+        "kind": "nixpkgs",
+        "narHash": "sha256-vboIEwIQojofItm2xGCdZCzW96U85l9nDW3ifMuAIdM=",
+        "provider": "nixpkgs-24_05",
+        "revision": "63dacb46bf939521bdc93981b4cbb7ecb58427a0"
+      },
+      "retained": false,
+      "sourceIdentity": {
+        "outputHash": "sha256-jZkUKv2SV28wsM18tCqNxoCZmLxdYH2Idh9RLibH2yA=",
+        "outputHashAlgo": "sha256",
+        "outputHashMode": "flat",
+        "revision": null,
+        "storePath": "/nix/store/pa10z4ngm0g83kx9mssrqzz30s84vq7k-hello-2.12.1.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.12.1.tar.gz"
+        ]
+      },
+      "version": "2.12.1",
+      "version_output": null
+    },
+    {
+      "arch": "x86_64",
+      "drv": "/nix/store/d0hv1bzgz8xapi4lwp7djyjxakjiafv4-hello--v2_12_1--r36c00d5ff653-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder.drv",
+      "machine": 62,
+      "narSize": 2088,
+      "output": "/nix/store/g137jhhnvs22qkqwm08pvjz9idff6c0f-hello--v2_12_1--r36c00d5ff653-x86_64-gcc15-O2-baseline-none-san-off-march-default-elf-folder",
+      "packageDrv": "/nix/store/ygpf3cqpkqbzh8p57kddwhywmylwaril-hello-variant-2.12.1.drv",
+      "packageId": "hello--v2_12_1--r36c00d5ff653",
+      "packageIdentity": "aff49915c904c4826f8e16ccc39518817d2107d58f615f074399c20e147e5db3",
+      "packageOutputs": {
+        "out": "/nix/store/d4s0arhl6633kwdyvb874iz8l10md62k-hello-variant-2.12.1"
+      },
+      "rawOutputBytes": 210505,
+      "recipeId": {
+        "adapterRevision": 0,
+        "attr": "hello",
+        "dependencyPolicy": "provider-pinned-with-selected-stdenv",
+        "kind": "nixpkgs",
+        "narHash": "sha256-vboIEwIQojofItm2xGCdZCzW96U85l9nDW3ifMuAIdM=",
+        "provider": "nixpkgs-24_05",
+        "revision": "63dacb46bf939521bdc93981b4cbb7ecb58427a0"
+      },
+      "retained": true,
+      "sourceIdentity": {
+        "outputHash": "sha256-jZkUKv2SV28wsM18tCqNxoCZmLxdYH2Idh9RLibH2yA=",
+        "outputHashAlgo": "sha256",
+        "outputHashMode": "flat",
+        "revision": null,
+        "storePath": "/nix/store/pa10z4ngm0g83kx9mssrqzz30s84vq7k-hello-2.12.1.tar.gz",
+        "urls": [
+          "mirror://gnu/hello/hello-2.12.1.tar.gz"
+        ]
+      },
+      "version": "2.12.1",
+      "version_output": "hello (GNU Hello) 2.12.1"
+    }
+  ],
+  "schema": 1
+}

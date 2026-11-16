@@ -19,6 +19,7 @@ from unittest import mock
 
 import pytest
 
+from compiler_suit_runner.tests.fakes import FakePrimaryHandle, make_suit_config
 from compiler_suit_runner.manifest_gen import (
     ManifestHeader,
     Phase,
@@ -40,17 +41,7 @@ _SYS = "x86_64-linux"
 
 
 def _make_config(tmp_path: pathlib.Path) -> SuitTaskConfig:
-    return SuitTaskConfig(
-        flake_ref=".",
-        sys_name=_SYS,
-        shared_fs=tmp_path,
-        manifest_dir=tmp_path / "manifests",
-        dataset_dir=tmp_path / "dataset",
-        peers_dir=tmp_path / "peers",
-        run_id="r1",
-        secondary_id="primary",
-        hostname="host",
-    )
+    return make_suit_config(tmp_path, sys_name=_SYS)
 
 
 def _common_dep_header(label: str, drv: str) -> ManifestHeader:
@@ -739,7 +730,7 @@ def test_replication_context_callables_route_through_self(
 
 
 def test_on_run_start_accepts_primary_handle_kwarg(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, fake_nix_keygen,
 ) -> None:
     """The ``on_run_start`` signature accepts the ``primary_handle``
     kwarg and stores the value on the task."""
@@ -761,7 +752,7 @@ def test_on_run_start_accepts_primary_handle_kwarg(
 
 
 def test_on_run_start_backward_compat_without_kwarg(
-    tmp_path: pathlib.Path,
+    tmp_path: pathlib.Path, fake_nix_keygen,
 ) -> None:
     """A caller that omits ``primary_handle`` still runs without
     raising; the attribute remains None."""
@@ -852,16 +843,23 @@ def test_phase_specs_matrix_eval_routes_to_build_worker() -> None:
     )
 
 
-def test_phase_specs_all_types_share_single_worker_module() -> None:
-    """Sanity: every TaskTypeSpec across all phases binds to the same
-    worker_module string."""
+def test_phase_specs_worker_modules() -> None:
+    """Sanity: TaskTypeSpec worker_modules are exactly the expected set.
+
+    Most types use ``build_worker``; the affine-import gate (#577) uses
+    its own dedicated ``affine_import_worker`` so the nix-store --import
+    runs in a subprocess rather than on the secondary oploop thread.
+    """
     pytest.importorskip("dynamic_runner.task_protocol")
     from compiler_suit_runner.suit_task import _phase_specs
     specs = _phase_specs(build_max_concurrent=None)
     modules = {
         t.worker_module for spec in specs for t in spec.types
     }
-    assert modules == {"compiler_suit_runner.workers.build_worker"}
+    assert modules == {
+        "compiler_suit_runner.workers.build_worker",
+        "compiler_suit_runner.workers.affine_import_worker",
+    }
 
 
 def test_phase_specs_matrix_eval_depends_on_build_compilers() -> None:
@@ -906,7 +904,7 @@ def test_phase_specs_build_carries_validate_common_dep_variant() -> None:
     build = next(s for s in specs if s.phase_id == "build")
     type_ids = {t.type_id for t in build.types}
     assert type_ids == {
-        "toolchain_import",
+        "affine_import",
         "toolchain_validate",
         "common_dep",
         "variant",
@@ -937,27 +935,19 @@ from compiler_suit_runner.streamed_spawn import (  # noqa: E402
 
 
 class _FakeSecondaryHandle:
-    """Records ``send_to_primary`` calls (topic, data, important)."""
+    """Records ``send_to_primary`` calls (topic, data, important, is_high_volume)."""
 
     def __init__(self) -> None:
-        self.sent: list[tuple[str, bytes, bool]] = []
+        self.sent: list[tuple[str, bytes, bool, bool]] = []
 
     def send_to_primary(
         self, topic: str, data: bytes, important: bool = False,
+        is_high_volume: bool = False,
     ) -> None:
-        self.sent.append((topic, data, important))
+        self.sent.append((topic, data, important, is_high_volume))
 
 
-class _FakePrimaryHandle:
-    """Records ``spawn_tasks`` calls; returns the configured errors."""
-
-    def __init__(self, errors: list | None = None) -> None:
-        self.calls: list[list] = []
-        self._errors = errors or []
-
-    def spawn_tasks(self, task_infos):
-        self.calls.append(list(task_infos))
-        return list(self._errors)
+_FakePrimaryHandle = FakePrimaryHandle
 
 
 def _streamed_task(tmp_path: pathlib.Path, **config_overrides) -> SuitTask:
@@ -1031,12 +1021,16 @@ def test_worker_message_listener_forwards_verbatim_important(
     tmp_path, topic,
 ) -> None:
     """Streamed-spawn topics are forwarded byte-for-byte (no decode) to
-    the primary with ``important=True``."""
+    the primary with ``important=True``. The high-volume SPAWN topic is
+    additionally flagged ``is_high_volume=True`` so its narration routes off
+    the operator's important channel (#583/#587); the single SUMMARY message
+    is not."""
     task = SuitTask(_make_config(tmp_path))
     handle = _FakeSecondaryHandle()
     payload = b"\x00 opaque non-JSON bytes \xff"
     task.worker_message_listener(7, "dep_graph", topic, payload, handle)
-    assert handle.sent == [(topic, payload, True)]
+    expected_high_volume = topic == SPAWN_TOPIC
+    assert handle.sent == [(topic, payload, True, expected_high_volume)]
 
 
 def test_worker_message_listener_ignores_foreign_topic(tmp_path) -> None:
@@ -1267,6 +1261,32 @@ def test_custom_message_handler_spawn_errors_logged_not_raised(
     assert task._streamed_spawned_count == 1
 
 
+
+def test_custom_message_handler_spawn_error_names_reordered_task(
+    tmp_path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The batch is reordered (common_deps first) before spawn_tasks, so
+    error index 0 is the common_dep even though the variant came first in
+    the descriptor stream. The warning must name the task at that index."""
+    task = _streamed_task(tmp_path, disable_task_deps=True)
+    handle = _FakePrimaryHandle(errors=[
+        (0, {"kind": "duplicate_task_hash", "task_hash": "h0"}),
+    ])
+    task._primary_handle = handle
+    with caplog.at_level(logging.WARNING):
+        task.custom_message_handler(
+            "secondary-1", SPAWN_TOPIC,
+            _batch_bytes([_variant_descriptor(0), _common_dep_descriptor()]),
+            True, handle,
+        )
+    msgs = [
+        r.getMessage() for r in caplog.records
+        if "duplicate task_hash" in r.getMessage()
+    ]
+    assert len(msgs) == 1
+    assert "common_dep__glibc" in msgs[0]
+
+
 # ── summary recording + on_phase_end reconciliation barrier ────────────
 
 
@@ -1466,7 +1486,7 @@ def test_discover_import_gate_tasks_emits_import_common_and_per_tc(
     items = list(task.discover_items())
     gate_ids = {
         getattr(ti, "task_id", None) for ti in items
-        if getattr(ti, "type_id", None) == "toolchain_import"
+        if getattr(ti, "type_id", None) == "affine_import"
     }
     assert IMPORT_COMMON_TASK_ID in gate_ids
     assert _import_tc_task_id(_TC_OUTPATH) in gate_ids
@@ -1482,9 +1502,9 @@ def test_discover_import_gate_tasks_secondary_affine_no_deps(
     items = list(task.discover_items())
     gates = [
         ti for ti in items
-        if getattr(ti, "type_id", None) == "toolchain_import"
+        if getattr(ti, "type_id", None) == "affine_import"
     ]
-    assert gates, "expected at least one toolchain_import gate task"
+    assert gates, "expected at least one affine_import gate task"
     for gate in gates:
         assert getattr(gate, "is_secondary_affine", None) is True, (
             f"gate {gate.task_id!r} missing is_secondary_affine=True"
@@ -1503,7 +1523,7 @@ def test_discover_import_gate_tasks_empty_when_no_outpaths_map(
     items = list(task.discover_items())
     gates = [
         ti for ti in items
-        if getattr(ti, "type_id", None) == "toolchain_import"
+        if getattr(ti, "type_id", None) == "affine_import"
     ]
     assert gates == []
 
@@ -1523,7 +1543,7 @@ def test_discover_import_gate_tasks_deduplicates_same_outpath(
     items = list(task.discover_items())
     tc_gate_ids = [
         getattr(ti, "task_id", None) for ti in items
-        if getattr(ti, "type_id", None) == "toolchain_import"
+        if getattr(ti, "type_id", None) == "affine_import"
         and getattr(ti, "task_id", "") != "import_common"
     ]
     assert tc_gate_ids.count(_import_tc_task_id(_TC_OUTPATH)) == 1
@@ -1556,6 +1576,50 @@ def test_header_depends_on_build_variant_includes_import_common_and_tc(
     bare = [d for d in deps if isinstance(d, str)]
     assert IMPORT_COMMON_TASK_ID in bare
     assert _import_tc_task_id(_TC_OUTPATH) in bare
+
+
+def test_header_depends_on_build_variant_orders_base_before_delta(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The work task lists each BASE import gate BEFORE its deduped DELTA
+    gate. This list order is the ONLY thing that makes the affine on-demand
+    dispatcher import the base archive on a secondary before the delta there
+    (affine_placement_for reads the WORK task's own task_depends_on in order;
+    gate→gate task_depends_on is NOT honoured). Base-before-delta:
+    import_common before import_tc_<hash>; import_toolchain_drv before
+    import_matrix_drv_<binary>. Regression guard for the substituter-free
+    'references not valid' delta-before-base import failure."""
+    from compiler_suit_runner.suit_task import (
+        IMPORT_COMMON_TASK_ID,
+        IMPORT_TOOLCHAIN_DRV_TASK_ID,
+        _header_depends_on,
+        _import_matrix_drv_task_id,
+        _import_tc_task_id,
+    )
+
+    header = ManifestHeader(
+        item_class="build_variant",
+        name="hello-x86_64-gcc15-O0",
+        size=0,
+        payload={
+            "sys": _SYS,
+            "pkg": "hello",
+            "arch": "x86_64",
+            "toolchain_outpath": _TC_OUTPATH,
+        },
+        task_id="build_variant__x86_64-linux__hello__gcc15-O0",
+    )
+    # matrix_eval_gates=True activates the drv-graph base/delta pair too.
+    deps = _header_depends_on(header, matrix_eval_gates=True)
+    bare = [d for d in deps if isinstance(d, str)]
+    # common (base) before tc (delta-on-common)
+    assert bare.index(IMPORT_COMMON_TASK_ID) < bare.index(
+        _import_tc_task_id(_TC_OUTPATH)
+    ), f"import_common must precede import_tc in {bare}"
+    # toolchain_drv (base) before matrix_drv (delta-on-toolchain_drv)
+    assert bare.index(IMPORT_TOOLCHAIN_DRV_TASK_ID) < bare.index(
+        _import_matrix_drv_task_id("hello")
+    ), f"import_toolchain_drv must precede import_matrix_drv in {bare}"
 
 
 def test_header_depends_on_build_common_dep_includes_import_common_only(
@@ -1659,226 +1723,8 @@ def test_streamed_spawn_variant_carries_import_deps(
     assert _import_tc_task_id(_TC_OUTPATH) in bare_deps
 
 
-def test_import_action_returns_none_without_matrix_eval_out_dir(
-    tmp_path: pathlib.Path,
-) -> None:
-    """import_action is None when matrix_eval_out_dir is not set (legacy)."""
-    config = _make_config(tmp_path)  # matrix_eval_out_dir=None
-    task = SuitTask(config)
-    assert task.import_action is None
-
-
-def test_import_action_import_common_calls_ensure_common(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """import_action('import_common') calls ensure_common_archive_imported
-    against matrix_eval_out_dir."""
-    import dataclasses as _dc  # noqa: PLC0415
-    import compiler_suit_runner.workers.build_worker as bw_mod  # noqa: PLC0415
-
-    config = _dc.replace(_make_config(tmp_path), matrix_eval_out_dir=tmp_path / "out")
-    (tmp_path / "out").mkdir()
-
-    calls: list[tuple] = []
-
-    def _fake_ensure_common(out_dir, *, run_subprocess=None):
-        calls.append(("common", out_dir))
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.suit_task.ensure_common_archive_imported",
-        _fake_ensure_common,
-    )
-
-    task = SuitTask(config)
-    action = task.import_action
-    assert action is not None
-    action("import_common")
-    assert calls == [("common", tmp_path / "out")]
-
-
-def test_import_action_import_tc_calls_ensure_toolchain_out(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """import_action('import_tc_<hash>') calls ensure_toolchain_out_archive_imported
-    with the tc_id (hash) extracted from the task_id — no toolchain_outpaths_map
-    needed (secondary case: toolchain_outpaths_map is None/empty)."""
-    import dataclasses as _dc  # noqa: PLC0415
-    from compiler_suit_runner.suit_task import _import_tc_task_id  # noqa: PLC0415
-    from compiler_suit_runner.preflight import toolchain_id_for_outpath  # noqa: PLC0415
-
-    # Secondary case: toolchain_outpaths_map is not provided (None → default).
-    config = _dc.replace(
-        _make_config(tmp_path),
-        matrix_eval_out_dir=tmp_path / "out",
-    )
-    (tmp_path / "out").mkdir()
-
-    calls: list[tuple] = []
-
-    def _fake_ensure_tc(tc_id, out_dir, *, run_subprocess=None):
-        calls.append(("tc", tc_id, out_dir))
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.suit_task.ensure_toolchain_out_archive_imported",
-        _fake_ensure_tc,
-    )
-
-    task = SuitTask(config)
-    action = task.import_action
-    assert action is not None
-    task_id = _import_tc_task_id(_TC_OUTPATH)
-    action(task_id)
-    expected_tc_id = toolchain_id_for_outpath(_TC_OUTPATH)
-    assert calls == [("tc", expected_tc_id, tmp_path / "out")]
-
-
-def test_import_action_import_tc_works_with_empty_outpaths_map(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """import_tc_<hash> works even when toolchain_outpaths_map is empty — the
-    secondary never receives this map but must still import archives correctly."""
-    import dataclasses as _dc  # noqa: PLC0415
-    from compiler_suit_runner.suit_task import _import_tc_task_id  # noqa: PLC0415
-    from compiler_suit_runner.preflight import toolchain_id_for_outpath  # noqa: PLC0415
-
-    config = _dc.replace(
-        _make_config(tmp_path),
-        matrix_eval_out_dir=tmp_path / "out",
-        toolchain_outpaths_map={},  # empty — mimics secondary config
-    )
-    (tmp_path / "out").mkdir()
-
-    calls: list[tuple] = []
-
-    def _fake_ensure_tc(tc_id, out_dir, *, run_subprocess=None):
-        calls.append(("tc", tc_id, out_dir))
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.suit_task.ensure_toolchain_out_archive_imported",
-        _fake_ensure_tc,
-    )
-
-    task = SuitTask(config)
-    action = task.import_action
-    assert action is not None
-    task_id = _import_tc_task_id(_TC_OUTPATH)
-    action(task_id)
-    expected_tc_id = toolchain_id_for_outpath(_TC_OUTPATH)
-    # Archive named toolchains.<hash>.out.archive — ensure_* receives the hash.
-    assert calls == [("tc", expected_tc_id, tmp_path / "out")]
-
-
-def test_import_action_unknown_task_id_raises(
-    tmp_path: pathlib.Path,
-) -> None:
-    """import_action raises RuntimeError for a completely unknown task_id."""
-    import dataclasses as _dc  # noqa: PLC0415
-
-    config = _dc.replace(
-        _make_config(tmp_path),
-        matrix_eval_out_dir=tmp_path / "out",
-        toolchain_outpaths_map={"x86_64/gcc15": _TC_OUTPATH},
-    )
-    task = SuitTask(config)
-    action = task.import_action
-    assert action is not None
-    with pytest.raises(RuntimeError, match="unknown gate task_id"):
-        action("not_an_import_task")
-
-
-def test_import_action_two_arg_call_dispatches_correctly(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """import_action accepts two positional args (task_id, payload_json) as
-    required by fed78773's affine_action_bridge, and dispatches correctly.
-    payload_json is ignored by the consumer."""
-    import dataclasses as _dc  # noqa: PLC0415
-
-    config = _dc.replace(_make_config(tmp_path), matrix_eval_out_dir=tmp_path / "out")
-    (tmp_path / "out").mkdir()
-
-    calls: list[tuple] = []
-
-    def _fake_ensure_common(out_dir, *, run_subprocess=None):
-        calls.append(("common", out_dir))
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.suit_task.ensure_common_archive_imported",
-        _fake_ensure_common,
-    )
-
-    task = SuitTask(config)
-    action = task.import_action
-    assert action is not None
-    # Two-arg call as the framework makes it (fed78773+): payload_json is None here
-    action("import_common", None)
-    assert calls == [("common", tmp_path / "out")]
-
-
-def test_import_action_two_arg_call_with_payload_dispatches_correctly(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """import_action accepts a non-None payload_json second arg (future-proof)
-    and still dispatches to the correct ensure_* function."""
-    import dataclasses as _dc  # noqa: PLC0415
-
-    config = _dc.replace(_make_config(tmp_path), matrix_eval_out_dir=tmp_path / "out")
-    (tmp_path / "out").mkdir()
-
-    calls: list[tuple] = []
-
-    def _fake_ensure_common(out_dir, *, run_subprocess=None):
-        calls.append(("common", out_dir))
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.suit_task.ensure_common_archive_imported",
-        _fake_ensure_common,
-    )
-
-    task = SuitTask(config)
-    action = task.import_action
-    assert action is not None
-    # Simulate a richer payload the framework might pass in future pins
-    action("import_common", {"some": "payload"})
-    assert calls == [("common", tmp_path / "out")]
-
-
-def test_import_action_one_arg_call_still_works(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """import_action still works with a single positional arg (older pins /
-    direct consumer calls) — the payload_json default keeps back-compat."""
-    import dataclasses as _dc  # noqa: PLC0415
-
-    config = _dc.replace(_make_config(tmp_path), matrix_eval_out_dir=tmp_path / "out")
-    (tmp_path / "out").mkdir()
-
-    calls: list[tuple] = []
-
-    def _fake_ensure_common(out_dir, *, run_subprocess=None):
-        calls.append(("common", out_dir))
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.suit_task.ensure_common_archive_imported",
-        _fake_ensure_common,
-    )
-
-    task = SuitTask(config)
-    action = task.import_action
-    assert action is not None
-    # One-arg call (old contract / direct test usage)
-    action("import_common")
-    assert calls == [("common", tmp_path / "out")]
-
-
 # ---------------------------------------------------------------------------
-# build_deps_local Phase 0+1: gate emission + import_action + dep wiring
+# build_deps_local Phase 0+1: gate emission + dep wiring
 # ---------------------------------------------------------------------------
 
 
@@ -1898,7 +1744,7 @@ def test_discover_import_gate_tasks_emits_import_build_deps_when_flag_set(
     items = list(task.discover_items())
     gate_ids = {
         getattr(ti, "task_id", None) for ti in items
-        if getattr(ti, "type_id", None) == "toolchain_import"
+        if getattr(ti, "type_id", None) == "affine_import"
     }
     assert IMPORT_BUILD_DEPS_TASK_ID in gate_ids
 
@@ -1914,7 +1760,7 @@ def test_discover_import_gate_tasks_no_import_build_deps_when_flag_off(
     items = list(task.discover_items())
     gate_ids = {
         getattr(ti, "task_id", None) for ti in items
-        if getattr(ti, "type_id", None) == "toolchain_import"
+        if getattr(ti, "type_id", None) == "affine_import"
     }
     assert IMPORT_BUILD_DEPS_TASK_ID not in gate_ids
 
@@ -1996,39 +1842,6 @@ def test_header_depends_on_build_common_dep_includes_import_build_deps_when_flag
     assert IMPORT_BUILD_DEPS_TASK_ID in bare
 
 
-def test_import_action_import_build_deps_calls_ensure_build_deps_imported(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """import_action('import_build_deps') calls ensure_build_deps_archive_imported
-    with matrix_eval_out_dir."""
-    import dataclasses as _dc  # noqa: PLC0415
-    from compiler_suit_runner.suit_task import IMPORT_BUILD_DEPS_TASK_ID  # noqa: PLC0415
-
-    config = _dc.replace(
-        _make_config(tmp_path),
-        matrix_eval_out_dir=tmp_path / "out",
-        build_deps_local=True,
-    )
-    (tmp_path / "out").mkdir()
-
-    calls: list[tuple] = []
-
-    def _fake_ensure_build_deps(out_dir, *, run_subprocess=None):
-        calls.append(("build_deps", out_dir))
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.workers.build_worker.ensure_build_deps_archive_imported",
-        _fake_ensure_build_deps,
-    )
-
-    task = SuitTask(config)
-    action = task.import_action
-    assert action is not None
-    action(IMPORT_BUILD_DEPS_TASK_ID)
-    assert calls == [("build_deps", tmp_path / "out")]
-
-
 # ---------------------------------------------------------------------------
 # DRV-archive gate tasks: import_toolchain_drv + import_matrix_drv_<binary>
 # ---------------------------------------------------------------------------
@@ -2070,7 +1883,7 @@ def test_discover_import_gate_tasks_emits_toolchain_drv_gate(
     items = list(task.discover_items())
     gate_ids = {
         getattr(ti, "task_id", None) for ti in items
-        if getattr(ti, "type_id", None) == "toolchain_import"
+        if getattr(ti, "type_id", None) == "affine_import"
     }
     assert IMPORT_TOOLCHAIN_DRV_TASK_ID in gate_ids
 
@@ -2087,7 +1900,7 @@ def test_discover_import_gate_tasks_emits_per_binary_matrix_drv_gates(
     items = list(task.discover_items())
     gate_ids = {
         getattr(ti, "task_id", None) for ti in items
-        if getattr(ti, "type_id", None) == "toolchain_import"
+        if getattr(ti, "type_id", None) == "affine_import"
     }
     assert _import_matrix_drv_task_id("hello") in gate_ids
     assert _import_matrix_drv_task_id("zlib") in gate_ids
@@ -2098,14 +1911,13 @@ def test_discover_import_gate_tasks_no_matrix_drv_gates_without_per_binary_metad
 ) -> None:
     """When per_binary_metadata is absent (secondary-container config),
     no import_matrix_drv_* gates are emitted."""
-    from compiler_suit_runner.suit_task import _import_matrix_drv_task_id  # noqa: PLC0415
 
     config = _config_with_outpaths(tmp_path)  # per_binary_metadata=None
     task = SuitTask(config)
     items = list(task.discover_items())
     gate_ids = {
         getattr(ti, "task_id", None) for ti in items
-        if getattr(ti, "type_id", None) == "toolchain_import"
+        if getattr(ti, "type_id", None) == "affine_import"
         and (getattr(ti, "task_id", "") or "").startswith("import_matrix_drv_")
     }
     assert gate_ids == set()
@@ -2123,7 +1935,7 @@ def test_discover_import_gate_tasks_no_toolchain_drv_without_matrix_eval_out_dir
     items = list(task.discover_items())
     gate_ids = {
         getattr(ti, "task_id", None) for ti in items
-        if getattr(ti, "type_id", None) == "toolchain_import"
+        if getattr(ti, "type_id", None) == "affine_import"
     }
     assert IMPORT_TOOLCHAIN_DRV_TASK_ID not in gate_ids
 
@@ -2165,7 +1977,6 @@ def test_header_depends_on_build_common_dep_includes_toolchain_drv_gate(
     from compiler_suit_runner.suit_task import (  # noqa: PLC0415
         IMPORT_TOOLCHAIN_DRV_TASK_ID,
         _header_depends_on,
-        _import_matrix_drv_task_id,
     )
 
     header = ManifestHeader(
@@ -2189,7 +2000,6 @@ def test_header_depends_on_no_drv_gates_when_matrix_eval_gates_off(
     from compiler_suit_runner.suit_task import (  # noqa: PLC0415
         IMPORT_TOOLCHAIN_DRV_TASK_ID,
         _header_depends_on,
-        _import_matrix_drv_task_id,
     )
 
     header = ManifestHeader(
@@ -2205,79 +2015,12 @@ def test_header_depends_on_no_drv_gates_when_matrix_eval_gates_off(
     assert not any(d.startswith("import_matrix_drv_") for d in bare)
 
 
-def test_import_action_import_toolchain_drv_calls_ensure_toolchain_archive(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """import_action('import_toolchain_drv') calls ensure_toolchain_archive_imported
-    with matrix_eval_out_dir."""
-    import dataclasses as _dc  # noqa: PLC0415
-    from compiler_suit_runner.suit_task import IMPORT_TOOLCHAIN_DRV_TASK_ID  # noqa: PLC0415
-
-    config = _dc.replace(
-        _make_config(tmp_path),
-        matrix_eval_out_dir=tmp_path / "out",
-        toolchain_outpaths_map={"x86_64/gcc15": _TC_OUTPATH},
-    )
-    (tmp_path / "out").mkdir()
-
-    calls: list[tuple] = []
-
-    def _fake_ensure_tc_archive(out_dir, *, run_subprocess=None):
-        calls.append(("toolchain_drv", out_dir))
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.suit_task.ensure_toolchain_archive_imported",
-        _fake_ensure_tc_archive,
-    )
-
-    task = SuitTask(config)
-    action = task.import_action
-    assert action is not None
-    action(IMPORT_TOOLCHAIN_DRV_TASK_ID)
-    assert calls == [("toolchain_drv", tmp_path / "out")]
-
-
-def test_import_action_import_matrix_drv_calls_ensure_binary_archive(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """import_action('import_matrix_drv_hello') calls ensure_binary_archive_imported
-    with binary='hello' and matrix_eval_out_dir."""
-    import dataclasses as _dc  # noqa: PLC0415
-    from compiler_suit_runner.suit_task import _import_matrix_drv_task_id  # noqa: PLC0415
-
-    config = _dc.replace(
-        _make_config(tmp_path),
-        matrix_eval_out_dir=tmp_path / "out",
-        toolchain_outpaths_map={"x86_64/gcc15": _TC_OUTPATH},
-    )
-    (tmp_path / "out").mkdir()
-
-    calls: list[tuple] = []
-
-    def _fake_ensure_binary(binary, out_dir, *, run_subprocess=None):
-        calls.append(("binary_drv", binary, out_dir))
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.suit_task.ensure_binary_archive_imported",
-        _fake_ensure_binary,
-    )
-
-    task = SuitTask(config)
-    action = task.import_action
-    assert action is not None
-    action(_import_matrix_drv_task_id("hello"))
-    assert calls == [("binary_drv", "hello", tmp_path / "out")]
-
-
 def test_streamed_spawn_variant_carries_drv_gate_deps_when_matrix_eval_out_dir_set(
     tmp_path: pathlib.Path,
 ) -> None:
     """The streamed-spawn path carries import_toolchain_drv and
     import_matrix_drv_<binary> as bare-string deps when the config has
     matrix_eval_out_dir set."""
-    import dataclasses as _dc  # noqa: PLC0415
     from compiler_suit_runner.suit_task import (  # noqa: PLC0415
         IMPORT_TOOLCHAIN_DRV_TASK_ID,
         _import_matrix_drv_task_id,
@@ -2472,7 +2215,6 @@ def test_streamed_spawn_emits_common_dep_affine_gate(tmp_path: pathlib.Path) -> 
     """A streamed build_common_dep descriptor spawns its is_secondary_affine
     import gate (depending on the build_common_dep task) AND the gate is NOT
     counted toward the reconciliation total."""
-    import dataclasses as _dc  # noqa: PLC0415
     from compiler_suit_runner.suit_task import _import_common_dep_task_id  # noqa: PLC0415
 
     task = _streamed_task(tmp_path, matrix_eval_out_dir=tmp_path / "out")
@@ -2554,33 +2296,6 @@ def test_streamed_spawn_no_common_dep_gate_when_disabled(
     assert not any(
         ti.task_id.startswith("import_common_dep_") for ti in spawned
     )
-
-
-def test_import_action_dispatches_common_dep_gate(
-    tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """import_action('import_common_dep_<hash>') calls
-    ensure_common_dep_out_archive_imported with the stripped cd_id."""
-    import dataclasses as _dc  # noqa: PLC0415
-
-    config = _dc.replace(_make_config(tmp_path), matrix_eval_out_dir=tmp_path / "out")
-    (tmp_path / "out").mkdir()
-    calls: list[tuple] = []
-
-    def _fake_ensure(cd_id, out_dir, *, run_subprocess=None):
-        calls.append((cd_id, out_dir))
-
-    monkeypatch.setattr(
-        "compiler_suit_runner.workers.build_worker.ensure_common_dep_out_archive_imported",
-        _fake_ensure,
-    )
-
-    task = SuitTask(config)
-    action = task.import_action
-    assert action is not None
-    action("import_common_dep_abc123", None)
-    assert calls == [("abc123", tmp_path / "out")]
 
 
 # ---------------------------------------------------------------------------

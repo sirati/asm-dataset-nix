@@ -56,6 +56,7 @@ def run_dependency_graph_task(
     run_subprocess: Optional[RunSubprocess] = None,
     clock: Optional[Callable[[], float]] = None,
     build_deps_local: bool = False,
+    compiler_capture: bool = False,
 ) -> DependencyGraphResult:
     """Assemble one sum-drv spanning ALL binaries' pre-built aggregate
     drvs and produce a single Phase 4 descriptor list (plus the
@@ -216,6 +217,7 @@ def run_dependency_graph_task(
         _derive_variant_lookups(
             drv_by_binary=drv_by_binary,
             toolchain_outpaths_map=toolchain_outpaths_map or {},
+            **({"compiler_capture":True} if compiler_capture else {}),
         )
     )
 
@@ -458,6 +460,7 @@ def _derive_variant_lookups(
     *,
     drv_by_binary: dict[str, str],
     toolchain_outpaths_map: dict[str, str],
+    compiler_capture: bool = False,
 ) -> tuple[dict[str, dict[tuple[str, str], dict]], list[str]]:
     """Build the per-binary ``variant_lookup`` map + plannable-binary
     list from every binary's matrix aggregate drv path.
@@ -488,6 +491,9 @@ def _derive_variant_lookups(
                 matrix_drv,
                 toolchain_outpaths_map=toolchain_outpaths_map,
             )
+            if compiler_capture:
+                from compiler_suit_runner.capture import captured_spec
+                lookup={key:captured_spec(spec) for key,spec in lookup.items()}
         except Exception as exc:  # noqa: BLE001
             raise DependencyGraphWorkerError(
                 binary=binary, stage="variant_lookup",
@@ -665,22 +671,49 @@ def _produce_build_deps_archive(
 ) -> None:
     """Compute and export the build-deps output closure archive.
 
-    Collects the unique set of variant drv paths from ``descriptors``,
-    then for each variant drv runs ``nix-store --query --references`` to
-    get its INPUT drvs, realises/substitutes the INPUT drv OUTPUTS (those
-    are the build-input realised outputs ``nix build`` needs locally),
-    computes ``nix-store --query --requisites`` over those output paths,
-    subtracts the toolchain closure already shipped by the toolchain
-    archives, and exports the remainder as ``build_deps.out.archive`` in
-    ``matrix_eval_out_dir``.
+    Collects the FULL set of drvs the build phase builds — both the
+    elf-folder (build_variant) drvs AND the build_common_dep drvs — as
+    the seed set.  For each seed drv, ``nix-store --query --requisites
+    --include-outputs`` yields the complete transitive build-input closure
+    (the stdenv bootstrap, source FODs, patches, autotools hooks, etc.).
+    The non-``.drv`` paths from that closure are the OUTPUT paths that
+    need to be realised and exported.  Outputs of the seed drvs themselves
+    (the build products) are excluded.  The toolchain closure (already
+    shipped by toolchain archives) is subtracted; the remainder is exported
+    as ``build_deps.out.archive``.
 
-    The COMPLETENESS GATE (fail-closed): after the export, verifies that
-    every variant-drv input output path is covered by either the
-    build_deps archive or the toolchain closure.  Any uncovered path would
-    still be substituted at build time — that is the problem this feature
-    solves.  A non-empty uncovered set raises :class:`RuntimeError` naming
-    the offending paths so the operator can investigate and abort rather
-    than silently running with partial pre-loading.
+    SEED SET:
+      * ``build_variant`` elf-folder drv paths (from descriptors and
+        variant_lookups, same as before).
+      * ``build_common_dep`` drv paths, reconstructed from
+        ``payload["ident"]`` as ``/nix/store/<ident>.drv`` (these are the
+        shared deps — zlib, libpng-apng, pkg-config-wrapper — built from
+        source; their bootstrap inputs were missing from the old closure).
+
+    BUILD-TIME CLOSURE:
+      ``nix-store --query --requisites --include-outputs <seed.drv>`` per
+      seed yields every ``.drv`` in the closure AND every output path of
+      those drvs, giving us the full pre-realise target set offline.
+
+    BUILD PRODUCTS EXCLUDED:
+      ``nix-store --query --outputs <seed.drv>`` resolves the seed drvs'
+      own output paths — these are produced by the build phase and must not
+      enter the realise/export set (they are not pre-fetchable; including
+      them caused the ``nix-store --realise`` hard gap).  This generalises
+      the existing ``-variant-`` exclusion to ALL build-phase products.
+
+    TOOLCHAIN SUBTRACTION:
+      Toolchain outpaths from ``variant_lookups`` are realised FIRST (so
+      their closures are valid in-store and ``--requisites`` can walk them),
+      then ``collect_toolchain_archive_paths`` computes the union closure to
+      subtract.  Realising them fixes the previous "toolchain closure has 0
+      paths" no-op.
+
+    COMPLETENESS GATE (fail-closed):
+      After export, verify that every build-input output path resolved from
+      the full seed closure is either in build_deps or in the toolchain
+      closure.  Any path absent from both would still be substituted at
+      build time — that is exactly the problem this feature prevents.
 
     Raises :class:`RuntimeError` on any failure (failed subprocess,
     unrealised inputs, export error, completeness gate violation).  The
@@ -693,22 +726,40 @@ def _produce_build_deps_archive(
 
     from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
 
-    # 1. Collect the unique variant drv paths from the planned descriptors.
+    # -------------------------------------------------------------------------
+    # 1. SEED SET: all drvs the build phase builds.
+    #    - build_variant elf-folder drvs (as before)
+    #    - build_common_dep drvs reconstructed from payload["ident"]
+    # -------------------------------------------------------------------------
     variant_drvs: set[str] = set()
+    common_dep_drvs: set[str] = set()
+
     for d in descriptors:
-        if getattr(d, "kind", None) == "build_variant":
-            drv = d.payload.get("drv") if hasattr(d, "payload") else None
+        kind = getattr(d, "kind", None)
+        payload = d.payload if hasattr(d, "payload") else {}
+        if kind == "build_variant":
+            drv = payload.get("drv") if isinstance(payload, dict) else None
             if drv and isinstance(drv, str):
                 variant_drvs.add(drv)
-    # Also pull from variant_lookups (covers cases where descriptors use a
-    # spec dict rather than a Phase4Descriptor with .payload).
+        elif kind == "build_common_dep":
+            ident = payload.get("ident") if isinstance(payload, dict) else None
+            if ident and isinstance(ident, str):
+                # Reconstruct the full drv path from the ident
+                # (``<hash>-<name>`` → ``/nix/store/<hash>-<name>.drv``).
+                drv_path = f"/nix/store/{ident}.drv"
+                common_dep_drvs.add(drv_path)
+
+    # Also pull variant drvs from variant_lookups (covers cases where
+    # descriptors use a spec dict rather than a Phase4Descriptor with .payload).
     for binary_lookup in variant_lookups.values():
         for spec in binary_lookup.values():
             drv = spec.get("drv") if isinstance(spec, dict) else None
             if drv and isinstance(drv, str):
                 variant_drvs.add(drv)
 
-    if not variant_drvs:
+    all_seed_drvs: set[str] = variant_drvs | common_dep_drvs
+
+    if not all_seed_drvs:
         _log.warning(
             "_produce_build_deps_archive: no variant drvs found in "
             "descriptors/lookups — skipping build_deps archive production"
@@ -716,137 +767,17 @@ def _produce_build_deps_archive(
         return
 
     _log.info(
-        "_produce_build_deps_archive: collecting input drvs for %d "
-        "unique variant drvs",
-        len(variant_drvs),
+        "_produce_build_deps_archive: seed set = %d variant drv(s) + "
+        "%d common_dep drv(s)",
+        len(variant_drvs), len(common_dep_drvs),
     )
 
-    # 2. For each variant drv, get its INPUT drvs via
-    #    ``nix-store --query --references``.  Filter to .drv paths only
-    #    (source files are also references but are not derivations and
-    #    have no "output" to realise).
-    all_input_drvs: set[str] = set()
-    _variant_pkg_drvs_skipped = 0
-    for variant_drv in sorted(variant_drvs):
-        stdout, stderr, rc = runner(
-            ["nix-store", "--query", "--references", variant_drv]
-        )
-        if rc != 0:
-            raise RuntimeError(
-                "_produce_build_deps_archive: nix-store --query --references "
-                f"failed for {variant_drv!r} (rc={rc}): "
-                + stderr.decode("utf-8", errors="replace").strip()
-            )
-        for line in stdout.decode("utf-8", errors="replace").splitlines():
-            ref = line.strip()
-            if not ref.endswith(".drv"):
-                continue
-            # Exclude the variant PACKAGE drv (``<pkg>-variant-<arch>-…``).
-            # mkBinaryFolder.nix interpolates the variant package's outputs
-            # into the elf-folder build script, so the variant package drv is
-            # an inputDrv of the elf-folder drv we just queried. Its OUTPUT
-            # (``…-<pkg>-variant-<arch>-…``) is exactly what the build phase
-            # PRODUCES — it is not pre-fetchable from any substituter, so it
-            # must never enter the realise/closure set (including it caused
-            # the build_deps ``nix-store --realise`` hard gap). The
-            # ``-variant-`` infix is set unconditionally by
-            # ``pname = "${pkg.attr}-variant"`` (mkVariant.nix) and never
-            # appears in a genuine build input.
-            if "-variant-" in ref.rsplit("/", 1)[-1]:
-                _variant_pkg_drvs_skipped += 1
-                continue
-            all_input_drvs.add(ref)
-
-    if _variant_pkg_drvs_skipped:
-        _log.info(
-            "_produce_build_deps_archive: excluded %d variant-package drv(s) "
-            "from the build-deps input set (their outputs are produced by the "
-            "build phase, not pre-fetchable)",
-            _variant_pkg_drvs_skipped,
-        )
-
-    if not all_input_drvs:
-        _log.warning(
-            "_produce_build_deps_archive: no input drvs found across "
-            "%d variant drvs — skipping",
-            len(variant_drvs),
-        )
-        return
-
-    _log.info(
-        "_produce_build_deps_archive: %d unique input drvs; resolving "
-        "output paths",
-        len(all_input_drvs),
-    )
-
-    # 3. Resolve the OUTPUT path of each input drv via
-    #    ``nix-store --query --outputs``.  Note: this reads the .drv file
-    #    and always returns the output path regardless of whether the path
-    #    is realised in the store; a non-zero rc here means the .drv itself
-    #    is missing from the local store (import failure), which is fatal.
-    input_outpaths: list[str] = []
-    for input_drv in sorted(all_input_drvs):
-        stdout, stderr, rc = runner(
-            ["nix-store", "--query", "--outputs", input_drv]
-        )
-        if rc != 0:
-            raise RuntimeError(
-                "_produce_build_deps_archive: nix-store --query --outputs "
-                f"failed for {input_drv!r} (rc={rc}) — the .drv is not "
-                "resident in the local store (import archive missing/corrupt?): "
-                + stderr.decode("utf-8", errors="replace").strip()
-            )
-        for line in stdout.decode("utf-8", errors="replace").splitlines():
-            op = line.strip()
-            if op:
-                input_outpaths.append(op)
-
-    if not input_outpaths:
-        _log.warning(
-            "_produce_build_deps_archive: no input outpaths resolved — "
-            "build_deps archive would be empty; skipping"
-        )
-        return
-
-    # 3b. REALISE the input output paths before compute_build_deps_closure.
-    #     ``--query --requisites`` requires the paths to be valid in the
-    #     store and export also needs them realised.  The dep_graph worker
-    #     only holds the drv graph (imported drv archives), NOT the built
-    #     outputs; we must substitute them from the configured substituters
-    #     (cache.nixos.org etc.) first.  Build is attempted only when
-    #     substitution is unavailable.
-    #
-    #     This realises the build-input closure on the dep_graph worker node
-    #     (one-time).  It may add noticeable dep_graph-phase latency for
-    #     large closures but is required for correctness.
-    _log.info(
-        "_produce_build_deps_archive: realising %d input outpath(s) via "
-        "nix-store --realise (may add dep_graph-phase latency)",
-        len(input_outpaths),
-    )
-    stdout, stderr, rc = runner(["nix-store", "--realise"] + input_outpaths)
-    if rc != 0:
-        failed_hint = stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            "_produce_build_deps_archive: nix-store --realise failed "
-            f"(rc={rc}) for {len(input_outpaths)} input outpath(s) — "
-            "one or more build inputs cannot be substituted or built.  "
-            "This is a hard gap: the build_deps feature cannot pre-load "
-            "paths that are neither in the store nor substitutable.  "
-            f"First 5 paths: {', '.join(input_outpaths[:5])}"
-            + (" …" if len(input_outpaths) > 5 else "")
-            + (f"\nnix-store stderr: {failed_hint}" if failed_hint else "")
-        )
-    _log.info(
-        "_produce_build_deps_archive: all %d input outpath(s) realised",
-        len(input_outpaths),
-    )
-
-    # 4. Compute the toolchain closure to subtract (paths already shipped
-    #    by toolchains.common.archive + toolchains.<id>.out.archive).
-    #    Toolchain outpaths are embedded in the variant specs as
-    #    ``toolchain_outpath``; use them as seeds for
-    #    collect_toolchain_archive_paths.
+    # -------------------------------------------------------------------------
+    # 2. TOOLCHAIN OUTPATH REALISATION (fixes the "0 paths" no-op subtraction).
+    #    Realise the toolchain output paths BEFORE computing their closure so
+    #    ``nix-store --query --requisites`` can walk them.  Without realising
+    #    them, collect_toolchain_archive_paths returns an empty frozenset.
+    # -------------------------------------------------------------------------
     _log.info(
         "_produce_build_deps_archive: computing toolchain closure to subtract"
     )
@@ -859,35 +790,198 @@ def _produce_build_deps_archive(
                 tc_outpaths_from_lookups.add(tc_op)
 
     if tc_outpaths_from_lookups:
-        tc_subtract = _preflight.collect_toolchain_archive_paths(
-            list(tc_outpaths_from_lookups),
-            run_subprocess=runner,
-        )
+        # Realise toolchain outpaths first so their closures are valid in-store.
+        tc_op_list = sorted(tc_outpaths_from_lookups)
         _log.info(
-            "_produce_build_deps_archive: toolchain closure has %d paths "
-            "(to subtract from build_deps)",
-            len(tc_subtract),
+            "_produce_build_deps_archive: realising %d toolchain outpath(s) "
+            "so subtraction closure can be computed",
+            len(tc_op_list),
         )
+        _tc_stdout, _tc_stderr, tc_realise_rc = runner(
+            ["nix-store", "--realise"] + tc_op_list
+        )
+        if tc_realise_rc != 0:
+            _log.warning(
+                "_produce_build_deps_archive: toolchain outpath realisation "
+                "failed (rc=%d); toolchain subtraction will be skipped — "
+                "build_deps archive may be larger than necessary: %s",
+                tc_realise_rc,
+                _tc_stderr.decode("utf-8", errors="replace").strip(),
+            )
+        else:
+            tc_subtract = _preflight.collect_toolchain_archive_paths(
+                tc_op_list,
+                run_subprocess=runner,
+            )
+            _log.info(
+                "_produce_build_deps_archive: toolchain closure has %d paths "
+                "(to subtract from build_deps)",
+                len(tc_subtract),
+            )
     else:
         _log.warning(
             "_produce_build_deps_archive: no toolchain outpaths found in "
             "variant_lookups; build_deps archive will include toolchain paths"
         )
 
+    # -------------------------------------------------------------------------
+    # 3. BUILD-TIME CLOSURE via ``--requisites --include-outputs``.
+    #    For each seed drv, collect the full transitive build-input closure:
+    #    ``.drv`` files (derivations) AND their output paths. We want the
+    #    OUTPUT paths (non-``.drv``) — these are the pre-realisable inputs.
+    # -------------------------------------------------------------------------
+    # Also compute the seed drvs' OWN output paths (build products to EXCLUDE).
+    seed_output_paths: set[str] = set()
+    for seed_drv in sorted(all_seed_drvs):
+        stdout, stderr, rc = runner(
+            ["nix-store", "--query", "--outputs", seed_drv]
+        )
+        if rc != 0:
+            raise RuntimeError(
+                "_produce_build_deps_archive: nix-store --query --outputs "
+                f"failed for seed drv {seed_drv!r} (rc={rc}) — the .drv is "
+                "not resident in the local store (import archive "
+                "missing/corrupt?): "
+                + stderr.decode("utf-8", errors="replace").strip()
+            )
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            op = line.strip()
+            if op:
+                seed_output_paths.add(op)
+
+    _log.info(
+        "_produce_build_deps_archive: %d seed drv(s); %d seed output paths "
+        "(build products, to exclude from realise/export)",
+        len(all_seed_drvs), len(seed_output_paths),
+    )
+
+    # Collect the full build-time closure input outpaths across all seeds.
+    # ``--requisites --include-outputs`` emits every .drv reachable from the
+    # seed AND every output path of those drvs (topological order, dep-first).
+    # We filter to non-`.drv` output paths only.
+    all_build_input_outpaths: list[str] = []
+    seen_outpaths: set[str] = set()
+
+    for seed_drv in sorted(all_seed_drvs):
+        stdout, stderr, rc = runner(
+            ["nix-store", "--query", "--requisites", "--include-outputs", seed_drv]
+        )
+        if rc != 0:
+            raise RuntimeError(
+                "_produce_build_deps_archive: nix-store --query --requisites "
+                f"--include-outputs failed for {seed_drv!r} (rc={rc}): "
+                + stderr.decode("utf-8", errors="replace").strip()
+            )
+        for line in stdout.decode("utf-8", errors="replace").splitlines():
+            path = line.strip()
+            if not path:
+                continue
+            if path.endswith(".drv"):
+                # Skip derivation files — we only want output paths.
+                continue
+            if path in seen_outpaths:
+                continue
+            seen_outpaths.add(path)
+            all_build_input_outpaths.append(path)
+
+    # Remove build-phase PRODUCTS: they are produced by the build phase, are
+    # not pre-fetchable/substitutable, and must never enter the realise/export
+    # set (including them re-introduces the ``nix-store --realise`` hard gap).
+    # Two classes of product:
+    #   1. seed outputs — the elf-folder + build_common_dep outputs (excluded
+    #      via ``seed_output_paths``).
+    #   2. the variant PACKAGE outputs — the ``<pkg>-variant-<arch>-…`` paths.
+    #      These are inputDrvs of the elf-folder seed (mkBinaryFolder.nix
+    #      interpolates the variant package's outputs), so ``--include-outputs``
+    #      pulls their OUTPUT paths into the closure, but the variant package is
+    #      NOT a seed → its output is NOT in ``seed_output_paths``.  It is built
+    #      in-place by the build phase and is not in any substituter, so it must
+    #      be excluded explicitly.  The ``-variant-`` infix is set
+    #      unconditionally by ``pname = "${pkg.attr}-variant"`` (mkVariant.nix)
+    #      and never appears in a genuine pre-fetchable build input.
+    _variant_product_outpaths_skipped = 0
+
+    def _is_build_product(path: str) -> bool:
+        nonlocal _variant_product_outpaths_skipped
+        if path in seed_output_paths:
+            return True
+        if "-variant-" in path.rsplit("/", 1)[-1]:
+            _variant_product_outpaths_skipped += 1
+            return True
+        return False
+
+    input_outpaths: list[str] = [
+        p for p in all_build_input_outpaths
+        if not _is_build_product(p)
+    ]
+
+    if _variant_product_outpaths_skipped:
+        _log.info(
+            "_produce_build_deps_archive: excluded %d variant-package output "
+            "path(s) (build-phase products, not pre-fetchable) from the "
+            "build-deps realise/export set",
+            _variant_product_outpaths_skipped,
+        )
+
+    _log.info(
+        "_produce_build_deps_archive: full build-time closure = %d paths; "
+        "%d after excluding seed outputs (build products)",
+        len(all_build_input_outpaths), len(input_outpaths),
+    )
+
+    if not input_outpaths:
+        _log.warning(
+            "_produce_build_deps_archive: no build-input output paths after "
+            "excluding seed outputs — build_deps archive would be empty; "
+            "skipping"
+        )
+        return
+
+    # -------------------------------------------------------------------------
+    # 4. REALISE the build-input output paths.
+    #    ``nix-store --realise`` substitutes from cache.nixos.org etc.
+    #    This is the one-time pre-load on the dep_graph worker node.
+    #    Hard-fail if any path cannot be realised (uncached, unbuildable).
+    # -------------------------------------------------------------------------
+    _log.info(
+        "_produce_build_deps_archive: realising %d build-input outpath(s) via "
+        "nix-store --realise (may add dep_graph-phase latency)",
+        len(input_outpaths),
+    )
+    stdout, stderr, rc = runner(["nix-store", "--realise"] + input_outpaths)
+    if rc != 0:
+        failed_hint = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            "_produce_build_deps_archive: nix-store --realise failed "
+            f"(rc={rc}) for {len(input_outpaths)} build-input outpath(s) — "
+            "one or more build inputs cannot be substituted or built.  "
+            "This is a hard gap: the build_deps feature cannot pre-load "
+            "paths that are neither in the store nor substitutable.  "
+            f"First 5 paths: {', '.join(input_outpaths[:5])}"
+            + (" …" if len(input_outpaths) > 5 else "")
+            + (f"\nnix-store stderr: {failed_hint}" if failed_hint else "")
+        )
+    _log.info(
+        "_produce_build_deps_archive: all %d build-input outpath(s) realised",
+        len(input_outpaths),
+    )
+
+    # -------------------------------------------------------------------------
     # 5. Compute build_deps closure = requisites(input_outpaths) − toolchain.
+    # -------------------------------------------------------------------------
     build_deps_paths, uncovered = _preflight.compute_build_deps_closure(
         input_outpaths,
         toolchain_paths_to_subtract=tc_subtract,
         run_subprocess=runner,
     )
 
-    # COMPLETENESS GATE (fail-closed): any uncovered input outpath would
+    # COMPLETENESS GATE (fail-closed): any uncovered build-input outpath would
     # still be substituted at build time — that is EXACTLY the problem this
     # feature prevents.  Abort with a clear error listing the offenders.
     if uncovered:
         raise RuntimeError(
             "_produce_build_deps_archive: COMPLETENESS GATE FAILED — "
-            "%d input outpath(s) not found in local store requisites; "
+            "%d build-input outpath(s) not found in local store requisites; "
             "they would still be substituted at build time even with "
             "build_deps_local=True.  Offending paths (first 10): %s"
             % (
@@ -905,7 +999,9 @@ def _produce_build_deps_archive(
         )
         return
 
+    # -------------------------------------------------------------------------
     # 6. Export build_deps.out.archive atomically.
+    # -------------------------------------------------------------------------
     _log.info(
         "_produce_build_deps_archive: exporting %d build-deps paths "
         "to %s/%s",

@@ -353,6 +353,24 @@ let
     let parts = builtins.match "([0-9]+)\\..*" version;
     in if parts != null then lib.toInt (builtins.head parts) else 0;
 
+  # Current LLVM wrappers use their own release's resource-directory spelling.
+  # A substituted legacy frontend needs its matching builtin headers instead.
+  clangResourceFixup = cc: version: ''
+    datasetClangInclude=
+    for datasetClangResourceRoot in ${cc} ${lib.getLib cc}; do
+      for datasetClangResourceVersion in ${version} ${toString (clangMajor version)}; do
+        if test -f "$datasetClangResourceRoot/lib/clang/$datasetClangResourceVersion/include/stddef.h"; then
+          datasetClangInclude=$datasetClangResourceRoot/lib/clang/$datasetClangResourceVersion/include
+          break 2
+        fi
+      done
+    done
+    test -n "$datasetClangInclude"
+    test -L "$out/resource-root/include"
+    rm "$out/resource-root/include"
+    ln -s "$datasetClangInclude" "$out/resource-root/include"
+  '';
+
   # Per-(arch, old-clang-version) ABI overrides. The hybrid wrapper splices
   # modern binutils + libgcc against an old clang binary; for archs whose
   # ABI defaults shifted between the old-clang era and modern nixpkgs, the
@@ -585,6 +603,8 @@ let
         # works for cross targets too: llvm-ar runs on the build platform
         # and LLVM bitcode is a host-agnostic container.
         mkLlvmTools = _targetPkgs: _target: oldPkgs.${attr}.llvm or null;
+        mkLld = _targetPkgs: _target: oldPkgs.${attr}.lld or null;
+        mkGold = _targetPkgs: _target: oldPkgs.binutils;
         mkStdenv =
           targetPkgs: target:
           if target.crossAttr == null && !(target ? crossSystem) then
@@ -622,18 +642,21 @@ let
               cc = extractClangCC oldPkgs.${attr};
               unwrapped = extractUnwrappedClang oldPkgs.${attr};
               needsHybrid =
-                nixpkgsInfo.nativeWrapperBroken || !(clangHasRealWrapper oldPkgs.${attr});
+                nixpkgsInfo.nativeWrapperBroken || !(clangHasRealWrapper oldPkgs.${attr})
+                # These wrappers initialize an empty C++ stdlib override,
+                # suppressing their own header-search fallback.
+                || lib.versionOlder version "5";
               nativeCC =
                 if needsHybrid then
-                  targetPkgs.llvmPackages.clang.override {
+                  targetPkgs.llvmPackages.clang.override (wrapperArgs: {
                     cc = unwrapped // {
                       hardeningUnsupportedFlags = getClangUnsupportedHardeningFlags version;
                     };
                     propagateDoc = false;
-                    extraBuildCommands = lib.optionalString (
+                    extraBuildCommands = (wrapperArgs.extraBuildCommands or "") + (lib.optionalString (
                       clangNeedsMacroPrefixMapStripped version
-                    ) stripMacroPrefixMapCommands;
-                  }
+                    ) stripMacroPrefixMapCommands) + clangResourceFixup unwrapped version;
+                  })
                 else
                   cc;
             in
@@ -646,71 +669,39 @@ let
                 })
                 nativeCC
             )
-          else if oldPkgs ? pkgsCross then
-            # pkgsCross available (22.11+): get cross-clang from buildPackages.
-            # Use .clang directly (not extractClangCC) because
-            # buildPackages.llvmPkg.stdenv.cc is the native compiler,
-            # while .clang is the actual cross-compiler wrapper.
-            let
-              oldCrossPkgs = getOldCrossPkgs nixpkgsInfo target;
-            in
-            if oldCrossPkgs == null then
-              builtins.throw "${attr}: cross target ${target.label} not available in this nixpkgs"
-            else
-              let
-                rawCrossClang = oldCrossPkgs.buildPackages.${attr}.clang;
-                abiFlags = abiFlagsFor target.label version;
-                # Override the wrapper's postFixup to append ABI flags to
-                # cc-cflags. The wrapper is already built; appending via
-                # overrideAttrs reruns its installation phase with the
-                # extra commands tacked on.
-                crossClang =
-                  if abiFlags == [ ] then
-                    rawCrossClang
-                  else
-                    rawCrossClang.overrideAttrs (old: {
-                      postFixup = (old.postFixup or "") + abiPostFixup abiFlags;
-                    });
-              in
-              # Defensive backfill: 22.11+ cross wrappers generally
-              # expose top-level cc-attrs, but their bintools
-              # (binutils-wrapper-2.39) predates ``isLLVM`` — libgcrypt
-              # reads ``stdenv.cc.bintools.isLLVM`` for the
-              # ``--undefined-version`` workaround. Idempotent — no-op
-              # when present. ``version`` flows from the entry; ``cc``
-              # is already present on real wrappers from buildPackages.
-              targetPkgs.overrideCC targetPkgs.stdenv (
-                ensureCcAttrs
-                  (clangCcDefaults targetPkgs // {
-                    targetPrefix = "${target.crossConfig}-";
-                    inherit version;
-                  })
-                  crossClang
-              )
           else
-            # Pre-pkgsCross (18.03, 15.09): hybrid wrapper approach.
-            # The old nixpkgs' cross infrastructure has broken C++ stdlib
-            # hooks that reference cross-compiled GCC binaries. Instead,
-            # take the modern cross clang wrapper and swap in the old
-            # unwrapped clang binary. This gives us correct cross bintools
-            # and sysroot from modern nixpkgs + old clang codegen.
+            # Use the current cross wrapper around the selected old frontend.
+            # Legacy buildPackages clang wrappers can select a C-only stage
+            # GCC with no C++ headers or runtime. The current wrapper supplies
+            # matching target libc, libstdc++ and bintools without rebuilding
+            # the compiler frontend.
             let
-              unwrappedClang = extractUnwrappedClang oldPkgs.${attr};
+              originalClang = extractUnwrappedClang oldPkgs.${attr};
+              n32Types = target.label=="mips64el" && version=="3.4.2";
+              n32Plugin = builtins.elem target.label ["mipsel" "mips64el"] && clangMajor version==16;
+              unwrappedClang = if n32Types then
+                import ./legacy-clang-n32.nix { inherit oldPkgs; clang=originalClang; llvm=llvmPkg.llvm; }
+                else if n32Plugin then import ./llvm-gold.nix { inherit pkgs; clang=originalClang; llvm=llvmPkg.llvm; }
+                else originalClang;
               unsupportedFlags = getClangUnsupportedHardeningFlags version;
               needsStripMacroMap = clangNeedsMacroPrefixMapStripped version;
               abiFlags = abiFlagsFor target.label version;
 
               # Use the modern cross clang wrapper as a template
               modernCrossClang = targetPkgs.buildPackages.llvmPackages.clang;
-              hybridClang = modernCrossClang.override {
+              hybridClang = modernCrossClang.override (wrapperArgs: {
                 cc = unwrappedClang // {
                   hardeningUnsupportedFlags = unsupportedFlags;
                 };
                 propagateDoc = false;
                 extraBuildCommands =
-                  (if needsStripMacroMap then stripMacroPrefixMapCommands else "")
-                  + abiPostFixup abiFlags;
-              };
+                  (wrapperArgs.extraBuildCommands or "")
+                  + lib.optionalString n32Plugin ''
+                    echo '-no-canonical-prefixes' >> "$out/nix-support/cc-cflags"
+                  ''
+                  + (if needsStripMacroMap then stripMacroPrefixMapCommands else "")
+                  + abiPostFixup abiFlags + clangResourceFixup unwrappedClang version;
+              });
             in
             targetPkgs.overrideCC targetPkgs.stdenv hybridClang;
       };

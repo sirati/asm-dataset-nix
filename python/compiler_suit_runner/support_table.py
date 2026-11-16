@@ -29,15 +29,20 @@ fine to keep).
 from __future__ import annotations
 
 import functools
+import logging
 import pathlib
 from typing import Optional
 
 __all__ = [
     "SupportStatus",
     "load_support_table",
+    "load_support_table_for_flake",
     "is_supported",
     "default_table_path",
+    "flake_root_from_ref",
 ]
+
+_LOG = logging.getLogger(__name__)
 
 # String-typed enum because the raw cell values are 2-3 ASCII chars
 # and we want them to round-trip through structured logs / JSON without
@@ -55,6 +60,38 @@ def default_table_path(flake_root: Optional[pathlib.Path] = None) -> pathlib.Pat
     return pathlib.Path(root) / "table.md"
 
 
+def flake_root_from_ref(flake_ref: str) -> Optional[pathlib.Path]:
+    """Return the local directory a flake reference points at.
+
+    Handles plain paths (``.``, ``/abs/dir``), ``path:`` and
+    ``git+file:`` references, with or without ``#attr`` and ``?query``
+    parts. Returns ``None`` for remote references such as ``github:``.
+    """
+    ref = flake_ref.split("#", 1)[0]
+    for prefix in ("path:", "git+file://", "git+file:"):
+        if ref.startswith(prefix):
+            ref = ref[len(prefix):]
+            break
+    else:
+        if ":" in ref:
+            return None
+    ref = ref.split("?", 1)[0]
+    return pathlib.Path(ref) if ref else None
+
+
+def load_support_table_for_flake(
+    flake_ref: str,
+) -> dict[tuple[str, str], SupportStatus]:
+    """Load ``table.md`` from the root of the flake ``flake_ref`` names.
+
+    Use this instead of :func:`load_support_table` with no path: the
+    working directory is not the flake root in the container (``/app``
+    versus ``/app/flake``) or when ``--flake`` names another directory.
+    A remote reference falls back to the working directory.
+    """
+    return load_support_table(default_table_path(flake_root_from_ref(flake_ref)))
+
+
 @functools.lru_cache(maxsize=8)
 def load_support_table(
     path: Optional[pathlib.Path] = None,
@@ -65,11 +102,16 @@ def load_support_table(
     file. Pass a fresh ``path`` on disk-modified test cases (or call
     ``load_support_table.cache_clear()``).
 
-    Returns an empty dict if the file is missing — callers that want
-    "no filter" can fall back gracefully.
+    Returns an empty dict if the file is missing, which disables the
+    filter, and logs a WARNING so that is visible.
     """
     target = pathlib.Path(path) if path is not None else default_table_path()
     if not target.is_file():
+        _LOG.warning(
+            "support table %s not found; the (compiler, arch) support "
+            "filter is disabled and every combo is allowed",
+            target,
+        )
         return {}
 
     rows: dict[tuple[str, str], SupportStatus] = {}

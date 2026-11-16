@@ -169,8 +169,9 @@ def _arch_indep_task_id(ident_str: str) -> str:
     return f"build_common_dep__arch_indep__{ident_str}"
 
 
-def _variant_task_id(binary: str, sys_name: str, label: str) -> str:
-    return f"build_variant__{sys_name}__{binary}__{label}"
+def _variant_task_id(binary: str, sys_name: str, label: str, arch: str, package_identity=None) -> str:
+    from ..package_selection import build_variant_task_id
+    return build_variant_task_id(sys_name, binary, arch, label, package_identity)
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +304,17 @@ def _variant_descriptor(
         # substitution — but with the split enabled it MUST be present).
         "toolchain_outpath": variant_spec.get("toolchain_outpath", ""),
     }
-    task_id = _variant_task_id(binary, sys_name, label)
+    from ..package_selection import release_metadata, variant_output_names
+    payload.update(release_metadata(variant_spec))
+    payload.update(variant_output_names({**variant_spec, "label": label, "arch": arch}))
+    for field in ("packageDrv", "packageOutputs", "outputPaths", "compilerCapture"):
+        if field in variant_spec:
+            payload[field] = variant_spec[field]
+    if variant_spec.get("compiler_capture") is not None:
+        payload["compiler_capture"] = variant_spec["compiler_capture"]
+    task_id = _variant_task_id(binary, sys_name, label, arch, variant_spec.get("packageIdentity"))
+    if variant_spec.get("compiler_capture") is not None:
+        task_id += "__capture_v2"
     # Deterministic ordering of both dep tuples so observers comparing
     # manifests across runs see stable diffs.
     return Phase4Descriptor(

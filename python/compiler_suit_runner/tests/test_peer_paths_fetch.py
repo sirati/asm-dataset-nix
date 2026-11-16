@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from typing import Optional
 
-import pytest
 
 from compiler_suit_runner import peer_paths_fetch
 from compiler_suit_runner.peer_cache import PeerInfo

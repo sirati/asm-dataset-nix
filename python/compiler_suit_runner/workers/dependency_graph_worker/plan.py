@@ -102,9 +102,9 @@ def plan_total(
     + ``find_or_register_template`` collapse equivalent shapes, and the
     finalize pass keys ``meta_templates`` / ``arch_indep_deps`` per
     binary). We then partition ``streaming_result["variant_arrays"]``
-    + ``["common_deps_per_arch_template"]`` per binary by inspecting
-    each template's root role (``<binary>-...-elf-folder.drv``) so each
-    binary's :class:`BinaryPlanInput` only sees its own variants.
+    + ``["common_deps_per_arch_template"]`` per binary by the matrix
+    each variant array was built under (``VariantArray.binary``) so
+    each binary's :class:`BinaryPlanInput` only sees its own variants.
 
     ``lax`` defaults to ``True`` (Phase 6.1 production default): the
     streaming planner records shape violations into
@@ -190,14 +190,16 @@ def _plan_total_impl(
 
     streaming_result = plan_from_drv_tree(stream_drv_tree(sum_drv), lax=lax)
 
-    # Group templates by the binary their root role encodes. Each
-    # binary's BinaryPlanInput consumes a sliced streaming_result
-    # carrying ONLY the templates / variant_arrays / classifications
-    # that belong to that binary; toolchain_drvs and arch_indep_deps
-    # are shared (the planner adapter only reads variant_arrays +
-    # classifications + templates from the per-binary slice).
-    templates = list(streaming_result.get("templates", []) or [])
-    binary_to_template_ids = _group_templates_by_binary(templates)
+    # Group templates by the binary their variant arrays were built
+    # under. Each binary's BinaryPlanInput consumes a sliced
+    # streaming_result carrying ONLY the templates / variant_arrays /
+    # classifications that belong to that binary; toolchain_drvs and
+    # arch_indep_deps are shared (the planner adapter only reads
+    # variant_arrays + classifications + templates from the per-binary
+    # slice).
+    binary_to_template_ids = _group_templates_by_binary(
+        streaming_result.get("variant_arrays", {}) or {}
+    )
 
     inputs: list[BinaryPlanInput] = []
     for binary in binaries:

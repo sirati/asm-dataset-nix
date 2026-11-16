@@ -30,6 +30,11 @@ let
   ] ++ [ dynamicRunner ];
 
   devPackages = with pkgs; [
+    cargo
+    rustc
+    rustfmt
+    clippy
+    time # GNU time supplies evaluator peak-RSS measurements.
     basedpyright
     nil
     nixd

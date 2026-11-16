@@ -14,6 +14,9 @@ from typing import Optional
 
 import pytest
 
+from .release_fixtures import catalog_entry
+from compiler_suit_runner.package_selection import RELEASE_FIELDS
+
 from compiler_suit_runner.preflight import (
     PreflightError,
     PreflightResult,
@@ -103,6 +106,14 @@ def _make_run_subprocess(responses: dict[str, object]):
         if attr not in responses:
             return b"", f"no fake for {attr}".encode(), 1
         payload = responses[attr]
+        if attr.startswith("_packageCatalog.") and apply_expr and "intersectAttrs" in apply_expr:
+            encoded = re.findall(r'builtins.fromJSON ("(?:[^"\\]|\\.)*")', apply_expr)
+            maps = [json.loads(json.loads(item)) for item in encoded]
+            keys = maps[-1]
+            payload = {key: payload[key] for key in keys}
+            if len(maps) == 2:
+                payload = {key: {**entry, "availability": {a: v for a, v in entry["availability"].items() if a in maps[0]}}
+                           for key, entry in payload.items()}
         if isinstance(payload, bytes):
             return payload, b"", 0
         # When ``--apply`` is in play, mimic nix's behaviour of running
@@ -217,6 +228,12 @@ def _all_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
         f"_meta.{sys_name}": meta,
         f"_drvPaths.{sys_name}": drvs,
         f"dataset.{sys_name}": drvs,
+        f"_packageCatalog.{sys_name}": {
+            pkg: {**catalog_entry(pkg, family=pkg), "availability": {
+                arch: {"available": arch in arches, "reason": None if arch in arches else "unsupported-platform"}
+                for arch in ("x86_64", "aarch64")
+            }} for pkg, arches in drvs.items()
+        },
         f"_crossToolchainsMeta.{sys_name}": _fake_toolchains(),
     }
     for pkg, arch_map in drvs.items():
@@ -292,7 +309,7 @@ def test_enumerate_variants_full_matrix():
     # cluster inside matrix_eval. The submitter only surfaces the four
     # per-pkg metadata fields below.
     assert set(result["hello"]) == {
-        "archs", "sample_size", "sample_seed", "tier",
+        "archs", "sample_size", "sample_seed", "tier", "skipped_targets", *RELEASE_FIELDS,
     }
 
 
@@ -321,7 +338,8 @@ def test_enumerate_variants_filter_by_archs():
     # doesn't actually expose.
     assert set(result.keys()) == {"hello", "busybox"}
     assert result["hello"]["archs"] == ["aarch64"]
-    assert result["busybox"]["archs"] == ["aarch64"]
+    assert result["busybox"]["archs"] == []
+    assert result["busybox"]["skipped_targets"] == {"aarch64": "unsupported-platform"}
 
 
 def test_enumerate_variants_combined_filter():
@@ -337,15 +355,10 @@ def test_enumerate_variants_combined_filter():
     assert result["busybox"]["archs"] == ["x86_64"]
 
 
-def test_enumerate_variants_filter_no_match_returns_empty():
+def test_enumerate_variants_unknown_family_is_an_error():
     runner, _ = _make_run_subprocess(_all_responses())
-    result = enumerate_variants(
-        ".",
-        "x86_64-linux",
-        packages=["nonexistent-pkg"],
-        run_subprocess=runner,
-    )
-    assert result == {}
+    with pytest.raises(ValueError, match="unknown package families"):
+        enumerate_variants(".", "x86_64-linux", packages=["nonexistent-pkg"], run_subprocess=runner)
 
 
 def test_enumerate_variants_tier_assignment():
@@ -485,6 +498,12 @@ def _wide_responses(sys_name: str = "x86_64-linux") -> dict[str, object]:
         f"_meta.{sys_name}": meta,
         f"_drvPaths.{sys_name}": drvs,
         f"dataset.{sys_name}": drvs,
+        f"_packageCatalog.{sys_name}": {
+            pkg: {**catalog_entry(pkg, family=pkg), "availability": {
+                arch: {"available": arch in arches, "reason": None if arch in arches else "unsupported-platform"}
+                for arch in ("x86_64", "aarch64")
+            }} for pkg, arches in drvs.items()
+        },
         f"_crossToolchainsMeta.{sys_name}": _fake_toolchains(),
     }
     for pkg, arch_map in drvs.items():
@@ -553,7 +572,7 @@ def test_filter_existing_returns_all_when_dataset_dir_absent(tmp_path: pathlib.P
 def test_filter_existing_drops_variants_with_existing_sidecar(
     tmp_path: pathlib.Path,
 ):
-    """Skip-existing matches by sidecar JSON ``label`` (not filename)."""
+    """Legacy sidecars cannot prove release identity and must rebuild."""
     import json as _json
 
     dataset = tmp_path / "dataset"
@@ -568,15 +587,14 @@ def test_filter_existing_drops_variants_with_existing_sidecar(
         _make_variant("c"),
     )
     kept, skipped = filter_existing_variants(variants, dataset_dir=dataset)
-    assert skipped == 2
-    assert {v["label"] for v in kept} == {"b"}
+    assert skipped == 0
+    assert {v["label"] for v in kept} == {"a", "b", "c"}
 
 
 def test_filter_existing_handles_legacy_flat_layout(
     tmp_path: pathlib.Path,
 ):
-    """Variants with no ``pkg`` field fall back to scanning
-    ``dataset_dir`` itself (legacy flat layout)."""
+    """Legacy flat-layout sidecars must rebuild without release proof."""
     import json as _json
 
     dataset = tmp_path / "dataset"
@@ -590,8 +608,8 @@ def test_filter_existing_handles_legacy_flat_layout(
 
     variants = (_v("a"), _v("b"))
     kept, skipped = filter_existing_variants(variants, dataset_dir=dataset)
-    assert skipped == 1
-    assert [v["label"] for v in kept] == ["b"]
+    assert skipped == 0
+    assert [v["label"] for v in kept] == ["a", "b"]
 
 
 # ---------------------------------------------------------------------------
@@ -652,29 +670,131 @@ def test_check_toolchains_locally_skips_falsy_entries():
     assert out == frozenset()
 
 
-def test_build_toolchains_locally_runs_nix_build_per_drv():
-    calls: list[list[str]] = []
+def test_build_toolchains_locally_realises_and_roots_full_closure(tmp_path):
+    """Each toolchain drv is built, then its FULL --include-outputs build
+    closure is realised AND gc-rooted so the split snapshot ships the bootstrap
+    (xgcc, bootstrap-stage*, …) — not just the stdenv output closure. With
+    substituters on the submitter, `nix build <drv>^*` alone leaves the
+    bootstrap unrealised, so the realise+root step is what makes the archive
+    complete."""
+    build_calls: list[list[str]] = []
+    query_calls: list[list[str]] = []
+    realise_calls: list[list[str]] = []
+
+    # build closure outputs (non-.drv) returned by --include-outputs per drv.
+    bc = {
+        "/nix/store/aaa.drv": [
+            "/nix/store/aaa.drv", "/nix/store/o1-stdenv",
+            "/nix/store/o2-xgcc", "/nix/store/o3-bootstrap-stage2",
+        ],
+        "/nix/store/bbb.drv": [
+            "/nix/store/bbb.drv", "/nix/store/o1-stdenv",  # o1 shared (dedup)
+            "/nix/store/o4-binutils-wrapper",
+        ],
+    }
 
     def runner(argv):
-        calls.append(list(argv))
-        return b"", b"", 0
+        argv = list(argv)
+        if argv[0] == "nix" and "build" in argv:
+            build_calls.append(argv)
+            return b"", b"", 0
+        if argv[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]:
+            query_calls.append(argv)
+            drv = argv[-1]
+            return ("\n".join(bc[drv]) + "\n").encode(), b"", 0
+        if argv[:2] == ["nix-store", "--realise"]:
+            realise_calls.append(argv)
+            return b"", b"", 0
+        raise AssertionError(f"unexpected argv: {argv}")
 
+    gcroot = tmp_path / "toolchain-gcroots"
     build_toolchains_locally(
         frozenset({"/nix/store/aaa.drv", "/nix/store/bbb.drv"}),
+        gcroot_dir=str(gcroot),
         run_subprocess=runner,
     )
-    assert len(calls) == 2
-    for argv in calls:
-        assert argv[0] == "nix"
-        assert "build" in argv
-        assert "--no-link" in argv
-        # ``<drv>^*`` realises every output.
-        assert argv[-2].endswith("^*")
+    # built + queried each drv
+    assert len(build_calls) == 2
+    assert len(query_calls) == 2
+    # realise+root the DEDUPED union of non-.drv outputs (5 unique outputs).
+    assert len(realise_calls) == 1  # one batch (< 256 paths)
+    rc = realise_calls[0]
+    assert "--add-root" in rc and "--indirect" in rc
+    rooted = [a for a in rc if a.startswith("/nix/store/")]
+    assert set(rooted) == {
+        "/nix/store/o1-stdenv", "/nix/store/o2-xgcc",
+        "/nix/store/o3-bootstrap-stage2", "/nix/store/o4-binutils-wrapper",
+    }
+    # no .drv path is realised (those ship via the drv archive)
+    assert not any(a.endswith(".drv") for a in rooted)
+    # the gcroot dir was (re)created
+    assert gcroot.is_dir()
 
 
-def test_build_toolchains_locally_raises_preflight_error_on_failure():
-    def runner(_argv):
-        return b"", b"compilation failed: missing /lib/foo\n", 1
+def test_build_toolchains_locally_deep_realises_drv_input_closure(tmp_path):
+    """deep_realise_drvs (the native build-host stdenv) get their FULL drv-input
+    closure realised, so build-time-only intermediates (xgcc, bootstrap-stage*)
+    materialise before the --include-outputs snapshot (which lists only EXISTING
+    outputs)."""
+    realise_drv_calls: list[list[str]] = []
+
+    def runner(argv):
+        argv = list(argv)
+        if argv[0] == "nix" and "build" in argv:
+            return b"", b"", 0
+        # the drv-input-closure query for the deep drv
+        if argv[:3] == ["nix-store", "--query", "--requisites"] and argv[3:] == ["/nix/store/native.drv"]:
+            return b"/nix/store/native.drv\n/nix/store/xgcc.drv\n/nix/store/stage2.drv\n", b"", 0
+        if argv[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]:
+            return b"/nix/store/native.drv\n/nix/store/native-out\n", b"", 0
+        if argv[:2] == ["nix-store", "--realise"]:
+            # distinguish the deep .drv realise from the output realise/root
+            if any(a.endswith(".drv") for a in argv):
+                realise_drv_calls.append(argv)
+            return b"", b"", 0
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    build_toolchains_locally(
+        frozenset({"/nix/store/native.drv"}),
+        gcroot_dir=str(tmp_path / "roots"),
+        deep_realise_drvs=frozenset({"/nix/store/native.drv"}),
+        run_subprocess=runner,
+    )
+    # the input .drv closure (xgcc.drv, stage2.drv, native.drv) was realised
+    assert len(realise_drv_calls) == 1
+    realised = [a for a in realise_drv_calls[0] if a.endswith(".drv")]
+    assert set(realised) == {
+        "/nix/store/native.drv", "/nix/store/xgcc.drv", "/nix/store/stage2.drv",
+    }
+
+
+def test_build_toolchains_locally_realises_without_root_when_no_gcroot_dir():
+    realise_calls: list[list[str]] = []
+
+    def runner(argv):
+        argv = list(argv)
+        if argv[0] == "nix" and "build" in argv:
+            return b"", b"", 0
+        if argv[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]:
+            return b"/nix/store/aaa.drv\n/nix/store/o1-stdenv\n", b"", 0
+        if argv[:2] == ["nix-store", "--realise"]:
+            realise_calls.append(argv)
+            return b"", b"", 0
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    build_toolchains_locally(
+        frozenset({"/nix/store/aaa.drv"}), run_subprocess=runner,
+    )
+    assert len(realise_calls) == 1
+    # realised but NOT rooted (no gcroot_dir supplied)
+    assert "--add-root" not in realise_calls[0]
+
+
+def test_build_toolchains_locally_raises_preflight_error_on_build_failure():
+    def runner(argv):
+        if list(argv)[0] == "nix" and "build" in argv:
+            return b"", b"compilation failed: missing /lib/foo\n", 1
+        return b"", b"", 0
 
     with pytest.raises(PreflightError, match="rc=1"):
         build_toolchains_locally(
@@ -682,24 +802,40 @@ def test_build_toolchains_locally_raises_preflight_error_on_failure():
         )
 
 
-def test_build_toolchains_locally_stops_at_first_failure():
-    """Once one build fails, the helper raises immediately — the
-    rest of the queue is implicitly abandoned because the operator
-    needs to investigate the first failure before continuing."""
+def test_build_toolchains_locally_raises_on_realise_failure(tmp_path):
+    """A realise failure (e.g. unsubstitutable bootstrap path) is fatal — never
+    proceed to ship a partial closure."""
+    def runner(argv):
+        argv = list(argv)
+        if argv[0] == "nix" and "build" in argv:
+            return b"", b"", 0
+        if argv[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]:
+            return b"/nix/store/aaa.drv\n/nix/store/o1-stdenv\n", b"", 0
+        if argv[:2] == ["nix-store", "--realise"]:
+            return b"", b"error: path '/nix/store/o1-stdenv' is not valid\n", 1
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    with pytest.raises(PreflightError, match="realise/root failed"):
+        build_toolchains_locally(
+            frozenset({"/nix/store/aaa.drv"}),
+            gcroot_dir=str(tmp_path / "roots"),
+            run_subprocess=runner,
+        )
+
+
+def test_build_toolchains_locally_stops_at_first_build_failure():
+    """Once one build fails, the helper raises immediately (no query/realise)."""
     calls: list[list[str]] = []
 
     def runner(argv):
         calls.append(list(argv))
-        # First drv fails; second would succeed if we got there.
-        if calls and len(calls) == 1:
-            return b"", b"boom\n", 1
-        return b"", b"", 0
+        return b"", b"boom\n", 1
 
-    # ``sorted`` order matters: the helper iterates sorted(drv_set).
     drvs = frozenset({"/nix/store/aaa.drv", "/nix/store/bbb.drv"})
     with pytest.raises(PreflightError):
         build_toolchains_locally(drvs, run_subprocess=runner)
     assert len(calls) == 1
+    assert calls[0][0] == "nix"  # failed at the build step
 
 
 
@@ -723,14 +859,14 @@ def test_enumerate_variants_returns_metadata_only():
     assert set(result.keys()) == {"hello", "busybox"}
 
     hello = result["hello"]
-    assert set(hello) == {"archs", "sample_size", "sample_seed", "tier"}
+    assert set(hello) == {"archs", "sample_size", "sample_seed", "tier", "skipped_targets", *RELEASE_FIELDS}
     assert sorted(hello["archs"]) == ["aarch64", "x86_64"]
     assert hello["sample_size"] == 3
     assert hello["sample_seed"] == "alpha"
     assert hello["tier"] == 1
 
     busybox = result["busybox"]
-    assert set(busybox) == {"archs", "sample_size", "sample_seed", "tier"}
+    assert set(busybox) == {"archs", "sample_size", "sample_seed", "tier", "skipped_targets", *RELEASE_FIELDS}
     assert busybox["archs"] == ["x86_64"]
     assert busybox["sample_size"] == 3
     assert busybox["sample_seed"] == "alpha"
@@ -1306,6 +1442,251 @@ def test_compute_toolchain_split_single_toolchain() -> None:
     split = compute_toolchain_split(list(closures), run_subprocess=runner)
     assert split.common_paths == frozenset({"/nix/store/only", "/nix/store/dep"})
     assert split.delta_paths["/nix/store/only"] == ()
+
+
+def test_compute_toolchain_split_uses_build_closure_when_deriver_resolves() -> None:
+    """When the realised outpath's deriver resolves, the split walks the
+    toolchain's BUILD closure (--include-outputs of the drv, re-closed via
+    --requisites) so the build-time tools the node needs to build with the
+    cross-stdenv (setup hooks, patchelf) are shipped — NOT just the stdenv
+    OUTPUT runtime closure (which omits them and caused offline cross builds
+    to try to BUILD patchelf/setup-hook)."""
+    out = "/nix/store/aaa-stdenv-linux"
+    drv = "/nix/store/aaa-stdenv-linux.drv"
+    build_closure_outputs = [
+        out, "/nix/store/hook-setup-hook", "/nix/store/patchelf-0.15.0",
+    ]
+
+    def runner(argv):
+        if argv[:4] == ["nix-store", "--query", "--deriver", out]:
+            return (drv + "\n").encode(), b"", 0
+        if argv[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]:
+            # drv build closure = the build-dep drvs + their OUTPUT paths.
+            paths = [
+                drv, "/nix/store/hook-setup-hook.drv",
+                "/nix/store/patchelf-0.15.0.drv",
+                *build_closure_outputs,
+            ]
+            return ("\n".join(paths)).encode() + b"\n", b"", 0
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            # re-close over the build-closure outputs (topological order).
+            return ("\n".join(build_closure_outputs)).encode() + b"\n", b"", 0
+        return b"", b"unexpected call", 1
+
+    split = compute_toolchain_split([out], run_subprocess=runner)
+    # Single toolchain -> COMMON is its full closure; it MUST carry the
+    # build-time hooks/patchelf, not only the stdenv output.
+    assert "/nix/store/hook-setup-hook" in split.common_paths
+    assert "/nix/store/patchelf-0.15.0" in split.common_paths
+
+
+def test_compute_toolchain_split_fails_loud_on_unrealized_build_closure() -> None:
+    """If the deriver resolves (build closure is KNOWN) but an --include-outputs
+    path is UNREALIZED, the requisites re-query fails — the split must RAISE,
+    not silently fall back to the output-only closure (which would omit the
+    bootstrap and make every substituter-free build fail 'import did not
+    land'). This is the regression that build_toolchains_locally's realise+root
+    prevents; the split is the belt-and-suspenders guard."""
+    out = "/nix/store/aaa-stdenv-linux"
+    drv = "/nix/store/aaa-stdenv-linux.drv"
+
+    def runner(argv):
+        if argv[:4] == ["nix-store", "--query", "--deriver", out]:
+            return (drv + "\n").encode(), b"", 0
+        if argv[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]:
+            return (
+                f"{drv}\n/nix/store/xgcc.drv\n{out}\n/nix/store/xgcc-out\n"
+            ).encode(), b"", 0
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            # the bootstrap output is UNREALIZED → requisites fails
+            return b"", b"error: path '/nix/store/xgcc-out' is not valid\n", 1
+        return b"", b"unexpected call", 1
+
+    with pytest.raises(RuntimeError, match="UNREALIZED"):
+        compute_toolchain_split([out], run_subprocess=runner)
+
+
+def test_compute_toolchain_split_force_common_ships_native_closure() -> None:
+    """GAP#2: force_common_outpaths (the native build-host stdenv) has its full
+    --include-outputs build closure force-added to COMMON even when those paths
+    are freq=1 (in no toolchain closure) — so they land via the always-imported
+    common gate, not an undeclared per-toolchain delta."""
+    tc_closures = {
+        "/nix/store/aaa-tc": ["/nix/store/aaa-tc", "/nix/store/shared"],
+        "/nix/store/bbb-tc": ["/nix/store/bbb-tc", "/nix/store/shared"],
+    }
+    native_out = "/nix/store/native-stdenv"
+    native_drv = "/nix/store/native-stdenv.drv"
+    native_bc = [native_out, "/nix/store/native-xgcc", "/nix/store/native-binutils"]
+
+    def runner(argv):
+        argv = list(argv)
+        if argv[:3] == ["nix-store", "--query", "--deriver"]:
+            # native stdenv has a known deriver (uses the build closure path);
+            # the toolchains are legacy/resident (unknown deriver -> fallback).
+            return (
+                (native_drv + "\n").encode() if argv[-1] == native_out
+                else b"unknown-deriver\n"
+            ), b"", 0
+        if argv[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]:
+            return ("\n".join([native_drv, "/nix/store/native-xgcc.drv", *native_bc])
+                    + "\n").encode(), b"", 0
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            tgt = argv[-1]
+            if tgt in tc_closures:
+                return ("\n".join(tc_closures[tgt]) + "\n").encode(), b"", 0
+            return ("\n".join(native_bc) + "\n").encode(), b"", 0
+        return b"", b"unexpected", 1
+
+    split = compute_toolchain_split(
+        list(tc_closures),
+        force_common_outpaths=[native_out],
+        run_subprocess=runner,
+    )
+    # the native build-host closure (freq=1) is force-added to COMMON...
+    assert "/nix/store/native-xgcc" in split.common_paths
+    assert "/nix/store/native-binutils" in split.common_paths
+    assert "/nix/store/native-stdenv" in split.common_paths
+    # ...the normal freq>=2 path stays common...
+    assert "/nix/store/shared" in split.common_paths
+    # ...and the native paths are NOT in any delta.
+    for d in split.delta_paths.values():
+        assert "/nix/store/native-xgcc" not in d
+
+
+def test_compute_toolchain_split_force_common_subtracts_baseline() -> None:
+    """force-common paths already in the image baseline are NOT re-shipped."""
+    tc_closures = {"/nix/store/aaa-tc": ["/nix/store/aaa-tc"]}
+    native_out = "/nix/store/native-stdenv"
+
+    def runner(argv):
+        argv = list(argv)
+        if argv[:3] == ["nix-store", "--query", "--deriver"]:
+            return (b"/nix/store/native-stdenv.drv\n" if argv[-1] == native_out
+                    else b"unknown-deriver\n"), b"", 0
+        if argv[:4] == ["nix-store", "--query", "--requisites", "--include-outputs"]:
+            return b"/nix/store/native-stdenv.drv\n/nix/store/native-stdenv\n/nix/store/resident\n/nix/store/fresh\n", b"", 0
+        if argv[:3] == ["nix-store", "--query", "--requisites"]:
+            if argv[-1] == "/nix/store/aaa-tc":
+                return b"/nix/store/aaa-tc\n", b"", 0
+            return b"/nix/store/native-stdenv\n/nix/store/resident\n/nix/store/fresh\n", b"", 0
+        return b"", b"unexpected", 1
+
+    split = compute_toolchain_split(
+        list(tc_closures),
+        baseline_paths=frozenset({"/nix/store/resident"}),
+        force_common_outpaths=[native_out],
+        run_subprocess=runner,
+    )
+    assert "/nix/store/fresh" in split.common_paths       # non-resident -> ships
+    assert "/nix/store/resident" not in split.common_paths  # baseline -> subtracted
+
+
+def test_eval_native_build_host_stdenvs_dedups_across_archs() -> None:
+    """The native build-host stdenv is the build platform's own stdenv (same
+    for every cross target) → multi-arch eval dedups to one drv/outpath."""
+    from compiler_suit_runner.preflight import eval_native_build_host_stdenvs
+
+    def runner(argv):
+        argv = list(argv)
+        attr = argv[-1]
+        if attr.endswith(".drvPath"):
+            return b"/nix/store/zzz-stdenv-linux.drv", b"", 0
+        if attr.endswith(".outPath"):
+            return b"/nix/store/yyy-stdenv-linux", b"", 0
+        return b"", b"unexpected", 1
+
+    drvs, outs = eval_native_build_host_stdenvs(
+        ".", "x86_64-linux", ["aarch64", "riscv64"], run_subprocess=runner,
+    )
+    assert drvs == ["/nix/store/zzz-stdenv-linux.drv"]
+    assert outs == ["/nix/store/yyy-stdenv-linux"]
+
+
+def test_eval_build_host_tools_returns_drv_and_outpath() -> None:
+    from compiler_suit_runner.preflight import eval_build_host_tools
+
+    def runner(argv):
+        attr = list(argv)[-1]
+        if attr.endswith(".drvPath"):
+            return b"/nix/store/bht-build-host-tools.drv", b"", 0
+        if attr.endswith(".outPath"):
+            return b"/nix/store/bht-build-host-tools", b"", 0
+        return b"", b"unexpected", 1
+
+    drv, out = eval_build_host_tools(".", "x86_64-linux", run_subprocess=runner)
+    assert drv == "/nix/store/bht-build-host-tools.drv"
+    assert out == "/nix/store/bht-build-host-tools"
+
+
+def test_eval_build_host_tools_returns_none_on_failure() -> None:
+    from compiler_suit_runner.preflight import eval_build_host_tools
+
+    def runner(_argv):
+        return b"", b"error: attribute '_buildHostTools' missing", 1
+
+    drv, out = eval_build_host_tools(".", "x86_64-linux", run_subprocess=runner)
+    assert drv is None and out is None
+
+
+def test_eval_native_build_host_stdenvs_skips_failed_arch() -> None:
+    from compiler_suit_runner.preflight import eval_native_build_host_stdenvs
+
+    def runner(argv):
+        argv = list(argv)
+        attr = argv[-1]
+        if "aarch64" in attr:
+            if attr.endswith(".drvPath"):
+                return b"/nix/store/a-stdenv.drv", b"", 0
+            return b"/nix/store/a-out", b"", 0
+        return b"", b"error: attribute missing", 1  # riscv64 eval fails
+
+    drvs, outs = eval_native_build_host_stdenvs(
+        ".", "x86_64-linux", ["aarch64", "riscv64"], run_subprocess=runner,
+    )
+    assert drvs == ["/nix/store/a-stdenv.drv"]  # failed arch skipped, not fatal
+    assert outs == ["/nix/store/a-out"]
+
+
+def test_compute_toolchain_split_subtracts_native_baseline() -> None:
+    """baseline_paths (the native std-compiler stdenv closure, resident on
+    every node via the image) is subtracted from each toolchain closure so
+    only the cross-specific delta ships; a toolchain whose closure is
+    ENTIRELY baseline (the x86_64-native toolchain) is skipped (no archive)."""
+    closures = {
+        "/nix/store/aaa-cross": [
+            "/nix/store/aaa-cross", "/nix/store/bash", "/nix/store/cross-gcc",
+        ],
+        "/nix/store/bbb-native": ["/nix/store/bash", "/nix/store/coreutils"],
+    }
+    baseline = frozenset({"/nix/store/bash", "/nix/store/coreutils"})
+    runner = _make_split_runner(closures)
+    split = compute_toolchain_split(
+        list(closures), baseline_paths=baseline, run_subprocess=runner,
+    )
+    shipped = set(split.common_paths) | {
+        p for d in split.delta_paths.values() for p in d
+    }
+    # Native baseline subtracted from what ships...
+    assert "/nix/store/bash" not in shipped
+    assert "/nix/store/coreutils" not in shipped
+    # ...cross-specific paths still ship.
+    assert "/nix/store/cross-gcc" in shipped
+    assert "/nix/store/aaa-cross" in shipped
+    # The entirely-baseline native toolchain produced no delta (skipped).
+    assert "/nix/store/bbb-native" not in split.delta_paths
+
+
+def test_compute_toolchain_split_no_baseline_ships_everything() -> None:
+    """Without baseline_paths (default), nothing is subtracted — the full
+    closures ship (byte-identical to pre-baseline behaviour)."""
+    closures = {
+        "/nix/store/aaa": ["/nix/store/aaa", "/nix/store/bash"],
+        "/nix/store/bbb": ["/nix/store/bbb", "/nix/store/bash"],
+    }
+    runner = _make_split_runner(closures)
+    split = compute_toolchain_split(list(closures), run_subprocess=runner)
+    assert "/nix/store/bash" in split.common_paths  # shared, not subtracted
 
 
 def test_compute_toolchain_split_raises_on_empty_paths() -> None:

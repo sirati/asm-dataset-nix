@@ -56,6 +56,7 @@ from enum import StrEnum
 from typing import Literal, Optional
 
 from compiler_suit_runner.partition import VariantSpec
+from compiler_suit_runner.package_selection import nix_attr_path
 
 
 # ---------------------------------------------------------------------------
@@ -251,11 +252,15 @@ def variant_task_id(variant: VariantSpec, sys_name: str) -> str:
     """Stable id for a build_variant task. Embeds the binary (``pkg``)
     in the id alongside ``sys_name`` and the full variant label so the
     namespacing matches the dependency_graph_planner's
-    ``build_variant__<sys>__<binary>__<label>`` shape one-to-one. The
-    label already encodes arch + compiler + every flag axis so the
-    overall id is unique per dispatch.
+    shared helper includes architecture even for suffix-only labels. New
+    records also include the resolved package identity, so a moving default
+    alias or revised recipe cannot retain the old task identity.
     """
-    return f"build_variant__{sys_name}__{variant['pkg']}__{variant['label']}"
+    from .package_selection import build_variant_task_id
+    suffix = "__capture_v2" if variant.get("compiler_capture") is not None else ""
+    return build_variant_task_id(
+        sys_name, variant["pkg"], variant["arch"], variant["label"], variant.get("packageIdentity"),
+    ) + suffix
 
 
 def matrix_eval_task_id(binary: str) -> str:
@@ -297,6 +302,8 @@ def make_matrix_eval_header(
     variant_sample: Optional[int] = None,
     variant_seed: Optional[str] = None,
     toolchain_dedup: bool = True,
+    compiler_capture: bool = False,
+    package_metadata: Optional[dict] = None,
 ) -> ManifestHeader:
     """Build a matrix_eval (distributed-eval) :class:`ManifestHeader`.
 
@@ -341,7 +348,7 @@ def make_matrix_eval_header(
         "binary": binary,
         "sys": sys_name,
         "archs": archs_list,
-        "attr": f"dataset.{sys_name}.{binary}",
+        "attr": nix_attr_path("datasetCaptured" if compiler_capture else "dataset", sys_name, binary),
         "toolchain_aggregate_drv": toolchain_aggregate_drv,
         # Toolchain-dedup feature flag (default ON). When True the eval
         # worker exports only ``requisites(matrix) − requisites(toolchain)``
@@ -350,8 +357,16 @@ def make_matrix_eval_header(
         # first by every consumer regardless, so this is the sole rollback.
         "toolchain_dedup": bool(toolchain_dedup),
     }
+    if package_metadata:
+        from .package_selection import release_metadata
+        payload.update(release_metadata(package_metadata))
+        if package_metadata.get("variant_inventory_schema") == 1:
+            payload["variant_inventory_schema"] = 1
+            payload["variant_inventory_identity"] = package_metadata["variant_inventory_identity"]
     if variant_sample is not None:
         payload["variant_sample"] = variant_sample
+    if compiler_capture:
+        payload["compiler_capture"] = True
     if variant_seed is not None:
         payload["variant_seed"] = variant_seed
     return ManifestHeader(
@@ -369,6 +384,7 @@ def make_build_compilers_header(
     arch: str,
     compiler_label: str,
     drv: str | None = None,
+    *, compiler_capture: bool = False,
 ) -> ManifestHeader:
     """Build a build_compilers cross-toolchain manifest.
 
@@ -381,7 +397,7 @@ def make_build_compilers_header(
         "sys": sys_name,
         "arch": arch,
         "compiler_label": compiler_label,
-        "attr": f"_crossToolchainMap.{sys_name}.{arch}.{compiler_label}",
+        "attr": f"{'_capturedCrossToolchainMap' if compiler_capture else '_crossToolchainMap'}.{sys_name}.{arch}.{compiler_label}",
     }
     if drv is not None:
         payload["drv"] = drv
@@ -400,6 +416,7 @@ def make_toolchain_validate_header(
     compiler_label: str,
     drv: str,
     outpath: str | None = None,
+    *, compiler_capture: bool = False,
 ) -> ManifestHeader:
     """Build a toolchain *validate-only* manifest.
 
@@ -424,7 +441,7 @@ def make_toolchain_validate_header(
         "sys": sys_name,
         "arch": arch,
         "compiler_label": compiler_label,
-        "attr": f"_crossToolchainMap.{sys_name}.{arch}.{compiler_label}",
+        "attr": f"{'_capturedCrossToolchainMap' if compiler_capture else '_crossToolchainMap'}.{sys_name}.{arch}.{compiler_label}",
         "drv": drv,
         "validate_only": True,
     }
@@ -524,7 +541,7 @@ def make_build_variant_header(
     arch = variant["arch"]
     label = variant["label"]
     compiler_id = variant["compiler_id"]
-    suffix = _label_to_attr_suffix(label)
+    suffix = variant.get("suffix") or _label_to_attr_suffix(label)
     payload = {
         "sys": sys_name,
         "pkg": pkg,
@@ -542,8 +559,20 @@ def make_build_variant_header(
         "sanitizer": variant.get("sanitizer", ""),
         "march": variant.get("march", ""),
         "tier": variant["tier"],
-        "attr": f"dataset.{sys_name}.{pkg}.{arch}.{suffix}",
+        "attr": f"{'datasetCaptured' if variant.get('compiler_capture') else 'dataset'}.{sys_name}.{pkg}.{arch}.{suffix}",
     }
+    from .package_selection import release_metadata, nix_attr_path, variant_output_names
+    payload.update(release_metadata(variant))
+    payload.update(variant_output_names(variant))
+    for field in ("packageDrv", "packageOutputs", "outputPaths", "compilerCapture"):
+        if field in variant:
+            payload[field] = variant[field]
+    captured = variant.get("compiler_capture") is not None
+    if captured:
+        payload["compiler_capture"] = variant["compiler_capture"]
+    payload["attr"] = nix_attr_path(
+        "datasetCaptured" if captured else "dataset", sys_name, pkg, arch, suffix,
+    )
     if input_drvs and drv_outpaths:
         # Only ship the inputs that we actually have an outpath
         # mapping for; the rest stay implicit (worker falls back to
@@ -633,17 +662,27 @@ def write_manifest(
 def read_manifest(path: pathlib.Path) -> ManifestHeader:
     """Inverse of :func:`write_manifest`.
 
-    Reads the whole file (matrix_eval manifests carry the full
-    per-binary suffix list and can run into the megabytes) and strips
-    any trailing NULs from legacy sparse-padded manifests before
-    parsing.
+    Retains the JSON document and checks legacy NUL padding in bounded
+    chunks. Sparse multi-GiB padding must not become a multi-GiB allocation.
     """
     path = pathlib.Path(path)
-    head = path.read_bytes()
-    # Strip any trailing NULs from legacy sparse-padded manifests so
-    # json.loads sees only the document; harmless for current
-    # non-padded files (no NULs to strip).
-    stripped = head.rstrip(b"\x00").decode("utf-8")
+    head = bytearray()
+    padding = False
+    with path.open("rb") as file:
+        while block := file.read(65536):
+            if padding:
+                if block.strip(b"\x00"):
+                    raise ValueError(f"{path}: non-NUL data follows legacy padding")
+                continue
+            first = block.find(b"\x00")
+            if first < 0:
+                head.extend(block)
+            else:
+                head.extend(block[:first])
+                if block[first:].strip(b"\x00"):
+                    raise ValueError(f"{path}: non-NUL data follows legacy padding")
+                padding = True
+    stripped = head.decode("utf-8")
     parsed = json.loads(stripped)
     if not isinstance(parsed, dict):
         raise ValueError(f"{path}: manifest JSON is not an object")
@@ -750,6 +789,7 @@ def emit_all_manifests(
     toolchain_outpath_placements: Optional[dict[str, list[str]]] = None,
     per_binary_metadata: Optional[dict[str, dict]] = None,
     stages: Optional[list[str]] = None,
+    compiler_capture: bool = False,
 ) -> ManifestSet:
     """Produce one ManifestHeader per JSON-backed queue item; write
     each to disk.
@@ -864,6 +904,7 @@ def emit_all_manifests(
             headers.append(
                 make_build_compilers_header(
                     sys_name, arch, compiler_label, drv=drv,
+                    **({"compiler_capture":True} if compiler_capture else {}),
                 )
             )
         if "toolchain_validate" in active_classes and drv:
@@ -871,6 +912,7 @@ def emit_all_manifests(
                 make_toolchain_validate_header(
                     sys_name, arch, compiler_label, drv,
                     outpath=outpaths_map.get(drv),
+                    **({"compiler_capture":True} if compiler_capture else {}),
                 )
             )
     if "build_common_dep" in active_classes:

@@ -238,17 +238,18 @@ def build_template(
 def _alloc_singleton(
     planner: "StreamPlanner", template: Template,
     label: str, tn: "RawTreeNode",
+    by_ident: dict,
 ) -> int:
-    """Find-or-allocate a singleton template node by extracted name.
+    """Find-or-allocate a singleton node by derivation identity.
     Source-terminal roles fold into ``is_toolchain`` so the walker
     discards their subtrees; counter + ``arch_indep_deps`` recording
     happens once per fresh alloc."""
+    if tn.ident in by_ident:
+        return by_ident[tn.ident]
     name = planner.name_extractor(tn.name)
     is_stdenv = _is_stdenv_role(name)
     if is_stdenv:
         _capture_stdenv(planner, [tn], [label], planner.vb.building_arch)
-    if name in template.name_to_id:
-        return template.name_to_id[name]
     is_src_terminal = _is_source_terminal_role(name)
     if is_src_terminal:
         _record_source_terminal(planner, [tn])
@@ -263,7 +264,8 @@ def _alloc_singleton(
     )
     nid = len(template.nodes)
     template.nodes.append(node)
-    template.name_to_id[name] = nid
+    template.name_to_id.setdefault(name, nid)
+    by_ident[tn.ident] = nid
     return nid
 
 
@@ -277,9 +279,10 @@ def build_template_singleton(
         template_built_from=[label],
     )
     visited: set[int] = set()
+    by_ident: dict = {}
 
     def _walk(tn: "RawTreeNode") -> int:
-        nid = _alloc_singleton(planner, template, label, tn)
+        nid = _alloc_singleton(planner, template, label, tn, by_ident)
         if not tn.is_backref:
             planner.mx.unclassified_nodes.discard(tn.ident)
         if nid in visited:
@@ -288,7 +291,9 @@ def build_template_singleton(
         if template.nodes[nid].is_toolchain:
             planner._discard_subtree(tn)
             return nid
-        for c in tn.children:
+        # Cowalk pairs same-role slots in ident order. Nix tree output is
+        # ordered by reference counts, so preserve that pairing explicitly.
+        for c in sorted(tn.children, key=lambda child: child.ident):
             cid = _walk(c)
             if cid not in template.nodes[nid].child_ids:
                 template.nodes[nid].child_ids.append(cid)

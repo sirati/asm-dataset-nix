@@ -100,8 +100,11 @@ Monitor(command = "cd <repo> && nix develop --no-write-lock-file --command bash 
 **FORBIDDEN:**
 - Backgrounding the dispatch and pointing a SEPARATE `Monitor 'tail -f out.log'` at its log — two moving parts where one suffices; the Monitor must BE the dispatch.
 - Wrapping the dispatch in a babysitter poll-loop (`while/until squeue|sacct|ps …; sleep N; done`), a `timeout`, a `tee`, or any pipe.
+- **Piping the dispatch through `grep`/`awk`/`sed`/any filter to "tame" the event stream.** The Monitor command is the BARE `compiler_suit_runner submit … --important-stdio-only` — nothing after it. `--important-stdio-only` IS the event filter; the operator does not add another. If you find yourself reaching for `| grep`, STOP — see the next bullet.
 - A `squeue`/`sacct` poll-loop Monitor to "watch teardown."
 - Omitting `--important-stdio-only` and monitoring raw verbose stdout — it floods the event stream and the Monitor auto-stops.
+
+**If `--important-stdio-only` itself floods the event stream, that is a FRAMEWORK BUG — report it to `dynrunner-owner`; do NOT add a filter to work around it.** `--important-stdio-only` is contracted to emit only wake-worthy events (secondary connect / `primary changed` / per-phase `phase complete` / `run complete` / failures + the ~10-min summary) — NOT per-task `assigned`/`changed state`/`completed` narration. A known leak (filed 2026-06-15): once a run actually reaches the build phase at any volume, per-task lines leak through `--important-stdio-only` and flood the channel. Until the framework closes that, the BARE Monitor will auto-stop under the flood — and **that is acceptable**: the Monitor auto-stopping does NOT stop the run (the relocated primary keeps going on the compute peer); you simply fall back to the mandated path — **verify by GATEWAY OUTPUT FILES, never the local observer** (see below). Never trade the no-filter rule for a longer-lived local observer; the local observer is not authoritative anyway.
 
 **Verify completion by GATEWAY OUTPUT FILES, never the local exit.** Under the peer overlay the submitter RELOCATES primary authority to a compute peer (`primary changed primary=secondary-N`), becomes an observer, and exits — so the Monitor ending is NOT completion, and the relocated primary's narration no longer reaches the submitter stdout. Therefore:
 - On relocated runs the dispatcher's terminal `run complete: N succeeded` line and the exit accounting can read ALL-ZEROS even on full success. Never rely on them either way.
@@ -117,6 +120,33 @@ ssh kruppb@remote.cip.ifi.lmu.de \
 ```
 
 (For test-env, replace the gateway with `kruppb@localhost -p <SSH_PORT>` and note that `slurmdbd` is disabled — fall back to `squeue` polling.)
+
+## Attaching a late-joiner observer (read-only, mid-run)
+
+Join a LIVE run as a passive peer-mesh observer: it narrates the run from the replicated CRDT and exits on `RunComplete`, runs zero workers, holds no authority, and cannot perturb the run. With `--gateway` set the framework fetches the gateway-side `connection_info` and opens a per-peer `ssh -L` tunnel itself — do NOT hand-roll ssh. The consumer `submit`/`secondary` verbs run a full pre-flight, so drive the framework directly:
+
+```bash
+SSH_AUTH_SOCK=$HOME/.1password/agent.sock \
+nix develop --no-write-lock-file --command bash -c '
+  cd /home/sirati/devel/nix/asm-dataset-nix
+  PYTHONPATH=python python - <<PY
+from dynamic_runner.cli import build_arg_parser, validate_parsed_args
+from dynamic_runner.run import run
+p = build_arg_parser("late-joiner observer")
+ns = p.parse_args([
+    "--observer-join-from-peer-info-dir",
+    "/home/k/kruppb/BIG/slurm/gen-binary-dataset/log/run_<TS>/connection_info",
+    "--gateway", "ssh://kruppb@remote.cip.ifi.lmu.de",
+])
+validate_parsed_args(ns, p)
+run(object(), args=ns)   # task is ignored: a late-joiner runs zero workers
+PY
+'
+```
+
+- `--observer-join-from-peer-info-dir` is the GATEWAY-SIDE `<slurm-root>/log/run_<TS>/connection_info` path AS-IS; with a remote `--gateway` the framework scp's the v2 `*.info` files and dials each recorded peer over its own `ssh -L` local-forward (nothing runs on the gateway).
+- LMU auth is the 1Password agent (`SSH_AUTH_SOCK`); do NOT pass `--ssh-identity-file` (LMU). Test-env: add `--ssh-identity-file /tmp/<key> --ssh-config /tmp/<cfg>`, or use a LOCAL `connection_info` path with `--gateway local` for direct dial.
+- Run it inside tmux (`tmux new-session -d -s asm-observer '<cmd>'`; attach with `tmux attach -t asm-observer`). `SIGUSR2` to the process = graceful abort (stop scheduling, drain, relocate, clean finish).
 
 ## Inspecting a running secondary
 

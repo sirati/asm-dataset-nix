@@ -515,3 +515,13 @@ pkgs.dockerTools.buildLayeredImage {
     WorkingDir = "/app";
   };
 }
+// {
+  # The store paths actually baked into the image rootfs, exposed so the
+  # submitter can subtract the EXACT resident-on-every-node closure as the
+  # STEP-2 toolchain-archive baseline (cli._compute_baseline_paths reads
+  # $out/nix-support/registration). Computed from the SAME runnerPkgs that
+  # build the image, so it never strands a path the way subtracting a
+  # separately-evaluated stdenv closure can — under any hash divergence it
+  # safely subtracts less (ships more), never more.
+  inherit storeDbRegistration;
+}

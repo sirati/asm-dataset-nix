@@ -65,6 +65,7 @@ __all__ = [
     "ensure_toolchain_out_archive_imported",
     "ensure_build_deps_archive_imported",
     "ensure_common_dep_out_archive_imported",
+    "_run_affine_import",
 ]
 
 
@@ -287,6 +288,7 @@ class BuildWorkerEnv:
     # are only paid when this is set. Wired from the ``--no-substituters``
     # consumer flag (see :func:`main`).
     no_substituters: bool = False
+    dataset_resume_dir: Optional[pathlib.Path] = None
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +625,24 @@ def _parse_dry_run_paths(stderr: bytes) -> tuple[list[str], list[str]]:
     return to_build, to_fetch
 
 
+def _is_variant_own_drv(path: str) -> bool:
+    """True iff ``path`` is one of a build_variant's OWN novel derivations.
+
+    In substituter-free mode the only things nix may legitimately build for
+    a ``build_variant`` task are the variant package itself and its
+    elf-folder wrapper — every other store path in the build closure
+    (toolchain, stdenv bootstrap, common_deps, build-deps, FOD sources) is
+    delivered by an affine import gate and must already be resident. Those
+    two own derivations carry our naming markers ``-variant-`` (the per-
+    variant package from ``mkVariant``) and ``-elf-folder`` (the binary-
+    folder wrapper); nothing else in the closure uses them. Used by
+    :func:`assert_no_substitute` to flag any OTHER to-build path so the
+    build is cancelled rather than re-deriving the toolchain offline.
+    """
+    name = path.rsplit("/", 1)[-1]
+    return "-variant" in name or "-elf-folder" in name
+
+
 def _required_present_paths(item_class: str, payload: dict) -> set[str]:
     """Store paths that MUST be locally present before this build runs.
 
@@ -729,6 +749,23 @@ def assert_no_substitute(
     # Any required path appearing in to-build OR to-fetch is a violation.
     planned = set(to_build) | set(to_fetch)
     offenders = sorted(required & planned)
+
+    # Decisive invariant for build_variant (Deliverable 2): the to-BUILD
+    # set must be ONLY the variant's OWN novel derivation(s) — the
+    # ``-variant-`` package and its ``-elf-folder`` wrapper. ANY other
+    # to-build .drv is a toolchain / dependency closure path that must
+    # have been delivered by an affine import gate; the declared
+    # ``required`` set only names the TOP-LEVEL imported paths (toolchain
+    # output, aggregate drv, declared inputs), so a TRANSITIVE closure
+    # path (bootstrap-stage*-stdenv-linux, texinfo, curl, …) that the
+    # import did not land would otherwise slip past ``required & planned``
+    # and let nix re-derive the ENTIRE cross-stdenv from source offline
+    # (multi-hour; defeats the whole import). Flag every non-own to-build
+    # path so the build is CANCELLED (recoverable) rather than rebuilding
+    # the toolchain.
+    if item_class == ITEM_CLASS_BUILD_VARIANT:
+        rebuilt_deps = [p for p in to_build if not _is_variant_own_drv(p)]
+        offenders = sorted(set(offenders) | set(rebuilt_deps))
 
     # Additionally, in substituter-free mode NOTHING should ever be
     # "fetched" (there is no substituter). A non-empty to-fetch set that
@@ -1023,6 +1060,25 @@ def _maybe_record_self_has(
             pass
 
 
+# Gateway-visible per-run directory for failed-task logs (the
+# container's bind-mount of ``<slurm_root>/log/<run_id>``).
+_BUILD_FAILURES_DIR = pathlib.Path("/app/log-network/build-failures")
+
+
+def _failure_log_key(manifest_path: pathlib.Path, name: str) -> str:
+    """File stem for this task's ``build-failures/`` log.
+
+    The framework hands a streamed task the synthetic path
+    ``<task_id>.json``, so the stem is the task id, which is unique. The
+    header ``name`` is not (two flex drvs share a name) and the directory
+    is shared by every secondary, so keying on it let failures overwrite
+    each other. Falls back to ``name`` for inline manifests.
+    """
+    if manifest_path.suffix == ".json" and manifest_path.stem:
+        return manifest_path.stem
+    return name
+
+
 def _validate_toolchain(
     payload: dict,
     env: BuildWorkerEnv,
@@ -1031,6 +1087,7 @@ def _validate_toolchain(
     name: str,
     start: float,
     clock: Callable[[], float],
+    log_key: Optional[str] = None,
 ) -> BuildWorkerResult:
     """Handle a ``toolchain_validate`` item: fetch instead of build.
 
@@ -1115,9 +1172,9 @@ def _validate_toolchain(
         # Only on failure: drop a diag log next to the build-failures
         # so an operator can see exactly which candidate(s) refused.
         try:
-            log_dir = pathlib.Path("/app/log-network/build-failures")
+            log_dir = _BUILD_FAILURES_DIR
             log_dir.mkdir(parents=True, exist_ok=True)
-            diag_path = log_dir / f"{name}.validate-diag.log"
+            diag_path = log_dir / f"{log_key or name}.validate-diag.log"
             candidate_set = placements.get(outpath, set())
             with diag_path.open("w", encoding="utf-8") as f:
                 f.write(
@@ -1365,13 +1422,15 @@ def ensure_common_archive_imported(
         return
     if _common_archive_imported:
         return
-    _common_archive_imported = True
     from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
     archive_path = matrix_eval_out_dir / _preflight.TOOLCHAIN_COMMON_ARCHIVE_NAME
     _import_archive_hard(
         archive_path, _preflight.TOOLCHAIN_COMMON_ARCHIVE_NAME,
         run_subprocess=run_subprocess,
     )
+    # Record success only after the import returned: a failed import must
+    # leave the guard clear so a retried gate on this worker imports again.
+    _common_archive_imported = True
 
 
 def ensure_build_deps_archive_imported(
@@ -1402,13 +1461,13 @@ def ensure_build_deps_archive_imported(
         return
     if _build_deps_archive_imported:
         return
-    _build_deps_archive_imported = True
     from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
     archive_path = matrix_eval_out_dir / _preflight.BUILD_DEPS_ARCHIVE_NAME
     _import_archive_hard(
         archive_path, _preflight.BUILD_DEPS_ARCHIVE_NAME,
         run_subprocess=run_subprocess,
     )
+    _build_deps_archive_imported = True
 
 
 def ensure_toolchain_out_archive_imported(
@@ -1441,13 +1500,41 @@ def ensure_toolchain_out_archive_imported(
         return
     if tc_id in _imported_toolchain_out_paths:
         return
-    _imported_toolchain_out_paths.add(tc_id)
     archive_name = f"toolchains.{tc_id}.out.archive"
     archive_path = matrix_eval_out_dir / archive_name
+    # ALL-BASELINE TOLERANCE: compute_toolchain_split ships NO per-toolchain
+    # delta when the toolchain's whole build closure is already in the
+    # image-resident baseline (the cross-delta is empty → the split skips it,
+    # so only N-1 of N archives are uploaded). Such a toolchain's output is
+    # therefore already present on every node via the image, so an ABSENT
+    # archive here is EXPECTED — not a failed upload. Tolerate it iff the
+    # toolchain output (`/nix/store/<tc_id>-stdenv-linux`) is resident;
+    # otherwise fall through to _import_archive_hard which raises (a genuine
+    # missing-upload of a non-baseline toolchain). Without this, the absent
+    # all-baseline archive raises NonRecoverable → the import gate cascade-
+    # poisons the node and every dependent build strands.
+    if not archive_path.exists():
+        from compiler_suit_runner.workers.dependency_graph_worker import (  # noqa: PLC0415
+            archive as _dg_archive,
+        )
+        tc_outpath = f"/nix/store/{tc_id}-stdenv-linux"
+        if _dg_archive.is_path_locally_present(
+            tc_outpath, run_subprocess=run_subprocess
+        ):
+            logging.getLogger(
+                "compiler_suit_runner.build_worker.archive_import"
+            ).info(
+                "toolchain %s delta archive absent but output %s resident "
+                "(all-baseline — closure entirely in the image baseline); "
+                "skipping import", tc_id, tc_outpath,
+            )
+            _imported_toolchain_out_paths.add(tc_id)
+            return
     _import_archive_hard(
         archive_path, archive_name,
         run_subprocess=run_subprocess,
     )
+    _imported_toolchain_out_paths.add(tc_id)
 
 
 # Per-process set of common-dep ids whose published OUTPUT archive has
@@ -1506,7 +1593,6 @@ def ensure_common_dep_out_archive_imported(
         ):
             _imported_common_dep_out_ids.add(cd_id)
             return
-    _imported_common_dep_out_ids.add(cd_id)
     from compiler_suit_runner import preflight as _preflight  # noqa: PLC0415
     archive_name = _preflight.common_dep_archive_name(cd_id)
     archive_path = (
@@ -1515,6 +1601,116 @@ def ensure_common_dep_out_archive_imported(
     _import_archive_hard(
         archive_path, archive_name, run_subprocess=run_subprocess,
     )
+    _imported_common_dep_out_ids.add(cd_id)
+
+
+NIX_DAEMON_UP_TASK_ID = "nix_daemon_up"
+_NIX_DAEMON_SOCKET_DEFAULT = "/nix/var/nix/daemon-socket/socket"
+_NIX_DAEMON_UP_TIMEOUT_S = 30.0
+
+
+def _nix_daemon_socket_path() -> str:
+    """The per-node nix-daemon socket path (override via env for tests)."""
+    return os.environ.get(
+        "NIX_DAEMON_SOCKET_PATH", _NIX_DAEMON_SOCKET_DEFAULT
+    )
+
+
+def _wait_for_nix_daemon(
+    timeout: float = _NIX_DAEMON_UP_TIMEOUT_S,
+    *,
+    poll_interval: float = 0.5,
+    socket_path: Optional[str] = None,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> None:
+    """Block until the per-node nix-daemon is accepting connections.
+
+    ``matrix_eval`` is the FIRST nix command a freshly-connected secondary
+    runs; on a fast (cached-image) start the daemon socket may not exist
+    yet, so ``nix eval`` fails with "cannot connect to socket at
+    '/nix/var/nix/daemon-socket/socket'". This is the body of the
+    per-secondary ``nix_daemon_up`` gate: it polls for the socket AND a
+    successful ``AF_UNIX`` connect (socket existence alone doesn't prove the
+    daemon is listening) up to ``timeout`` seconds. Returns once ready.
+    Raises :class:`OSError` on timeout — the caller maps that to a
+    :class:`RecoverableError` so the gate is re-dispatched and waits again;
+    30 s comfortably outlasts the observed ~10 s startup.
+    """
+    import socket as _socket  # noqa: PLC0415
+
+    path = socket_path or _nix_daemon_socket_path()
+    deadline = monotonic() + timeout
+    last_err: Optional[Exception] = None
+    while True:
+        if os.path.exists(path):
+            probe = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            try:
+                probe.settimeout(2.0)
+                probe.connect(path)
+                return  # daemon is listening
+            except OSError as exc:
+                last_err = exc
+            finally:
+                probe.close()
+        if monotonic() >= deadline:
+            raise OSError(
+                f"nix-daemon socket {path!r} not ready after {timeout:.0f}s"
+                + (f": {last_err}" if last_err is not None else " (absent)")
+            )
+        sleep(poll_interval)
+
+
+def _run_affine_import(
+    gate_task_id: str,
+    matrix_eval_out_dir: pathlib.Path,
+) -> None:
+    """Execute a secondary-affine import gate in the WORKER subprocess.
+
+    Mirrors the dispatch of the legacy
+    ``suit_task.SuitTask.import_action`` callback (which ran on the
+    secondary's single-threaded oploop) — keyed on the gate task id — but
+    runs HERE in the worker subprocess so the multi-GB ``nix-store
+    --import`` never blocks the secondary's event loop (#577: affine
+    bodies run on a worker, not the secondary thread).
+
+    The six gate-id forms match ``suit_task``'s ``IMPORT_*`` constants;
+    they are string literals here to avoid a ``build_worker`` →
+    ``suit_task`` import cycle (a divergence would be caught by
+    ``tests/test_build_worker`` which asserts the two stay in lock-step).
+
+    Raises:
+      * :class:`ValueError` — an unrecognised gate id (caller maps to a
+        non-recoverable error).
+      * Whatever the underlying ``ensure_*_imported`` helper raises on a
+        genuine archive miss (``OSError`` is transient/retry per
+        ``import_action``'s contract; anything else is non-recoverable).
+    """
+    if gate_task_id == NIX_DAEMON_UP_TASK_ID:
+        # Per-secondary daemon-readiness barrier — NOT an import. Runs once
+        # per node before any nix-using task so the first nix command does
+        # not race a not-yet-started nix-daemon (the matrix_eval abort).
+        _wait_for_nix_daemon()
+        return
+    if gate_task_id == "import_common":
+        ensure_common_archive_imported(matrix_eval_out_dir)
+    elif gate_task_id == "import_build_deps":
+        ensure_build_deps_archive_imported(matrix_eval_out_dir)
+    elif gate_task_id == "import_toolchain_drv":
+        ensure_toolchain_archive_imported(matrix_eval_out_dir)
+    elif gate_task_id.startswith("import_common_dep_"):
+        cd_id = gate_task_id[len("import_common_dep_"):]
+        ensure_common_dep_out_archive_imported(cd_id, matrix_eval_out_dir)
+    elif gate_task_id.startswith("import_matrix_drv_"):
+        binary = gate_task_id[len("import_matrix_drv_"):]
+        ensure_binary_archive_imported(binary, matrix_eval_out_dir)
+    elif gate_task_id.startswith("import_tc_"):
+        tc_id = gate_task_id[len("import_tc_"):]
+        ensure_toolchain_out_archive_imported(tc_id, matrix_eval_out_dir)
+    else:
+        raise ValueError(
+            f"affine_import: unknown gate task id {gate_task_id!r}"
+        )
 
 
 def _publish_common_dep_archive(
@@ -1633,7 +1829,7 @@ def _run_import_prelude(
 
     All archive imports that were once per-worker-process are now handled
     ONCE PER SECONDARY NODE by the framework's secondary-affine import gate
-    mechanism (``SuitTask.import_action``):
+    mechanism (``affine_import_worker``, #577):
 
     * ``toolchains.common.archive``          → ``import_common`` gate
     * ``toolchains.<hash>.out.archive``      → ``import_tc_<hash>`` gate
@@ -1642,19 +1838,20 @@ def _run_import_prelude(
     * ``build_deps.out.archive`` (optional)  → ``import_build_deps`` gate
 
     This function is therefore a no-op for the default case where
-    ``matrix_eval_out_dir`` is set and the framework fires the gate actions
-    before any dependent build task runs.  The function is kept so that
-    legacy flows (``matrix_eval_out_dir=None``, unit tests that bypass gates)
-    continue to build correctly: each ``ensure_*`` helper is a no-op when
-    its archive directory is ``None``.
+    ``matrix_eval_out_dir`` is set and the framework dispatches gate tasks
+    to ``affine_import_worker`` before any dependent build task runs.  The
+    function is kept so that legacy flows (``matrix_eval_out_dir=None``,
+    unit tests that bypass gates) continue to build correctly: each
+    ``ensure_*`` helper is a no-op when its archive directory is ``None``.
 
     This function currently performs no operations; it exists as a call-site
     placeholder and to document that gate-driven import has superseded
     per-process import for all archive types.
     """
-    # All imports moved to secondary-affine gates in SuitTask.import_action.
-    # The per-process ensure_* helpers are still callable (tests + legacy
-    # non-gate flows); callers that need them should invoke them directly.
+    # All imports moved to secondary-affine gates dispatched by
+    # affine_import_worker (#577).  The per-process ensure_* helpers are
+    # still callable (tests + legacy non-gate flows); callers that need
+    # them should invoke them directly.
 
 
 def _prefetch_variant_inputs(
@@ -1782,6 +1979,23 @@ def build_worker(
             error="manifest missing 'payload' object",
         )
 
+    if item_class == ITEM_CLASS_BUILD_VARIANT and env.dataset_resume_dir is not None:
+        from compiler_suit_runner.publication import variant_complete
+        from compiler_suit_runner.package_selection import validate_package_id
+        try:
+            pkg = validate_package_id(payload.get("pkg"))
+            published_dir = env.dataset_resume_dir / pkg
+            if variant_complete(published_dir, payload):
+                return BuildWorkerResult(
+                    item_class=item_class, name=name, success=True,
+                    duration_seconds=max(0.0, clock() - start),
+                    output_path=published_dir / payload["variant_dir"],
+                    drv=payload.get("drv"),
+                )
+        except ValueError as exc:
+            return BuildWorkerResult(item_class=item_class, name=name, success=False,
+                                     duration_seconds=max(0.0, clock() - start), error=str(exc))
+
     # Validate-only items have a different shape: no ``nix build``,
     # just a path-info probe + targeted ``nix copy`` against the
     # placement map. Branch here so the rest of the dispatch keeps
@@ -1791,6 +2005,7 @@ def build_worker(
             payload, env,
             item_class=item_class, name=name,
             start=start, clock=clock,
+            log_key=_failure_log_key(manifest_json_path, name),
         )
 
     # Prefer the absolute drv path when the manifest carries it: lets
@@ -1906,10 +2121,12 @@ def build_worker(
         # visible from the dispatching machine via SSH.
         excerpt = _excerpt_log(stderr, env.log_excerpt_lines)
         try:
-            log_dir = pathlib.Path("/app/log-network/build-failures")
+            log_dir = _BUILD_FAILURES_DIR
             log_dir.mkdir(parents=True, exist_ok=True)
-            (log_dir / f"{name}.log").write_text(
+            failure_key = _failure_log_key(manifest_json_path, name)
+            (log_dir / f"{failure_key}.log").write_text(
                 f"item_class: {item_class}\n"
+                f"name: {name}\n"
                 f"attr: {attr}\n"
                 f"--- stderr excerpt ---\n{excerpt}\n--- end ---\n",
                 encoding="utf-8",
@@ -1960,10 +2177,59 @@ def build_worker(
             if isinstance(pkg, str) and pkg
             else env.dataset_output_dir
         )
+        capture_summary = None
+        sidecar_base = {
+            "label": payload.get("label"), "pkg": pkg, "arch": payload.get("arch"),
+            "compiler": payload.get("compiler_id"), "compiler_family": payload.get("compiler_family"),
+            "compiler_version": payload.get("compiler_version"), "optimization": payload.get("optimization"),
+            "flag_set": payload.get("flag_set"), "hardening": payload.get("hardening"),
+            "sanitizer": payload.get("sanitizer"), "march": payload.get("march"),
+            "drv": payload.get("drv"), "variant_dir": variant_dir,
+        }
+        captured = payload.get("compiler_capture") is not None or (
+            out_store / "auxiliary" / "datasetCapture"
+        ).exists()
+        if "packageIdentity" in payload:
+            if captured:
+                # Captured releases publish under the capture contract;
+                # carry the release identity into their sidecar.
+                from compiler_suit_runner.package_selection import release_metadata
+                sidecar_base.update(release_metadata(payload))
+            else:
+                from compiler_suit_runner.publication import stage_release
+                try:
+                    staged = stage_release(out_store, per_pkg_dir, payload)
+                except Exception as exc:  # noqa: BLE001 - report failed provenance/publication
+                    return BuildWorkerResult(
+                        item_class=item_class, name=name, success=False,
+                        duration_seconds=max(0.0, clock() - start),
+                        error=f"release staging failed: {exc}",
+                    )
+                return BuildWorkerResult(
+                    item_class=item_class, name=name, success=True,
+                    duration_seconds=max(0.0, clock() - start),
+                    output_path=per_pkg_dir / variant_dir,
+                    staged_outputs=tuple(staged), outpath=str(out_store),
+                    drv=drv if isinstance(drv, str) else None,
+                )
         try:
-            elf_paths = copy_elf_folder(
-                out_store, per_pkg_dir, variant_dir
-            )
+            capture_contract = payload.get("compiler_capture")
+            meta_path = out_store / "meta.json"
+            if meta_path.is_file():
+                folder_meta = json.loads(meta_path.read_text())
+                folder_contract = folder_meta.get("compilerCapture")
+                if capture_contract is not None and capture_contract != folder_contract:
+                    raise ValueError("requested compiler capture differs from built metadata")
+                capture_contract = folder_contract or capture_contract
+            if capture_contract is not None or (out_store / "auxiliary" / "datasetCapture").exists():
+                from compiler_suit_runner.capture import stage_captured_variant
+                elf_paths, capture_summary = stage_captured_variant(
+                    out_store, per_pkg_dir, variant_dir, label=payload.get("label"),
+                    drv=payload.get("drv"), contract=capture_contract, expected=payload,
+                    metadata=sidecar_base if capture_contract.get("publication_schema", 1) >= 2 else None,
+                )
+            else:
+                elf_paths = copy_elf_folder(out_store, per_pkg_dir, variant_dir)
         except Exception as exc:  # noqa: BLE001 - never raise out
             return BuildWorkerResult(
                 item_class=item_class,
@@ -1984,28 +2250,19 @@ def build_worker(
         # — older manifests in cached pre-flight dirs won't have it.
         metadata_name = payload.get("metadata_name")
         if isinstance(metadata_name, str) and metadata_name:
-            sidecar = {
-                "label": payload.get("label"),
-                "pkg": pkg,
-                "arch": payload.get("arch"),
-                "compiler": payload.get("compiler_id"),
-                "compiler_family": payload.get("compiler_family"),
-                "compiler_version": payload.get("compiler_version"),
-                "optimization": payload.get("optimization"),
-                "flag_set": payload.get("flag_set"),
-                "hardening": payload.get("hardening"),
-                "sanitizer": payload.get("sanitizer"),
-                "march": payload.get("march"),
-                "drv": payload.get("drv"),
-                "variant_dir": variant_dir,
-            }
+            sidecar = dict(sidecar_base)
+            if capture_summary is not None:
+                sidecar["compiler_capture"] = capture_summary
             try:
                 sidecar_path = write_sidecar_metadata(
                     per_pkg_dir, metadata_name, sidecar
                 )
                 staged.append(sidecar_path)
-            except Exception:  # noqa: BLE001 - sidecar is best-effort
-                pass
+            except Exception as exc:  # noqa: BLE001
+                if capture_summary is not None:
+                    return BuildWorkerResult(item_class=item_class, name=name, success=False,
+                        duration_seconds=max(0.0, clock() - start),
+                        error=f"capture sidecar staging failed: {exc}")
 
         _LOG.info(
             "build DONE variant=%s (%d outputs staged)", name, len(staged),
@@ -2079,9 +2336,21 @@ def main() -> int:
 
     Builds a :class:`BuildWorkerEnv` from CLI flags, hands a
     :func:`_handle` closure to :func:`dynamic_runner.worker.run`, and
-    lets the framework runtime own the comm channel. Build failures
-    are surfaced to the manager as ``error:non_recoverable:`` lines via
-    :class:`NonRecoverableError`.
+    lets the framework runtime own the comm channel.
+
+    Error mapping, the one rule every branch of ``handle`` follows:
+
+    * A failure the task cannot recover from by retrying raises
+      :class:`NonRecoverableError`. The pinned framework treats that as
+      permanent: the task fails and the failure cascades to every
+      dependent. This includes ``RuntimeError`` from the eval and
+      dependency-graph workers and any unexpected ``Exception``.
+    * :class:`RecoverableError` is raised only where a retry can succeed,
+      today the build path's missing-affine-import case.
+    * ``SystemExit`` and ``KeyboardInterrupt`` are never caught. The
+      framework raises ``SystemExit`` on SIGTERM/SIGHUP (graceful drain,
+      eviction) and reports the interrupted task as recoverable, so a
+      drain must not be turned into a permanent failure here.
     """
     import argparse
 
@@ -2092,6 +2361,11 @@ def main() -> int:
         Task,
         WorkerOutput,
         run,
+    )
+    from dynamic_runner.worker.publish import (
+        DEFAULT_SRC_ROOT,
+        ENV_SRC_ROOT,
+        dst_root as _publish_dst_root,
     )
 
     parser = argparse.ArgumentParser(
@@ -2197,9 +2471,15 @@ def main() -> int:
         # framework silences anyway in this case). No tracebacks.
         pass
 
+    try:
+        resume_dir = _publish_dst_root() / pathlib.Path(args.dataset_output_dir).relative_to(
+            pathlib.Path(os.environ.get(ENV_SRC_ROOT, DEFAULT_SRC_ROOT)))
+    except ValueError:
+        resume_dir = None
     env = BuildWorkerEnv(
         flake_ref=args.flake_ref,
         dataset_output_dir=pathlib.Path(args.dataset_output_dir),
+        dataset_resume_dir=resume_dir,
         substituters_file=(
             pathlib.Path(args.substituters_file)
             if args.substituters_file
@@ -2324,11 +2604,12 @@ def main() -> int:
                 # the framework so this is the only off-process surface.
                 if result.nix_log_excerpt:
                     try:
-                        log_dir = pathlib.Path(
-                            "/app/log-network/build-failures"
-                        )
+                        log_dir = _BUILD_FAILURES_DIR
                         log_dir.mkdir(parents=True, exist_ok=True)
-                        (log_dir / f"{bc_name}.log").write_text(
+                        bc_key = _failure_log_key(
+                            pathlib.Path(task.relative_path or ""), bc_name,
+                        )
+                        (log_dir / f"{bc_key}.log").write_text(
                             f"item_class: build_compilers\n"
                             f"name: {bc_name}\n"
                             f"error: {result.error or 'unknown'}\n"
@@ -2378,12 +2659,12 @@ def main() -> int:
             except RuntimeError as exc:
                 _handle_log.exception(
                     "handle: run_eval_task raised RuntimeError"
-                    " (retry-eligible)"
+                    " (non-recoverable)"
                 )
                 raise NonRecoverableError(
                     f"matrix_eval failed: {exc}"
                 ) from exc
-            except BaseException as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - SystemExit must pass
                 _handle_log.exception(
                     "handle: run_eval_task raised unexpectedly"
                 )
@@ -2456,33 +2737,18 @@ def main() -> int:
                 from compiler_suit_runner.workers.dependency_graph_worker.archive import (  # noqa: PLC0415
                     load_drv_map_from_sidecars,
                 )
-                # Discover which binaries this run covers by scanning the
-                # archives in out_dir (the same set that discover_archives
-                # would return); the wanted_binaries set is the run's own
-                # binary scope.  We fall back to ALL sidecars if the archive
-                # list is empty (edge case: no archives yet but sidecars exist
-                # from a prior run — the archives will be present for the
-                # dep_graph to import them, so this path is only a safety net).
-                from compiler_suit_runner.workers.dependency_graph_worker.archive import (  # noqa: PLC0415
-                    discover_archives,
-                    binary_from_archive_name,
-                )
-                archives = discover_archives(out_dir)
-                wanted = {binary_from_archive_name(a) for a in archives}
-                if not wanted:
-                    raise NonRecoverableError(
-                        "build_worker dep_graph (prestaged): no"
-                        " matrix-<binary>.drv.archive files found in"
-                        f" {out_dir} — was matrix_eval run at least"
-                        " once before using --prestaged-matrix-eval?"
-                    )
+                # Scope reuse to the current resolved release selection.
+                expected_catalog = dg_payload.get("package_catalog")
+                if not isinstance(expected_catalog, dict) or not expected_catalog:
+                    raise NonRecoverableError("prestaged matrix reuse requires the resolved package catalog; rerun preflight")
+                wanted = set(expected_catalog)
                 _handle_log.info(
                     "handle: dep_graph prestaged mode — loading drv map"
                     " from %d sidecar(s) in %s: %r",
                     len(wanted), out_dir, sorted(wanted),
                 )
                 try:
-                    matrix_drvs = load_drv_map_from_sidecars(out_dir, wanted)
+                    matrix_drvs = load_drv_map_from_sidecars(out_dir, wanted, package_metadata=expected_catalog)
                 except FileNotFoundError as exc:
                     raise NonRecoverableError(str(exc)) from exc
             else:
@@ -2529,8 +2795,9 @@ def main() -> int:
                     sys_name=sys_name,
                     toolchain_outpaths_map=tc_outpaths_map,
                     build_deps_local=build_deps_local_flag,
+                    **({"compiler_capture":True} if payload.get("compiler_capture") else {}),
                 )
-            except BaseException as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - SystemExit must pass
                 _handle_log.exception(
                     "handle: run_dependency_graph_task raised unexpectedly"
                 )
@@ -2560,7 +2827,7 @@ def main() -> int:
         # makes the exception class explicit at this seam.
         try:
             result = build_worker(manifest_path, env, manifest_data=manifest_data)
-        except BaseException as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - SystemExit must pass
             _handle_log.exception(
                 "handle: build_worker raised unexpectedly (re-raising as NonRecoverable)"
             )
@@ -2581,17 +2848,29 @@ def main() -> int:
             if result.recoverable:
                 raise RecoverableError(result.error or "build failed (recoverable)")
             raise NonRecoverableError(result.error or "build failed")
-        # Atomic stage→destination publish via the framework: the
-        # worker wrote into ``DYNRUNNER_PUBLISH_SRC_ROOT`` (tmpfs);
-        # ``task.publish_all`` mirrors each staged path under
-        # ``DYNRUNNER_PUBLISH_DST_ROOT`` (NFS) with a single rename
-        # at the destination. Phase-2 builds have nothing staged
-        # (toolchains/common-deps fan out via harmonia substitution,
-        # not file delivery) so the call is a no-op for those.
+        # Revision-2 capture uses the framework transport to fill a hidden
+        # destination generation, validates it, then atomically replaces the
+        # visible variant link. The framework's file-set publication alone
+        # does not remove files omitted by a retry. Other outputs retain the
+        # ordinary mirrored publication with explicit (src, dst) pairs.
+        # Phase-2 builds have nothing staged (toolchains/common-deps fan
+        # out via affine imports, not file delivery) so the call is a
+        # no-op for those.
         if result.staged_outputs:
             try:
-                task.publish_all(*result.staged_outputs)
-            except PublishError as exc:
+                _src_root = pathlib.Path(
+                    os.environ.get(ENV_SRC_ROOT, DEFAULT_SRC_ROOT)
+                )
+                _dst_root = _publish_dst_root()
+                from compiler_suit_runner.capture import captured_variant_complete
+                from compiler_suit_runner.capture_publish import publish_outputs
+                handled = publish_outputs(result.staged_outputs, _src_root, _dst_root,
+                    task.publish_all, captured_variant_complete)
+                if not handled:
+                    task.publish_all(
+                        [(s, _dst_root / s.relative_to(_src_root)) for s in result.staged_outputs]
+                    )
+            except (PublishError, OSError, ValueError) as exc:
                 raise NonRecoverableError(
                     f"publish failed: {exc}"
                 ) from exc

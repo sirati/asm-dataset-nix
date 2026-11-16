@@ -208,6 +208,10 @@ def drv_role(name: str) -> str:
     Strips: target triples, version segments. Retains extensions up to
     2 levels, optional ``.<digits>`` and ``.drv``.
     """
+    # Dataset roots already encode exact catalog IDs and matrix axes. Treat
+    # them as identities, including reserved double hyphens in release IDs.
+    if name.endswith("-elf-folder.drv"):
+        return name
     base = name
     has_drv = base.endswith(".drv")
     if has_drv:

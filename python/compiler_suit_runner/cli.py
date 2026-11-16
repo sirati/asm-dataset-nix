@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import pathlib
@@ -33,7 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Optional
 
 from compiler_suit_runner.incremental_cache import (
@@ -53,9 +54,12 @@ from compiler_suit_runner.preflight import (
     check_toolchains_locally,
     enumerate_toolchains_only,
     enumerate_variants,
-    export_toolchain_archive,
-    preflight as run_preflight,
+    eval_build_host_tools,
+    eval_native_build_host_stdenvs,
+    resolve_package_selection,
+    run_nix_eval,
 )
+from compiler_suit_runner.package_selection import catalog_token, nix_attr_path, release_metadata
 from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
 
 
@@ -120,6 +124,8 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     These are kept on each subparser (rather than on the top-level
     parser) so ``--help`` for each subcommand is self-contained.
     """
+    parser.add_argument("--compiler-capture",action="store_true",
+        help="Build the opt-in captured matrix and require validated compiler artifacts.")
     parser.add_argument(
         "--flake",
         default=".",
@@ -152,8 +158,14 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         default=None,
         metavar="PKG",
-        help="Limit to these matrix packages (default: all).",
+        help="Select package families (default: all families, default releases only).",
     )
+    parser.add_argument("--package-versions", nargs="+", action="extend", default=None,
+                        metavar="FAMILY=VERSION", help="Exact curated releases, e.g. hello=2.12.1 hello=2.12.3. May repeat; replaces that family's default.")
+    parser.add_argument("--package-ids", nargs="+", action="extend", default=None,
+                        metavar="ID", help="Exact catalog IDs, including recipe disambiguation.")
+    parser.add_argument("--all-package-versions", action="store_true",
+                        help="Select every curated release of the selected families.")
     parser.add_argument(
         "--archs",
         nargs="+",
@@ -566,6 +578,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common_args(p_preflight)
 
+    p_catalog = sub.add_parser("catalog", help="List curated releases and target availability.")
+    p_catalog.add_argument("--flake", default=".")
+    p_catalog.add_argument("--system", dest="sys_name", default="x86_64-linux")
+    p_catalog.add_argument("--packages", nargs="+", default=None, metavar="FAMILY")
+    p_catalog.add_argument("--json", action="store_true", help="Print full resolved provenance as JSON.")
+
     p_clear = sub.add_parser(
         "clear-cache",
         help="Invalidate the incremental cache.",
@@ -637,6 +655,50 @@ def _resolve_build_deps_local(args: argparse.Namespace) -> bool:
     return False
 
 
+def _resolve_no_substituters(args: argparse.Namespace) -> bool:
+    """Resolve substituter-free mode (default OFF — but implied by affine).
+
+    A run is *secondary-affine* when EVERY build-input transport is an
+    affine import gate rather than a substituter: the toolchain and the
+    per-binary matrix ``.drv`` archives are always affine-imported in the
+    current phase taxonomy, so the run is fully affine once the remaining
+    two legs are too — the per-common_dep affine OUTPUT-import gate
+    (``--no-common-deps-affine`` OFF, i.e. ``common_deps_affine`` True)
+    AND the build-deps output-closure import (``build_deps_local`` ON).
+    In that mode NO nix invocation needs an external/peer substituter, so
+    starting harmonia or threading ``--extra-substituters`` is pure dead
+    weight (and the bug the operator hit: harmonia kept starting and peer
+    substituters kept leaking into nix commands during an affine run).
+
+    So secondary-affine IMPLIES the substituter-free behaviour: this
+    returns True when the operator passed ``--no-substituters`` OR when
+    the run is secondary-affine. The opt-out is the existing
+    ``--no-common-deps-affine`` (which removes the common_dep affine leg
+    and so legitimately needs the substituter-as-transport fallback) —
+    that flips ``common_deps_affine`` False, leaving this False unless
+    ``--no-substituters`` was explicitly given.
+
+    NB: reuses :func:`_resolve_build_deps_local`, which itself returns
+    True whenever ``--no-substituters`` is set, so the two resolvers are
+    mutually consistent (substituter-free ⇒ build-deps-local ⇒
+    substituter-free).
+
+    Also honours the ``CSR_NO_SUBSTITUTERS`` env var (set ``1`` to force
+    ON). This is the channel the submitter uses to forward the resolved
+    decision into each secondary container (the framework drops consumer
+    argv), and lets any node re-derive the same answer from the
+    environment alone.
+    """
+    if getattr(args, "no_substituters", False):
+        return True
+    env = os.environ.get("CSR_NO_SUBSTITUTERS")
+    if env is not None and env.strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    common_deps_affine = getattr(args, "common_deps_affine", True)
+    build_deps_local = _resolve_build_deps_local(args)
+    return bool(common_deps_affine and build_deps_local)
+
+
 def _resolve_toolchain_dedup(args: argparse.Namespace) -> bool:
     """Resolve the toolchain-dedup feature flag (default ON).
 
@@ -690,11 +752,12 @@ def _config_from_args(
     _raw_me_out = getattr(args, "matrix_eval_out_dir", None)
     matrix_eval_out_dir = (
         pathlib.Path(_raw_me_out) if _raw_me_out is not None
-        else dataset_dir / "_matrix_eval"
+        else dataset_dir / ("_matrix_eval_capture_v2" if getattr(args,"compiler_capture",False) else "_matrix_eval")
     )
     return SuitTaskConfig(
         flake_ref=args.flake,
         sys_name=args.sys_name,
+        compiler_capture=bool(getattr(args,"compiler_capture",False)),
         shared_fs=shared,
         manifest_dir=shared / "manifests",
         dataset_dir=dataset_dir,
@@ -716,15 +779,24 @@ def _config_from_args(
         # Harmonia ON by default — it's the whole point of cluster
         # peer-cache federation. The on_run_start lifecycle hook
         # starts nix-daemon + harmonia + PeerListWatcher +
-        # PeerNixConfWatcher as a single unit. ``--no-substituters``
-        # forces it OFF: substituter-free mode runs with no harmonia and
-        # no --substituters to nix, relying entirely on the affine import
-        # gates for every pre-built dependency.
-        enable_harmonia=not getattr(args, "no_substituters", False),
+        # PeerNixConfWatcher as a single unit. Substituter-free mode
+        # forces it OFF: it runs with no harmonia and no --substituters to
+        # nix, relying entirely on the affine import gates for every
+        # pre-built dependency. The resolved bool is True for explicit
+        # ``--no-substituters`` OR an implied secondary-affine run (see
+        # ``_resolve_no_substituters``); fall back to the raw flag for
+        # callers (tests) that build args without the resolver having run.
+        enable_harmonia=not getattr(
+            args, "_no_substituters_resolved",
+            getattr(args, "no_substituters", False),
+        ),
         # Substituter-free mode flag threaded to build workers via the
         # ``--no-substituters`` worker flag (pins empty substituters +
         # enables the pre-build no-substitute safety assertion).
-        no_substituters=getattr(args, "no_substituters", False),
+        no_substituters=getattr(
+            args, "_no_substituters_resolved",
+            getattr(args, "no_substituters", False),
+        ),
         # Opt-in ssh-debug back-door. Off by default; the user
         # toggles via --enable-ssh-debug.
         enable_ssh_debug=getattr(args, "enable_ssh_debug", False),
@@ -768,6 +840,7 @@ def _toolchain_axes_from_args(args: argparse.Namespace) -> ToolchainAxes:
     return ToolchainAxes.from_values(
         sys_name=getattr(args, "sys_name", "x86_64-linux"),
         archs=getattr(args, "archs", None),
+        compiler_capture=bool(getattr(args,"compiler_capture",False)),
     )
 
 
@@ -783,9 +856,12 @@ def _variant_axes_from_args(args: argparse.Namespace) -> VariantAxes:
     return VariantAxes.from_values(
         sys_name=getattr(args, "sys_name", "x86_64-linux"),
         packages=getattr(args, "packages", None),
+        package_ids=getattr(args, "_resolved_package_ids", None),
+        catalog_identity=getattr(args, "_package_catalog_token", ""),
         archs=getattr(args, "archs", None),
         variant_sample=getattr(args, "variant_sample", 0) or 0,
         variant_seed=getattr(args, "variant_seed", "42") or "42",
+        compiler_capture=bool(getattr(args,"compiler_capture",False)),
     )
 
 
@@ -986,49 +1062,65 @@ def _produce_and_upload_toolchain_archive(
     #    (the preflight built it), so the export is a cheap requisites +
     #    nix-store --export.
     local_dir = pathlib.Path(tempfile.mkdtemp(prefix="csr-toolchain-archive-"))
+    # The archive holds the whole toolchain drv closure; remove it once
+    # uploaded so each submit does not leave a large file in /tmp.
     try:
-        local_archive = preflight.export_toolchain_archive(
-            tc_aggregate_drv, local_dir,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.error(
-            "toolchain-dedup: failed to export toolchains.drv.archive "
-            "from %r: %s",
-            tc_aggregate_drv, exc,
-        )
-        return 1
-
-    # 2. Transfer to the gateway. parse_gateway_url leaves auth fields
-    #    None; thread the consumer's identity/config onto the config so
-    #    the upload authenticates the same way the rest of the dispatch
-    #    does.
-    cfg = parse_gateway_url(args.gateway)
-    cfg.ssh_identity_file = getattr(args, "ssh_identity_file", None)
-    cfg.ssh_config_file = getattr(args, "ssh_config", None)
-    remote_dir = f"{args.slurm_root_folder}/out/_matrix_eval"
-    remote_archive = f"{remote_dir}/{preflight.TOOLCHAIN_ARCHIVE_NAME}"
-    gw = create_gateway(cfg)
-    try:
-        gw.connect()
-        gw.create_directory(remote_dir)
-        gw.upload_file(str(local_archive), remote_archive)
-        log.info(
-            "toolchain-dedup: uploaded %s -> %s",
-            local_archive.name, remote_archive,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.error(
-            "toolchain-dedup: failed to upload toolchains.drv.archive to "
-            "%s: %s",
-            remote_archive, exc,
-        )
-        return 1
-    finally:
         try:
-            gw.disconnect()
-        except Exception:  # noqa: BLE001 — best-effort teardown
-            pass
-    return 0
+            local_archive = preflight.export_toolchain_archive(
+                tc_aggregate_drv, local_dir,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "toolchain-dedup: failed to export toolchains.drv.archive "
+                "from %r: %s",
+                tc_aggregate_drv, exc,
+            )
+            return 1
+
+        # 2. Transfer to the gateway. parse_gateway_url leaves auth fields
+        #    None; thread the consumer's identity/config onto the config so
+        #    the upload authenticates the same way the rest of the dispatch
+        #    does.
+        cfg = parse_gateway_url(args.gateway)
+        cfg.ssh_identity_file = getattr(args, "ssh_identity_file", None)
+        cfg.ssh_config_file = getattr(args, "ssh_config", None)
+        remote_dir = f"{args.slurm_root_folder}/out/_matrix_eval"
+        remote_archive = f"{remote_dir}/{preflight.TOOLCHAIN_ARCHIVE_NAME}"
+        gw = create_gateway(cfg)
+        try:
+            from dynamic_runner.packaging.gateway import (  # noqa: PLC0415
+                retry_transient,
+            )
+
+            gw.connect()
+            gw.create_directory(remote_dir)
+            # Shield the idempotent fixed-target copy from one-off transport
+            # hiccups (an scp stream reset / dropped ssh master frame on the
+            # rootless-podman test-env path): the framework's retry policy,
+            # otherwise a single OSError aborts the whole dispatch.
+            retry_transient(
+                lambda: gw.upload_file(str(local_archive), remote_archive),
+                "toolchain-dedup upload toolchains.drv.archive",
+            )
+            log.info(
+                "toolchain-dedup: uploaded %s -> %s",
+                local_archive.name, remote_archive,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "toolchain-dedup: failed to upload toolchains.drv.archive to "
+                "%s: %s",
+                remote_archive, exc,
+            )
+            return 1
+        finally:
+            try:
+                gw.disconnect()
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                pass
+        return 0
+    finally:
+        shutil.rmtree(local_dir, ignore_errors=True)
 
 
 def _upload_archive_with_sidecar(
@@ -1073,38 +1165,155 @@ def _upload_archive_with_sidecar(
     except Exception:  # noqa: BLE001 — sidecar absent / unreadable
         remote_hex = ""
     if remote_hex and remote_hex == local_hex:
-        log.info(
+        log.debug(
             "toolchain-split-archive: %s remote sidecar matches "
             "(sha256=%s); skipping upload",
             label, local_hex[:16],
         )
         return True
 
+    from dynamic_runner.packaging.gateway import (  # noqa: PLC0415
+        retry_transient,
+    )
+
     gw.create_directory(remote_dir)  # type: ignore[attr-defined]
-    gw.upload_file(str(local_archive), remote_archive)  # type: ignore[attr-defined]
+    # Idempotent fixed-target copy: shield it from one-off transport faults
+    # (scp stream reset / dropped ssh master frame) so a single transient
+    # OSError on one of N sequential archive copies does not abort dispatch.
+    retry_transient(
+        lambda: gw.upload_file(str(local_archive), remote_archive),  # type: ignore[attr-defined]
+        f"toolchain-split upload {label}",
+    )
     # Write sidecar AFTER successful upload so a partial upload never
     # leaves a matching sidecar that would suppress a re-upload.
     try:
         local_sidecar = local_dir / f"{local_archive.name}.sha256"
         local_sidecar.write_text(local_hex + "\n")
-        gw.upload_file(str(local_sidecar), remote_sidecar)  # type: ignore[attr-defined]
+        retry_transient(
+            lambda: gw.upload_file(str(local_sidecar), remote_sidecar),  # type: ignore[attr-defined]
+            f"toolchain-split sidecar upload {label}",
+        )
     except Exception as exc:  # noqa: BLE001 — sidecar upload best-effort
         log.warning(
             "toolchain-split-archive: sidecar upload for %s failed "
             "(next run will re-upload): %s",
             label, exc,
         )
-    log.info(
+    log.debug(
         "toolchain-split-archive: uploaded %s -> %s",
         local_archive.name, remote_archive,
     )
     return True
 
 
+def _parse_store_db_registration(text: str) -> "frozenset[str]":
+    """Extract every ``/nix/store/<hash>-<name>`` path from a
+    ``nix-store --load-db``-format registration file.
+
+    The registration (produced by ``closureInfo``) lists, for each path in
+    the closure, the path itself plus its references — every store path
+    appears on its own line; the interleaved deriver / narHash / narSize /
+    reference-count lines are not store paths. Taking the UNION of all
+    store-path lines therefore yields exactly the image closure, which is
+    what we want as the resident-everywhere baseline. ``.drv`` deriver lines
+    are harmless (they never match an output-path closure entry).
+    """
+    paths = {
+        line
+        for raw in text.splitlines()
+        if (line := raw.strip()).startswith("/nix/store/")
+    }
+    return frozenset(paths)
+
+
+def _compute_baseline_paths(
+    args: argparse.Namespace,
+    log: logging.Logger,
+    *,
+    run_subprocess: Optional[Callable[[list[str]], tuple[bytes, bytes, int]]] = None,
+) -> "frozenset[str]":
+    """Compute the baseline subtracted from each toolchain archive: the EXACT
+    set of store paths baked into the runner image rootfs (resident on every
+    build node), read from the image's ``closureInfo`` registration.
+
+    This is the authoritative baseline. An earlier version subtracted the
+    submitter-evaluated ``pkgs.stdenv`` build closure, but the image is built
+    with ``runnerPkgs`` (no dataset overlay): under any stdenv-hash divergence
+    that subtracted overlay-hashed paths ABSENT from the runnerPkgs image, so
+    those paths shipped in neither the archive (subtracted) nor the image
+    (different hash) and every affected build rebuilt its whole toolchain
+    from source — fatal under ``--no-substituters``. Subtracting the image's
+    own closure instead can only ever subtract paths that are genuinely
+    resident: under hash divergence it subtracts LESS (ships more), never more.
+
+    Safe-by-default: returns an EMPTY frozenset on ANY failure (eval/realise/
+    read/parse), which makes ``compute_toolchain_split`` subtract nothing and
+    ship the full closure — correct, just larger. Never aborts the dispatch.
+    """
+    from compiler_suit_runner import preflight  # noqa: PLC0415
+
+    sys_name = getattr(args, "sys_name", "x86_64-linux")
+    flake = getattr(args, "flake", ".")
+    attr = f"{flake}#_imageStoreRegistration.{sys_name}"
+    runner = run_subprocess or preflight._default_run_subprocess  # noqa: SLF001
+    try:
+        out, err, rc = runner(
+            ["nix", "eval", "--no-write-lock-file", "--raw", f"{attr}.outPath"]
+        )
+        if rc != 0:
+            log.warning(
+                "baseline-subtract: eval %s failed (rc=%d): %s — shipping "
+                "full toolchain closures", attr, rc,
+                err.decode("utf-8", errors="replace").strip()[:200],
+            )
+            return frozenset()
+        reg_outpath = out.decode("utf-8", errors="replace").strip()
+        # Realise the registration derivation (cheap runCommand; its
+        # closureInfo input is the image closure the submitter builds anyway).
+        _o, berr, brc = runner(
+            ["nix", "build", "--no-write-lock-file", "--no-link", attr]
+        )
+        if brc != 0:
+            log.warning(
+                "baseline-subtract: realise %s failed (rc=%d): %s — shipping "
+                "full toolchain closures", attr, brc,
+                berr.decode("utf-8", errors="replace").strip()[:200],
+            )
+            return frozenset()
+        reg_file = pathlib.Path(reg_outpath) / "nix-support" / "registration"
+        if not reg_file.is_file():
+            log.warning(
+                "baseline-subtract: registration file %s missing — shipping "
+                "full toolchain closures", reg_file,
+            )
+            return frozenset()
+        baseline = _parse_store_db_registration(
+            reg_file.read_text(encoding="utf-8", errors="replace")
+        )
+        if not baseline:
+            log.warning(
+                "baseline-subtract: empty image registration %s — shipping "
+                "full toolchain closures", reg_file,
+            )
+            return frozenset()
+        log.info(
+            "baseline-subtract: image-resident closure = %d paths "
+            "(subtracted from each toolchain closure → only non-resident "
+            "paths ship)", len(baseline),
+        )
+        return baseline
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "baseline-subtract: %s — shipping full toolchain closures", exc
+        )
+        return frozenset()
+
+
 def _produce_and_upload_toolchain_split_archives(
     args: argparse.Namespace,
     tc_out_paths: list[str],
     log: logging.Logger,
+    force_common_outpaths: Optional[list[str]] = None,
 ) -> int:
     """Produce + upload the per-toolchain split archives to the gateway.
 
@@ -1136,9 +1345,16 @@ def _produce_and_upload_toolchain_split_archives(
 
     local_dir = pathlib.Path(tempfile.mkdtemp(prefix="csr-tc-split-archive-"))
     try:
-        # 1. Compute the toolchain split.
+        # 1. Compute the toolchain split, subtracting the image-resident
+        # closure so only non-resident paths ship (the bulk — the native
+        # bootstrap — is already baked into every node via the image).
+        baseline_paths = _compute_baseline_paths(args, log)
         try:
-            split = preflight.compute_toolchain_split(tc_out_paths)
+            split = preflight.compute_toolchain_split(
+                tc_out_paths,
+                baseline_paths=baseline_paths,
+                force_common_outpaths=force_common_outpaths,
+            )
         except Exception as exc:
             log.error(
                 "toolchain-split-archive: compute_toolchain_split failed"
@@ -1226,6 +1442,31 @@ def cmd_submit(args: argparse.Namespace) -> int:
         log.error("--shared-fs is required for submit")
         return 2
 
+    # Resolve releases and validate targets before staging or enumerating any
+    # toolchain, including on cache hits. A moving default alias is not a key.
+    try:
+        selected_catalog = resolve_package_selection(
+            args.flake, args.sys_name, packages=args.packages,
+            package_versions=getattr(args, "package_versions", None),
+            package_ids=getattr(args, "package_ids", None),
+            all_package_versions=getattr(args, "all_package_versions", False),
+            archs=args.archs,
+        )
+        args._resolved_package_ids = sorted(selected_catalog)
+        args._package_catalog_token = catalog_token(selected_catalog)
+        if args.archs:
+            known_archs = {a for entry in selected_catalog.values() for a in entry["availability"]}
+            if set(args.archs) - known_archs:
+                raise ValueError("unknown target architectures: " + ", ".join(sorted(set(args.archs) - known_archs)))
+        if selected_catalog and not any(
+            state["available"] for entry in selected_catalog.values()
+            for arch, state in entry["availability"].items() if not args.archs or arch in args.archs
+        ):
+            raise ValueError("no available package/target cells")
+    except (ValueError, RuntimeError):
+        log.exception("package release selection failed")
+        return 2
+
     shared_fs = pathlib.Path(args.shared_fs)
     shared_fs.mkdir(parents=True, exist_ok=True)
     manifest_dir = shared_fs / "manifests"
@@ -1245,6 +1486,12 @@ def cmd_submit(args: argparse.Namespace) -> int:
     # build-input paths.  Stash the resolved bool on args so
     # _config_from_args can read it via getattr without an extra param.
     args._build_deps_local_resolved = _resolve_build_deps_local(args)  # noqa: SLF001
+    # Substituter-free mode: explicit ``--no-substituters`` OR implied by a
+    # fully secondary-affine run (all build-input transport is an affine
+    # import gate, so no substituter / harmonia is needed). Stash the
+    # resolved bool on args so _config_from_args and the submitter-peer
+    # gate read the SAME value via getattr.
+    args._no_substituters_resolved = _resolve_no_substituters(args)  # noqa: SLF001
 
     cache = IncrementalCache(args.cache_root)
     # Repo-state half of the memoization keys; ``None`` (collection
@@ -1282,6 +1529,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         try:
             tc_pairs, tc_drvs, tc_aggregate_drv = enumerate_toolchains_only(
                 args.flake, args.sys_name, archs=args.archs,
+                **({"compiler_capture":True} if getattr(args,"compiler_capture",False) else {}),
             )
         except Exception:  # noqa: BLE001
             log.exception("toolchain enumeration failed")
@@ -1303,6 +1551,14 @@ def cmd_submit(args: argparse.Namespace) -> int:
             repo_inputs, _variant_axes_from_args(args)
         )
     per_binary_meta_raw = cache.lookup_variants(var_key) if var_key else None
+    if per_binary_meta_raw is not None and (
+        set(per_binary_meta_raw) != set(selected_catalog) or any(
+            release_metadata(meta) != release_metadata(selected_catalog[key])
+            for key, meta in per_binary_meta_raw.items()
+        )
+    ):
+        log.warning("cached variant provenance differs from the resolved catalog; rebuilding inventory")
+        per_binary_meta_raw = None
     if per_binary_meta_raw is not None:
         log.info(
             "variant enumeration: cache hit (%d binaries)",
@@ -1315,12 +1571,11 @@ def cmd_submit(args: argparse.Namespace) -> int:
         )
         try:
             per_binary_meta_raw = enumerate_variants(
-                args.flake,
-                args.sys_name,
-                packages=args.packages,
-                archs=args.archs,
+                args.flake, args.sys_name, packages=args.packages,
+                archs=args.archs, selected_catalog=selected_catalog,
                 sample_size=getattr(args, "variant_sample", 0) or 0,
                 sample_seed=getattr(args, "variant_seed", "42") or "42",
+                **({"compiler_capture":True} if getattr(args,"compiler_capture",False) else {}),
             )
         except Exception:  # noqa: BLE001
             log.exception("variant enumeration failed")
@@ -1371,6 +1626,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
         if not archs_list:
             continue
         per_binary_metadata[pkg] = {
+            **release_metadata(meta),
+            **{key: meta[key] for key in ("variant_inventory_schema", "variant_inventory_identity") if key in meta},
             "archs": archs_list,
             "variant_sample": meta.get("sample_size"),
             "variant_seed": meta.get("sample_seed"),
@@ -1405,6 +1662,74 @@ def cmd_submit(args: argparse.Namespace) -> int:
     build_compilers_on = bool(getattr(args, "build_compilers", False))
     debug_testbuild = getattr(args, "debug_testbuild", None)
     tc_drv_set = frozenset(d for d in tc_drvs.values() if d)
+    # GAP#2: the NATIVE build-host stdenv (crossToolchains.<sys>.<arch>.stdenv)
+    # build closure is needed at every cross variant's depsBuildBuild but is NOT
+    # in any per-compiler cross toolchain closure. Eval it here so we realise +
+    # gc-root it alongside the toolchains and force-ship it into import_common.
+    native_host_drvs: list[str] = []
+    native_host_outpaths: list[str] = []
+    # The elf-folder build-host tools (file/find/awk) — built (NOT deep-
+    # realised) and force-common'd: every cross variant's elf-folder runs them
+    # on the build host (lib/mkBinaryFolder.nix) and they are in no toolchain
+    # closure. Build-set realise materialises their outputs so force-common
+    # ships the runtime closure.
+    bht_drv: Optional[str] = None
+    bht_out: Optional[str] = None
+    # The gateway split archives are a hard requirement of the dispatch
+    # (see _produce_and_upload_toolchain_split_archives). When they are
+    # produced, a failed eval of their inputs must abort here, not
+    # surface later as a build failure on every node.
+    split_archives_required = bool(
+        tc_drv_set
+        and toolchain_dedup
+        and args.gateway
+        and args.slurm_root_folder
+    )
+    # Substituter-free nodes get the build-host stdenv and tools only
+    # through import_common, so then their evals are required too.
+    build_host_required = split_archives_required and bool(
+        getattr(args, "_no_substituters_resolved", False)
+    )
+    build_host_eval_failed = False
+    if tc_drv_set:
+        try:
+            native_host_drvs, native_host_outpaths = (
+                eval_native_build_host_stdenvs(
+                    args.flake, args.sys_name, args.archs,
+                )
+            )
+            if native_host_outpaths:
+                log.info(
+                    "submit pre-flight: native build-host stdenv(s) for "
+                    "force-common: %d resolved", len(native_host_outpaths),
+                )
+        except Exception:  # noqa: BLE001
+            build_host_eval_failed = True
+            log.exception(
+                "submit pre-flight: native build-host stdenv eval failed; "
+                "cross builds may miss their build-host closure"
+            )
+        try:
+            bht_drv, bht_out = eval_build_host_tools(
+                args.flake, args.sys_name,
+            )
+            if bht_out:
+                log.info(
+                    "submit pre-flight: elf-folder build-host tools for "
+                    "force-common: %s", bht_out,
+                )
+        except Exception:  # noqa: BLE001
+            build_host_eval_failed = True
+            log.exception(
+                "submit pre-flight: build-host tools eval failed; cross "
+                "variants' elf-folder may miss file/find/awk"
+            )
+    if build_host_eval_failed and build_host_required:
+        log.error(
+            "submit pre-flight: substituter-free run cannot ship the "
+            "build-host closure in import_common; aborting dispatch"
+        )
+        return 1
     if tc_drv_set:
         try:
             missing_tcs = check_toolchains_locally(tc_drv_set)
@@ -1414,27 +1739,45 @@ def cmd_submit(args: argparse.Namespace) -> int:
             )
             missing_tcs = tc_drv_set
         if missing_tcs:
-            if not build_compilers_on:
-                log.error(
-                    "submit pre-flight: %d/%d toolchains missing locally "
-                    "and --build-compilers is off",
-                    len(missing_tcs), len(tc_drv_set),
-                )
-                for drv in sorted(missing_tcs):
-                    log.error("  %s", drv)
-                return 1
+            # The submitter is the toolchain producer and must have every
+            # toolchain output realised before dispatch. Cross toolchains
+            # are the FULL cross-stdenv (``overrideCC`` → custom store
+            # hash), which Hydra does not build, so they are NOT cache-
+            # substitutable: "missing locally" here means "needs an actual
+            # BUILD", not "operator forgot to pre-stage".
             log.warning(
-                "submit pre-flight: building %d missing toolchains locally",
-                len(missing_tcs),
+                "submit pre-flight: %d/%d toolchains not locally realised "
+                "(will build)", len(missing_tcs), len(tc_drv_set),
             )
-            try:
-                build_toolchains_locally(missing_tcs)
-            except PreflightError as exc:
-                log.error("local toolchain build aborted: %s", exc)
-                return 1
-            except Exception:  # noqa: BLE001
-                log.exception("local toolchain build failed")
-                return 1
+        # Realise + GC-root the toolchain AGGREGATE (one wrapper drv over all
+        # toolchains). A single realise builds every toolchain and one
+        # indirect root pins the whole aggregate closure — keeping the
+        # build-time-only outputs (bootstrap-stage*-stdenv-linux, the setup
+        # hooks, …) resident until the split snapshots them. This is
+        # unconditional (not gated on missing_tcs) because a WARM toolchain —
+        # OUTPUT resident but build-time deps GARBAGE-COLLECTED since it built
+        # — would otherwise ship an INCOMPLETE split archive and the offline
+        # build node re-derives the whole cross-stdenv (the bootstrap cascade
+        # that broke v9). Pre-flight legitimately uses cache.nixos.org here
+        # (only WORKER builds are substituter-free). Fail loud (PreflightError
+        # → abort) rather than upload incomplete data.
+        try:
+            _tc_gcroot_dir = str(
+                pathlib.Path(args.cache_root) / "toolchain-gcroots"
+            )
+            build_toolchains_locally(
+                tc_drv_set | frozenset(native_host_drvs)
+                | (frozenset({bht_drv}) if bht_drv else frozenset()),
+                aggregate_drv=(tc_aggregate_drv or None),
+                gcroot_dir=_tc_gcroot_dir,
+                deep_realise_drvs=frozenset(native_host_drvs),
+            )
+        except PreflightError as exc:
+            log.error("local toolchain build/root aborted: %s", exc)
+            return 1
+        except Exception:  # noqa: BLE001
+            log.exception("local toolchain build/root failed")
+            return 1
 
     # Resolve toolchain outpaths so toolchain_validate manifests
     # carry ``payload.outpath``. Without this the build_worker's
@@ -1457,6 +1800,19 @@ def cmd_submit(args: argparse.Namespace) -> int:
                 " validate manifests will be missing payload.outpath"
             )
             dist_eval_drv_outpaths = {}
+    if split_archives_required:
+        unresolved = sorted(
+            d for d in tc_drv_set
+            if not (dist_eval_drv_outpaths or {}).get(d)
+        )
+        if unresolved:
+            log.error(
+                "submit pre-flight: %d/%d toolchain outpaths unresolved "
+                "(e.g. %s); the toolchain split archives cannot be "
+                "produced, aborting dispatch",
+                len(unresolved), len(tc_drv_set), unresolved[0],
+            )
+            return 1
 
     # Stages literal: matrix_eval (phase 2) + dependency_graph
     # (phase 3) are JSON-free and built in-memory by
@@ -1484,6 +1840,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
             per_binary_metadata=per_binary_metadata,
             drv_outpaths=dist_eval_drv_outpaths,
             stages=stages,
+            **({"compiler_capture":True} if getattr(args,"compiler_capture",False) else {}),
         )
     except Exception:  # noqa: BLE001
         log.exception("submit pre-flight: manifest emission failed")
@@ -1616,6 +1973,10 @@ def cmd_submit(args: argparse.Namespace) -> int:
             ]
             rc = _produce_and_upload_toolchain_split_archives(
                 args, tc_out_paths, log,
+                force_common_outpaths=[
+                    *native_host_outpaths,
+                    *([bht_out] if bht_out else []),
+                ],
             )
             if rc != 0:
                 return rc
@@ -1626,11 +1987,22 @@ def cmd_submit(args: argparse.Namespace) -> int:
         # (added in dynamic-runner afa024e) does the SSH-R on the
         # primary's existing ControlMaster — we just run harmonia
         # locally + drop the peer-info file on the gateway.
-        # Skipped if --no-submitter-peer.
+        # Skipped if --no-submitter-peer, and ALWAYS skipped in
+        # substituter-free / secondary-affine mode: starting harmonia +
+        # SSH-R'ing it into the compute nodes would re-introduce a peer
+        # substituter (PeerListWatcher would then write the submitter's
+        # URL into the per-node substituters file) — exactly what affine
+        # mode exists to avoid. The affine import gates already carry
+        # every pre-built path, so there is no fetch for harmonia to serve.
         submitter = None
         extra_pf: tuple[tuple[int, int], ...] = ()
+        _no_subst = getattr(
+            args, "_no_substituters_resolved",
+            getattr(args, "no_substituters", False),
+        )
         if (
             getattr(args, "submitter_peer", True)
+            and not _no_subst
             and args.gateway
             and args.slurm_root_folder
         ):
@@ -1701,6 +2073,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
             # secondary-id ...`` and does not forward primary CLI
             # flags, so the env-var shim is the only reliable path.
             run_args: list[str] = ["--pids-limit=16384"]
+            if config.compiler_capture:
+                run_args += ["-e","CSR_COMPILER_CAPTURE=1"]
             if getattr(args, "enable_ssh_debug", False):
                 run_args += [
                     "-e", "CSR_ENABLE_SSH_DEBUG=1",
@@ -1708,6 +2082,28 @@ def cmd_submit(args: argparse.Namespace) -> int:
                     f"CSR_SSH_DEBUG_PORT="
                     f"{getattr(args, 'ssh_debug_port', 22222)}",
                 ]
+            # Propagate the RESOLVED substituter-free decision to every
+            # secondary container via an env var. The framework rebuilds
+            # each secondary's argv from a synthesized
+            # ``--secondary tcp://... --secondary-id ...`` (framework +
+            # task flags ONLY — it explicitly drops consumer flags, and
+            # the run-config it pushes to the secondary is ``argv_len=0``),
+            # so ``--no-substituters`` and the ``_no_substituters_resolved``
+            # bool stashed on the submitter's namespace NEVER reach the
+            # secondary's parser. Without this shim the secondary's
+            # ``_config_from_args`` falls back to the raw (absent) flag and
+            # comes out ``enable_harmonia=True`` — so harmonia starts and
+            # PeerListWatcher writes ``_substituters.<id>.txt`` on the
+            # node despite a substituter-free run. Forward the SAME
+            # resolved bool the submitter computed (explicit
+            # ``--no-substituters`` OR implied secondary-affine) so the
+            # decision is identical on every node. ``cmd_secondary`` reads
+            # it back via ``_parse_framework_spawned_secondary``.
+            if getattr(
+                args, "_no_substituters_resolved",
+                getattr(args, "no_substituters", False),
+            ):
+                run_args += ["-e", "CSR_NO_SUBSTITUTERS=1"]
             # Opt-in kill-chasing instrumentation. Enabled by setting
             # ``ASM_TRACE_KILLS=1`` in the submitter env; no-op
             # otherwise. Adds SYS_PTRACE capability + propagates the
@@ -1902,28 +2298,66 @@ def cmd_secondary(args: argparse.Namespace) -> int:
     return rc
 
 
+def cmd_catalog(args: argparse.Namespace) -> int:
+    try:
+        catalog = resolve_package_selection(args.flake, args.sys_name,
+                                            packages=args.packages, all_package_versions=True)
+    except (ValueError, RuntimeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(catalog, indent=2, sort_keys=True))
+    else:
+        for key, entry in catalog.items():
+            default = " default" if entry["isDefault"] else ""
+            print(f"{key}: {entry['packageFamily']} {entry['packageVersion']}{default} "
+                  f"{entry['recipeId']['provider']}@{entry['recipeId']['revision']}")
+            print("  targets: " + ", ".join(
+                arch if state["available"] else f"{arch} (skip: {state['reason']})"
+                for arch, state in sorted(entry["availability"].items())))
+    return 0
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     """Run preflight only and print the manifest count by class."""
     log = _setup_logging(args.debug)
 
     try:
-        pre = run_preflight(
+        entries = enumerate_variants(
             args.flake,
             args.sys_name,
             packages=args.packages,
+            package_versions=args.package_versions,
+            package_ids=args.package_ids,
+            all_package_versions=args.all_package_versions,
             archs=args.archs,
             sample_size=getattr(args, "variant_sample", 0) or 0,
             sample_seed=getattr(args, "variant_seed", "42") or "42",
         )
+        targets = sorted({arch for entry in entries.values() for arch in entry["archs"]})
+        if targets:
+            from compiler_suit_runner.package_selection import nix_string
+            projection = nix_string(json.dumps(dict.fromkeys(targets)))
+            counts = run_nix_eval(args.flake, nix_attr_path("_variantCounts", args.sys_name),
+                                  apply=f"m: builtins.intersectAttrs (builtins.fromJSON {projection}) m")
+            if not isinstance(counts, dict) or set(counts) != set(targets) or any(type(v) is not int or v < 0 for v in counts.values()):
+                raise ValueError("invalid variant count inventory")
+        else:
+            counts = {}
     except Exception:  # noqa: BLE001
         log.exception("preflight failed")
         return 1
 
-    print(f"sys: {pre.sys_name}")
-    print(f"variants: {len(pre.variants)}")
-    print(f"toolchains: {len(pre.toolchain_specs)}")
-    print(f"common_deps: {len(pre.common_dep_drvs)}")
-    print(f"distinct_drvs: {len(pre.toolchain_drvs)}")
+    print(f"sys: {args.sys_name}")
+    total = 0
+    for key, entry in entries.items():
+        count = sum(counts.get(arch, 0) for arch in entry["archs"])
+        total += count
+        print(f"{key}: {entry['packageVersion']} ({entry['packageIdentity']}) "
+              f"targets={','.join(entry['archs'])} variants<={count}")
+        for arch, reason in entry["skipped_targets"].items():
+            print(f"  skip {arch}: {reason}")
+    print(f"estimated variants before support filtering/sampling: {total}")
     return 0
 
 
@@ -1947,6 +2381,7 @@ def cmd_clear_cache(args: argparse.Namespace) -> int:
 
 
 _DISPATCH = {
+    "catalog": cmd_catalog,
     "submit": cmd_submit,
     "secondary": cmd_secondary,
     "preflight": cmd_preflight,
@@ -1996,7 +2431,8 @@ def _parse_framework_spawned_secondary(
     # matrix_eval archives land on the shared bind mount so the primary's
     # watcher can read them. /app/out-network is the container view of
     # <shared_fs>/dataset (host view).
-    ns.matrix_eval_out_dir = pathlib.Path("/app/out-network/_matrix_eval")
+    ns.compiler_capture = ns.compiler_capture or os.environ.get("CSR_COMPILER_CAPTURE","0")=="1"
+    ns.matrix_eval_out_dir = pathlib.Path("/app/out-network") / ("_matrix_eval_capture_v2" if ns.compiler_capture else "_matrix_eval")
     ns.sys_name = getattr(ns, "sys_name", None) or "x86_64-linux"
     # The primary side propagates --enable-ssh-debug via the
     # CSR_ENABLE_SSH_DEBUG env var (the framework rebuilds this argv
@@ -2005,6 +2441,34 @@ def _parse_framework_spawned_secondary(
     ns.enable_ssh_debug = os.environ.get("CSR_ENABLE_SSH_DEBUG", "0") == "1"
     ns.ssh_debug_port = int(os.environ.get("CSR_SSH_DEBUG_PORT", "22222"))
     ns.submitter_peer = False
+    # Substituter-free decision crosses the submitter→secondary seam via
+    # an env var (CSR_NO_SUBSTITUTERS), NOT argv: the framework rebuilds
+    # this argv synthetically (framework + task flags only) and drops our
+    # consumer ``--no-substituters`` flag, and the run-config it pushes is
+    # ``argv_len=0``, so there is no flag-forward channel. The submitter
+    # forwards the RESOLVED bool (explicit --no-substituters OR implied
+    # secondary-affine) as CSR_NO_SUBSTITUTERS=1. Set BOTH the raw flag
+    # (so the env-fallback resolvers, e.g. _resolve_build_deps_local, stay
+    # consistent on this node) AND the pre-resolved bool that
+    # _config_from_args reads to gate enable_harmonia / no_substituters —
+    # so harmonia does NOT start, PeerListWatcher does NOT write
+    # _substituters.<id>.txt, and PeerNixConfWatcher does NOT run here.
+    _no_subst = os.environ.get("CSR_NO_SUBSTITUTERS", "0") == "1"
+    ns.no_substituters = _no_subst
+    ns._no_substituters_resolved = _no_subst  # noqa: SLF001
+    # build_deps_local is DERIVED from no_substituters (substituter-free is
+    # only sound when the full build-input closure is affine-imported), but
+    # _config_from_args reads the pre-resolved ``_build_deps_local_resolved``
+    # with NO no_substituters fallback. The submit path sets it via
+    # _resolve_build_deps_local; this framework-spawned-secondary seam must
+    # do the same, or the in-cluster SuitTask.config.build_deps_local stays
+    # False — which silently SUPPRESSES the ``import_build_deps`` affine gate
+    # (suit_task._discover_import_gate_tasks) even though the dep_graph still
+    # PRODUCES build_deps.out.archive. The archive is then orphaned: built but
+    # never imported. Invisible on x86_64 (build-time deps live in the image)
+    # but FATAL on cross arches (their stdenv build tools are not in the
+    # image) — "Cannot build texinfo/which/xz/<source>.drv".
+    ns._build_deps_local_resolved = _resolve_build_deps_local(ns)  # noqa: SLF001
     return ns
 
 

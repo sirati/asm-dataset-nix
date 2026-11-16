@@ -23,6 +23,7 @@ import pathlib
 
 import pytest
 
+from compiler_suit_runner.tests.fakes import make_suit_config
 from compiler_suit_runner.suit_task import SuitTask, SuitTaskConfig
 
 
@@ -31,18 +32,7 @@ def _make_config(
     *,
     build_max_concurrent: int | None = None,
 ) -> SuitTaskConfig:
-    return SuitTaskConfig(
-        flake_ref=".",
-        sys_name="x86_64-linux",
-        shared_fs=tmp_path,
-        manifest_dir=tmp_path / "manifests",
-        dataset_dir=tmp_path / "dataset",
-        peers_dir=tmp_path / "peers",
-        run_id="r1",
-        secondary_id="primary",
-        hostname="host",
-        build_max_concurrent=build_max_concurrent,
-    )
+    return make_suit_config(tmp_path, build_max_concurrent=build_max_concurrent)
 
 
 def _phases(task: SuitTask):
@@ -136,16 +126,23 @@ def test_build_phase_carries_validate_common_dep_variant_types(
     types = phases["build"].types
     type_ids = {t.type_id for t in types}
     assert type_ids == {
-        "toolchain_import",
+        "affine_import",
         "toolchain_validate",
         "common_dep",
         "variant",
     }
+    # affine_import uses its own worker module; others use build_worker.
     for t in types:
-        assert (
-            t.worker_module
-            == "compiler_suit_runner.workers.build_worker"
-        )
+        if t.type_id == "affine_import":
+            assert (
+                t.worker_module
+                == "compiler_suit_runner.workers.affine_import_worker"
+            )
+        else:
+            assert (
+                t.worker_module
+                == "compiler_suit_runner.workers.build_worker"
+            )
 
 
 def test_build_phase_is_non_barrier_for_dep_graph_overlap(
@@ -281,3 +278,84 @@ def test_build_worker_command_args_dep_graph_includes_matrix_eval_out_dir(
         skip_existing=False,
     )
     assert "--matrix-eval-out-dir" in argv_eval, argv_eval
+
+
+def test_build_worker_command_args_threads_substituters_file_by_default(
+    tmp_path: pathlib.Path,
+) -> None:
+    """With substituters ON (the default), every build-shaped worker
+    gets --substituters-file so peer substitution still works."""
+    from argparse import Namespace
+    from compiler_suit_runner.suit_task import SuitTaskConfig
+    config = SuitTaskConfig(
+        flake_ref=".",
+        sys_name="x86_64-linux",
+        shared_fs=tmp_path,
+        manifest_dir=tmp_path / "manifests",
+        dataset_dir=tmp_path / "dataset",
+        peers_dir=tmp_path / "peers",
+        run_id="r1",
+        secondary_id="primary",
+        hostname="host",
+        no_substituters=False,
+    )
+    task = SuitTask(config)
+    for type_id in ("variant", "common_dep", "eval", "build_compilers"):
+        argv = task.build_worker_command_args(
+            type_id,
+            Namespace(),
+            source_dir=tmp_path,
+            output_dir=tmp_path,
+            skip_existing=False,
+        )
+        assert "--substituters-file" in argv, (type_id, argv)
+
+
+def test_build_worker_command_args_omits_substituters_file_when_no_substituters(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Substituter-free / secondary-affine mode: --substituters-file is
+    NEVER threaded to ANY worker type. The build worker already ignores
+    it (pins ``--option substituters ""``), but eval / build_compilers
+    splice the file's content verbatim into their nix invocations — so
+    passing it at all would leak --extra-substituters into those nix
+    commands. Withholding it at the source keeps every worker
+    substituter-free."""
+    from argparse import Namespace
+    from compiler_suit_runner.suit_task import SuitTaskConfig
+    config = SuitTaskConfig(
+        flake_ref=".",
+        sys_name="x86_64-linux",
+        shared_fs=tmp_path,
+        manifest_dir=tmp_path / "manifests",
+        dataset_dir=tmp_path / "dataset",
+        peers_dir=tmp_path / "peers",
+        run_id="r1",
+        secondary_id="primary",
+        hostname="host",
+        no_substituters=True,
+    )
+    task = SuitTask(config)
+    for type_id in (
+        "variant", "common_dep", "eval", "build_compilers",
+        "dep_graph", "toolchain_validate",
+    ):
+        argv = task.build_worker_command_args(
+            type_id,
+            Namespace(),
+            source_dir=tmp_path,
+            output_dir=tmp_path,
+            skip_existing=False,
+        )
+        assert "--substituters-file" not in argv, (type_id, argv)
+    # The build-shaped types still get the worker --no-substituters flag
+    # so the worker pins empty substituters + runs the safety assertion.
+    for type_id in ("variant", "common_dep"):
+        argv = task.build_worker_command_args(
+            type_id,
+            Namespace(),
+            source_dir=tmp_path,
+            output_dir=tmp_path,
+            skip_existing=False,
+        )
+        assert "--no-substituters" in argv, (type_id, argv)

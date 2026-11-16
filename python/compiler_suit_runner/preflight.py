@@ -32,19 +32,22 @@ from compiler_suit_runner.partition import VariantSpec
 
 
 def _short_dataset_name(
-    *, compiler_id: str, arch: str, optimization: str, full_label: str
+    *, compiler_id: str, arch: str, optimization: str, full_label: str,
+    package_identity: Optional[str] = None, variant_drv: Optional[str] = None,
 ) -> str:
     """Return the short filesystem identifier for a variant.
 
-    Format: ``<compiler>_<arch>_<opt>_<8-hex-hash>``. The hash is
-    deterministic (sha256 of the full variant label), so the same
+    Format: ``<compiler>_<arch>_<opt>_<hash>``. New release records use
+    16 hex digits over label, package identity and actual derivation;
+    legacy records retain their 8-digit label hash. The same
     variant always maps to the same filename — re-running with new
     flag dimensions added to the matrix doesn't shift previously-built
     tarballs around. Filesystem-unsafe characters are scrubbed from
     the leading fields (compilers like ``gcc-old-4_4`` keep their
     hyphens / underscores; nothing else is currently problematic).
     """
-    digest = hashlib.sha256(full_label.encode("utf-8")).hexdigest()[:8]
+    identity = json.dumps([full_label, package_identity, variant_drv], separators=(",", ":")) if package_identity else full_label
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16 if package_identity else 8]
     safe = re.compile(r"[^A-Za-z0-9._-]+")
     parts = [
         safe.sub("-", compiler_id) or "unknown-compiler",
@@ -142,6 +145,7 @@ def run_nix_eval(
     *,
     raw: bool = False,
     apply: Optional[str] = None,
+    no_eval_cache: bool = False,
     run_subprocess: Optional[RunSubprocess] = None,
 ):
     """Invoke ``nix eval`` on a single attribute.
@@ -164,6 +168,8 @@ def run_nix_eval(
         "--extra-experimental-features",
         "nix-command flakes",
     ]
+    if no_eval_cache:
+        argv.append("--no-eval-cache")
     if raw:
         argv.append("--raw")
     else:
@@ -787,6 +793,10 @@ def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
     Adding a new rule typically means adding to one of the
     ``_LEGACY_BROKEN_*`` dicts above — not writing new branches here.
     """
+    # Package rules are curated by family, including explicit releases. A
+    # package ID is not an upstream package name and must not be reparsed.
+    if meta_entry.get("packageFamily"):
+        meta_entry = {**meta_entry, "package": meta_entry["packageFamily"]}
     # Flag-vs-flag conflicts (compiler-independent).
     for predicate in _FLAG_CONFLICTS:
         reason = predicate(meta_entry)
@@ -855,15 +865,89 @@ def is_known_bad_combo(meta_entry: dict) -> Optional[str]:
     return None
 
 
+def resolve_package_selection(
+    flake_ref: str, sys_name: str, *, packages=None, package_versions=None,
+    package_ids=None, all_package_versions=False, archs=None, run_subprocess=None,
+) -> dict[str, dict]:
+    """Read a cheap index, then resolve provenance for the selected families."""
+    from .package_selection import nix_string, select_package_ids, validate_release
+
+    if packages is not None and not packages:
+        raise ValueError("package selection is empty")
+    if archs is not None and not archs:
+        raise ValueError("target architecture selection is empty")
+    if all_package_versions and (package_versions or package_ids):
+        raise ValueError("--all-package-versions cannot be combined with explicit release selections")
+    attr = f"_packageCatalog.{sys_name}"
+    index = run_nix_eval(
+        flake_ref, attr, run_subprocess=run_subprocess,
+        apply="c: builtins.mapAttrs (_: p: { inherit (p) packageFamily packageId isDefault; }) c",
+    )
+    if not isinstance(index, dict) or not index:
+        raise ValueError("package catalog index is empty or malformed")
+    known = {entry["packageFamily"] for entry in index.values()}
+    requested = set(packages or ())
+    implied = set()
+    for spec in package_versions or ():
+        family, sep, version = spec.partition("=")
+        if not sep or not family or not version:
+            raise ValueError(f"expected FAMILY=EXACT_VERSION, got {spec!r}")
+        implied.add(family)
+    for key in package_ids or ():
+        if key not in index:
+            raise ValueError(f"unknown package ID: {key}")
+        implied.add(index[key]["packageFamily"])
+    unknown = (requested | implied) - known
+    if unknown:
+        raise ValueError(f"unknown package families: {', '.join(sorted(unknown))}")
+    if packages is not None and implied - requested:
+        raise ValueError("release selections conflict with --packages: " + ", ".join(sorted(implied - requested)))
+    wanted = requested if packages is not None else implied or known
+    candidates = {key: entry for key, entry in index.items() if entry["packageFamily"] in wanted}
+    # Exact version matching needs only native versions and recipe IDs, not
+    # sources or availability of every release on every architecture.
+    version_families = {spec.partition("=")[0] for spec in package_versions or ()}
+    version_keys = {key: None for key, entry in candidates.items() if entry["packageFamily"] in version_families}
+    if version_keys:
+        versions = run_nix_eval(
+            flake_ref, attr, run_subprocess=run_subprocess,
+            apply=f"c: builtins.mapAttrs (_: p: {{ inherit (p) packageFamily packageId isDefault packageVersion recipeId; }}) "
+                  f"(builtins.intersectAttrs (builtins.fromJSON {nix_string(json.dumps(version_keys))}) c)",
+        )
+        if not isinstance(versions, dict) or set(versions) != set(version_keys):
+            raise ValueError("version catalog does not match its index")
+        candidates.update(versions)
+    ids = select_package_ids(candidates, families=packages, versions=package_versions,
+                             package_ids=package_ids, all_versions=all_package_versions)
+    keys = dict.fromkeys(ids)
+    projection = f"builtins.intersectAttrs (builtins.fromJSON {nix_string(json.dumps(keys))}) c"
+    if archs is not None:
+        targets = nix_string(json.dumps(dict.fromkeys(sorted(set(archs)))))
+        projection = f"builtins.mapAttrs (_: p: p // {{ availability = builtins.intersectAttrs (builtins.fromJSON {targets}) p.availability; }}) ({projection})"
+    details = run_nix_eval(flake_ref, attr, run_subprocess=run_subprocess, apply=f"c: {projection}")
+    if not isinstance(details, dict) or set(details) != set(keys):
+        raise ValueError("resolved package catalog does not match its index")
+    result = {key: details[key] for key in ids}
+    for entry in result.values():
+        if any(state["available"] for state in entry.get("availability", {}).values()):
+            validate_release(entry)
+    return result
+
+
 def enumerate_variants(
     flake_ref: str,
     sys_name: str,
     *,
     packages: Optional[list[str]] = None,
+    package_versions: Optional[list[str]] = None,
+    package_ids: Optional[list[str]] = None,
+    all_package_versions: bool = False,
+    selected_catalog: Optional[dict[str, dict]] = None,
     archs: Optional[list[str]] = None,
     sample_size: int = 0,
     sample_seed: str = "42",
     run_subprocess: Optional[RunSubprocess] = None,
+    compiler_capture: bool = False,
 ) -> dict[str, dict]:
     """Enumerate every ``(pkg, arch)`` cell the matrix exposes.
 
@@ -887,56 +971,38 @@ def enumerate_variants(
           ...
         }
     """
-    pkg_filter = set(packages) if packages else None
-    arch_filter = set(archs) if archs else None
+    from .package_selection import release_metadata
 
-    all_pkgs_raw = run_nix_eval(
-        flake_ref,
-        f"dataset.{sys_name}",
-        run_subprocess=run_subprocess,
-        apply="m: builtins.attrNames m",
+    catalog = selected_catalog if selected_catalog is not None else resolve_package_selection(
+        flake_ref, sys_name, packages=packages, package_versions=package_versions,
+        package_ids=package_ids, all_package_versions=all_package_versions,
+        archs=archs, run_subprocess=run_subprocess,
     )
-    if not isinstance(all_pkgs_raw, list):
-        raise RuntimeError(
-            f"dataset.{sys_name} attrNames is not a JSON array "
-            f"(got {type(all_pkgs_raw).__name__})"
-        )
-    all_pkgs = [p for p in all_pkgs_raw if isinstance(p, str)]
-
-    if arch_filter is None:
-        per_pkg_archs_raw = run_nix_eval(
-            flake_ref,
-            f"dataset.{sys_name}",
-            run_subprocess=run_subprocess,
-            apply="m: builtins.mapAttrs (_: a: builtins.attrNames a) m",
-        )
-        if not isinstance(per_pkg_archs_raw, dict):
-            raise RuntimeError(
-                f"dataset.{sys_name} per-pkg attrNames is not a JSON object "
-                f"(got {type(per_pkg_archs_raw).__name__})"
-            )
-    else:
-        per_pkg_archs_raw = None
-
+    arch_filter = set(archs) if archs else None
     out: dict[str, dict] = {}
-    for pkg in sorted(all_pkgs):
-        if pkg_filter is not None and pkg not in pkg_filter:
-            continue
-        if arch_filter is not None:
-            pkg_archs = sorted(arch_filter)
-        else:
-            raw_archs = per_pkg_archs_raw.get(pkg) if per_pkg_archs_raw else None
-            if not isinstance(raw_archs, list):
-                continue
-            pkg_archs = sorted(a for a in raw_archs if isinstance(a, str))
-        if not pkg_archs:
-            continue
+    for pkg, entry in sorted(catalog.items()):
+        availability = entry["availability"]
+        requested_archs = arch_filter if arch_filter is not None else set(availability)
+        unknown_archs = requested_archs - set(availability)
+        if unknown_archs:
+            raise ValueError(f"unknown target architectures: {', '.join(sorted(unknown_archs))}")
+        pkg_archs = sorted(a for a in requested_archs if availability[a]["available"])
         out[pkg] = {
+            **release_metadata(entry),
             "archs": pkg_archs,
+            "skipped_targets": {a: availability[a]["reason"] for a in sorted(requested_archs) if not availability[a]["available"]},
             "sample_size": int(sample_size or 0),
             "sample_seed": sample_seed,
-            "tier": _tier_from_pkg(pkg),
+            "tier": _tier_from_pkg(entry["packageFamily"]),
         }
+        if entry.get("variantInventorySchema") == 1:
+            out[pkg]["variant_inventory_schema"] = 1
+            out[pkg]["variant_inventory_identity"] = entry["variantInventoryIdentity"]
+    if not any(entry["archs"] for entry in out.values()):
+        raise ValueError(f"no available package/target cells: {out}")
+    if compiler_capture:
+        for metadata in out.values():
+            metadata["compiler_capture"] = True
     return out
 
 
@@ -951,6 +1017,7 @@ def eval_toolchain_drvs(
     pairs: tuple[tuple[str, str], ...],
     *,
     run_subprocess: Optional[RunSubprocess] = None,
+    compiler_capture: bool = False,
 ) -> dict[tuple[str, str], str]:
     """Evaluate the drv path for each ``(arch, compiler)`` toolchain.
 
@@ -966,6 +1033,7 @@ def eval_toolchain_drvs(
     to flake-attr resolution, which will fail loudly on the secondary
     and surface in the build-failure log).
     """
+    toolchain_root="_capturedCrossToolchainMap" if compiler_capture else "_crossToolchainMap"
     if not pairs:
         return {}
     runner = run_subprocess or _default_run_subprocess
@@ -984,14 +1052,15 @@ def eval_toolchain_drvs(
     # individual compiler entries.
     if shutil.which("nix-eval-jobs") is None:
         return _eval_toolchain_drvs_fallback(
-            flake_ref, sys_name, pairs, run_subprocess=runner
+            flake_ref, sys_name, pairs, run_subprocess=runner,
+            **({"compiler_capture":True} if compiler_capture else {})
         )
 
     requested = {(arch, compiler) for arch, compiler in pairs}
     argv: list[str] = [
         "nix-eval-jobs",
         "--flake",
-        f"{flake_ref}#_crossToolchainMap.{sys_name}",
+        f"{flake_ref}#{toolchain_root}.{sys_name}",
         "--force-recurse",
         "--workers",
         "16",
@@ -1004,7 +1073,8 @@ def eval_toolchain_drvs(
         # don't affect rc. Fallback to the inline path so callers
         # still get something.
         return _eval_toolchain_drvs_fallback(
-            flake_ref, sys_name, pairs, run_subprocess=runner
+            flake_ref, sys_name, pairs, run_subprocess=runner,
+            **({"compiler_capture":True} if compiler_capture else {})
         )
 
     out: dict[tuple[str, str], str] = {}
@@ -1038,12 +1108,14 @@ def _eval_toolchain_drvs_fallback(
     pairs: tuple[tuple[str, str], ...],
     *,
     run_subprocess: Optional[RunSubprocess] = None,
+    compiler_capture: bool = False,
 ) -> dict[tuple[str, str], str]:
     """One ``nix eval`` per (arch, compiler) — used when
     ``nix-eval-jobs`` isn't on PATH (test harness, hermetic
     environments). Slower than the parallel evaluator but still
     per-entry isolated.
     """
+    toolchain_root="_capturedCrossToolchainMap" if compiler_capture else "_crossToolchainMap"
     runner = run_subprocess or _default_run_subprocess
     safe = re.compile(r"^[A-Za-z0-9._-]+$")
     out: dict[tuple[str, str], str] = {}
@@ -1056,7 +1128,7 @@ def _eval_toolchain_drvs_fallback(
             "--extra-experimental-features",
             "nix-command flakes",
             "--raw",
-            f"{flake_ref}#_crossToolchainMap.{sys_name}.{arch}.{compiler}.drvPath",
+            f"{flake_ref}#{toolchain_root}.{sys_name}.{arch}.{compiler}.drvPath",
         ]
         stdout, _stderr, rc = runner(argv)
         if rc != 0:
@@ -1099,9 +1171,9 @@ def enumerate_toolchains(
     # nothing.
     from compiler_suit_runner.support_table import (  # noqa: PLC0415
         is_supported,
-        load_support_table,
+        load_support_table_for_flake,
     )
-    support = load_support_table()
+    support = load_support_table_for_flake(flake_ref)
 
     arch_filter = set(archs) if archs else None
     pairs: list[tuple[str, str]] = []
@@ -1129,6 +1201,7 @@ def enumerate_toolchains_only(
     *,
     archs: Optional[list[str]] = None,
     run_subprocess: Optional[RunSubprocess] = None,
+    compiler_capture: bool = False,
 ) -> tuple[
     tuple[tuple[str, str], ...],
     dict[tuple[str, str], str],
@@ -1170,6 +1243,7 @@ def enumerate_toolchains_only(
         return pairs, {}, ""
     drv_paths = eval_toolchain_drvs(
         flake_ref, sys_name, pairs, run_subprocess=run_subprocess,
+        **({"compiler_capture":True} if compiler_capture else {}),
     )
     leaf_drvs = sorted(d for d in drv_paths.values() if d)
     if not leaf_drvs:
@@ -1318,12 +1392,97 @@ class ToolchainSplit:
     delta_paths: dict[str, tuple[str, ...]]
 
 
+def _toolchain_build_closure(
+    outpath: str, runner: RunSubprocess
+) -> Optional[list[str]]:
+    """Return the toolchain's BUILD-time closure (topologically ordered), or
+    ``None`` if the drv can't be resolved (caller falls back to the OUTPUT
+    closure).
+
+    A build node must IMPORT everything needed to BUILD with the cross-
+    stdenv — the setup hooks, ``patchelf``, ``pkg-config``, ``make-binary-
+    wrapper-hook``, the bootstrap — none of which appear in the stdenv
+    OUTPUT's runtime requisites (~82 paths) but all of which are in the
+    drv's ``--include-outputs`` build closure (~hundreds of paths). Shipping
+    only the output closure left the node trying to BUILD the missing build-
+    time paths offline ("Cannot build patchelf/setup-hook/...drv").
+
+    Steps: resolve the realised outpath's deriver, take that drv's
+    ``--include-outputs`` build closure OUTPUT paths, then re-query
+    ``--requisites`` over those outputs so the exported list is runtime-
+    closed AND dependency-first ordered (import requires a path's references
+    to be registered first; ``export_closure_exact`` does not re-query
+    order, so it must be correct here).
+    """
+    der_out, _der_err, der_rc = runner(
+        ["nix-store", "--query", "--deriver", outpath]
+    )
+    if der_rc != 0:
+        return None
+    drvs = [
+        l for l in der_out.decode("utf-8", errors="replace").splitlines()
+        if l.strip()
+    ]
+    drv = drvs[0] if drvs else ""
+    if not drv.endswith(".drv") or "unknown-deriver" in drv:
+        return None
+    bc_out, _bc_err, bc_rc = runner(
+        ["nix-store", "--query", "--requisites", "--include-outputs", drv]
+    )
+    if bc_rc != 0:
+        return None
+    outputs = [
+        l for l in bc_out.decode("utf-8", errors="replace").splitlines()
+        if l.strip() and not l.endswith(".drv")
+    ]
+    if not outputs:
+        return None
+    req_out, req_err, req_rc = runner(
+        ["nix-store", "--query", "--requisites", *outputs]
+    )
+    if req_rc != 0:
+        # FAIL LOUD (do NOT silently fall back to the output closure): the
+        # build-closure OUTPUTS exist as derivations but at least one is
+        # UNREALIZED in the local store, so requisites cannot be resolved.
+        # Silently returning None here drops the toolchain's bootstrap (xgcc,
+        # bootstrap-stage*, binutils-wrapper, …) from the shipped archive and
+        # every substituter-free build then fails offline with "import did not
+        # land". The producer MUST realise + gc-root the full build closure
+        # (see build_toolchains_locally) before the split runs; if it didn't,
+        # abort rather than upload a silently-incomplete archive.
+        raise RuntimeError(
+            "_toolchain_build_closure: build-closure requisites query failed "
+            f"for {drv} — an --include-outputs path is UNREALIZED (the toolchain "
+            "build closure was not realised+gc-rooted before the split, so the "
+            "archive would silently omit the bootstrap). rc=%d: %s" % (
+                req_rc, req_err.decode("utf-8", errors="replace").strip()[-800:],
+            )
+        )
+    return [
+        l for l in req_out.decode("utf-8", errors="replace").splitlines()
+        if l.strip()
+    ]
+
+
 def compute_toolchain_split(
     toolchain_out_paths: list[str],
     *,
+    baseline_paths: Optional[frozenset[str]] = None,
+    force_common_outpaths: Optional[list[str]] = None,
     run_subprocess: Optional[RunSubprocess] = None,
 ) -> ToolchainSplit:
     """Compute COMMON + per-toolchain deltas from realized out-paths.
+
+    ``baseline_paths`` (the native std-compiler stdenv's build closure,
+    present on EVERY build node via the image) is subtracted from each
+    toolchain's build closure before the common/delta split, so only the
+    cross-specific delta ships (the user directive: "only include binaries
+    not in the normal stdenv with the std compiler"). This shrinks the
+    common archive massively (the native bootstrap is the bulk and is
+    already resident). A toolchain whose closure is ENTIRELY baseline (e.g.
+    the x86_64-native toolchain) yields an empty delta and is skipped — the
+    build worker must tolerate its absent per-toolchain archive (all-baseline
+    ⇒ already resident).
 
     For each toolchain out-path ``Ti``:
       closure(Ti) = ``nix-store --query --requisites Ti``
@@ -1340,16 +1499,24 @@ def compute_toolchain_split(
     Upload property: COMMON + Σ|delta_i| == |union| (each path is in
     COMMON or exactly one delta) — total upload ≈ union size, no blowup.
 
-    Paths that are unrealized or produce an empty requisites output are
-    SKIPPED with a warning (one bad toolchain doesn't zero the split).
-    Raises :class:`RuntimeError` only if NO toolchain produces a valid
-    closure, or if a requisites query hard-fails with a non-zero rc.
+    FAIL LOUD on incompleteness: if a toolchain's build closure can be
+    resolved (deriver known) but an ``--include-outputs`` path is UNREALIZED,
+    :func:`_toolchain_build_closure` raises and that propagates here — the
+    split aborts rather than silently shipping the output-only closure (which
+    would omit the bootstrap). The producer must realise+gc-root the full
+    build closure first (:func:`build_toolchains_locally`). Only the benign
+    cases (invalid/non-store outpath, or an entirely-baseline toolchain) are
+    skipped with a warning; a legacy stdenv with an unknown deriver falls back
+    to its already-resident OUTPUT closure. Raises :class:`RuntimeError` if NO
+    toolchain produces a valid closure, on any unrealized build closure, or if
+    a requisites query hard-fails with a non-zero rc.
     """
     if not toolchain_out_paths:
         raise RuntimeError(
             "compute_toolchain_split: no toolchain out-paths supplied"
         )
     runner = run_subprocess or _default_run_subprocess
+    baseline = baseline_paths or frozenset()
     # Keep each closure as the ORDERED requisites list: ``nix-store
     # --query --requisites`` emits paths in topological (dependency-first)
     # order, which ``nix-store --import`` REQUIRES — a path's references
@@ -1369,21 +1536,43 @@ def compute_toolchain_split(
                 outpath,
             )
             continue
-        stdout, stderr, rc = runner(
-            ["nix-store", "--query", "--requisites", outpath]
-        )
-        if rc != 0:
-            _split_log.warning(
-                "compute_toolchain_split: requisites query failed for "
-                "%r (rc=%d): %s — skipping",
-                outpath, rc,
-                stderr.decode("utf-8", errors="replace").strip(),
+        # Prefer the toolchain's full BUILD-time closure (setup hooks,
+        # patchelf, pkg-config, bootstrap), not just its OUTPUT runtime
+        # closure — the build node imports this to BUILD with the cross-
+        # stdenv offline. Falls back to the output closure when the drv is
+        # unresolved (legacy/already-resident stdenvs).
+        lines = _toolchain_build_closure(outpath, runner)
+        if lines is None:
+            stdout, stderr, rc = runner(
+                ["nix-store", "--query", "--requisites", outpath]
             )
-            continue
-        lines = [l for l in stdout.decode("utf-8", errors="replace").splitlines() if l.strip()]
+            if rc != 0:
+                _split_log.warning(
+                    "compute_toolchain_split: requisites query failed for "
+                    "%r (rc=%d): %s — skipping",
+                    outpath, rc,
+                    stderr.decode("utf-8", errors="replace").strip(),
+                )
+                continue
+            lines = [l for l in stdout.decode("utf-8", errors="replace").splitlines() if l.strip()]
+        if baseline:
+            # Subtract the native std-compiler baseline (resident on every
+            # node via the image): ship only the cross-specific delta. Order
+            # is preserved (filter keeps the dependency-first sequence).
+            kept = [l for l in lines if l not in baseline]
+            if not kept:
+                _split_log.info(
+                    "compute_toolchain_split: %r is entirely in the native "
+                    "baseline (%d paths) — no cross-specific delta to ship "
+                    "(build worker must tolerate the absent per-toolchain "
+                    "archive)",
+                    outpath, len(lines),
+                )
+                continue
+            lines = kept
         if not lines:
             _split_log.warning(
-                "compute_toolchain_split: requisites query returned no "
+                "compute_toolchain_split: closure query returned no "
                 "paths for %r — skipping",
                 outpath,
             )
@@ -1396,6 +1585,39 @@ def compute_toolchain_split(
             "closure (all paths unrealized or requisites queries failed)"
         )
 
+    # FORCE-COMMON (gap#2): the native build-host stdenv's build closure must
+    # land on EVERY build node via the always-imported common gate — a cross
+    # variant's depsBuildBuild needs it to run configure/make on the build
+    # host, but it is NOT part of any per-compiler cross toolchain's closure,
+    # so it would otherwise be freq=1 → routed to an undeclared delta gate →
+    # never imported. We force its whole --include-outputs build closure into
+    # COMMON unconditionally (minus baseline). Same fail-loud contract as the
+    # toolchain closures (unrealized → raise, never ship partial).
+    force_common: set[str] = set()
+    for outpath in force_common_outpaths or ():
+        if not isinstance(outpath, str) or not outpath.startswith("/"):
+            continue
+        lines = _toolchain_build_closure(outpath, runner)
+        if lines is None:
+            stdout, stderr, rc = runner(
+                ["nix-store", "--query", "--requisites", outpath]
+            )
+            if rc != 0:
+                raise RuntimeError(
+                    "compute_toolchain_split: force-common requisites query "
+                    "failed for %r (rc=%d): %s" % (
+                        outpath, rc,
+                        stderr.decode("utf-8", errors="replace").strip(),
+                    )
+                )
+            lines = [
+                l for l in stdout.decode("utf-8", errors="replace").splitlines()
+                if l.strip()
+            ]
+        if baseline:
+            lines = [l for l in lines if l not in baseline]
+        force_common.update(lines)
+
     # freq(p) = number of toolchains whose closure contains p.
     # COMMON = {p : freq(p) >= 2} so paths shared by at least two
     # toolchains (any era) form the common archive.  A single-toolchain
@@ -1404,13 +1626,15 @@ def compute_toolchain_split(
     # the single-toolchain case works: delta = empty, common = full).
     if len(closures) == 1:
         only_paths = next(iter(closures.values()))
-        common: frozenset[str] = frozenset(only_paths)
+        common: frozenset[str] = frozenset(only_paths) | frozenset(force_common)
     else:
         import collections as _collections  # noqa: PLC0415
         freq: dict[str, int] = _collections.Counter(
             p for paths in closures.values() for p in paths
         )
-        common = frozenset(p for p, count in freq.items() if count >= 2)
+        common = frozenset(
+            p for p, count in freq.items() if count >= 2
+        ) | frozenset(force_common)
 
     # delta = closure − COMMON per toolchain, PRESERVING topological order.
     delta_paths: dict[str, tuple[str, ...]] = {
@@ -1418,6 +1642,116 @@ def compute_toolchain_split(
         for outpath, lines in closures.items()
     }
     return ToolchainSplit(common_paths=common, delta_paths=delta_paths)
+
+
+def eval_native_build_host_stdenvs(
+    flake_ref: str,
+    sys_name: str,
+    archs: Iterable[str],
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> tuple[list[str], list[str]]:
+    """Eval the NATIVE build-host stdenv (``crossToolchains.<sys>.<arch>.stdenv``)
+    drv + outpath for each target arch, deduplicated.
+
+    A cross variant's ``depsBuildBuild`` needs the native build-platform stdenv
+    to run configure/make on the build host; substituter-free, that stdenv's
+    FULL build closure (xgcc, bootstrap-stage*, binutils-wrapper, bash,
+    patchelf, …) must be resident on every build node. That closure is NOT part
+    of any per-compiler cross toolchain's closure, so the submitter must realise
+    it and force-ship it into the always-imported common archive. The native
+    stdenv is the build platform's own stdenv (identical across cross targets),
+    so we eval per-arch and dedup → a multi-arch run ships it once.
+
+    Returns ``(drv_paths, out_paths)`` (sorted, deduplicated). An arch whose
+    attr is missing or fails to eval is skipped with a warning rather than
+    aborting — a genuinely-absent native closure surfaces downstream as the
+    split's fail-loud guard or the build worker's substituter-free assertion.
+    """
+    import logging as _logging  # noqa: PLC0415
+    _log = _logging.getLogger(
+        "compiler_suit_runner.preflight.native_stdenv"
+    )
+    runner = run_subprocess or _default_run_subprocess
+    drvs: set[str] = set()
+    outs: set[str] = set()
+    for arch in sorted({a for a in archs if a}):
+        attr = f"{flake_ref}#crossToolchains.{sys_name}.{arch}.stdenv"
+        d_out, _d_err, d_rc = runner([
+            "nix", "--extra-experimental-features", "nix-command flakes",
+            "eval", "--raw", f"{attr}.drvPath",
+        ])
+        o_out, _o_err, o_rc = runner([
+            "nix", "--extra-experimental-features", "nix-command flakes",
+            "eval", "--raw", f"{attr}.outPath",
+        ])
+        if d_rc != 0 or o_rc != 0:
+            _log.warning(
+                "native build-host stdenv eval failed for arch %s "
+                "(drv_rc=%d out_rc=%d)", arch, d_rc, o_rc,
+            )
+            continue
+        d = d_out.decode("utf-8", errors="replace").strip()
+        o = o_out.decode("utf-8", errors="replace").strip()
+        if d.endswith(".drv") and o.startswith("/nix/store/"):
+            drvs.add(d)
+            outs.add(o)
+        else:
+            _log.warning(
+                "native build-host stdenv eval for arch %s returned "
+                "unexpected paths (drv=%r out=%r)", arch, d, o,
+            )
+    return sorted(drvs), sorted(outs)
+
+
+def eval_build_host_tools(
+    flake_ref: str,
+    sys_name: str,
+    *,
+    run_subprocess: Optional[RunSubprocess] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Eval the elf-folder build-host tools aggregate
+    (``_buildHostTools.<sys>`` = file/findutils/gawk) drv + outpath.
+
+    Every cross variant's elf-folder wrapper (lib/mkBinaryFolder.nix) runs
+    ``file -bL`` / find / awk on the BUILD host to collect ELF binaries — so
+    their output closure must be resident on every build node for a
+    substituter-free build, but they are in no toolchain/stdenv closure. The
+    submitter realises this aggregate (materialising the tool outputs) and
+    force-ships its closure into import_common.
+
+    Returns ``(drv, outpath)`` or ``(None, None)`` if the attr is missing /
+    fails to eval (the build worker's assertion surfaces a genuinely-absent
+    tool downstream).
+    """
+    import logging as _logging  # noqa: PLC0415
+    _log = _logging.getLogger(
+        "compiler_suit_runner.preflight.build_host_tools"
+    )
+    runner = run_subprocess or _default_run_subprocess
+    attr = f"{flake_ref}#_buildHostTools.{sys_name}"
+    d_out, _d_err, d_rc = runner([
+        "nix", "--extra-experimental-features", "nix-command flakes",
+        "eval", "--raw", f"{attr}.drvPath",
+    ])
+    o_out, _o_err, o_rc = runner([
+        "nix", "--extra-experimental-features", "nix-command flakes",
+        "eval", "--raw", f"{attr}.outPath",
+    ])
+    if d_rc != 0 or o_rc != 0:
+        _log.warning(
+            "build-host tools eval failed (drv_rc=%d out_rc=%d)", d_rc, o_rc,
+        )
+        return None, None
+    d = d_out.decode("utf-8", errors="replace").strip()
+    o = o_out.decode("utf-8", errors="replace").strip()
+    if d.endswith(".drv") and o.startswith("/nix/store/"):
+        return d, o
+    _log.warning(
+        "build-host tools eval returned unexpected paths (drv=%r out=%r)",
+        d, o,
+    )
+    return None, None
 
 
 def export_toolchain_archive(
@@ -1698,73 +2032,27 @@ def filter_existing_variants(
     *,
     dataset_dir,
 ) -> tuple[tuple[VariantSpec, ...], int]:
-    """Drop variants whose sidecar already records the same ``label``.
-
-    Returns ``(remaining_variants, skipped_count)``. The output layout
-    is per-package: phase-3 build_worker writes the ELF folder + sidecar
-    JSON at ``<dataset_dir>/<pkg>/<variant_dir>/<elf>`` and
-    ``<dataset_dir>/<pkg>/<variant_dir>.json``.
-
-    Match is on the ``label`` field of each sidecar, NOT the filename.
-    The filename is a sha256-derived short hash of label; matching the
-    hash works as long as the hash function never changes, but reading
-    ``label`` directly is the canonical precise-flags identifier and
-    survives short-name refactors. A bonus consequence: a variant
-    written under a different short-name scheme is still recognised as
-    "we already have this combo", so we never rebuild what's already
-    on disk.
-
-    Sidecars per pkg are scanned at most once each (O(existing+todo)
-    rather than per-variant ``stat``).
-    """
+    """Skip only a complete publication of the exact release and derivation."""
     import pathlib
-
+    from .publication import variant_complete
     dataset_dir = pathlib.Path(dataset_dir)
-    if not dataset_dir.is_dir():
-        return variants, 0
-
-    # Lazy: only scan a pkg's subdir once we encounter a variant
-    # claiming that pkg. Variants without ``pkg`` fall back to the
-    # legacy flat-layout scan in ``dataset_dir`` itself.
-    labels_by_pkg: dict[str, set[str]] = {}
-
-    def _labels_for(pkg_dir: pathlib.Path) -> set[str]:
-        seen: set[str] = set()
-        try:
-            entries = list(pkg_dir.iterdir())
-        except OSError:
-            return seen
-        for entry in entries:
-            if not entry.is_file() or entry.suffix != ".json":
-                continue
-            try:
-                with entry.open("rb") as fh:
-                    data = json.load(fh)
-            except (OSError, json.JSONDecodeError):
-                continue
-            label = data.get("label") if isinstance(data, dict) else None
-            if isinstance(label, str) and label:
-                seen.add(label)
-        return seen
-
     remaining: list[VariantSpec] = []
     skipped = 0
     for variant in variants:
         pkg = variant.get("pkg") if isinstance(variant, dict) else None
-        label = variant.get("label") if isinstance(variant, dict) else None
-        if not isinstance(label, str) or not label:
-            remaining.append(variant)
-            continue
-        # Cache lookup; fill the cache the first time we see each pkg.
-        cache_key = pkg if isinstance(pkg, str) and pkg else ""
-        if cache_key not in labels_by_pkg:
-            scan_dir = (
-                dataset_dir / pkg
-                if isinstance(pkg, str) and pkg
-                else dataset_dir
+        if not (isinstance(pkg, str) and pkg):
+            complete = False
+        elif variant.get("compiler_capture") is not None:
+            # Captured variants publish under their own contract.
+            from compiler_suit_runner.capture import captured_variant_complete
+            complete = captured_variant_complete(
+                dataset_dir / pkg / variant["variant_dir"],
+                label=variant.get("label"), drv=variant.get("drv"),
+                contract=variant["compiler_capture"], expected=variant,
             )
-            labels_by_pkg[cache_key] = _labels_for(scan_dir)
-        if label in labels_by_pkg[cache_key]:
+        else:
+            complete = variant_complete(dataset_dir / pkg, variant)
+        if complete:
             skipped += 1
         else:
             remaining.append(variant)
@@ -1928,38 +2216,154 @@ def query_initial_toolchain_placement(
 def build_toolchains_locally(
     toolchain_drvs: frozenset[str],
     *,
+    aggregate_drv: Optional[str] = None,  # noqa: ARG001 - accepted, unused
+    gcroot_dir: Optional[str] = None,
+    deep_realise_drvs: frozenset[str] = frozenset(),
     run_subprocess: Optional[RunSubprocess] = None,
 ) -> None:
-    """Realise every toolchain drv in the local nix store.
+    """Realise AND gc-root every toolchain's FULL build closure so the split
+    upload ships a COMPLETE substituter-free archive.
 
-    Calls ``nix build <drv>^* --no-link`` per drv (sequentially —
-    nix handles internal parallelism). On the first non-zero exit,
-    raises :class:`PreflightError` with the stderr snippet so the
-    operator can see why the build aborted.
+    A substituter-free build node must import the toolchain's entire BUILD
+    closure — the bootstrap (xgcc, bootstrap-stage*, binutils-wrapper, bash,
+    patchelf, setup hooks) — none of which appears in the stdenv OUTPUT runtime
+    closure. ``nix build <drv>^*`` only materialises the FINAL stdenv outputs;
+    worse, with substituters enabled on the submitter it FETCHES those final
+    outputs directly and never realises the bootstrap at all. The bootstrap
+    outputs are then absent when :func:`compute_toolchain_split` snapshots the
+    ``--include-outputs`` closure → the requisites re-query fails → (pre-fix)
+    the split silently fell back to the ~82-path output closure → every worker
+    failed offline with "import did not land" for ~114 missing bootstrap paths.
 
-    ``--no-link`` avoids polluting the cwd with ``result`` symlinks;
-    the build artefacts land in the store regardless and the
-    placement gossip will be written from the first secondary that
-    pulls them.
+    So this, in order:
+      1. builds each toolchain's final outputs (``nix build <drv>^*``),
+      1.5. for ``deep_realise_drvs`` (the native build-host stdenv), realises
+         the FULL drv-input closure so build-time-only intermediates (xgcc,
+         bootstrap-stage*) — which ``--include-outputs`` omits while unrealised
+         — actually exist before the snapshot,
+      2. computes the union of every toolchain's ``--include-outputs`` build-
+         closure OUTPUT paths,
+      3. REALISES that union (substituting the bootstrap from the submitter's
+         caches — the producer is allowed substituters) so every build-closure
+         output is present, and
+      4. GC-ROOTS the realised union (indirect roots under ``gcroot_dir``) so it
+         survives until the split snapshots it ("after rebuilding the compiler
+         stuff you must add a gc root, otherwise it's collected again").
+
+    Sizing note: the complete cross-aarch64 build closure is ~34GB / ~1344
+    paths (measured) — NOT the ~99GB seen earlier, which was an all-arch over-
+    realisation (rooting every -man/-debug/-doc + intermediate). One arch fits
+    comfortably; the image-resident baseline is subtracted at split time.
+
+    Realise + root are batched (256 paths/call) to bound argv length and avoid
+    the per-path rooting hang. Raises :class:`PreflightError` on the first
+    non-zero exit at any step (fail loud — never proceed to ship a partial
+    closure).
     """
     runner = run_subprocess or _default_run_subprocess
-    for drv in sorted(toolchain_drvs):
-        if not drv:
-            continue
-        cmd = [
-            "nix",
-            "--extra-experimental-features",
-            "nix-command flakes",
-            "build",
-            f"{drv}^*",
-            "--no-link",
-        ]
-        _stdout, stderr, rc = runner(cmd)
+    _BATCH = 256
+    drvs = sorted(d for d in toolchain_drvs if d)
+    if not drvs:
+        return
+
+    # 1. Build each toolchain's final outputs (resolves derivers; nix handles
+    #    internal parallelism per drv).
+    for drv in drvs:
+        _stdout, stderr, rc = runner([
+            "nix", "--extra-experimental-features", "nix-command flakes",
+            "build", f"{drv}^*", "--no-link",
+        ])
         if rc != 0:
             decoded = stderr.decode("utf-8", errors="replace").strip()
             raise PreflightError(
                 f"local toolchain build failed for {drv} (rc={rc}): "
                 f"{decoded[-1000:]}"
+            )
+
+    # 1.5. DEEP-REALISE the FULL drv-input closure for deep_realise_drvs (the
+    #      native build-host stdenv). ``nix build <drv>^*`` / whole-output
+    #      substitution leaves BUILD-TIME-ONLY intermediates (xgcc,
+    #      bootstrap-stage*) UNREALISED, and ``--include-outputs`` lists only
+    #      EXISTING outputs — so the snapshot would still miss them. Realising
+    #      the input-derivation closure materialises every build-closure output
+    #      (cheap for the native stdenv: standard cached nixpkgs). We do NOT do
+    #      this for the cross toolchains — their build-time-only intermediates
+    #      are uncached (would rebuild from source) and variants don't need
+    #      them; only the native build-host bootstrap is required at a cross
+    #      variant's depsBuildBuild.
+    for drv in sorted(d for d in deep_realise_drvs if d):
+        out, err, rc = runner([
+            "nix-store", "--query", "--requisites", drv,
+        ])
+        if rc != 0:
+            decoded = err.decode("utf-8", errors="replace").strip()
+            raise PreflightError(
+                f"native build-host closure query failed for {drv} "
+                f"(rc={rc}): {decoded[-1000:]}"
+            )
+        input_drvs = sorted({
+            ln.strip()
+            for ln in out.decode("utf-8", errors="replace").splitlines()
+            if ln.strip().endswith(".drv")
+        })
+        for i in range(0, len(input_drvs), _BATCH):
+            batch = input_drvs[i:i + _BATCH]
+            _o, stderr, rc = runner(["nix-store", "--realise", *batch])
+            if rc != 0:
+                decoded = stderr.decode("utf-8", errors="replace").strip()
+                raise PreflightError(
+                    "native build-host closure realise failed "
+                    f"(rc={rc}): {decoded[-1000:]}"
+                )
+
+    # 2. Union of --include-outputs build-closure OUTPUT paths across all
+    #    toolchains (the drv files are shipped separately via the drv archive).
+    bc_outputs: set[str] = set()
+    for drv in drvs:
+        out, err, rc = runner([
+            "nix-store", "--query", "--requisites", "--include-outputs", drv,
+        ])
+        if rc != 0:
+            decoded = err.decode("utf-8", errors="replace").strip()
+            raise PreflightError(
+                f"toolchain build-closure query failed for {drv} (rc={rc}): "
+                f"{decoded[-1000:]}"
+            )
+        for line in out.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.endswith(".drv"):
+                bc_outputs.add(line)
+    if not bc_outputs:
+        return
+    ordered = sorted(bc_outputs)
+
+    # 3 + 4. Realise the union (substitute the bootstrap) and gc-root it in one
+    #    batched pass. A fresh gcroot dir each call keeps this run's roots
+    #    bounded (no unbounded accumulation across submits). ``--add-root``
+    #    with N paths creates <link>, <link>-2, <link>-3 … all registered as
+    #    indirect gcroots, so one call roots a whole batch.
+    root_base: Optional[pathlib.Path] = None
+    if gcroot_dir:
+        root_base = pathlib.Path(gcroot_dir)
+        if root_base.exists():
+            shutil.rmtree(root_base, ignore_errors=True)
+        root_base.mkdir(parents=True, exist_ok=True)
+
+    for i in range(0, len(ordered), _BATCH):
+        batch = ordered[i:i + _BATCH]
+        cmd = ["nix-store", "--realise"]
+        if root_base is not None:
+            cmd += [
+                "--add-root", str(root_base / f"tc-build-closure-{i // _BATCH}"),
+                "--indirect",
+            ]
+        cmd += batch
+        _stdout, stderr, rc = runner(cmd)
+        if rc != 0:
+            decoded = stderr.decode("utf-8", errors="replace").strip()
+            raise PreflightError(
+                "local toolchain build-closure realise/root failed "
+                f"(rc={rc}): {decoded[-1000:]}"
             )
 
 

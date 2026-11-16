@@ -1,6 +1,7 @@
 # Ignore build outputs from performing a nix-build or `nix build` command
 result
 result-*
+.multiversion-work/
 
 # Ignore automatically generated direnv output
 .direnv
@@ -25,6 +26,10 @@ __pycache__/
 
 # Local work-in-progress notes; not part of the dataset.
 transformer_spec.md
+
+# Compiler capture experiments and local Rust artifacts.
+.capture-experiments/
+rust/compiler-capture/target/
 
 # template_graph probe caches (auto-generated, large, easily regenerated).
 template_graph/tests/fixtures/.probe_cache*.json

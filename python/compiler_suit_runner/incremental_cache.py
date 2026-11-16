@@ -91,6 +91,7 @@ class ToolchainAxes:
 
     sys_name: str = "x86_64-linux"
     archs: Optional[tuple[str, ...]] = None
+    compiler_capture: bool = False
 
     @classmethod
     def from_values(
@@ -98,10 +99,12 @@ class ToolchainAxes:
         *,
         sys_name: str = "x86_64-linux",
         archs: Optional[Sequence[str]] = None,
+        compiler_capture: bool = False,
     ) -> "ToolchainAxes":
         return cls(
             sys_name=str(sys_name),
             archs=_canonical_str_tuple(archs),
+            compiler_capture=bool(compiler_capture),
         )
 
     def canonical_bytes(self) -> bytes:
@@ -114,6 +117,9 @@ class ToolchainAxes:
         variants key built from coincidentally identical fields.
         """
         payload = {"kind": self.KIND, **dataclasses.asdict(self)}
+        if self.compiler_capture:
+            from compiler_suit_runner.capture import PUBLICATION_SCHEMA
+            payload["capture_publication_schema"] = PUBLICATION_SCHEMA
         return json.dumps(
             payload,
             sort_keys=True,
@@ -143,9 +149,13 @@ class VariantAxes:
 
     sys_name: str = "x86_64-linux"
     packages: Optional[tuple[str, ...]] = None
+    package_ids: Optional[tuple[str, ...]] = None
     archs: Optional[tuple[str, ...]] = None
     variant_sample: int = 0
     variant_seed: str = "42"
+    compiler_capture: bool = False
+    catalog_identity: str = ""
+    catalog_schema: int = 1
 
     @classmethod
     def from_values(
@@ -153,22 +163,31 @@ class VariantAxes:
         *,
         sys_name: str = "x86_64-linux",
         packages: Optional[Sequence[str]] = None,
+        package_ids: Optional[Sequence[str]] = None,
         archs: Optional[Sequence[str]] = None,
         variant_sample: int = 0,
         variant_seed: str = "42",
+        compiler_capture: bool = False,
+        catalog_identity: str = "",
     ) -> "VariantAxes":
         return cls(
             sys_name=str(sys_name),
             packages=_canonical_str_tuple(packages),
+            package_ids=_canonical_str_tuple(package_ids),
             archs=_canonical_str_tuple(archs),
             variant_sample=int(variant_sample),
             variant_seed=str(variant_seed),
+            compiler_capture=bool(compiler_capture),
+            catalog_identity=str(catalog_identity),
         )
 
     def canonical_bytes(self) -> bytes:
         """Deterministic serialization for hashing (see
         :meth:`ToolchainAxes.canonical_bytes`)."""
         payload = {"kind": self.KIND, **dataclasses.asdict(self)}
+        if self.compiler_capture:
+            from compiler_suit_runner.capture import PUBLICATION_SCHEMA
+            payload["capture_publication_schema"] = PUBLICATION_SCHEMA
         return json.dumps(
             payload,
             sort_keys=True,
@@ -191,7 +210,7 @@ class InputHashInputs:
 
     flake_lock: bytes  # contents of flake.lock
     git_rev: str  # git rev-parse HEAD output (40-char hex, stripped)
-    git_diff: bytes  # git diff worktree contents (may be empty)
+    git_diff: bytes  # ``git diff HEAD``: staged and unstaged changes (may be empty)
     # Canonical bytes of the sub-entry axes (``canonical_bytes()``).
     # Defaults to empty so the repo state can be collected once and the
     # per-sub-entry keys derived via ``dataclasses.replace`` (see
@@ -269,7 +288,10 @@ def collect_input_hash_inputs(
     """Collect the repo-state inputs for the cache keys.
 
     Reads ``flake.lock`` from disk; calls ``git rev-parse HEAD`` and
-    ``git diff`` via ``run_subprocess`` (default: :func:`subprocess.run`).
+    ``git diff HEAD`` via ``run_subprocess`` (default: :func:`subprocess.run`).
+    ``git diff HEAD`` covers staged and unstaged changes to tracked files,
+    which is what a git flake evaluates. Untracked files are ignored by
+    the flake and so are not part of the key.
     If git is missing or ``repo_root`` is not a git repo, raises
     :class:`RuntimeError`. Use ``read_bytes`` (default
     :meth:`pathlib.Path.read_bytes`) for testability.
@@ -308,14 +330,14 @@ def collect_input_hash_inputs(
     git_rev = (rev_proc.stdout or b"").decode("utf-8", errors="replace").strip()
 
     try:
-        diff_proc = run_subprocess(["git", "diff"], cwd=repo_root)
+        diff_proc = run_subprocess(["git", "diff", "HEAD"], cwd=repo_root)
     except FileNotFoundError as e:
         raise RuntimeError(f"git not found: {e}") from e
 
     if diff_proc.returncode != 0:
         stderr = (diff_proc.stderr or b"").decode("utf-8", errors="replace")
         raise RuntimeError(
-            f"git diff failed in {repo_root} "
+            f"git diff HEAD failed in {repo_root} "
             f"(returncode={diff_proc.returncode}): {stderr.strip()}"
         )
 
@@ -430,6 +452,15 @@ def _variants_from_payload(payload: dict) -> dict[str, dict]:
             raise ValueError(f"non-string binary key: {pkg!r}")
         if not isinstance(meta, dict):
             raise ValueError(f"binary {pkg!r} metadata is not a dict")
+        from .package_selection import RELEASE_FIELDS, validate_release
+        if set(RELEASE_FIELDS) - meta.keys():
+            raise ValueError("cached entry lacks release provenance")
+        if meta.get("archs") or not meta.get("skipped_targets"):
+            validate_release(meta)
+        elif meta.get("packageCatalogSchema") != 1 or meta.get("packageIdentity") is not None:
+            raise ValueError("invalid unavailable-release cache record")
+        if meta["packageId"] != pkg:
+            raise ValueError("cached package ID does not match catalog key")
         missing = [k for k in _VARIANT_META_REQUIRED_KEYS if k not in meta]
         if missing:
             raise ValueError(
@@ -482,7 +513,7 @@ class IncrementalCache:
     can never be replayed.
     """
 
-    ENTRY_VERSION = 1
+    ENTRY_VERSION = 3
     ENTRY_NAME = "entry.json"
     TOOLCHAINS_NAMESPACE = ToolchainAxes.KIND
     VARIANTS_NAMESPACE = VariantAxes.KIND

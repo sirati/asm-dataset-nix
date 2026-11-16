@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import pathlib
+import shlex
 import shutil
 import signal
 import socket as _socket
@@ -611,12 +612,22 @@ class PeerListWatcher(threading.Thread):
         exclude_id: str | None = None,
         tick_seconds: float = DEFAULT_TICK_SECONDS,
         substitute_on_destination: bool = True,
+        write_substituters: bool = True,
     ) -> None:
         super().__init__(name="PeerListWatcher", daemon=True)
         self._shared_fs = pathlib.Path(shared_fs)
         self._exclude_id = exclude_id
         self._tick_seconds = float(tick_seconds)
         self._substitute_on_destination = substitute_on_destination
+        # Substituter-free / secondary-affine mode: keep tracking peers
+        # (the K=3 replication / placement plane needs the live peer set,
+        # discovered over the push-server transport, NOT harmonia), but do
+        # NOT publish ``peers/_substituters.<id>.txt`` — there is no
+        # harmonia to federate, and the file is exactly the per-node
+        # peer-substituter leak affine mode exists to avoid. Workers never
+        # thread it anyway (``_substituters_file_path`` returns None under
+        # ``no_substituters``); withholding the write keeps it off disk too.
+        self._write_substituters = write_substituters
         self._stop_event = threading.Event()
         # Wake event: set on stop() OR on request_refresh(). The run
         # loop blocks on this between ticks so a push notification can
@@ -689,6 +700,10 @@ class PeerListWatcher(threading.Thread):
         )
         with self._lock:
             self._peers = new_peers
+        if not self._write_substituters:
+            # Peer set tracked for the replication/placement plane, but no
+            # substituters file published (substituter-free / affine mode).
+            return
         try:
             _write_substituters_file(self._substituters_path, new_args)
         except OSError:
@@ -1542,6 +1557,87 @@ class PeerNixConfWatcher(threading.Thread):
 _SUBMITTER_KEY_DIR = pathlib.Path.home() / ".cache" / "asm-dataset-nix-runner"
 
 
+def _harmonia_owner_file(key_dir: pathlib.Path, local_port: int) -> pathlib.Path:
+    """File recording which submitter's harmonia serves ``local_port``.
+
+    It holds ``"<harmonia pgid> <submitter pid>"``. A later submitter on
+    the same port reads it to tell an orphan (its submitter is gone)
+    from another live dispatch.
+    """
+    return key_dir / f"harmonia-{local_port}.owner"
+
+
+def _read_harmonia_owner(path: pathlib.Path) -> tuple[int, int] | None:
+    try:
+        pgid_s, owner_s = path.read_text().split()
+        return int(pgid_s), int(owner_s)
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _group_runs_harmonia(pgid: int) -> bool:
+    """True iff some process in group ``pgid`` is a ``harmonia-cache``.
+
+    Guards against a recycled pgid: the group must still be running
+    harmonia before it is killed.
+    """
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if os.getpgid(int(entry.name)) != pgid:
+                continue
+            cmdline = (entry / "cmdline").read_bytes()
+        except (OSError, ProcessLookupError):
+            continue
+        if b"harmonia-cache" in cmdline:
+            return True
+    return False
+
+
+def _kill_orphan_harmonia(
+    owner: tuple[int, int] | None, log: logging.Logger,
+) -> bool:
+    """Kill the harmonia group in ``owner`` if it is an orphan.
+
+    ``owner`` is what the previous submitter on this port recorded. The
+    group is killed only when that submitter process is gone and the
+    group still runs ``harmonia-cache``. Harmonia instances of other
+    dispatches, including a live one on the same port, are left alone.
+    Returns True when a group was killed.
+    """
+    if owner is None:
+        log.warning(
+            "no harmonia owner record for this port; not killing anything"
+        )
+        return False
+    pgid, owner_pid = owner
+    if _pid_alive(owner_pid):
+        log.error(
+            "harmonia port is held by a live dispatch (submitter pid %d);"
+            " pick another --submitter-harmonia-port", owner_pid,
+        )
+        return False
+    if not _group_runs_harmonia(pgid):
+        return False
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        return False
+    log.warning("killed orphan harmonia process group %d", pgid)
+    return True
+
+
 def _generate_submitter_signing_key(
     key_dir: pathlib.Path,
 ) -> tuple[pathlib.Path, str]:
@@ -1786,7 +1882,10 @@ class SubmitterPeer:
         # squatting on local_port, our new one will fail to bind with
         # EADDRINUSE while the probe still succeeds (the orphan answers
         # for ``/nix-cache-info``). Detect that state, clear the
-        # squatter, and retry.
+        # squatter, and retry. The previous owner record is read before
+        # our own harmonia overwrites it.
+        owner_file = _harmonia_owner_file(_SUBMITTER_KEY_DIR, self.local_port)
+        previous_owner = _read_harmonia_owner(owner_file)
         for attempt in range(2):
             log_fh = open(log_path, "wb")
             self._harmonia = subprocess.Popen(  # noqa: S603
@@ -1795,6 +1894,8 @@ class SubmitterPeer:
                 stdin=subprocess.DEVNULL,
                 start_new_session=True, close_fds=True,
             )
+            # start_new_session makes the harmonia pid its group id.
+            owner_file.write_text(f"{self._harmonia.pid} {os.getpid()}\n")
             probe = (
                 f"http://127.0.0.1:{self.local_port}/nix-cache-info"
             )
@@ -1832,24 +1933,18 @@ class SubmitterPeer:
                 break
 
             if bind_failed and attempt == 0:
-                # Wipe the squatter so the retry can bind. We only
-                # touch processes named harmonia-cache to avoid
-                # killing unrelated services that happened to
-                # collide on the port.
+                # Kill only the orphan the previous submitter on this
+                # port recorded. Other dispatches' harmonia instances
+                # (other ports, or a live one on this port) survive.
                 self.log.warning(
                     "submitter harmonia bind to :%d failed - clearing"
-                    " orphan harmonia processes and retrying",
+                    " the orphan harmonia recorded for this port",
                     self.local_port,
                 )
-                try:
-                    subprocess.run(  # noqa: S603,S607
-                        ["pkill", "-KILL", "-f", "harmonia-cache"],
-                        check=False, capture_output=True, timeout=5,
-                    )
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-                time.sleep(0.5)
-                continue
+                if _kill_orphan_harmonia(previous_owner, self.log):
+                    time.sleep(0.5)
+                    continue
+                break
 
             self.log.warning(
                 "submitter harmonia did not respond on :%d within 10s"
@@ -1885,7 +1980,7 @@ class SubmitterPeer:
                 f"{self.slurm_root}/log/{self._run_id}"
                 "/peers/submitter.json"
             )
-            self._ssh_oneshot([f"rm -f {remote_path}"])
+            self._ssh_oneshot([f"rm -f {shlex.quote(remote_path)}"])
         if self._harmonia is not None:
             # ``nix shell --command harmonia-cache`` runs in its own
             # session (``start_new_session=True``), so the Popen handle
@@ -1915,6 +2010,13 @@ class SubmitterPeer:
                         self._harmonia.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         pass
+            owner_file = _harmonia_owner_file(
+                _SUBMITTER_KEY_DIR, self.local_port,
+            )
+            if _read_harmonia_owner(owner_file) == (
+                self._harmonia.pid, os.getpid(),
+            ):
+                owner_file.unlink(missing_ok=True)
 
     def _poll_loop(self) -> None:
         while not self._stop_evt.is_set():
@@ -1996,7 +2098,7 @@ class SubmitterPeer:
         # JSON. Two round-trips per discovery attempt is fine since
         # this only fires once.
         rc, out, _err = self._ssh_oneshot([
-            f"ls -1 {peers_dir} 2>/dev/null"
+            f"ls -1 {shlex.quote(peers_dir)} 2>/dev/null"
             " | grep -E '^[^_].*\\.json$'"
             " | grep -v '^submitter\\.json$'"
             " | head -1",
@@ -2007,7 +2109,7 @@ class SubmitterPeer:
         if not peer_file:
             return None
         rc2, blob, _err2 = self._ssh_oneshot([
-            f"cat {peers_dir}/{peer_file} 2>/dev/null",
+            f"cat {shlex.quote(f'{peers_dir}/{peer_file}')} 2>/dev/null",
         ])
         if rc2 != 0 or not blob.strip():
             return None
@@ -2075,9 +2177,30 @@ class SubmitterPeer:
         except (subprocess.SubprocessError, OSError) as exc:
             return 1, "", str(exc)
 
+    def _ssh_write_file(
+        self, remote_dir: str, remote_path: str, body: bytes,
+    ) -> tuple[int, str, str]:
+        """Write ``body`` to ``remote_path`` on the gateway.
+
+        The body goes over ssh's stdin, not into the command line: a
+        single shell argument is capped at 128 KiB (MAX_ARG_STRLEN),
+        which a few hundred placement records exceed. The file is
+        written to a temporary name and renamed, so a reader never sees
+        a partial file. Paths are shell-quoted.
+        """
+        tmp_path = f"{remote_path}.tmp.{os.getpid()}"
+        return self._ssh_oneshot(
+            [
+                f"mkdir -p {shlex.quote(remote_dir)}"
+                f" && cat > {shlex.quote(tmp_path)}"
+                f" && mv -f {shlex.quote(tmp_path)} {shlex.quote(remote_path)}"
+            ],
+            stdin_input=body,
+        )
+
     def _list_run_ids(self) -> set[str]:
         rc, out, _err = self._ssh_oneshot([
-            f"ls -1 {self.slurm_root}/log 2>/dev/null"
+            f"ls -1 {shlex.quote(f'{self.slurm_root}/log')} 2>/dev/null"
             " | grep -E '^run_[0-9_]+$'",
         ])
         if rc != 0:
@@ -2149,13 +2272,9 @@ class SubmitterPeer:
         body = "\n".join(records) + "\n"
         remote_dir = f"{self.slurm_root}/log/{self._run_id}/peers"
         remote_path = f"{remote_dir}/_paths_submitter.jsonl"
-
-        import base64
-        b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
-        rc, _out, err = self._ssh_oneshot([
-            f"mkdir -p {remote_dir}",
-            f"echo {b64} | base64 -d > {remote_path}",
-        ])
+        rc, _out, err = self._ssh_write_file(
+            remote_dir, remote_path, body.encode("utf-8"),
+        )
         if rc != 0:
             self.log.warning(
                 "publish_placements failed: rc=%d err=%s", rc, err
@@ -2190,14 +2309,9 @@ class SubmitterPeer:
             f"{self.slurm_root}/log/{self._run_id}/peers"
         )
         remote_path = f"{remote_dir}/submitter.json"
-
-        # base64-encode to keep the remote shell command quoting-safe.
-        import base64
-        b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
-        rc, _out, err = self._ssh_oneshot([
-            f"mkdir -p {remote_dir}",
-            f"echo {b64} | base64 -d > {remote_path}",
-        ])
+        rc, _out, err = self._ssh_write_file(
+            remote_dir, remote_path, body.encode("utf-8"),
+        )
         if rc != 0:
             self.log.warning(
                 "publish peer file failed: rc=%d err=%s", rc, err

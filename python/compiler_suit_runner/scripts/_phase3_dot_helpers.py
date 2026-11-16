@@ -52,10 +52,8 @@ class _NullTask:
     def publish_string(self, key: str, value: str) -> None:
         del key, value
 
-    def publish(self, src, *, dst=None, key=None) -> None:
+    def publish(self, src, dst, *, key=None) -> None:
         del key
-        if dst is None:
-            raise ValueError("_NullTask.publish requires dst=")
         dst = pathlib.Path(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))

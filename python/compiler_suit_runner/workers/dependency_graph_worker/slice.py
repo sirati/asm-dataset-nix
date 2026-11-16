@@ -19,55 +19,25 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 
-def _binary_of_template(template: Any) -> str:
-    """Return the binary name encoded in a template's root role.
-
-    Variant-root role is ``<binary>-<arch>-<comp>-<opt>-...-elf-folder.drv``;
-    the binary is the first ``-``-delimited segment. Returns
-    ``"<unknown>"`` when the root role doesn't carry the elf-folder
-    suffix (singleton templates synthesised from non-variant trees
-    in tests).
-
-    Re-implemented locally rather than imported from
-    ``template_graph.cowalk.template_histogram._binary_of`` to keep
-    this module's import surface tight (the histogram module pulls in
-    hashlib + the full template graph machinery for an unrelated
-    diagnostic).
-    """
-    nodes = getattr(template, "nodes", None)
-    if nodes is None and isinstance(template, Mapping):
-        nodes = template.get("nodes")
-    if not nodes:
-        return "<unknown>"
-    root_id = getattr(template, "root_id", None)
-    if root_id is None and isinstance(template, Mapping):
-        root_id = template.get("root_id", 0)
-    if not isinstance(root_id, int) or root_id < 0 or root_id >= len(nodes):
-        return "<unknown>"
-    root = nodes[root_id]
-    root_name = getattr(root, "name", None)
-    if root_name is None and isinstance(root, Mapping):
-        root_name = root.get("name", "")
-    if not isinstance(root_name, str):
-        return "<unknown>"
-    if not root_name.endswith("-elf-folder.drv"):
-        return "<unknown>"
-    first_dash = root_name.find("-")
-    if first_dash <= 0:
-        return "<unknown>"
-    return root_name[:first_dash]
-
-
 def _group_templates_by_binary(
-    templates: list[Any],
+    variant_arrays: Mapping[Any, Any],
 ) -> dict[str, set[int]]:
-    """Map ``binary -> {template_id, ...}`` by inspecting each template's
-    root role.
+    """Map ``binary -> {template_id, ...}`` from the variant arrays.
+
+    Each array records the matrix it was built under
+    (``VariantArray.binary``). Reading that instead of parsing the
+    template's root drv name keeps dashed binaries such as ``c-ares``
+    and ``zlib-ng`` apart from ``c`` and ``zlib``. Arrays without a
+    binary group under ``"<unknown>"``.
     """
     grouped: dict[str, set[int]] = {}
-    for tid, template in enumerate(templates):
-        binary = _binary_of_template(template)
-        grouped.setdefault(binary, set()).add(tid)
+    for key, arr in variant_arrays.items():
+        binary = getattr(arr, "binary", None)
+        if binary is None and isinstance(arr, Mapping):
+            binary = arr.get("binary")
+        grouped.setdefault(binary or "<unknown>", set()).add(
+            _key_template_id(key)
+        )
     return grouped
 
 

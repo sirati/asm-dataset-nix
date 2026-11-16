@@ -369,14 +369,14 @@ def _make_task_mock() -> MagicMock:
     * ``task.publish_string("matrix_aggregate_drv", drv_path)`` (Step 6b)
       surfaces the matrix-aggregate drv to successor tasks via the
       framework's keyed-outputs API. A bare MagicMock records the call.
-    * ``task.publish(src, dst=...)`` is the framework's concurrency-safe
+    * ``task.publish(src, dst)`` is the framework's concurrency-safe
       stage→destination delivery (replaces the prior hand-rolled
       ``.tmp`` + ``os.replace`` straight onto the shared mount). The
       real framework moves the staged file to ``dst``; the stub mirrors
       that — it records ``(src, dst)`` on ``task.publish_calls`` AND
       copies ``src`` → ``dst`` so downstream "archive exists on the
-      shared mount" assertions hold. ``run_eval_task`` always passes the
-      explicit ``dst=`` form, so the stub asserts ``dst`` is present.
+      shared mount" assertions hold. Both ``src`` and ``dst`` are
+      required positional arguments in the new API.
 
     Tests read ``task.publish_calls`` (list of ``(src, dst)`` Path
     tuples) to verify delivery went through ``publish`` and never via a
@@ -385,8 +385,7 @@ def _make_task_mock() -> MagicMock:
     task = MagicMock()
     task.publish_calls = []
 
-    def _publish(src, dst=None, *, key=None):
-        assert dst is not None, "run_eval_task must publish with explicit dst="
+    def _publish(src, dst, *, key=None):
         src_p = pathlib.Path(src)
         dst_p = pathlib.Path(dst)
         task.publish_calls.append((src_p, dst_p))
@@ -1251,7 +1250,7 @@ def test_run_eval_task_calls_meta_even_when_no_sampling(
         if c and c[0] == "nix" and any("#_meta." in p for p in c)
     ]
     assert len(meta_calls) == 2
-    arches_queried = sorted(c[-1].rsplit(".", 1)[-1] for c in meta_calls)
+    arches_queried = sorted(next(arg for arg in c if "#_meta." in arg).rsplit(".", 1)[-1] for c in meta_calls)
     assert arches_queried == ["aarch64", "x86_64"]
     # The full filtered set is forwarded to the bulk eval (no rng
     # down-sampling): 2 archs × 2 surviving suffixes = 4 variants.
@@ -2083,7 +2082,7 @@ class TestSamplePerArchFilters:
         """
         seen: list[str] = []
 
-        def _stub(sys_name, binary, arch, *, flake_ref, run_subprocess):
+        def _stub(sys_name, binary, arch, *, flake_ref, run_subprocess, selected_suffixes=None):
             seen.append(arch)
             return meta_by_arch.get(arch, {})
 
@@ -2122,6 +2121,37 @@ class TestSamplePerArchFilters:
             },
         })
         out = self._call(["aarch64"], [], None, None)
+        assert out == {"aarch64": ["good"]}
+
+    def test_reads_table_from_flake_root_not_cwd(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+    ) -> None:
+        """In the container the cwd is ``/app`` and the flake is
+        ``/app/flake``. The support table must come from the flake root
+        the worker resolved, otherwise the filter silently allows all."""
+        from compiler_suit_runner import support_table as _support_table
+
+        flake = tmp_path / "app" / "flake"
+        flake.mkdir(parents=True)
+        (flake / "table.md").write_text(_FILTER_TEST_TABLE, encoding="utf-8")
+        monkeypatch.chdir(tmp_path / "app")
+        _support_table.load_support_table.cache_clear()
+        self._patch_meta(monkeypatch, {
+            "aarch64": {
+                "good": {"compiler": "gcc15", "optimization": "O0"},
+                "bad": {"compiler": "gcc4_6", "optimization": "O0"},
+            },
+        })
+        try:
+            out = eval_worker._sample_per_arch(
+                ["aarch64"], [], None, None,
+                sys_name="x86_64-linux",
+                binary="hello",
+                flake_ref=f"path:{flake}",
+                run_subprocess=lambda argv: (b"", b"", 0),
+            )
+        finally:
+            _support_table.load_support_table.cache_clear()
         assert out == {"aarch64": ["good"]}
 
     def test_drops_suffix_with_known_bad_combo(

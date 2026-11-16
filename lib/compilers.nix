@@ -101,6 +101,21 @@ let
 
 in
 {
+  # Direct lookup avoids discovering every historical/LLVM compiler just to
+  # instantiate one explicitly selected modern compiler.
+  getByLabel = label:
+    let
+      gccMatch = builtins.match "gcc([0-9]+)" label;
+      clangMatch = builtins.match "clang([0-9]+)" label;
+      attr = if gccMatch != null then label else if clangMatch != null
+        then "llvmPackages_${builtins.head clangMatch}" else null;
+      probe = builtins.tryEval (
+        if attr == null || !(pkgs ? ${attr}) then false
+        else if gccMatch != null then builtins.deepSeq (pkgs.${attr}.cc.version or pkgs.${attr}.version) true
+        else builtins.seq pkgs.${attr}.stdenv true
+      );
+    in if !probe.success || !probe.value then null
+       else if gccMatch != null then mkGccEntry attr else mkClangEntry attr;
   gcc = map mkGccEntry gccAvailable;
   clang = map mkClangEntry llvmAvailable;
   all = (map mkGccEntry gccAvailable) ++ (map mkClangEntry llvmAvailable);

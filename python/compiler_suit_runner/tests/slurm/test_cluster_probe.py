@@ -138,7 +138,6 @@ def test_worker_argv_uses_proxycommand_with_port() -> None:
     # the inner ``-J`` ssh would otherwise pick up only the user's
     # default config, which on a freshly re-keyed slurm-test-env
     # surfaces as ``Host key verification failed`` for the inner hop.
-    pc_idx = argv.index("ProxyCommand=", 0, len(argv) - 2) if False else None
     pc_entries = [e for e in argv if e.startswith("ProxyCommand=")]
     assert len(pc_entries) == 1
     pc = pc_entries[0]

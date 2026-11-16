@@ -118,6 +118,7 @@ def _build_and_drain_arch(planner: "StreamPlanner", arch: str) -> None:
         arch=arch,
         variants=[],
         hashes=[[] for _ in template.nodes],
+        binary=planner.mx.matrix_binary,
     )
     planner.out.variant_arrays[(tmpl_id, arch)] = arr
     # Drain the calibration pair into the new VariantArray (these
@@ -160,6 +161,7 @@ def _close_current_matrix(planner: "StreamPlanner") -> None:
                 arch=arch,
                 variants=[],
                 hashes=[[] for _ in planner.out.templates[tmpl_id].nodes],
+                binary=planner.mx.matrix_binary,
             )
             planner.out.variant_arrays[(tmpl_id, arch)] = arr
             planner._cowalk_into_arr(tmpl_id, arch, label, tree)

@@ -10,6 +10,9 @@
 {
   pkgs,
   lib,
+  capture ? null,
+  packageProviders,
+  evaluationIdentity ? null,
   extraCompilers ? {
     gcc = [ ];
     clang = [ ];
@@ -40,8 +43,13 @@ let
   };
   archDefs = import ./architectures.nix { };
   flagDefs = import ./flags.nix { };
-  pkgDefs = import ./packages.nix { };
-  mkVariant = import ./mkVariant.nix { inherit pkgs lib; };
+  catalog = import ./package-versions.nix { inherit lib; providers = packageProviders; };
+  pkgDefs = { all = catalog.entries; };
+  resolvePackage = import ./resolve-package.nix { inherit pkgs lib; providers = packageProviders; };
+  mkVariant = import ./mkVariant.nix {
+    inherit pkgs lib;
+    resolvePackage = { pkg, target }: resolvedPackages.${pkg.packageId}.${target.label};
+  };
   mkBinaryFolder = import ./mkBinaryFolder.nix { inherit pkgs lib; };
 
   # Skip compiler/target combos below the minimum supported version (from support_matrix.md).
@@ -115,17 +123,6 @@ let
     && meetsMaxVersion cv maxV
     && !(isVersionInBrokenList cv brokenList);
 
-  # All valid (compiler, optLevel) pairs. Optimization levels carry the
-  # same constraint fields as the other axes (clangOnly for -Oz,
-  # minGccVersion for -Ofast), so reuse the generic per-axis filter
-  # (defined below; Nix lets-bindings are order-independent).
-  compilerOptPairs = lib.concatMap (
-    compiler:
-    map (opt: { inherit compiler opt; }) (
-      builtins.filter (e: entryAcceptsCompiler e compiler) flagDefs.optimizationLevels
-    )
-  ) compilers.all;
-
   # Generic per-axis filter: an axis entry may declare
   # ``minGccVersion`` / ``minClangVersion`` (default: no minimum),
   # ``clangOnly`` (default false), and ``archs`` (default: null =
@@ -156,112 +153,40 @@ let
     in
     allowed == null || builtins.elem target.label allowed;
 
-  # Generic matrix-side gate: a package can be variant-instantiated by
-  # ``mkVariant`` (which calls ``targetPkgs.${attr}.override { stdenv = …; }``)
-  # only if its underlying package function declares a ``stdenv`` parameter.
-  # ``stdenvNoCC``-only packages (e.g. ``nanopb``) survive into the matrix
-  # otherwise and throw ``unexpected argument 'stdenv'`` at build time.
-  #
-  # Introspection: nixpkgs' ``lib.makeOverridable`` wraps ``.override`` as a
-  # functor whose ``__functionArgs`` mirrors the underlying package lambda's
-  # formal parameters. ``pkg.override.__functionArgs ? stdenv`` is therefore
-  # the most direct, allocation-free probe — no need to actually invoke
-  # ``override`` or call ``overrideAttrs`` (both would force real evaluation).
-  # The whole probe is wrapped in ``tryEval`` so a malformed/legacy override
-  # mechanism on some obscure package can't take down the entire matrix.
-  pkgAcceptsStdenv =
-    targetPkgs: pkgDef:
-    if targetPkgs == null || !(targetPkgs ? ${pkgDef.attr}) then
-      false
-    else
-      let
-        probe = builtins.tryEval (
-          let
-            p = targetPkgs.${pkgDef.attr};
-          in
-          p ? override
-          && (p.override ? __functionArgs)
-          && (p.override.__functionArgs ? stdenv)
-        );
-      in
-      probe.success && probe.value;
+  # Bind these computations once. Nix shares bound thunks, not arbitrary
+  # repeated function applications over every compiler/flag combination.
+  resolvedPackages = lib.mapAttrs (_: pkg:
+    lib.mapAttrs (_: target: resolvePackage { inherit pkg target; }) archDefs.targets
+  ) catalog.byId;
+  pkgIsBuildableForTarget = target: pkg: resolvedPackages.${pkg.packageId}.${target.label}.available;
 
-  # Per-(pkg, arch) platform-availability gate, complementary to
-  # ``pkgAcceptsStdenv``. Many nixpkgs packages declare a non-trivial
-  # ``meta.platforms`` allowlist or ``meta.badPlatforms`` denylist (e.g.
-  # ``guetzli`` ships SSE2 intrinsics unconditionally → x86-only;
-  # ``hyperscan`` is x86-only; ``rav1e`` rules out most cross targets).
-  # Others mark themselves ``meta.broken = true`` on hosts where their
-  # build is known not to land (``xed`` on aarch64 cross), or carry
-  # ``meta.insecure = true`` so nixpkgs refuses to evaluate them by
-  # default (``quickjs`` with active CVEs).
-  #
-  # nixpkgs collapses all three signals into a single boolean,
-  # ``pkg.meta.available``, computed in ``<nixpkgs>/lib/meta.nix`` by
-  # combining ``availableOn`` (platforms/badPlatforms vs the build's
-  # host platform) with ``broken`` and the insecure-allowlist check.
-  # ``stdenv.mkDerivation``'s "Refusing to evaluate package … because
-  # it is not available on the requested hostPlatform" error fires from
-  # exactly the same condition we check here, so using ``meta.available``
-  # mirrors the upstream gate one-to-one.
-  #
-  # The probe runs inside ``tryEval`` because a small number of legacy
-  # attrs throw from ``meta`` itself (broken assertions in old nixpkgs
-  # revisions or `requireFile`-style fetchers). The fallback ``false``
-  # keeps the rest of the matrix evaluable; a probe that can't determine
-  # availability is treated as "not available".
-  pkgSupportsPlatform =
-    targetPkgs: pkgDef:
-    if targetPkgs == null || !(targetPkgs ? ${pkgDef.attr}) then
-      false
-    else
-      let
-        probe = builtins.tryEval (
-          let
-            p = targetPkgs.${pkgDef.attr};
-          in
-          (p.meta.available or true)
-        );
-      in
-      probe.success && probe.value;
-
-  # Combined gate: both axes must hold for a (pkg, arch) cell to
-  # enumerate variants. Single source of truth used by both
-  # ``nestedMatrix`` (derivation-building) and ``metaMatrix`` (pure
-  # metadata) so they stay in lock-step — if any cell shows up empty
-  # in ``_meta``, the same cell will be empty in ``dataset``.
-  pkgIsBuildableForTarget =
-    targetPkgs: pkgDef:
-    pkgAcceptsStdenv targetPkgs pkgDef
-    && pkgSupportsPlatform targetPkgs pkgDef;
-
-  # All (compiler, optLevel, flagSet, hardening, sanitizer, march)
-  # tuples — compiler-only filtering happens here; arch filtering
-  # gets applied later in ``combosForTarget``. Each axis independent;
-  # mutually-exclusive options live within a single axis (one
-  # sanitizer per build, one march level per build).
-  allFlagCombos = lib.concatMap (
-    { compiler, opt }:
-    lib.concatMap (
-      flagSet:
-      lib.concatMap (
-        hardening:
-        lib.concatMap (
-          sanitizer:
-          map (march: {
-            inherit
-              compiler
-              opt
-              flagSet
-              hardening
-              sanitizer
-              march
-              ;
-          }) (builtins.filter (e: entryAcceptsCompiler e compiler) flagDefs.marchLevels)
-        ) (builtins.filter (e: entryAcceptsCompiler e compiler) flagDefs.sanitizerModes)
-      ) (builtins.filter (e: entryAcceptsCompiler e compiler) flagDefs.hardeningModes)
-    ) (builtins.filter (e: entryAcceptsCompiler e compiler) flagDefs.flagSets)
-  ) compilerOptPairs;
+  # Filter each independent axis before forming its Cartesian product.
+  # Compiler versions and permitted axes are shared by all optimization levels.
+  groupsForTarget = target: lib.concatMap (compiler:
+    let
+      accepts = entry: entryAcceptsCompiler entry compiler
+        && (target == null || entryAcceptsArch entry target);
+      axes = {
+        flagSets = builtins.filter accepts flagDefs.flagSets;
+        hardeningModes = builtins.filter accepts flagDefs.hardeningModes;
+        sanitizerModes = builtins.filter accepts flagDefs.sanitizerModes;
+        marchLevels = builtins.filter accepts flagDefs.marchLevels;
+      };
+    in if target != null && !(isValidArchCombo compiler target) then [] else
+      map (opt: { inherit compiler opt axes; })
+        (builtins.filter (entry: entryAcceptsCompiler entry compiler) flagDefs.optimizationLevels)
+  ) compilers.all;
+  groupsByTarget = lib.mapAttrs (_: target: groupsForTarget target) archDefs.targets;
+  groupSize = group: builtins.foldl' (n: entries: n * builtins.length entries) 1
+    (builtins.attrValues group.axes);
+  countGroups = groups: builtins.foldl' (n: group: n + groupSize group) 0 groups;
+  expandGroup = { compiler, opt, axes }: lib.concatMap (flagSet:
+    lib.concatMap (hardening: lib.concatMap (sanitizer:
+      map (march: { inherit compiler opt flagSet hardening sanitizer march; }) axes.marchLevels
+    ) axes.sanitizerModes) axes.hardeningModes
+  ) axes.flagSets;
+  combosByTarget = lib.mapAttrs (_: groups: lib.concatMap expandGroup groups) groupsByTarget;
+  combosForTarget = target: combosByTarget.${target.label};
 
   # Compute the suffix key and metadata without creating any derivation.
   mkSuffix =
@@ -304,7 +229,7 @@ let
           ;
       };
     in
-    {
+    resolvedPackages.${pkgDef.packageId}.${target.label}.meta // {
       variantLabel = lib.concatStringsSep "-" [
         pkgDef.label
         target.label
@@ -320,6 +245,12 @@ let
       hardening = hardening.label;
       sanitizer = sanitizer.label;
       march = march.label;
+    } // lib.optionalAttrs (capture != null) {
+      compilerCapture = import ./capture-contract.nix {
+        inherit (compiler) family;
+        policy = capture.policy or "required";
+        debugPolicy = capture.debugPolicy or "required";
+      };
     };
 
   # Build one variant entry (lazy — derivation not forced until .elfFolder/.rawPkg is accessed)
@@ -328,6 +259,16 @@ let
     let
       suffix = mkSuffix combo;
       meta = mkMeta pkgDef target combo;
+      variant = mkVariant {
+        pkg = pkgDef;
+        compiler = combo.compiler;
+        inherit target capture;
+        optLevel = combo.opt;
+        flagSet = combo.flagSet;
+        hardening = combo.hardening;
+        sanitizer = combo.sanitizer;
+        march = combo.march;
+      };
     in
     {
       name = suffix;
@@ -335,44 +276,69 @@ let
         inherit meta;
         inherit (meta) variantLabel;
         # These are lazy — only evaluated when actually accessed
-        elfFolder = mkBinaryFolder (mkVariant {
-          pkg = pkgDef;
-          compiler = combo.compiler;
-          inherit target;
-          optLevel = combo.opt;
-          flagSet = combo.flagSet;
-          hardening = combo.hardening;
-          sanitizer = combo.sanitizer;
-          march = combo.march;
-        });
-        rawPkg =
-          (mkVariant {
-            pkg = pkgDef;
-            compiler = combo.compiler;
-            inherit target;
-            optLevel = combo.opt;
-            flagSet = combo.flagSet;
-            hardening = combo.hardening;
-            sanitizer = combo.sanitizer;
-            march = combo.march;
-          }).variantPkg;
+        elfFolder = mkBinaryFolder variant;
+        rawPkg = variant.variantPkg;
       };
     };
 
-  # Filter flag combos for a specific target: drop combos whose
-  # compiler doesn't meet the target's minimum version, AND drop
-  # combos whose flagSet/hardening/sanitizer/march entry has an
-  # ``archs`` allow-list that excludes this target.
-  combosForTarget =
-    target:
-    builtins.filter (
-      combo:
-      isValidArchCombo combo.compiler target
-      && entryAcceptsArch combo.flagSet target
-      && entryAcceptsArch combo.hardening target
-      && entryAcceptsArch combo.sanitizer target
-      && entryAcceptsArch combo.march target
-    ) allFlagCombos;
+  # Selected builds do not need the flat legacy key set. Resolve each
+  # requested suffix against the small independent axis lists instead.
+  consume = axis: entries: text:
+    let matches = builtins.filter (entry: lib.hasPrefix "${entry.label}-" text) entries;
+        ordered = builtins.sort (a: b: builtins.stringLength a.label > builtins.stringLength b.label) matches;
+        entry = if ordered == [] then throw "unknown variant ${axis}: ${text}" else builtins.head ordered;
+    in { value = entry; rest = lib.removePrefix "${entry.label}-" text; };
+  comboForSuffix = target: suffix:
+    let
+      requestedCompiler = builtins.head (lib.splitString "-" suffix);
+      current = currentCompilers.getByLabel requestedCompiler;
+      c = if current == null then consume "compiler" compilers.all suffix else {
+        value = current; rest = lib.removePrefix "${requestedCompiler}-" suffix;
+      };
+      o = consume "optimization" flagDefs.optimizationLevels c.rest;
+      f = consume "flag set" flagDefs.flagSets o.rest;
+      h = consume "hardening" flagDefs.hardeningModes f.rest;
+      z = consume "sanitizer" flagDefs.sanitizerModes h.rest;
+      m = lib.findFirst (entry: entry.label == z.rest) null flagDefs.marchLevels;
+      compiler = c.value;
+      entries = [ f.value h.value z.value ] ++ lib.optional (m != null) m;
+      valid = m != null && isValidArchCombo compiler target
+        && entryAcceptsCompiler o.value compiler
+        && builtins.all (entry: entryAcceptsCompiler entry compiler && entryAcceptsArch entry target) entries;
+    in if !valid then throw "unsupported variant ${target.label}/${suffix}" else {
+      inherit compiler;
+      opt = o.value; flagSet = f.value; hardening = h.value; sanitizer = z.value; march = m;
+    };
+  selectDataset = lib.mapAttrs (_: pkg: request:
+    let selection = if request ? selection then
+      if (request.identity or null) != evaluationIdentity then throw "evaluation inputs changed since preflight"
+      else request.selection
+      else request;
+    in
+    lib.mapAttrs (arch: suffixes:
+      let target = archDefs.targets.${arch} or (throw "unknown target ${arch}");
+      in if !(pkgIsBuildableForTarget target pkg) then
+        throw "package ${pkg.packageId} on ${arch}: ${resolvedPackages.${pkg.packageId}.${arch}.reason}"
+      else lib.genAttrs suffixes (suffix: (mkEntry pkg target (comboForSuffix target suffix)).value.elfFolder)
+    ) selection
+  ) catalog.byId;
+  variantAxes = lib.mapAttrs (arch: groups: {
+    schema = 1;
+    inherit arch;
+    identity = evaluationIdentity;
+    groups = map (group: {
+      compiler = group.compiler.label;
+      compilerFamily = group.compiler.family;
+      compilerVersion = group.compiler.version;
+      optimization = group.opt.label;
+      axes = {
+        flags = map (entry: entry.label) group.axes.flagSets;
+        hardening = map (entry: entry.label) group.axes.hardeningModes;
+        sanitizer = map (entry: entry.label) group.axes.sanitizerModes;
+        march = map (entry: entry.label) group.axes.marchLevels;
+      };
+    }) groups;
+  }) groupsByTarget;
 
   # ── Nested attrset: dataset.<pkg>.<arch>.<suffix> ────────────────────────
   nestedMatrix = lib.genAttrs (map (p: p.label) pkgDefs.all) (
@@ -384,9 +350,8 @@ let
       archName:
       let
         target = archDefs.targets.${archName};
-        targetPkgs' = archDefs.getPkgsForTarget pkgs target;
       in
-      if !(pkgIsBuildableForTarget targetPkgs' pkgDef) then
+      if !(pkgIsBuildableForTarget target pkgDef) then
         { }
       else
         builtins.listToAttrs (map (mkEntry pkgDef target) (combosForTarget target))
@@ -403,9 +368,8 @@ let
       archName:
       let
         target = archDefs.targets.${archName};
-        targetPkgs' = archDefs.getPkgsForTarget pkgs target;
       in
-      if !(pkgIsBuildableForTarget targetPkgs' pkgDef) then
+      if !(pkgIsBuildableForTarget target pkgDef) then
         { }
       else
         builtins.listToAttrs (
@@ -418,10 +382,11 @@ let
   );
 
   # Count without forcing derivation evaluation
-  combosPerArch = builtins.length allFlagCombos;
+  combosPerArch = countGroups (groupsForTarget null);
   numArchs = builtins.length (builtins.attrNames archDefs.targets);
   numPkgs = builtins.length pkgDefs.all;
-  matrixSize = combosPerArch * numArchs * numPkgs;
+  matrixSize = combosPerArch * numArchs * builtins.length catalog.defaultIds;
+  curatedMatrixSize = combosPerArch * numArchs * numPkgs;
 
   # ── Cross-toolchain pre-build ──────────────────────────────────────────
   # For each valid (target, compiler) pair, expose the cross-compiler (cc)
@@ -453,9 +418,21 @@ let
             # for ppc32 missing ``platform.kernelArch``) become
             # eval-time throws inside the tryEval and we cleanly drop
             # that one combo while keeping the rest of the arch.
+            # Seed on the FULL cross-stdenv (``mkStdenv``), not just its
+            # ``.cc``: a variant builds against ``overrideCC targetPkgs.stdenv
+            # cc`` (mkVariant.nix:250), so the build node needs the whole
+            # cross-stdenv closure (the ``stdenv-linux`` base + cc + bintools +
+            # cross-libc), not only the compiler. Seeding on ``.cc`` shipped the
+            # compiler but dropped the ``stdenv-linux`` output → offline cross
+            # builds failed with "Cannot build stdenv-linux.drv". The shared
+            # native build tools (bash/coreutils/make) are subtracted as the
+            # per-node baseline at upload time, so only the cross-specific delta
+            # ships.
             tried = builtins.tryEval (
-              let cc = (comp.mkStdenv targetPkgs' target).cc;
-              in builtins.deepSeq cc.drvPath cc
+              let toolchainStdenv = ((import ./resolve-toolchain.nix { inherit pkgs lib; }) {
+                compiler = comp; inherit target capture;
+              }).stdenv;
+              in builtins.deepSeq toolchainStdenv.drvPath toolchainStdenv
             );
           in
           if tried.success then
@@ -477,13 +454,14 @@ let
   ) archDefs.targets;
 
   # Per-arch linkFarms for batch building: one derivation that depends on
-  # every valid cross-compiler for the architecture.
+  # every valid cross-stdenv (compiler + cross build environment) for the
+  # architecture, so a single build realises the full cross-stdenv closures.
   crossToolchains = lib.mapAttrs (
     archName: compilerMap:
     pkgs.linkFarm "cross-toolchains-${archName}" (
-      lib.mapAttrsToList (label: cc: {
+      lib.mapAttrsToList (label: tc: {
         name = label;
-        path = cc;
+        path = tc;
       }) compilerMap
     )
   ) crossToolchainMap;
@@ -499,15 +477,47 @@ let
     }) (builtins.filter (comp: isValidArchCombo comp target) compilers.all)
   ) archDefs.targets;
 
+  packageCatalog = lib.mapAttrs (_: pkg:
+    let native = resolvedPackages.${pkg.packageId}.x86_64;
+    in {
+      inherit (pkg) packageFamily packageId releaseId recipeId isDefault;
+      packageVersion = if native.meta == null then null else native.meta.packageVersion;
+      packageIdentity = if native.meta == null then null else native.meta.packageIdentity;
+      sourceIdentity = if native.meta == null then null else native.meta.sourceIdentity;
+      packageCatalogSchema = catalog.schema;
+      variantInventorySchema = 1;
+      variantInventoryIdentity = evaluationIdentity;
+      availability = lib.mapAttrs (_: target:
+        let resolved = resolvedPackages.${pkg.packageId}.${target.label};
+        in { inherit (resolved) available reason; }
+      ) archDefs.targets;
+    }
+  ) catalog.byId;
+
+  variantCounts = lib.mapAttrs (_: groups: countGroups groups) groupsByTarget;
+
+  packageVariantCounts = lib.mapAttrs (_: pkg:
+    lib.mapAttrs (_: target:
+      if (pkgIsBuildableForTarget target pkg)
+      then countGroups groupsByTarget.${target.label} else 0
+    ) archDefs.targets
+  ) catalog.byId;
+
 in
 {
   inherit
     nestedMatrix
     metaMatrix
     matrixSize
+    curatedMatrixSize
     crossToolchainMap
     crossToolchains
     crossToolchainsMeta
+    packageCatalog
+    packageVariantCounts
+    selectDataset
+    variantAxes
+    variantCounts
     ;
 
   # Targeted access (fast — only evaluates the requested slice)

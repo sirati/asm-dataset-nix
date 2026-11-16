@@ -288,8 +288,16 @@ class StreamPlanner:
         anything not pre-listed in toolchain_drvs is just incidental
         build noise. Discard the whole subtree from unclassified."""
         stack = [t_node]
+        visited: set[int] = set()
         while stack:
             n = stack.pop()
+            # Backrefs collapse onto shared RawTreeNode objects. A diamond
+            # dependency DAG has exponentially many paths, but each object
+            # only needs to be discarded once.
+            node_id = id(n)
+            if node_id in visited:
+                continue
+            visited.add(node_id)
             if not n.is_backref:
                 self.mx.unclassified_nodes.discard(n.ident)
             stack.extend(n.children)
